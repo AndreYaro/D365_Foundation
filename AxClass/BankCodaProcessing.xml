@@ -1,0 +1,1522 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BankCodaProcessing</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class BankCodaProcessing extends RunBase
+{
+    PaymMoneyTransferSlip_BE moneyTransferSlipBE;
+    BankCodaAccountStatement bankCodaAccountStatement;
+    int recCount;
+    boolean allProcessed;
+    BankCodaSettlementType childSettlements;
+    Notes errorLog;
+    BankCodaParameters bankCodaParameters;
+    private const int PaymentLength = 10;
+    private BankCodaAccountPreprocessedDetails bankCodaCustomerPreprocessedDetails;
+    private BankCodaAccountPreprocessedDetails bankCodaVendorPreprocessedDetails;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkSpecTrans</Name>
+				<Source><![CDATA[
+    protected recId checkSpecTrans(CustVendTransOpen _custVendTransOpen)
+    {
+        SpecTrans specTrans;
+
+        select firstonly crossCompany RecId from specTrans
+            where specTrans.SpecTableId == tableNum(BankCodaAccountStatementLines)
+               && specTrans.RefTableId == _custVendTransOpen.TableId
+               && specTrans.RefRecId == _custVendTransOpen.RecId
+               && specTrans.RefCompany == _custVendTransOpen.company();
+
+        return specTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearErrorMessage</Name>
+				<Source><![CDATA[
+    //clears the log field of the record
+    protected void clearErrorMessage(BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        _bankCodaAccountStatementLines.HasProcessErrors = NoYes::No;
+        _bankCodaAccountStatementLines.Log = "";
+        _bankCodaAccountStatementLines.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custSettlement</Name>
+				<Source><![CDATA[
+    //This method handles a movement record as a custsettlement.
+    //Tries to find a customer and/or an invoice for the movement.In case none is found the method calls noMatching.
+    [Replaceable]
+    public BankCodaAccountStatementLines custSettlement(
+        BankCodaTransDefTable _bankCodaTransDefTable,
+        BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        PaymId paymentId;
+        CustTrans       custTrans;
+        CustTable       custTable;
+        boolean         noMatching = false;
+        CustTransOpen   custTransOpen;
+        SpecTransManager    specTransManager;
+        AmountCur       maxAmount;
+
+        paymentId = moneyTransferSlipBE.decodePaymId(_bankCodaAccountStatementLines.StructuredMessageType,_bankCodaAccountStatementLines.Message);
+        if (!paymentId)
+        {
+            this.updateErrorLog(BankCodaProcessErrorCause::StructuredNoId,_bankCodaAccountStatementLines);
+        }
+
+        custTable = this.findCustomer(_bankCodaTransDefTable,_bankCodaAccountStatementLines);
+
+        if (custTable)
+        {
+            _bankCodaAccountStatementLines.initFromCustTable(custTable);
+        }
+
+        if (paymentId)
+        {
+            custTrans = this.findInvoiceCustomer(paymentId,_bankCodaAccountStatementLines);
+
+            if (custTrans)
+            {
+                this.clearErrorMessage(_bankCodaAccountStatementLines);
+                if (!custTable)
+                {
+                    _bankCodaAccountStatementLines.initFromCustTable(CustTable::find(custTrans.AccountNum));
+                }
+                _bankCodaAccountStatementLines.InvoiceId          = custTrans.Invoice;
+                maxAmount = custTrans.AmountCur + (custTrans.AmountCur / 100) * bankCodaParameters.CodaDeviation;
+                if (_bankCodaAccountStatementLines.AmountCur <= maxAmount)
+                {
+                    custTransOpen = CustTransOpen::findRefId(custTrans.RecId);
+                    specTransManager = SpecTransManager::newFromSpec(_bankCodaAccountStatementLines, false);
+
+                    if (this.canBeMarkedForSettlement(
+                            _bankCodaAccountStatementLines,
+                            custTrans.TableId,
+                            custTrans.RecId,
+                            specTransManager,
+                            custTransOpen))
+                    {
+                        specTransManager.insert(custTransOpen.company(), custTransOpen.TableId, custTransOpen.RecId, custTrans.AmountCur, '');
+
+                        _bankCodaAccountStatementLines.CodaSettlementType = BankCodaSettlementType::Settled;
+                    }
+                    else
+                    {
+                        checkFailed(strFmt("@ApplicationSuite_Localization:InvoiceCannotBeMarkedForSettlement",
+                            _bankCodaAccountStatementLines.SequenceNumber,
+                            _bankCodaAccountStatementLines.InvoiceId));
+                        _bankCodaAccountStatementLines.InvoiceId = '';
+                    }
+                }
+            }
+            else
+            {
+                this.updateErrorLog(BankCodaProcessErrorCause::NoInvoice,_bankCodaAccountStatementLines);
+                noMatching = true;
+            }
+        }
+
+        if (! _bankCodaAccountStatementLines.LedgerDimension)
+        {
+            this.updateErrorLog(BankCodaProcessErrorCause::NoCust,_bankCodaAccountStatementLines);
+            if (noMatching)
+            {
+                this.noMatching(_bankCodaAccountStatementLines);
+            }
+        }
+        else
+        {
+            if (bankCodaParameters.CreateNewAccount)
+            {
+                BankCodaProcessing::createNewCustBankAccount(_bankCodaAccountStatementLines);
+            }
+        }
+
+        return _bankCodaAccountStatementLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayProgress</Name>
+				<Source><![CDATA[
+    public void displayProgress(
+        Counter                     _line,
+        BankCodaTransactionType     _transType
+        )
+    {
+        this.progressUpdate(strFmt("@SYS79599",_line, enum2str(_transType)),_line);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findCustomer</Name>
+				<Source><![CDATA[
+    //Method tries to find a customer by using
+    //(if available) the bankaccountnumber, name and Address
+    protected CustTable findCustomer(
+        BankCodaTransDefTable          _bankCodaTransDefTable,
+        BankCodaAccountStatementLines  _bankCodaAccountStatementLines
+        )
+    {
+        CustTable                   custTable;
+        CustBankAccount             custBankAccount;
+        BankIBAN                    iban = strLTrim(strRTrim(_bankCodaAccountStatementLines.OtherPartyBankAccountID));
+
+        custTable = CustTable::find(_bankCodaTransDefTable.parmAccount());
+
+        if (! custTable && _bankCodaAccountStatementLines.OtherPartyBankAccountID)
+        {
+            unchecked (Uncheck::TableSecurityPermission)
+            {
+                select firstonly custBankAccount where
+                    custBankAccount.BankIBAN == iban;
+
+                if (!custBankAccount)
+                {
+                    while select AccountNum, CustAccount from custBankAccount
+                    {
+                        if (strKeep(custBankAccount.AccountNum,'0123456789') == _bankCodaAccountStatementLines.OtherPartyBankAccountID)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            custTable =  CustTable::find(custBankAccount.CustAccount);
+
+            if (!custTable && (_bankCodaAccountStatementLines.OtherPartyAddress || _bankCodaAccountStatementLines.OtherPartyName))
+            {
+                select firstonly custTable
+                    exists join bankCodaCustomerPreprocessedDetails
+                        where bankCodaCustomerPreprocessedDetails.CustVendTableRecId == custTable.RecId
+                            && (bankCodaCustomerPreprocessedDetails.FormattedName == strKeep(_bankCodaAccountStatementLines.OtherPartyName,'abcdefghijklmnopqrstuvwxyz')
+                                || bankCodaCustomerPreprocessedDetails.FormattedAddress == _bankCodaAccountStatementLines.OtherPartyAddress);
+            }
+        }
+
+        return custTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findDefinition</Name>
+				<Source><![CDATA[
+    //Tries to find a codadefinition for a given
+    //BankAccount, Family, Transaction & category. If found the bankCodaAccountStatementLine record is updated with the found values.
+    protected BankCodaTransDefTable findDefinition(BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        BankCodaTransDefTable                   bankCodaTransDefTable;
+        BankCodaAccountStatementLines           bankCodaAccountStatementLine;
+
+        bankCodaTransDefTable = BankCodaTransDefTable::findByCODADefinition(_bankCodaAccountStatementLines.AccountId,
+                                                        _bankCodaAccountStatementLines.TransactionFamily,
+                                                        _bankCodaAccountStatementLines.Transaction,
+                                                        _bankCodaAccountStatementLines.TransactionCategory);
+        if (bankCodaTransDefTable)
+        {
+            if (_bankCodaAccountStatementLines.GlobalisationCode != bankCodaTransDefTable.GlobalisationCode)
+            {
+                _bankCodaAccountStatementLines.GlobalisationCode = bankCodaTransDefTable.GlobalisationCode;
+            }
+            if (_bankCodaAccountStatementLines.GlobalisationCode == GlobalisationCode::Global)
+            {
+                update_recordset bankCodaAccountStatementLine
+                    setting GlobalisationCode = GlobalisationCode::Details
+                    where bankCodaAccountStatementLine.SequenceNumber == _bankCodaAccountStatementLines.SequenceNumber
+                        && bankCodaAccountStatementLine.RefRecId == _bankCodaAccountStatementLines.RecId;
+            }
+            else
+            {
+                update_recordset bankCodaAccountStatementLine
+                    setting GlobalisationCode = GlobalisationCode::Global
+                    where bankCodaAccountStatementLine.SequenceNumber == _bankCodaAccountStatementLines.SequenceNumber
+                        && bankCodaAccountStatementLine.RefRecId == _bankCodaAccountStatementLines.RecId;
+            }
+        }
+        else
+        {
+            this.updateErrorLog(BankCodaProcessErrorCause::TransDefinition,_bankCodaAccountStatementLines);
+        }
+
+        return bankCodaTransDefTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInvoiceCustomer</Name>
+				<Source><![CDATA[
+    //This method will search for an invoice of a
+    //particular customer by using the decoded paymid
+    protected CustTrans findInvoiceCustomer(
+        PaymId _paymentId,
+        BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        CustTrans custTrans;
+        CustTransOpen custTransOpen;
+        PaymId paymentId;
+
+        if (_bankCodaAccountStatementLines.LedgerDimension)
+        {
+            if (_paymentId)
+            {
+                while select custTrans
+                    where custTrans.AccountNum == _bankCodaAccountStatementLines.parmAccount()
+                        && custTrans.PaymReference like this.getPaymentIdFilter(_paymentId)
+                    join custTransOpen
+                        where custTransOpen.RefRecId == custTrans.RecId
+                {
+                    if (!this.checkSpecTrans(custTransOpen))
+                    {
+                        this.setCashDiscLinked(
+                            _bankCodaAccountStatementLines,
+                            custTrans.AmountCur - custTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate));
+                        break;
+                    }
+                }
+
+                if (!custTrans)
+                {
+                    while select custTrans
+                        where custTrans.AccountNum == _bankCodaAccountStatementLines.parmAccount()
+                            && !(custTrans.PaymReference like this.getPaymentIdFilter(_paymentId))
+                        join custTransOpen
+                            where custTransOpen.RefRecId == custTrans.RecId
+                    {
+                        paymentId = subStr(moneyTransferSlipBE.encodePaymId(custTrans.Invoice, PaymentStub::BelSMS101), 1, PaymentLength);
+
+                        if (paymentId == _paymentId 
+                            && !this.checkSpecTrans(custTransOpen))
+                        {
+                            this.setCashDiscLinked(
+                                _bankCodaAccountStatementLines,
+                                custTrans.AmountCur - custTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!custTrans)
+            {
+                custTrans = this.findInvoiceCustomerByAmount(_bankCodaAccountStatementLines);
+            }
+        }
+        else
+        {
+            while select custTrans
+                where custTrans.PaymReference like this.getPaymentIdFilter(_paymentId)
+                join custTransOpen
+                    where custTransOpen.RefRecId == custTrans.RecId
+            {
+                if (!this.checkSpecTrans(custTransOpen))
+                {
+                    break;
+                }
+            }
+
+            if (!custTrans)
+            {
+                while select custTrans
+                    where !(custTrans.PaymReference like this.getPaymentIdFilter(_paymentId))
+                    join custTransOpen
+                        where custTransOpen.RefRecId == custTrans.RecId
+                {
+                    paymentId = subStr(moneyTransferSlipBE.encodePaymId(custTrans.Invoice, PaymentStub::BelSMS101), 1, PaymentLength);
+
+                    if (paymentId == _paymentId &&
+                        !this.checkSpecTrans(custTransOpen))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        return custTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPaymentIdFilter</Name>
+				<Source><![CDATA[
+    private str getPaymentIdFilter(PaymId _paymentId)
+    {
+        return _paymentId
+            ? _paymentId + '*'
+            : '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInvoiceCustomerByAmount</Name>
+				<Source><![CDATA[
+    protected CustTrans findInvoiceCustomerByAmount(BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        CustTrans custTrans;
+        CustTransOpen custTransOpen;
+        CustVendAC bankCodaAccount = _bankCodaAccountStatementLines.parmAccount();
+        SpecTransManager specTransManager = SpecTransManager::newFromSpec(_bankCodaAccountStatementLines, false);
+
+        //check for invoices with exact matching
+        while select AmountCur, RecId from custTrans
+            where custTrans.AccountNum == bankCodaAccount
+            join custTransOpen
+                where custTransOpen.RefRecId == custTrans.RecId
+        {
+            if (!this.checkSpecTrans(custTransOpen)
+                && _bankCodaAccountStatementLines.AmountCur == custTrans.AmountCur
+                && this.canBeMarkedForSettlement(
+                    _bankCodaAccountStatementLines,
+                    custTrans.TableId,
+                    custTrans.RecId,
+                    specTransManager,
+                    custTransOpen))
+            {
+                break;
+            }
+        }
+
+        Amount invoiceAmount;
+
+        if (!custTrans)
+        {
+            //check for invoices with exact matching after cashdiscount
+            while select AmountCur, RecId from custTrans
+                where custTrans.AccountNum == bankCodaAccount
+                join custTransOpen
+                where custTransOpen.RefRecId == custTrans.RecId
+            {
+                if (!this.checkSpecTrans(custTransOpen)
+                    && custTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate)
+                    && this.canBeMarkedForSettlement(
+                        _bankCodaAccountStatementLines,
+                        custTrans.TableId,
+                        custTrans.RecId,
+                        specTransManager,
+                        custTransOpen))
+                {
+                    invoiceAmount = custTrans.AmountCur - custTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate);
+                    if (invoiceAmount == _bankCodaAccountStatementLines.AmountCur)
+                    {
+                        _bankCodaAccountStatementLines.CashDiscLinked = NoYes::Yes;
+                        _bankCodaAccountStatementLines.update();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!custTrans)
+        {
+            //check for invoices where matching within range
+            while select AmountCur, RecId from custTrans
+                where custTrans.AccountNum == bankCodaAccount
+                join custTransOpen
+                where custTransOpen.RefRecId == custTrans.RecId
+            {
+                if (!this.checkSpecTrans(custTransOpen)
+                    && this.canBeMarkedForSettlement(
+                        _bankCodaAccountStatementLines,
+                        custTrans.TableId,
+                        custTrans.RecId,
+                        specTransManager,
+                        custTransOpen))
+                {
+                    invoiceAmount = custTrans.AmountCur;
+                    Amount paidAmount = _bankCodaAccountStatementLines.AmountCur;
+                    Amount maxAmount = invoiceAmount + ((invoiceAmount / 100) * bankCodaParameters.CodaDeviation);
+                    Amount minAmount = invoiceAmount - ((invoiceAmount / 100) * bankCodaParameters.CodaDeviation);
+
+                    if (paidAmount >= minAmount && paidAmount <= maxAmount)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        custTrans = CustTrans::find(custTrans.RecId);
+
+        return custTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInvoiceVendor</Name>
+				<Source><![CDATA[
+    //This method will search for an invoice of a particular
+    //vendor by using the decoded paymid
+    protected CustVendTrans findInvoiceVendor(
+        PaymId _paymentId,
+        BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        VendTrans vendTrans;
+        VendTransOpen vendTransOpen;
+
+        if (_bankCodaAccountStatementLines.LedgerDimension)
+        {
+            if (_paymentId)
+            {
+                while select vendTrans
+                    where vendTrans.AccountNum == _bankCodaAccountStatementLines.parmAccount()
+                        && vendTrans.PaymId == _paymentId
+                    join vendTransOpen
+                        where vendTransOpen.RefRecId == vendTrans.RecId
+                {
+                    if (!this.checkSpecTrans(vendTransOpen))
+                    {
+                        this.setCashDiscLinked(
+                            _bankCodaAccountStatementLines,
+                            vendTrans.AmountCur - vendTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate));
+                        break;
+                    }
+                }
+
+                if (!vendTrans)
+                {
+                    while select vendTrans
+                        where vendTrans.AccountNum == _bankCodaAccountStatementLines.parmAccount()
+                           && vendTrans.PaymId != _paymentId
+                        join vendTransOpen
+                            where vendTransOpen.RefRecId == vendTrans.RecId
+                    {
+                        if (subStr(strKeep(vendTrans.PaymId,'0123456789'), 1, PaymentLength) == _paymentId &&
+                            !this.checkSpecTrans(vendTransOpen))
+                        {
+                            this.setCashDiscLinked(
+                                _bankCodaAccountStatementLines,
+                                vendTrans.AmountCur - vendTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!vendTrans)
+            {
+                vendTrans = this.findInvoiceVendorByAmount(_bankCodaAccountStatementLines);
+            }
+        }
+        else
+        {
+            while select vendTrans
+                where vendTrans.PaymId == _paymentId
+                join vendTransOpen
+                    where vendTransOpen.RefRecId == vendTrans.RecId
+            {
+                if (!this.checkSpecTrans(vendTransOpen))
+                {
+                    break;
+                }
+            }
+
+            if (!vendTrans)
+            {
+                while select vendTrans
+                    where vendTrans.PaymId != _paymentId
+                    join vendTransOpen
+                        where vendTransOpen.RefRecId == vendTrans.RecId
+                {
+                    if (strKeep(vendTrans.PaymId,'0123456789') == _paymentId &&
+                        !this.checkSpecTrans(vendTransOpen))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        return vendTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInvoiceVendorByAmount</Name>
+				<Source><![CDATA[
+    protected VendTrans findInvoiceVendorByAmount(BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        VendTrans vendTrans;
+        VendTransOpen vendTransOpen;
+
+        CustVendAC bankCodaAccount = _bankCodaAccountStatementLines.parmAccount();
+        SpecTransManager specTransManager = SpecTransManager::newFromSpec(_bankCodaAccountStatementLines, false);
+
+        //check for invoices with exact matching
+        while select AmountCur, RecId from vendTrans
+            where vendTrans.AccountNum == bankCodaAccount
+            join vendTransOpen
+                where vendTransOpen.RefRecId == vendTrans.RecId
+        {
+            if (!this.checkSpecTrans(vendTransOpen)
+                && _bankCodaAccountStatementLines.AmountCur == vendTrans.AmountCur
+                && this.canBeMarkedForSettlement(
+                    _bankCodaAccountStatementLines,
+                    vendTrans.TableId,
+                    vendTrans.RecId,
+                    specTransManager,
+                    vendTransOpen))
+            {
+                break;
+            }
+        }
+
+        Amount invoiceAmount;
+
+        if (!vendTrans)
+        {
+            //check for invoices with exact matching after cashdiscount
+            while select AmountCur, RecId from vendTrans
+                where vendTrans.AccountNum == bankCodaAccount
+                join vendTransOpen
+                    where vendTransOpen.RefRecId == vendTrans.RecId
+            {
+                if (!this.checkSpecTrans(vendTransOpen)
+                    && vendTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate)
+                    && this.canBeMarkedForSettlement(
+                        _bankCodaAccountStatementLines,
+                        vendTrans.TableId,
+                        vendTrans.RecId,
+                        specTransManager,
+                        vendTransOpen))
+                {
+                    invoiceAmount = vendTrans.AmountCur - vendTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate);
+                    if (invoiceAmount == _bankCodaAccountStatementLines.AmountCur)
+                    {
+                        _bankCodaAccountStatementLines.CashDiscLinked = NoYes::Yes;
+                        _bankCodaAccountStatementLines.update();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!vendTrans)
+        {
+            //check for invoices where matching within range
+            while select AmountCur, RecId from vendTrans
+                where vendTrans.AccountNum == bankCodaAccount
+                join vendTransOpen
+                    where vendTransOpen.RefRecId == vendTrans.RecId
+            {
+                if (!this.checkSpecTrans(vendTransOpen)
+                    && vendTrans.possibleCashDisc(_bankCodaAccountStatementLines.TransDate)
+                    && this.canBeMarkedForSettlement(
+                        _bankCodaAccountStatementLines,
+                        vendTrans.TableId,
+                        vendTrans.RecId,
+                        specTransManager,
+                        vendTransOpen))
+                {
+                    invoiceAmount = vendTrans.AmountCur;
+                    Amount paidAmount = _bankCodaAccountStatementLines.AmountCur;
+                    Amount maxAmount = invoiceAmount + ((invoiceAmount / 100) * bankCodaParameters.CodaDeviation);
+                    Amount minAmount = invoiceAmount - ((invoiceAmount / 100) * bankCodaParameters.CodaDeviation);
+
+                    if (paidAmount >= minAmount && paidAmount <= maxAmount)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        vendTrans = VendTrans::find(vendTrans.RecId);
+
+        return vendTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findVendor</Name>
+				<Source><![CDATA[
+    //Method tries to find a vendor by using
+    //(if available) the bankaccountnumber, name and Address
+    protected VendTable findVendor(
+        BankCodaTransDefTable          _bankCodaTransDefTable,
+        BankCodaAccountStatementLines  _bankCodaAccountStatementLines
+        )
+    {
+        VendTable                   vendTable;
+        VendBankAccount             vendBankAccount;
+        BankIBAN                    iban = strLTrim(strRTrim(_bankCodaAccountStatementLines.OtherPartyBankAccountID));
+
+        vendTable = VendTable::find(_bankCodaTransDefTable.parmAccount());
+
+        if (! vendTable && _bankCodaAccountStatementLines.OtherPartyBankAccountID)
+        {
+            unchecked(Uncheck::TableSecurityPermission)
+            {
+                select firstonly vendBankAccount where
+                vendBankAccount.BankIBAN == iban;
+                if (! vendBankAccount)
+                {
+                    while select AccountNum,VendAccount from vendBankAccount
+                    {
+                        if (strKeep(vendBankAccount.AccountNum,'0123456789') == _bankCodaAccountStatementLines.OtherPartyBankAccountID)
+                        break;
+                    }
+                }
+            }
+            vendTable = VendTable::find(vendBankAccount.VendAccount);
+
+            if (!vendTable && (_bankCodaAccountStatementLines.OtherPartyAddress || _bankCodaAccountStatementLines.OtherPartyName))
+            {
+                select firstonly vendTable
+                    exists join bankCodaVendorPreprocessedDetails
+                        where bankCodaVendorPreprocessedDetails.CustVendTableRecId == vendTable.RecId
+                            && (bankCodaVendorPreprocessedDetails.FormattedName == strKeep(_bankCodaAccountStatementLines.OtherPartyName,'abcdefghijklmnopqrstuvwxyz')
+                                || bankCodaVendorPreprocessedDetails.FormattedAddress == _bankCodaAccountStatementLines.OtherPartyAddress);
+            }
+        }
+
+        return vendTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ledger</Name>
+				<Source><![CDATA[
+    //This method updates a movement record as a
+    //BankCodaAccountStatementLines record. With the data of the bankCodaTransDefTable record.
+    protected BankCodaAccountStatementLines ledger(
+        BankCodaTransDefTable           _bankCodaTransDefTable,
+        BankCodaAccountStatementLines   _bankCodaAccountStatementLines
+        )
+    {
+        MainAccountLegalEntity mainAccountLegalEntity   = MainAccountLegalEntity::findByMainAccountLegalEntity(MainAccount::findByLedgerDimension(_bankCodaTransDefTable.LedgerDimension).RecId, CompanyInfo::current());
+        _bankCodaAccountStatementLines.AccountType      = _bankCodaTransDefTable.AccountType;
+        _bankCodaAccountStatementLines.LedgerDimension  = LedgerDimensionFacade::serviceCreateLedgerDimension(_bankCodaTransDefTable.LedgerDimension, mainAccountLegalEntity.DefaultDimension);
+        _bankCodaAccountStatementLines.TaxGroup         = _bankCodaTransDefTable.TaxGroup;
+        _bankCodaAccountStatementLines.TaxItemGroup     = _bankCodaTransDefTable.TaxItemGroup;
+        _bankCodaAccountStatementLines.Processed        = NoYes::Yes;
+
+        if (!_bankCodaAccountStatementLines.LedgerDimension)
+        {
+            this.updateErrorLog(BankCodaProcessErrorCause::NoLedgerAccount, _bankCodaAccountStatementLines);
+        }
+
+        return _bankCodaAccountStatementLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>noMatching</Name>
+				<Source><![CDATA[
+    //If the parameter "overridecodaerror" is set to true on the
+    //bankParameters then in case a record has no matching at all the record will be handled as a record defined in the bankaparameters
+    protected void noMatching(BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        if (bankCodaParameters.OverrideCodaError == NoYes::Yes)
+        {
+            if (bankCodaParameters.LedgerDimension)
+            {
+                _bankCodaAccountStatementLines.HasProcessErrors  = NoYes::No;
+                _bankCodaAccountStatementLines.Processed         = NoYes::Yes;
+                _bankCodaAccountStatementLines.GlobalisationCode = GlobalisationCode::Global;
+                _bankCodaAccountStatementLines.AccountType       = BankCodaLedgerJournalACType::Ledger;
+                _bankCodaAccountStatementLines.LedgerDimension   = bankCodaParameters.LedgerDimension;
+                _bankCodaAccountStatementLines.TaxGroup          = bankCodaParameters.TaxGroup;
+                _bankCodaAccountStatementLines.TaxItemGroup      = bankCodaParameters.TaxItemGroup;
+                _bankCodaAccountStatementLines.update();
+            }
+            else
+            {
+                this.updateErrorLog(BankCodaProcessErrorCause::OverrideNoData,_bankCodaAccountStatementLines);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfRecords</Name>
+				<Source><![CDATA[
+    //determines the number of record that will be processed
+    //in this run.
+    public int numberOfRecords()
+    {
+        BankCodaAccountStatementLines bankCodaAccountStatementLines;
+
+        select count(RecId)
+            from bankCodaAccountStatementLines
+                where bankCodaAccountStatementLines.AccountStatementNum == bankCodaAccountStatement.AccountStatementNum
+                    && bankCodaAccountStatementLines.StatementDate      == bankCodaAccountStatement.AccountStatementDate
+                    && bankCodaAccountStatementLines.TransactionType    == BankCodaTransactionType::Movement
+                    && bankCodaAccountStatementLines.Processed          == NoYes::No;
+
+        return any2int(bankCodaAccountStatementLines.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        container ret;
+
+        ret = super();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBankAccountStatement</Name>
+				<Source><![CDATA[
+    public void parmBankAccountStatement(BankCodaAccountStatement   _bankCodaAccountStatement)
+    {
+        bankCodaAccountStatement = _bankCodaAccountStatement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    //According to the value of Accounttype an
+    //adequate method is called to handle the record.
+    protected void process(
+        BankCodaAccountStatementLines  _bankCodaAccountStatementLines,
+        BankCodaTransDefTable          _bankCodaTransDefTable
+        )
+    {
+        _bankCodaAccountStatementLines.AccountType = _bankCodaTransDefTable.AccountType;
+
+        switch (_bankCodaTransDefTable.AccountType)
+        {
+            case BankCodaLedgerJournalACType::Cust:
+                _bankCodaAccountStatementLines = this.custSettlement(_bankCodaTransDefTable,_bankCodaAccountStatementLines);
+                break;
+
+            case BankCodaLedgerJournalACType::Vend:
+                _bankCodaAccountStatementLines = this.vendSettlement(_bankCodaTransDefTable,_bankCodaAccountStatementLines);
+                break;
+
+            case BankCodaLedgerJournalACType::Ledger:
+                _bankCodaAccountStatementLines = this.ledger(_bankCodaTransDefTable,_bankCodaAccountStatementLines);
+                break;
+
+            default :
+                this.updateErrorLog(BankCodaProcessErrorCause::NoAccountType,_bankCodaAccountStatementLines);
+        }
+
+        if (! _bankCodaAccountStatementLines.Log)
+        {
+            _bankCodaAccountStatementLines.Processed = NoYes::Yes;
+        }
+
+        _bankCodaAccountStatementLines.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processChildren</Name>
+				<Source><![CDATA[
+    //According to the the value of Globalisationcode,
+    //this method will call Process for all the children found or processGrandChildren. If ProcessGrandChildren,
+    //after this processing the value of ChildSettlements will be copied to the settlementtype of the parent.
+    protected void processChildren(
+        BankCodaAccountStatementLines   _bankCodaAccountStatementLines,
+        int                             _level                              = 1
+        )
+    {
+        BankCodaAccountStatementLines   bankAccountStatementLinesChild;
+        boolean                         firstRun;
+        BankCodaTransDefTable           bankCodaTransDefTable;
+
+        childSettlements = BankCodaSettlementType::Settled;
+        firstRun = true;
+        while select forupdate bankAccountStatementLinesChild
+            where bankAccountStatementLinesChild.SequenceNumber == _bankCodaAccountStatementLines.SequenceNumber
+                && bankAccountStatementLinesChild.Processed     == NoYes::No
+                && bankAccountStatementLinesChild.DetailNumber  != '0000'
+                && bankAccountStatementLinesChild.RefRecId      == _bankCodaAccountStatementLines.RecId
+        {
+            recCount ++;
+            this.displayProgress(recCount,BankCodaTransactionType::Movement);
+            this.clearErrorMessage(bankAccountStatementLinesChild);
+
+            if (! BankCodaAccountStatementLines::hasDetails(bankAccountStatementLinesChild))
+            {
+                bankCodaTransDefTable = this.findDefinition(bankAccountStatementLinesChild);
+                bankAccountStatementLinesChild = this.setGlobalisationCode(bankAccountStatementLinesChild, bankCodaTransDefTable.GlobalisationCode);
+
+                if (bankCodaTransDefTable)
+                {
+                    this.process(bankAccountStatementLinesChild,bankCodaTransDefTable);
+                    if (bankAccountStatementLinesChild.Log)
+                    {
+                        allProcessed = false;
+                        errorLog += strFmt("@SYS79605",_level,_bankCodaAccountStatementLines.DetailNumber)+'\n'+bankAccountStatementLinesChild.Log;
+                    }
+
+                    if (bankAccountStatementLinesChild.CodaSettlementType != BankCodaSettlementType::Settled)
+                    {
+                        if (bankAccountStatementLinesChild.CodaSettlementType == BankCodaSettlementType::NotSettled && firstRun)
+                        {
+                            childSettlements = BankCodaSettlementType::NotSettled;
+                        }
+                        else
+                        {
+                            childSettlements = BankCodaSettlementType::PartialySettled;
+
+                            if (! bankCodaParameters.ProcessCodaDetail)
+                            {
+								this.updateErrorLog(BankCodaProcessErrorCause::Partiallysettled,_bankCodaAccountStatementLines);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (childSettlements != BankCodaSettlementType::Settled)
+                        {
+                            childSettlements = BankCodaSettlementType::PartialySettled;
+
+                            if (! bankCodaParameters.ProcessCodaDetail)
+                            {
+								this.updateErrorLog(BankCodaProcessErrorCause::Partiallysettled,_bankCodaAccountStatementLines);
+                            }
+                        }
+                    }
+                    firstRun = false;
+                }
+                else
+                {
+                    this.update(bankAccountStatementLinesChild,false,false);
+                }
+            }
+            else
+            {
+                this.processGrandChildren(bankAccountStatementLinesChild,2);
+                this.update(bankAccountStatementLinesChild,allProcessed);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processGrandChildren</Name>
+				<Source><![CDATA[
+    //This method will call Process for all the grandchildren found
+    protected void processGrandChildren(
+        BankCodaAccountStatementLines   _bankCodaAccountStatementLines,
+        int                             _level
+        )
+    {
+        BankCodaAccountStatementLines   bankAccountStatementLinesChild;
+        boolean                         firstRun;
+        BankCodaTransDefTable           bankCodaTransDefTable;
+
+        childSettlements = BankCodaSettlementType::Settled;
+        firstRun         = true;
+
+        while select forupdate bankAccountStatementLinesChild
+            where bankAccountStatementLinesChild.SequenceNumber == _bankCodaAccountStatementLines.SequenceNumber
+                && bankAccountStatementLinesChild.Processed     == NoYes::No
+                && bankAccountStatementLinesChild.DetailNumber  != '0000'
+                && bankAccountStatementLinesChild.RefRecId      == _bankCodaAccountStatementLines.RecId
+        {
+            recCount ++;
+            this.clearErrorMessage(bankAccountStatementLinesChild);
+            this.displayProgress(recCount,BankCodaTransactionType::Movement);
+            bankCodaTransDefTable = this.findDefinition(bankAccountStatementLinesChild);
+            bankAccountStatementLinesChild = this.setGlobalisationCode(bankAccountStatementLinesChild, bankCodaTransDefTable.GlobalisationCode);
+
+            if (bankCodaTransDefTable)
+            {
+                this.process(bankAccountStatementLinesChild,bankCodaTransDefTable);
+                if (bankAccountStatementLinesChild.Log)
+                {
+                    allProcessed = false;
+                    errorLog += strFmt("@SYS79605",_level,_bankCodaAccountStatementLines.DetailNumber)+'\n'+bankAccountStatementLinesChild.Log;
+                }
+                else
+                {
+                    this.update(bankAccountStatementLinesChild,true);
+                }
+
+                if (bankAccountStatementLinesChild.CodaSettlementType != BankCodaSettlementType::Settled)
+                {
+                    if (bankAccountStatementLinesChild.CodaSettlementType == BankCodaSettlementType::NotSettled && firstRun)
+                    {
+                        childSettlements = BankCodaSettlementType::NotSettled;
+                    }
+                    else
+                    {
+                        childSettlements = BankCodaSettlementType::PartialySettled;
+
+                        if (! bankCodaParameters.ProcessCodaDetail)
+                        {
+							this.updateErrorLog(BankCodaProcessErrorCause::Partiallysettled,_bankCodaAccountStatementLines);
+						}
+                    }
+                }
+                else
+                {
+                    if (childSettlements != BankCodaSettlementType::Settled)
+                    {
+                        childSettlements = BankCodaSettlementType::PartialySettled;
+
+                        if (! bankCodaParameters.ProcessCodaDetail)
+                        {
+							this.updateErrorLog(BankCodaProcessErrorCause::Partiallysettled,_bankCodaAccountStatementLines);
+                        }
+                    }
+                }
+                firstRun = false;
+            }
+            else
+            {
+                this.update(bankAccountStatementLinesChild,false,false);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>progressUpdate</Name>
+				<Source><![CDATA[
+    protected void progressUpdate(
+        str         _text,
+        Counter     _line
+        )
+    {
+        progress.setCount(_line);
+        progress.setText(_text);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeHardBreaks</Name>
+				<Source><![CDATA[
+    //This method will filter out all the CRLF from a message
+    protected Notes removeHardBreaks(Notes _message)
+    {
+        Notes       newMessage;
+        int         pos;
+
+        pos = strScan(_message,'\n',1,strLen(_message));
+        newMessage = _message;
+        while (pos)
+        {
+            newMessage = strRTrim(subStr(newMessage,1,pos-1))+' '+strLTrim(subStr(newMessage,pos+1,strLen(newMessage)));
+            pos = strScan(newMessage,'\n',1,strLen(newMessage));
+        }
+        return newMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Contains the code that does the actual job of the class.
+    /// </summary>
+    //According to the the value of Globalisationcode,
+    //this method will call Process or processChildren.
+    public void run()
+    {
+        BankCodaTransDefTable           bankCodaTransDefTable;
+        BankCodaAccountStatementLines   bankCodaAccountStatementLines;
+
+        this.preProcessAccountDetails();
+
+        moneyTransferSlipBE = new PaymMoneyTransferSlip_BE();
+        bankCodaParameters  = BankCodaParameters::find();
+
+        this.progressInit(strFmt("@SYS79606",bankCodaAccountStatement.AccountStatementNum), this.numberOfRecords(),#AviFindFile);
+        this.displayProgress(recCount,BankCodaTransactionType::Movement);
+
+        ttsbegin;
+        while select forupdate bankCodaAccountStatementLines
+            where bankCodaAccountStatementLines.AccountStatementNum == bankCodaAccountStatement.AccountStatementNum
+                && bankCodaAccountStatementLines.StatementDate      == bankCodaAccountStatement.AccountStatementDate
+                && bankCodaAccountStatementLines.AccountId          == bankCodaAccountStatement.AccountId
+                && bankCodaAccountStatementLines.TransactionType    == BankCodaTransactionType::Movement
+                && bankCodaAccountStatementLines.Processed          == NoYes::No
+                && bankCodaAccountStatementLines.DetailNumber       == '0000'
+        {
+            recCount ++;
+            allProcessed = true;
+
+            this.displayProgress(recCount,BankCodaTransactionType::Movement);
+            this.clearErrorMessage(bankCodaAccountStatementLines);
+            bankCodaTransDefTable = this.findDefinition(bankCodaAccountStatementLines);
+            bankCodaAccountStatementLines = this.setGlobalisationCode(bankCodaAccountStatementLines, bankCodaTransDefTable.GlobalisationCode);
+
+            if (bankCodaTransDefTable)
+            {
+                if (! BankCodaAccountStatementLines::hasDetails(bankCodaAccountStatementLines))
+                {
+                    this.process(bankCodaAccountStatementLines,bankCodaTransDefTable);
+                }
+                else
+                {
+                    this.processChildren(bankCodaAccountStatementLines,1);
+                    this.update(bankCodaAccountStatementLines,allProcessed);
+                }
+            }
+            else
+            {
+                this.update(bankCodaAccountStatementLines,false,false);
+            }
+        }
+        ttscommit;
+
+        Info("@ApplicationSuite_Localization:BankCodaOperationComplete");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPaymMoneyTransferSlip</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes BE giro reports.
+    /// </summary>
+    /// <returns>Instance of <c>PaymMoneyTransferSlip_BE</c> class.</returns>
+    protected PaymMoneyTransferSlip_BE createPaymMoneyTransferSlip()
+    {
+        return new PaymMoneyTransferSlip_BE();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setGlobalisationCode</Name>
+				<Source><![CDATA[
+    protected BankCodaAccountStatementLines setGlobalisationCode(
+        BankCodaAccountStatementLines   _bankCodaAccountStatementLines,
+        GlobalisationCode               _globalisationCode)
+    {
+        _bankCodaAccountStatementLines.GlobalisationCode = _globalisationCode;
+
+        return _bankCodaAccountStatementLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        boolean ret;
+
+        ret = super(packedClass);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>update</Name>
+				<Source><![CDATA[
+    protected void update(
+        BankCodaAccountStatementLines _bankCodaAccountStatementLines,
+        boolean                       _allProcessed,
+        boolean                       _defOk                                = true
+        )
+    {
+        if (_defOk)
+        {
+            if (_allProcessed == NoYes::Yes)
+            {
+                _bankCodaAccountStatementLines.Processed = NoYes::Yes;
+            }
+            else
+            {
+                _bankCodaAccountStatementLines.HasProcessErrors = NoYes::Yes;
+                _bankCodaAccountStatementLines.Log += errorLog;
+            }
+            _bankCodaAccountStatementLines.CodaSettlementType = childSettlements;
+        }
+        else
+        {
+            _bankCodaAccountStatementLines.HasProcessErrors = NoYes::Yes;
+            _bankCodaAccountStatementLines.Processed        = NoYes::No;
+        }
+        _bankCodaAccountStatementLines.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateErrorLog</Name>
+				<Source><![CDATA[
+    //Given an errorcause and a bankaccountstatementline record,
+    // this method will copy the adequate error message to the log field of the record
+    protected void updateErrorLog(
+        BankCodaProcessErrorCause           _errorCause,
+        BankCodaAccountStatementLines       _bankCodaAccountStatementLines
+        )
+    {
+        switch (_errorCause)
+        {
+            case BankCodaProcessErrorCause::TransDefinition:
+                _bankCodaAccountStatementLines.Log  = "@SYS79607" + '\n';
+                break;
+
+            case BankCodaProcessErrorCause::NoAccountType:
+                _bankCodaAccountStatementLines.Log += "@SYS79608" + '\n';
+                break;
+
+            case BankCodaProcessErrorCause::NoInvoice:
+                _bankCodaAccountStatementLines.Log += "@SYS79609" + '\n';
+                break;
+
+            case BankCodaProcessErrorCause::NoCust:
+                _bankCodaAccountStatementLines.Log += "@SYS79610" + '\n';
+                break;
+
+            case BankCodaProcessErrorCause::StructuredNoId:
+                _bankCodaAccountStatementLines.Log += "@SYS79611" + '\n';
+                break;
+
+            case BankCodaProcessErrorCause::NoVend:
+                _bankCodaAccountStatementLines.Log += "@SYS79612" + '\n';
+                break;
+
+            case BankCodaProcessErrorCause::OverrideNoData:
+                _bankCodaAccountStatementLines.Log += "@SYS79613" + '\n';
+                break;
+
+            case BankCodaProcessErrorCause::Partiallysettled:
+                _bankCodaAccountStatementLines.Log += "@SYS79613" + '\n';
+                break;
+
+            case BankCodaProcessErrorCause::NoLedgerAccount:
+                _bankCodaAccountStatementLines.Log += "@CashManagement:NoLedgerAccount" + '\n';
+                break;
+        }
+        _bankCodaAccountStatementLines.HasProcessErrors = NoYes::Yes;
+        _bankCodaAccountStatementLines.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>vendSettlement</Name>
+				<Source><![CDATA[
+    //This method handles a movement record as
+    // a vendsettlement. Tries to find a vendor and an invoice
+    //for the movement.In case none is found the method calls noMatching.
+    protected BankCodaAccountStatementLines
+        vendSettlement(BankCodaTransDefTable    _bankCodaTransDefTable,
+        BankCodaAccountStatementLines           _bankCodaAccountStatementLines
+        )
+    {
+        PaymId          paymentId;
+        VendTrans       vendTrans;
+        VendTable       vendTable;
+        boolean         noMatching = false;
+        VendTransOpen   vendTransOpen;
+        SpecTransManager    specTransManager;
+        AmountCur       maxAmount;
+
+        paymentId = moneyTransferSlipBE.decodePaymId(_bankCodaAccountStatementLines.StructuredMessageType,_bankCodaAccountStatementLines.Message);
+        if (! paymentId)
+        {
+            this.updateErrorLog(BankCodaProcessErrorCause::StructuredNoId,_bankCodaAccountStatementLines);
+        }
+
+        vendTable = this.findVendor(_bankCodaTransDefTable,_bankCodaAccountStatementLines);
+        if (vendTable)
+        {
+            _bankCodaAccountStatementLines.initFromVendTable(vendTable);
+        }
+
+        if (paymentId)
+        {
+            vendTrans = this.findInvoiceVendor(paymentId,_bankCodaAccountStatementLines);
+            if (vendTrans)
+            {
+                this.clearErrorMessage(_bankCodaAccountStatementLines);
+                if (!vendTable)
+                {
+                    _bankCodaAccountStatementLines.initFromVendTable(VendTable::find(vendTrans.AccountNum));
+                }
+                _bankCodaAccountStatementLines.InvoiceId          = vendTrans.Invoice;
+                maxAmount = vendTrans.AmountCur + (vendTrans.AmountCur / 100) * bankCodaParameters.CodaDeviation;
+                //For vendor, the values are negative
+                if (_bankCodaAccountStatementLines.AmountCur >= maxAmount)
+                {
+                    vendTransOpen = VendTransOpen::findRefId(vendTrans.RecId);
+
+                    specTransManager = SpecTransManager::newFromSpec(_bankCodaAccountStatementLines, false);
+
+                    if (this.canBeMarkedForSettlement(
+                            _bankCodaAccountStatementLines,
+                            vendTrans.TableId,
+                            vendTrans.RecId,
+                            specTransManager,
+                            vendTransOpen))
+                    {
+                        specTransManager.insert(vendTransOpen.company(), vendTransOpen.TableId, vendTransOpen.RecId, vendTrans.AmountCur, '');
+
+                        _bankCodaAccountStatementLines.CodaSettlementType = BankCodaSettlementType::Settled;
+                    }
+                    else
+                    {
+                        checkFailed(strFmt("@ApplicationSuite_Localization:InvoiceCannotBeMarkedForSettlement",
+                            _bankCodaAccountStatementLines.SequenceNumber,
+                            _bankCodaAccountStatementLines.InvoiceId));
+                        _bankCodaAccountStatementLines.InvoiceId = '';
+                    }
+                }
+            }
+            else
+            {
+                this.updateErrorLog(BankCodaProcessErrorCause::NoInvoice,_bankCodaAccountStatementLines);
+                noMatching = true;
+            }
+        }
+
+        if (! _bankCodaAccountStatementLines.LedgerDimension)
+        {
+            this.updateErrorLog(BankCodaProcessErrorCause::NoVend,_bankCodaAccountStatementLines);
+            if (noMatching)
+            {
+                this.noMatching(_bankCodaAccountStatementLines);
+            }
+        }
+
+        return _bankCodaAccountStatementLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    static public BankCodaProcessing construct()
+    {
+        return new BankCodaProcessing();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createNewCustBankAccount</Name>
+				<Source><![CDATA[
+    static public void createNewCustBankAccount(BankCodaAccountStatementLines _bankCodaAccountStatementLines)
+    {
+        CustBankAccount             custBankAccount;
+        boolean                     inSystem            = false;
+        int                         counter;
+        BankCodaAccountPrefix       codaBankAccountPrefix;
+        str                         otherPartyBankAccountID;
+        #define.subStrPosition(5)
+
+        if (_bankCodaAccountStatementLines.OtherPartyBankAccountID)
+        {
+            otherPartyBankAccountID = strKeep(subStr(_bankCodaAccountStatementLines.OtherPartyBankAccountID, #subStrPosition, strLen(_bankCodaAccountStatementLines.OtherPartyBankAccountID)), '0123456789');
+
+            unchecked (Uncheck::TableSecurityPermission)
+            {
+                while select AccountNum from custBankAccount
+                    where  custBankAccount.CustAccount == _bankCodaAccountStatementLines.parmAccount()
+                {
+                    if (strKeep(custBankAccount.AccountNum, '0123456789') == otherPartyBankAccountID)
+                    {
+                        inSystem = true;
+                        break;
+                    }
+                }
+
+                if (! inSystem)
+                {
+                    codaBankAccountPrefix = BankCodaParameters::find().CodaBankAccountPrefix;
+
+                    select count(RecId) from custBankAccount
+                        where custBankAccount.CustAccount ==  _bankCodaAccountStatementLines.parmAccount()
+                            && custBankAccount.AccountID like (codaBankAccountPrefix+'*');
+
+                    counter = any2int(custBankAccount.RecId) + 1;
+                    while (CustBankAccount::exist(_bankCodaAccountStatementLines.parmAccount(), codaBankAccountPrefix + '_' + int2str(counter)))
+                    {
+                        counter++;
+                    }
+                    custBankAccount.AccountID   = codaBankAccountPrefix + '_' + int2str(counter);
+                    custBankAccount.CustAccount = _bankCodaAccountStatementLines.parmAccount();
+                    custBankAccount.AccountNum  = subStr(_bankCodaAccountStatementLines.OtherPartyBankAccountID, #subStrPosition, strLen(_bankCodaAccountStatementLines.OtherPartyBankAccountID));
+                    custBankAccount.Name        = "@SYS7439"+':'+_bankCodaAccountStatementLines.AccountId+
+                                            '/'+_bankCodaAccountStatementLines.AccountStatementNum+
+                                            '/'+_bankCodaAccountStatementLines.BankRefNumber;
+                    custBankAccount.RecId = 0;
+
+                    unchecked (Uncheck::TableSecurityPermission)
+                    {
+                        custBankAccount.BankIBAN = _bankCodaAccountStatementLines.OtherPartyBankAccountID;
+                    }
+                    custBankAccount.insert();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static public void main(Args _args)
+    {
+        BankCodaProcessing      bankCodaProcessing = BankCodaProcessing::construct();
+
+        if (_args.dataset() == tableNum(BankCodaAccountStatement))
+        {
+            bankCodaProcessing.parmBankAccountStatement(_args.record());
+        }
+        else
+        {
+            if (_args.dataset() == tableNum(BankCodaAccountStatementLines))
+            {
+                bankCodaProcessing.parmBankAccountStatement(BankCodaAccountStatement::findLines(_args.record()));
+            }
+            else
+            {
+                throw error("@SYS79604");
+            }
+        }
+        bankCodaProcessing.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canBeMarkedForSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validating can the transaction be marked for settlement with bank coda account statetement.
+    /// </summary>
+    /// <param name = "_bankCodaAccountStatementLines"> bank coda account statetement's record.</param>
+    /// <param name = "_refTableId">Transaction table's referecnce.</param>
+    /// <param name = "_refRecId">Transaction record's reference.</param>
+    /// <param name = "_specTransManager">SpecTransManager's object.</param>
+    /// <param name = "_custVendTransOpen"> TransOpen's record.</param>
+    /// <returns>Return true if the transaction can be marked for settlement with bank coda account statetement, false othersise.</returns>
+    private boolean canBeMarkedForSettlement(
+        BankCodaAccountStatementLines _bankCodaAccountStatementLines,
+        RefTableId _refTableId,
+        RefRecId _refRecId,
+        SpecTransManager _specTransManager,
+        CustVendTransOpen _custVendTransOpen)
+    {
+        return _custVendTransOpen.RecId != 0 &&
+            _specTransManager.findUnmarkedAmountForRef(
+            _custVendTransOpen.AmountCur,
+            _custVendTransOpen.company(),
+            _custVendTransOpen.TableId,
+            _custVendTransOpen.RecId) != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCashDiscLinked</Name>
+				<Source><![CDATA[
+    private void setCashDiscLinked(
+        BankCodaAccountStatementLines _bankCodaAccountStatementLines,
+        Amount _invoiceAmount)
+    {
+        if (_invoiceAmount == _bankCodaAccountStatementLines.AmountCur)
+        {
+            _bankCodaAccountStatementLines.CashDiscLinked = NoYes::Yes;
+            _bankCodaAccountStatementLines.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preProcessAccountDetails</Name>
+				<Source><![CDATA[
+    private void preProcessAccountDetails()
+    {
+        CustTable custTable;
+
+        while select custTable
+        {
+            this.fillPreprocessTmpTable(
+                bankCodaCustomerPreprocessedDetails,
+                custTable.RecId,
+                custTable.name(),
+                custTable.postalAddress().Address);
+        }
+
+        VendTable vendTable;
+
+        while select vendTable
+        {
+            this.fillPreprocessTmpTable(
+                bankCodaVendorPreprocessedDetails,
+                vendTable.RecId,
+                vendTable.name(),
+                vendTable.postalAddress().Address);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fillPreprocessTmpTable</Name>
+				<Source><![CDATA[
+    private void fillPreprocessTmpTable(
+        BankCodaAccountPreprocessedDetails _details,
+        RefRecId _accountId,
+        str _name,
+        str _address)
+    {
+        _details.clear();
+        _details.CustVendTableRecId = _accountId;
+        _details.FormattedName = subStr(strKeep(_name,'abcdefghijklmnopqrstuvwxyz'),1,26);
+        _details.FormattedAddress = subStr(this.removeHardBreaks(_address),1,26);
+        _details.insert();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

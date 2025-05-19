@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailProvisioningEndPoint</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using AppLogging = Microsoft.Dynamics.Application.Instrumentation.ApplicationEventSource;
+
+/// <summary>
+/// This class is responsible for implementing the business logic for the retail specific provisioning handler.
+/// </summary>
+public class RetailProvisioningEndPoint
+{
+    public static const str cloudPosAppId = 'd5527362-3bc8-4e63-b5b3-606dc14747e9';
+    public static const str modernPosAppId = 'd6b5a0bd-bf3f-4a8c-b370-619fb3d0e1cc';
+    public static const str ecomAppIdTaeOfficialTenant = 'a694eb1d-18f3-437b-84f3-a6f871646c5c';
+    public static const str ecomAppIdAx7PartnerTenant = '0e928d0c-f1c7-4391-a597-341661dfa071';
+    public static const str posResourceId = 'https://commerce.dynamics.com';
+    public static const str ppeNetworkDomain = 'https://sts.windows-ppe.net/';
+
+    private static readonly String255 RetailEssentialsConfigKey = configurationKeyStr(RetailEssentials);
+    private static readonly Name CdxGlobalConfigScheduleName = '1110';
+    private static readonly Name CdxChannelConfigScheduleName = '1070';
+    private static readonly String255 RealtimeServiceUser = 'RetailServerSystemAccount@dynamics.com';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>onPostProvisioning</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post-provisioning event handler.
+    /// </summary>
+    /// <param name = "source">The event source.</param>
+    /// <param name = "message">The provisioning message.</param>
+    [SubscribesTo(classstr(ProvisioningEndpoint),
+        delegatestr(ProvisioningEndpoint, onPostProvisioning))]
+    public static void onPostProvisioning(ProvisioningEndpoint source, ProvisioningMessage message)
+    {
+        AppLogging::EventWriteRetailProvisioningPostProvisioningStart(guid2Str(message.Id()));
+
+        if (RetailDeploymentUtility::isRetailEnabled())
+        {
+            RetailTransactionServiceProfile transactionServiceProfile;
+            update_recordset transactionServiceProfile setting UserId = RealtimeServiceUser
+                where transactionServiceProfile.IsCustomerRecord == NoYes::No;
+
+            RetailChannelProfile channelProfile;
+            RetailChannelProfileProperty channelProfileProperty;
+
+            select channelProfileProperty where
+                    channelProfileProperty.Key == RetailServerProfilePropertyKey::InternalUrl
+                join channelProfile where
+                    channelProfile.RecId == channelProfileProperty.channelProfile &&
+                    channelProfile.Name == 'Default';
+
+            if (!channelProfileProperty.RecId)
+            {
+                AppLogging::EventWriteRetailChannelProfileNotFoundOnPostProvisining();
+            }
+
+            RetailProvisioningEndPoint::updateRetailAuthTables(message.TenantId(), message.TenantNetworkDomain(), channelProfileProperty.Value);
+
+            if (RetailDeploymentUtility::isDemoDataLoaded())
+            {
+                // Run "Global configuration job" to sync SysServiceConfigSetting, RetailIdentityProvider, RetailRelyingParty, RetailServerResource tables' changes to channel for enabling AAD auth on retail server
+                RetailProvisioningEndPoint::runCDXSchedule(message, CdxGlobalConfigScheduleName);
+
+                // Run "Channel configuration job" to sync RETAILTRANSACTIONSERVICEPROFILE table changes to channel for enabling RTS client on retail server
+                RetailProvisioningEndPoint::runCDXSchedule(message, CdxChannelConfigScheduleName);
+            }
+        }
+
+        AppLogging::EventWriteRetailProvisioningPostProvisioningStop(guid2Str(message.Id()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRetailAuthTables</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates tables participating in RS authentication (RetailIdentityProvider, RetailRelyingParty, RetailServerResourceId)
+    /// by taking into account TenantId as well as passed in AAD applications' IDs.
+    /// </summary>
+    /// <param name = "tenantId">The Tenant ID.</param>
+    /// <param name = "tenantNetworkDomain">The Tenant's domain.</param>
+    public static void updateRetailAuthTables(guid _tenantId, str _tenantNetworkDomain, str _retailServerUrl)
+    {
+        // Sanitizing guid string by removing brackets and making it lowercase (tenant in AAD is lowercased).
+        str sanitizedTenantId = guid2Str(_tenantId);
+        sanitizedTenantId = strReplace(sanitizedTenantId, '{', '');
+        sanitizedTenantId = strReplace(sanitizedTenantId, '}', '');
+        sanitizedTenantId = strLwr(sanitizedTenantId);
+
+        ttsbegin;
+
+        // Update other auth values.
+        RetailProvisioningEndPoint::updateAAdAuthValues(sanitizedTenantId, _tenantNetworkDomain);
+
+        RetailProvisioningEndPoint::updateCommerceAuthValues(_retailServerUrl);
+
+        if (RetailDeploymentUtility::isDemoDataLoaded())
+        {
+            RetailProvisioningEndPoint::updateGoogleAuthValues();
+
+            if (_tenantNetworkDomain == ppeNetworkDomain)
+            {
+                RetailProvisioningEndPoint::updateFacebookAuthValues();
+                RetailProvisioningEndPoint::updateWindowsLiveAuthValues();
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAAdAuthValues</Name>
+				<Source><![CDATA[
+    private static void updateAAdAuthValues(str sanitizedTenantId, str tenantNetworkDomain)
+    {
+        str issuer = tenantNetworkDomain + sanitizedTenantId + '/';
+        // 1. Inserting Identity Provider.
+        RetailIdentityProvider identityProvider = RetailIdentityProvider::findOrCreate(issuer, "@RetailAuthentication:AadDescription", RetailIdentityProviderType::Aad);
+
+        // 2. Inserting Relying Parties.
+        RetailRelyingParty cposRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, cloudPosAppId, RetailRelyingPartyType::Public, RetailRelyingPartyUserType::Worker);
+        RetailRelyingParty mposRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, modernPosAppId, RetailRelyingPartyType::Public, RetailRelyingPartyUserType::Worker);
+
+        // 3. Inserting Server Resource IDs.
+        RetailServerResource::findOrCreate(cposRelyingParty.RecId, posResourceId);
+        RetailServerResource::findOrCreate(mposRelyingParty.RecId, posResourceId);
+
+        // 4. Update TenantId in RetailSharedParameters.
+        RetailSharedParameters retailSharedParameters;
+        retailSharedParameters = RetailSharedParameters::find(true);
+        retailSharedParameters.TenantId = sanitizedTenantId;
+        retailSharedParameters.update();
+
+        if (tenantNetworkDomain == ppeNetworkDomain)
+        {
+            // Add AppId from taeofficial.ccsctp.net tenant for tests on CoreXT and AppId from ax7partner.ccsctp.net tenant for outer loop tests.
+            RetailProvisioningEndPoint::addRetailRelyingParty(ecomAppIdTaeOfficialTenant, identityProvider, posResourceId);
+            RetailProvisioningEndPoint::addRetailRelyingParty(ecomAppIdAx7PartnerTenant, identityProvider, posResourceId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addRetailRelyingParty</Name>
+				<Source><![CDATA[
+    private static void addRetailRelyingParty(str _appId, RetailIdentityProvider _identityProvider, str _resourceId)
+    {
+        RetailRelyingParty ecomRelyingParty = RetailRelyingParty::findOrCreate(_identityProvider.RecId, _appId, RetailRelyingPartyType::Confidential, RetailRelyingPartyUserType::Application);
+        RetailServerResource::findOrCreate(ecomRelyingParty.RecId, _resourceId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCommerceAuthValues</Name>
+				<Source><![CDATA[
+    private static void updateCommerceAuthValues(str _retailServerUrl)
+    {
+        try
+        {
+            // If the old issuer exists in the system, mark it as deprecated by updating it's name.
+            RetailIdentityProvider deprecatedIdentityProvider;
+            str commerceIdentityProviderName = 'Commerce Identity Provider';
+            select firstonly forupdate deprecatedIdentityProvider
+            where deprecatedIdentityProvider.Issuer == 'https://commerce.dynamics.com/auth'
+            && deprecatedIdentityProvider.Type == RetailIdentityProviderType::OpenIdConnect
+            && deprecatedIdentityProvider.Name == commerceIdentityProviderName;
+
+            if (deprecatedIdentityProvider)
+            {
+                ttsbegin;
+
+                deprecatedIdentityProvider.Name = 'Commerce Identity Provider (Deprecated)';
+                deprecatedIdentityProvider.update();
+
+                // Update user type on relying party for Modern POS and cloud POS if it is not set as worker.
+                RetailRelyingParty cposRelyingParty;
+                select firstonly forupdate cposRelyingParty
+                where cposRelyingParty.ProviderId == deprecatedIdentityProvider.RecId
+                && cposRelyingParty.ClientId == 'Cloud POS'
+                && cposRelyingParty.UserType != RetailRelyingPartyUserType::Worker;
+
+                if (cposRelyingParty)
+                {
+                    cposRelyingParty.UserType = RetailRelyingPartyUserType::Worker;
+                    cposRelyingParty.update();
+                }
+
+                RetailRelyingParty mposRelyingParty;
+                select firstonly forupdate mposRelyingParty
+                where mposRelyingParty.ProviderId == deprecatedIdentityProvider.RecId
+                && mposRelyingParty.ClientId == 'Modern POS'
+                && mposRelyingParty.UserType != RetailRelyingPartyUserType::Worker;
+
+                if (mposRelyingParty)
+                {
+                    mposRelyingParty.UserType = RetailRelyingPartyUserType::Worker;
+                    mposRelyingParty.update();
+                }
+
+                ttscommit;
+            }
+
+            // Create the new issuer.
+            System.String rsUrl = _retailServerUrl;
+            rsUrl = rsUrl.Trim().TrimEnd('/');
+            
+            int idx = rsUrl.IndexOf('/commerce', System.StringComparison::OrdinalIgnoreCase);
+            if (idx != -1)
+            {
+                rsUrl = rsUrl.Substring(0, idx);
+            }
+
+            str commerceTokenIssuerUri = rsUrl + '/auth';
+
+            RetailIdentityProvider identityProvider = RetailIdentityProvider::findOrCreate(commerceTokenIssuerUri, 'Commerce Identity Provider', RetailIdentityProviderType::OpenIdConnect);
+
+            RetailRelyingParty cposRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, 'Cloud POS', RetailRelyingPartyType::Public, RetailRelyingPartyUserType::Worker);
+            RetailRelyingParty mposRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, 'Modern POS', RetailRelyingPartyType::Public, RetailRelyingPartyUserType::Worker);
+            
+        }
+        catch (Exception::CLRError)
+        {
+            str message = "";
+            System.Exception ex = ClrInterop::getLastException();
+            if (ex != null)
+            {
+                ex = ex.get_InnerException();
+                if (ex != null)
+                {
+                    message = ex.ToString();
+                }
+            }
+
+            AppLogging::EventWriteRetailIdentityProviderSetupFailed(message, _retailServerUrl);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateGoogleAuthValues</Name>
+				<Source><![CDATA[
+    private static void updateGoogleAuthValues()
+    {
+        RetailIdentityProvider identityProvider = RetailIdentityProvider::findOrCreate('https://accounts.google.com', 'Google', RetailIdentityProviderType::OpenIdConnect);
+
+        RetailRelyingParty cposRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, '58340890588-7fk40bvjjn5n34f1sd9e2ckhnp41gdtj.apps.googleusercontent.com', RetailRelyingPartyType::Confidential, RetailRelyingPartyUserType::Customer);
+        RetailRelyingParty mposRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, '58340890588-fj2b165t1n40c1s2pdeig9tv7cut70dk.apps.googleusercontent.com', RetailRelyingPartyType::Public, RetailRelyingPartyUserType::Customer);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTestOpenIdConnectAuthValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds entry in Retail Shared Parameters (Identity Providers and Relying Parties) for the identity provider that will be used for eCommerce tests that run as authenticated customer.
+    /// </summary>
+    public static void updateTestOpenIdConnectAuthValues()
+    {
+        RetailIdentityProvider identityProvider = RetailIdentityProvider::findOrCreate('https://localhost:44336/core', 'Test Identity Provider', RetailIdentityProviderType::OpenIdConnect);
+
+        RetailRelyingParty ecomRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, 'https://localhost:44336/core/resources', RetailRelyingPartyType::Confidential, RetailRelyingPartyUserType::Customer);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFacebookAuthValues</Name>
+				<Source><![CDATA[
+    private static void updateFacebookAuthValues()
+    {
+        RetailIdentityProvider identityProvider = RetailIdentityProvider::findOrCreate('https://ecommerce-facebook.accesscontrol.windows.net/', 'Facebook via ACS', RetailIdentityProviderType::AadAcs);
+
+        RetailRelyingParty ecomRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, 'https://usnconeboxax1ecom.cloud.onebox.dynamics.com/SignIn/AcsRedirect', RetailRelyingPartyType::Confidential, RetailRelyingPartyUserType::Customer);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateWindowsLiveAuthValues</Name>
+				<Source><![CDATA[
+    private static void updateWindowsLiveAuthValues()
+    {
+        RetailIdentityProvider identityProvider = RetailIdentityProvider::findOrCreate('https://ecommerce-windowslive.accesscontrol.windows.net/', 'Windows Live ID via ACS', RetailIdentityProviderType::AadAcs);
+
+        RetailRelyingParty ecomRelyingParty = RetailRelyingParty::findOrCreate(identityProvider.RecId, 'https://usnconeboxax1ecom.cloud.onebox.dynamics.com/SignIn/AcsRedirect', RetailRelyingPartyType::Confidential, RetailRelyingPartyUserType::Customer);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runCDXSchedule</Name>
+				<Source><![CDATA[
+    private static void runCDXSchedule(ProvisioningMessage _message, Name _name)
+    {
+        RetailConnSchedule schedule = RetailConnSchedule::find(_name);
+
+        // Missing distribution schedule should not block provisioning, especially for re-provisioning where the schedule could have been removed by the user already
+        // The user can always recover by generating retail seed data from UI to get distribution schedule back and manually run the schedule.
+        if (!schedule)
+        {
+            AppLogging::EventWriteRetailProvisioningCDXScheduleNotFound(guid2Str(_message.Id()), _name);
+        }
+        else
+        {
+            AppLogging::EventWriteRetailProvisioningRunCDXScheduleStart(guid2Str(_message.Id()), _name);
+
+            RetailCDXScheduleRunner runner = new RetailCDXScheduleRunner();
+            runner.paramScheduleRecID(schedule.RecId);
+            runner.runOperation();
+
+            AppLogging::EventWriteRetailProvisioningRunCDXScheduleStop(guid2Str(_message.Id()), _name);
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

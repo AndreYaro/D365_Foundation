@@ -1,0 +1,1334 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsWorkExecutePutAwayToLocation</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WhsWorkExecutePutAwayToLocation</c> handles put away to a location during work execution.
+/// </summary>
+final class WhsWorkExecutePutAwayToLocation
+{
+    private WhsWorkExecute whsWorkExecute;
+
+    private LedgerVoucher ledgerVoucher;
+    private WHSWorkInventTrans workInventTrans;
+    private WHSWorkInventTrans loopWorkInventTrans;
+    private boolean isCWItem;
+    private WHSWorkLine workLine;
+    private WHSInventMov_Work workMovement;
+    private boolean handleByLP;
+    private boolean isProcessingDeferredPut;
+
+    private WHSInstrumentationLogger logger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>runFromParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs the put operation using the parameters.
+    /// </summary>
+    /// <param name = "_parameters">The put parameters.</param>
+    [Hookable(false)]
+    internal void runFromParameters(WHSWorkPutOperationParameters _parameters)
+    {
+        this.run(_parameters.parmWorkId(), _parameters.parmLineNum(), _parameters.parmPutWMSlocationId(), _parameters.parmWorkPutFlow(), _parameters.parmUserId(), _parameters.parmSourceLicensePlateId(), _parameters.parmTargetLicensePlateId(), _parameters.parmHandleByLP());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates necessary records to put inventory in a location
+    /// </summary>
+    /// <param name="_workId">
+    ///    Work id associated with action
+    /// </param>
+    /// <param name="_lineNum">
+    ///    Line number of work
+    /// </param>
+    /// <param name="_locationId">
+    ///    Location inventory id to be put into
+    /// </param>
+    /// <param name="_workPutFlow">
+    ///    Determines if all inventory is being put down from the user
+    /// </param>
+    /// <param name="_userId">
+    ///    User executing work
+    /// </param>
+    /// <param name="_sourceLicensePlateId">
+    ///    Source license plate
+    /// </param>
+    /// <param name="_targetLicensePlateId">
+    ///    Target license plate
+    /// </param>
+    /// <param name="_handleByLP">
+    ///    A Boolean value that indicates whether to use standard put procedure or "Handle by LP" put
+    /// </param>
+    internal void run(WHSWorkId            _workId,
+        LineNum              _lineNum,
+        WMSLocationId        _locationId,
+        WHSWorkPutFlow       _workPutFlow,
+        WHSUserId            _userId,
+        WHSLicensePlateId    _sourceLicensePlateId,
+        WHSLicensePlateId    _targetLicensePlateId,
+        boolean              _handleByLP)
+    {
+        InventTransOrigin   inventTransOrigin;
+        InventDim           toInventDim, fromInventDim;
+        InventDim           workTransInventDim;
+        InventTrans         inventTrans;
+        WHSWorkLine         tmpWorkLine;
+        LineNum             fromLineNum;
+        LineNum             toLineNum;
+        InventHandlingQty   qtyToMove, qtyMoved;
+        WHSWorkTrans        workTrans;
+        WHSWorkTrans        newWorkTrans;
+
+        handleByLP = _handleByLP;
+
+        WHSLicensePlateId   sourceLicensePlateId = _sourceLicensePlateId, targetLicensePlateId = _targetLicensePlateId;
+
+        using (var putAwayActivityContext = this.activities().putAwayToLocation(_workPutFlow, isProcessingDeferredPut))
+        using (var activityContext = whsWorkExecute.instrumentationLogger().workExecuteActivities().putAwayToLocation(_workPutFlow))
+        {
+            Counter processedWorkInventTransCount;
+
+            ttsbegin;
+
+            if (targetLicensePlateId)
+            {
+                WHSLicensePlate::createLicensePlate(targetLicensePlateId);
+            }
+
+            workLine = WHSWorkLine::find(_workId, _lineNum);
+
+            // If work has WorkLineLoadLineDetails and subsequent Pick steps (another STAGE), copy over the WorkLineLoadLineDetails to the corresponding Pick
+            if (workLine.WorkType == WHSWorkType::Put && workLine.whsWorkTable().HasWorkLineLoadLineDetails)
+            {
+                WHSWorkLine prevPickLine = WHSWorkLine::getPrevOppositeWorkLine(workLine.WorkId, workLine.LineNum, workLine.WorkType);
+                WHSWorkLine nextPickLine = WHSWorkLine::find(workLine.WorkId, WHSWorkLine::getNextOppositeWorkLine(workLine.WorkId, workLine.LineNum, workLine.WorkType));
+
+                if (nextPickLine && prevPickLine)
+                {
+                    WHSWorkLineLoadLineDetails::createWorkLineLoadLineDetailsFromWorkLine(nextPickLine, prevPickLine);
+                }
+            }
+            
+            boolean putLocationIsLPControlled = WMSLocation::find(_locationId, WHSWorkTable::find(_workId).InventLocationId).whsLocationIsLPControlled();
+
+            if (_workPutFlow == WHSWorkPutFlow::MoveAll)
+            {
+                qtyToMove = workLine.InventQtyRemain;
+
+                // Move the whole qty/license plate.  First get the range of previous picks
+                [fromLineNum, toLineNum] = whsWorkExecute.getPrevLineRange(_workId, _lineNum, WHSWorkType::Pick);
+
+                boolean skipZeroQuantityWorkInventTransOnPut = WHSSkipZeroQuantityWorkInventTransOnPutFlight::instance().isEnabled();
+
+                // Loop over all WITs for this workline
+                while select forupdate workInventTrans
+                where  workInventTrans.WorkId    == _workId
+                    && workInventTrans.LineNum   == _lineNum
+                {
+                    if (skipZeroQuantityWorkInventTransOnPut && workInventTrans.InventQtyRemain <= 0)
+                    {
+                        this.activities().logWorkInventTransSkipped(workInventTrans.RecId);
+                        continue;
+                    }
+
+                    isCWItem = PdsGlobal::pdsIsCWItem(workInventTrans.ItemId);
+
+                    workMovement = InventMovement::construct(workInventTrans) as WHSInventMov_Work;
+                    if (!ledgerVoucher
+                    && !workMovement.canUseLiteProcess())
+                    {
+                        ledgerVoucher = WHSInvent::beginLedger(_workId);
+                    }
+
+                    boolean             statusChange;
+                    WHSInventStatusId   newStatusId;
+
+                    if (workLine.whsWorkTable().WorkTransType == WHSWorkTransType::Invent)
+                    {
+                        newStatusId = workLine.inventDim().InventStatusId;
+                        statusChange = WHSWorkLine::find(_workId, fromLineNum).inventDim().InventStatusId != newStatusId;
+                    }
+
+                    if (WHSInventoryTransactionConfigurationProvider::shouldUseWarehouseInventoryTransactionStack(_workId))
+                    {
+                        // Combined delivery can do multiple handle by lp picks for a single work.
+                        if (handleByLP)
+                        {
+                            WHSLicensePlateId handleByLPLicensePlateId = InventDim::find(workInventTrans.InventDimIdFrom).LicensePlateId;
+                            if (handleByLPLicensePlateId)
+                            {
+                                sourceLicensePlateId = handleByLPLicensePlateId;
+                                targetLicensePlateId = handleByLPLicensePlateId;
+                            }
+                        }
+
+                        boolean isPackedContainerPickingWithNestedLP =
+                               WHSWorkTable::find(_workId).WorkTransType == WHSWorkTransType::PackedContainerPicking
+                            && WHSLicensePlate::isParentLicensePlate(sourceLicensePlateId);
+
+                        if (isPackedContainerPickingWithNestedLP)
+                        {
+                            WHSInventoryTransactionWorkController workInventoryController = WHSInventoryTransactionWorkController::construct();
+
+                            // In case of the  packed container picking work, the source/target LP is the parent LP, but actual inventory is located on the child license plates.
+                            // The below map contains items sets corresponding to the currently processed put line's work inventory transaction, split by the child license plate.
+                            Map itemSetByLicensePlateMap = WHSPackedContainerPickingWorkPutAwayCalculator::construct().constructPutAwayItemSetsSplitByChildLicensePlate(workInventTrans);
+
+                            MapEnumerator itemSetByLicensePlateMapEnumerator = itemSetByLicensePlateMap.getEnumerator();
+                            while (itemSetByLicensePlateMapEnumerator.moveNext())
+                            {
+                                WHSLicensePlateId childLicensePlateId = itemSetByLicensePlateMapEnumerator.currentKey();
+                                WHSInventoryItemSetDescriptor itemSetToPutAway = itemSetByLicensePlateMapEnumerator.currentValue();
+
+                                qtyMoved += workInventoryController.putAwaySpecificItemSetToLocation(
+                                    _workPutFlow,
+                                    workLine,
+                                    workInventTrans,
+                                    itemSetToPutAway,
+                                    childLicensePlateId,
+                                    _locationId,
+                                    childLicensePlateId);
+                            }
+                        }
+                        else
+                        {
+                            qtyMoved += WHSInventoryTransactionWorkController::construct().putAwayToLocation(
+                                _workPutFlow,
+                                workLine,
+                                workInventTrans,
+                                sourceLicensePlateId,
+                                _locationId,
+                                putLocationIsLPControlled ? targetLicensePlateId : '');
+                        }
+                    }
+                    else
+                    {
+                        // It is possible the status on the put is not the same as the status on the pick
+                        // so transactions need to be found for the correct dimensions.
+                        if (statusChange)
+                        {
+                            InventDim       inventDimTo, inventDimFrom;
+                            InventDimParm   noStatusDimParm = InventDimParm::allInventDim();
+                            noStatusDimParm.InventStatusFlag = NoYes::No;
+
+                            // Loop over all InventTrans records that match each previous WIT,
+                            // matching the dimensions will not include matching the inventory status as it will be different.
+                            while select sum(Qty), sum(PdsCWQty), inventDimId from inventTrans
+                        group by inventTrans.inventDimId, loopWorkInventTrans.LineNum
+                        where inventTrans.StatusReceipt == StatusReceipt::Purchased && inventTrans.StatusIssue == StatusIssue::None
+                        join RecId, InventTransId from inventTransOrigin
+                            where  inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                            join LineNum from loopWorkInventTrans
+                                where loopWorkInventTrans.InventTransIdTo       == inventTransOrigin.InventTransId
+                                    && loopWorkInventTrans.WorkId               == workInventTrans.WorkId
+                                    && loopWorkInventTrans.LineNum              >= fromLineNum
+                                    && loopWorkInventTrans.LineNum              <= toLineNum
+                                    && loopWorkInventTrans.ItemId               == workInventTrans.ItemId
+                                    && loopWorkInventTrans.InventTransIdParent  == workInventTrans.InventTransIdParent
+                                exists join inventDimTo
+                                    where inventDimTo.inventDimId == loopWorkInventTrans.InventDimIdTo
+                                    #InventDimExistsJoin(workInventTrans.InventDimIdFrom, inventDimFrom, inventDimTo, noStatusDimParm)
+                            {
+                                PmfQtyDataCarrier qtyDataCarrier = PmfQtyDataCarrier::newStandard(inventTrans.qty, inventTrans.PdsCWQty);
+
+                                if (handleByLP)
+                                {
+                                    sourceLicensePlateId = WHSWorkLine::find(workLine.WorkId, loopWorkInventTrans.LineNum).LocatedLPId;
+                                    targetLicensePlateId = sourceLicensePlateId;
+                                }
+                                else
+                                {
+                                    sourceLicensePlateId = '';
+                                }
+
+                                qtyMoved += this.putAwayAllQuantityToLocation(inventTrans.inventDimId, qtyDataCarrier, _locationId, newStatusId, targetLicensePlateId);
+                            }
+                        }
+                        else
+                        {
+                            // Next loop over all InventTrans records that match each previous WIT
+                            while select sum(Qty), sum(PdsCWQty), inventDimId from inventTrans
+                            group by inventTrans.inventDimId, loopWorkInventTrans.LineNum
+                            where inventTrans.StatusReceipt == StatusReceipt::Purchased && inventTrans.StatusIssue == StatusIssue::None
+                            join RecId, InventTransId from inventTransOrigin
+                                where  inventTrans.InventTransOrigin     == inventTransOrigin.RecId
+                                join LineNum from loopWorkInventTrans
+                                    where loopWorkInventTrans.InventTransIdTo       == inventTransOrigin.InventTransId
+                                        && loopWorkInventTrans.WorkId               == workInventTrans.WorkId
+                                        && loopWorkInventTrans.LineNum              >= fromLineNum
+                                        && loopWorkInventTrans.LineNum              <= toLineNum
+                                        && loopWorkInventTrans.InventDimIdTo        == workInventTrans.InventDimIdFrom
+                                        && loopWorkInventTrans.ItemId               == workInventTrans.ItemId
+                                        && loopWorkInventTrans.InventTransIdParent  == workInventTrans.InventTransIdParent
+                            {
+                                PmfQtyDataCarrier qtyDataCarrier = PmfQtyDataCarrier::newStandard(inventTrans.qty, inventTrans.PdsCWQty);
+                            
+                                if (handleByLP)
+                                {
+                                    sourceLicensePlateId = WHSWorkLine::find(workLine.WorkId, loopWorkInventTrans.LineNum).LocatedLPId;
+                                    targetLicensePlateId = sourceLicensePlateId;
+                                }
+                                else
+                                {
+                                    sourceLicensePlateId = '';
+                                }
+
+                                qtyMoved += this.putAwayAllQuantityToLocation(inventTrans.inventDimId, qtyDataCarrier, _locationId, '', targetLicensePlateId);
+                            }
+                        }
+                    }
+
+                    whsWorkExecute.createNextWorkInventTransQuantities(workLine,
+                        workInventTrans,
+                        workInventTrans.Qty,
+                        workInventTrans.TransactionWeight,
+                        WHSWorkLine::getNextOppositeWorkLine(_workId, _lineNum, WHSWorkType::Put),
+                        _locationId,
+                        false,
+                        '');
+
+                    processedWorkInventTransCount++;
+                }
+
+                if (_handleByLP && qtyToMove != qtyMoved)
+                {
+                    throw error(strFmt("@WAX4149", sourceLicensePlateId));
+                }
+
+                if (qtyMoved < qtyToMove)
+                {
+                    throw error(strFmt("@WAX:InventoryMovementWasNotPerformedError", workLine.WorkId, qtyToMove));
+                }
+
+                // Start building the inventDim & license plate info for workTrans
+                workTransInventDim = workLine.inventDim();
+                if (targetLicensePlateId)
+                {
+                    workTransInventDim.LicensePlateId = targetLicensePlateId;
+                }
+                else
+                {
+                    select firstonly InventDimId, TargetLicensePlateId from workTrans
+                    where  workTrans.WorkId      == _workId
+                        && workTrans.LineNum     == toLineNum;
+
+                    if (WHSPopulateSourceAndTargetLPOnWHSWorkTransFeature::instance().isEnabled()
+                        || WHSConsumeTargetLPFromWHSWorkTransFlight::instance().isEnabled())
+                    {
+                        workTransInventDim.LicensePlateId = workTrans.TargetLicensePlateId;
+                    }
+                    else
+                    {
+                        workTransInventDim.LicensePlateId = InventDim::find(workTrans.InventDimId).LicensePlateId;
+                    }
+                }
+            }
+            else    // Only part of the qty on the user is being put away
+            {
+                boolean catchWeightItemsPutUsesInventQty = this.catchWeightItemsPutUsesInventQty();
+
+                // Finally perform the updates
+                while select forupdate workInventTrans
+                where workInventTrans.WorkId          == _workId
+                    && workInventTrans.LineNum         == _lineNum
+                {
+                    if (workInventTrans.InventQtyRemain <= 0)
+                    {
+                        this.activities().logWorkInventTransSkipped(workInventTrans.RecId);
+                        continue;
+                    }
+
+                    isCWItem = PdsGlobal::pdsIsCWItem(workInventTrans.ItemId);
+                    UnitOfMeasureDecimalPrecision weightUnitDecimalPrecision = InventTable::inventDecimals(workInventTrans.ItemId);
+
+                    workMovement = InventMovement::construct(workInventTrans) as WHSInventMov_Work;
+                    if (!ledgerVoucher
+                    && !workMovement.canUseLiteProcess())
+                    {
+                        ledgerVoucher = WHSInvent::beginLedger(_workId);
+                    }
+
+                    // Get the line number of the previous pick, only want to look at current puts
+                    fromLineNum = WHSWorkLine::getPrevOppositeWorkLine(_workId, _lineNum, WHSWorkType::Put).LineNum;
+                    
+                    boolean             statusChange;
+                    WHSInventStatusId   newStatusId;
+
+                    if (workLine.whsWorkTable().WorkTransType == WHSWorkTransType::Invent)
+                    {
+                        newStatusId = workLine.inventDim().InventStatusId;
+                        statusChange = WHSWorkLine::find(_workId, fromLineNum).inventDim().InventStatusId != newStatusId;
+                    }
+
+                    if (WHSInventoryTransactionConfigurationProvider::shouldUseWarehouseInventoryTransactionStack(_workId))
+                    {
+                        qtyToMove += WHSInventoryTransactionWorkController::construct().putAwayToLocation(
+                            _workPutFlow,
+                            workLine,
+                            workInventTrans,
+                            sourceLicensePlateId,
+                            _locationId,
+                            putLocationIsLPControlled ? targetLicensePlateId : '');
+                    }
+                    else
+                    {
+                        if (statusChange)
+                        {
+                            InventDim       inventDimTo, inventDimFrom;
+                            InventDimParm   noStatusDimParm = InventDimParm::allInventDim();
+                            noStatusDimParm.InventStatusFlag = NoYes::No;
+
+                            while select InventDimId, sum(Qty), sum(PdsCWQty) from inventTrans
+                            join RecId, InventTransId from inventTransOrigin
+                        group inventTransOrigin.InventTransId, inventTransOrigin.RecId, inventTrans.inventDimId
+                        where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+                            && inventTrans.StatusReceipt     == StatusReceipt::Purchased
+                            && inventTrans.StatusIssue       == StatusIssue::None
+                            exists join loopWorkInventTrans
+                        where loopWorkInventTrans.InventTransIdTo     == inventTransOrigin.InventTransId
+                            && loopWorkInventTrans.WorkId              == workInventTrans.WorkId
+                            && loopWorkInventTrans.LineNum             <  workInventTrans.LineNum
+                            && loopWorkInventTrans.ItemId              == workInventTrans.ItemId
+                            && loopWorkInventTrans.InventTransIdParent == workInventTrans.InventTransIdParent
+                            exists join inventDimTo
+                        where inventDimTo.inventDimId == loopWorkInventTrans.InventDimIdTo
+                        #InventDimExistsJoin(workInventTrans.InventDimIdFrom, inventDimFrom, inventDimTo, noStatusDimParm)
+                            exists join tmpWorkLine
+                        where tmpWorkLine.WorkId    == loopWorkInventTrans.WorkId
+                            && tmpWorkLine.LineNum   == loopWorkInventTrans.LineNum
+                            && tmpWorkLine.WorkType  == WHSWorkType::Pick
+                            {
+                                // Finally prep Dim Ids and move qty
+                                toInventDim = this.initializeToInventDim(inventTrans.InventDimId, _locationId, targetLicensePlateId);
+
+                                toInventDim.InventStatusId = newStatusId;
+                                toInventDim = InventDim::findOrCreate(toInventDim);
+
+                                fromInventDim = InventDim::find(inventTrans.InventDimId);
+
+                                fromInventDim.InventStatusId = newStatusId;
+                                fromInventDim = InventDim::findOrCreate(fromInventDim);
+
+                                qtyToMove += this.putAwaySplitQuantityToLocation(inventTrans, fromLineNum, fromInventDim, toInventDim, weightUnitDecimalPrecision);
+                            }
+                        }
+                        else
+                        {
+                            boolean consumeInventoryWeight;
+
+                            if (isCWItem && catchWeightItemsPutUsesInventQty)
+                            {
+                                consumeInventoryWeight = this.shouldConsumeInventoryWeight(workInventTrans);
+                            }
+                            while select InventDimId, sum(Qty), sum(PdsCWQty) from inventTrans
+                            join RecId, InventTransId from inventTransOrigin
+                                group inventTransOrigin.InventTransId, inventTransOrigin.RecId, inventTrans.inventDimId
+                                where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+                                    && inventTrans.StatusReceipt     == StatusReceipt::Purchased
+                                    && inventTrans.StatusIssue       == StatusIssue::None
+                            exists join loopWorkInventTrans
+                                where loopWorkInventTrans.InventTransIdTo     == inventTransOrigin.InventTransId
+                                    && loopWorkInventTrans.WorkId              == workInventTrans.WorkId
+                                    && loopWorkInventTrans.LineNum             <  workInventTrans.LineNum
+                                    && loopWorkInventTrans.ItemId              == workInventTrans.ItemId
+                                    && loopWorkInventTrans.InventTransIdParent == workInventTrans.InventTransIdParent
+                                    && loopWorkInventTrans.InventDimIdTo       == workInventTrans.InventDimIdFrom
+                            exists join tmpWorkLine
+                                where tmpWorkLine.WorkId    == loopWorkInventTrans.WorkId
+                                    && tmpWorkLine.LineNum   == loopWorkInventTrans.LineNum
+                                    && tmpWorkLine.WorkType  == WHSWorkType::Pick
+                            {
+                                // Finally prep Dim Ids and move qty
+                                toInventDim = this.initializeToInventDim(inventTrans.InventDimId, _locationId, targetLicensePlateId);
+
+                                fromInventDim = InventDim::find(inventTrans.InventDimId);
+                            
+                                qtyToMove += this.putAwaySplitQuantityToLocation(inventTrans, fromLineNum, fromInventDim, toInventDim, weightUnitDecimalPrecision, consumeInventoryWeight);
+                            }
+                        }
+                    }
+
+                    processedWorkInventTransCount++;
+                }
+
+                // Start building the inventDim & license plate info for workTrans
+                workTransInventDim = toInventDim;
+                workTransInventDim.clearBelowLocationDim(workLine.ItemId);
+
+                if (WHSPopulateSourceAndTargetLPOnWHSWorkTransFeature::instance().isEnabled()
+                    || WHSConsumeTargetLPFromWHSWorkTransFlight::instance().isEnabled())
+                {
+                    workTransInventDim.LicensePlateId = fromInventDim.LicensePlateId;
+                }
+                else
+                {
+                    workTransInventDim.LicensePlateId = toInventDim.LicensePlateId;
+                }
+
+                workTransInventDim = InventDim::findOrCreate(workTransInventDim);
+            }
+
+            this.activities().parmProcessedWorkInventTransCount(putAwayActivityContext, processedWorkInventTransCount);
+
+            // do not update the captured weight as that field is only to record the captured actual weight during picking
+            whsWorkExecute.updateWorkLineRemainingQuantities(workLine, qtyToMove, 0);
+
+            workTransInventDim.wmsLocationId = _locationId;
+            newWorkTrans.setWorkTransId();
+            newWorkTrans.initFromWorkLine(workLine);
+            newWorkTrans.InventDimId        = InventDim::findOrCreate(workTransInventDim).InventDimId;
+            newWorkTrans.Qty                = qtyToMove;
+            newWorkTrans.TransDateTime      = DateTimeUtil::utcNow();
+            newWorkTrans.UserId             = _userId;
+
+            if (WHSPopulateSourceAndTargetLPOnWHSWorkTransFeature::instance().isEnabled()
+                || WHSPopulateTargetLPOnWHSWorkTransFlight::instance().isEnabled())
+            {
+                newWorkTrans.TargetLicensePlateId = targetLicensePlateId;
+            }
+
+            newWorkTrans.insert();
+
+            // can skip multi-status on a single license plate check here since the same dimensions were verified by the put operation.
+            using (WHSInventMoveWorkQtyContext context = WHSInventMoveWorkQtyContext::constructWithSkipCheckMultiStatusLP(true))
+            {
+                this.updateWorkStatusCheckWorkLineStatus(_workId, _lineNum, _userId);
+                
+                this.updateTagStatusPickCompleted(_workId, _lineNum);
+            }
+
+            this.updatePackedContainerLocation(workLine);
+
+
+            WHSWorkTable workTable = WHSWorkTable::find(_workId);
+            workLine.reread();
+
+            if(workLine.WorkType == WHSWorkType::Put
+            && workLine.WorkStatus == WHSWorkStatus::Closed
+            && workTable.WorkStatus == WHSWorkStatus::Closed
+            && WMSLocation::find(workLine.WMSLocationId, workTable.InventLocationId).isPackingLocation()
+            && WHSPackingWorkLocationSetup::find(workTable.InventLocationId, workLine.WMSLocationId).IsEnabled
+            && (WhsWorkTransactionTypeIsWorkLineForOutboundShipmentFlight::instance().isEnabled() ? 
+                WhsWorkTransactionType::singletonFromTypeOrDefault(workTable.WorkTransType).isWorkLineForOutboundShipment(WHSWorkLine::getPrevOppositeWorkLine(workLine.WorkId, workLine.LineNum, workLine.WorkType)) :
+                WhsWorkTransactionType::singletonFromTypeOrDefault(workTable.WorkTransType).isForOutboundShipment()))
+            {
+                this.createPackingWorkFromPutawayWorkAndLocation(workTable, workLine.WMSLocationId);
+            }
+
+            if (ledgerVoucher)
+            {
+                ledgerVoucher.end();
+            }
+
+            if (WhsWorkExecuteDisplay::isFinalPutKanbanAutoComplete(WHSWorkLine::find(_workId, _lineNum)))
+            {
+                KanbanBoardTmpTransferJob kanbanTmpTransferJob = KanbanBoardTmpTransferJob::createTmpRecordForKanbanId(WHSWorkTable::find(_workId).OrderNum);
+                MenuFunction              menuFunct = new MenuFunction(menuItemActionStr(KanbanTransferJobCompleteSilent), MenuItemType::Action);
+
+                Args args = new Args();
+                args.record(kanbanTmpTransferJob);
+                menuFunct.run(args);
+            }
+
+            InventLocationId inventLocationId = workLine.whsWorkTable().InventLocationId;
+
+            // Update location status fields for the put location.
+            WHSLocationWorkUpdater::updateLocationInfoFromPickPutWork(
+            inventLocationId,
+            _locationId,
+            WHSWorkType::Put,
+            targetLicensePlateId);
+
+            WMSLocation wmsLocation = WMSLocation::find(_locationId, inventLocationId);
+            
+            WHSLocationLicensePlatePositioningSequencer::newFromLicensePlateAtLocation(_targetLicensePlateId, wmsLocation).putLicensePlateAtFirstPosition();
+            
+            workLine.reread();
+
+            this.createProdPickListJournal(workLine);
+                
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>catchWeightItemsPutUsesInventQty</Name>
+				<Source><![CDATA[
+	private boolean catchWeightItemsPutUsesInventQty()
+    {
+        return WHSCatchWeightItemsPutUsesInventQtyContext::instance().canCatchWeightItemsPutUseInventQty
+			&& workLine.whsWorkTable().WorkTransType == WHSWorkTransType::TransferReceipt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldConsumeInventoryWeight</Name>
+				<Source><![CDATA[
+    private boolean shouldConsumeInventoryWeight(WHSWorkInventTrans _workInventTrans)
+    {
+        InventTrans inventTrans;
+        InventTransOrigin inventTransOrigin;
+        WHSWorkLine tmpWorkLine;
+
+		select sum(Qty), sum(PdsCWQty) from inventTrans
+			exists join inventTransOrigin
+				where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+					&& inventTrans.StatusReceipt     == StatusReceipt::Purchased
+					&& inventTrans.StatusIssue       == StatusIssue::None
+			exists join loopWorkInventTrans
+				where loopWorkInventTrans.InventTransIdTo     == inventTransOrigin.InventTransId
+					&& loopWorkInventTrans.WorkId              == workInventTrans.WorkId
+					&& loopWorkInventTrans.LineNum             <  workInventTrans.LineNum
+					&& loopWorkInventTrans.ItemId              == workInventTrans.ItemId
+					&& loopWorkInventTrans.InventTransIdParent == workInventTrans.InventTransIdParent
+					&& loopWorkInventTrans.InventDimIdTo       == workInventTrans.InventDimIdFrom
+			exists join tmpWorkLine
+				where tmpWorkLine.WorkId    == loopWorkInventTrans.WorkId
+					&& tmpWorkLine.LineNum   == loopWorkInventTrans.LineNum
+					&& tmpWorkLine.WorkType  == WHSWorkType::Pick;
+
+        if (_workInventTrans.InventQtyRemain == inventTrans.PdsCWQty
+            && _workInventTrans.RemainingTransactionWeight == inventTrans.Qty)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeToInventDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes final inventory dimension to put inventory in a location.
+    /// </summary>
+    /// <param name = "_inventDimId">Inventory dimension of the transaction.</param>
+    /// <param name="_locationId">Final inventory location id.</param>
+    /// <param name="_targetLicensePlateId">Target license plate.</param>
+    /// <returns>Initialized final inventory dimension.</returns>
+    protected InventDim initializeToInventDim(InventDimId _inventDimId, WMSLocationId _locationId, WHSLicensePlateId _targetLicensePlateId)
+    {
+        InventDim toInventDim = InventDim::find(_inventDimId);
+
+        toInventDim.wmsLocationId = _locationId;
+
+        if (_targetLicensePlateId)
+        {
+            toInventDim.LicensePlateId = _targetLicensePlateId;
+        }
+        if (!toInventDim.wmsLocation().whsLocationIsLPControlled())
+        {
+            toInventDim.LicensePlateId = '';
+        }
+
+        toInventDim = InventDim::findOrCreate(toInventDim);
+
+        return toInventDim;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateTotalHandlingQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates total handling quantity to be moved for a work line in put away scenario.
+    /// </summary>
+    /// <param name = "_workLine">Work line to calculate quantity for.</param>
+    /// <param name = "_workInventTrans">Work inventory transaction.</param>
+    /// <param name = "_inventTrans">Inventory transaction.</param>
+    /// <param name = "_fromLineNum">Line number of the previous pick work line.</param>
+    /// <param name = "_isCWItem">Boolean value that indicates whether the item is catch weight enabled.</param>
+    /// <returns>Calculated total handling quantity.</returns>
+    protected InventHandlingQty calculateTotalHandlingQty(WHSWorkLine _workLine,
+        WHSWorkInventTrans _workInventTrans,
+        InventTrans _inventTrans,
+        LineNum _fromLineNum,
+        boolean _isCWItem)
+    {
+        InventHandlingQty tmpHandlingQty;
+
+        WHSWorkLine otherWorkLine;
+        // Check if another put line with the same InventTransId has already been closed, this happens if splitting the put
+        // and then changing the location for the rest of the put.
+        select firstOnly RecId from otherWorkLine
+            where otherWorkLine.WorkId           == _workLine.WorkId
+                && otherWorkLine.ItemId          == _workLine.ItemId
+                && otherWorkLine.InventTransId   == _workLine.InventTransId
+                && otherWorkLine.WorkType        == WHSWorkType::Put
+                && otherWorkLine.WorkStatus      == WHSWorkStatus::Closed
+                && otherWorkLine.LineNum          > _fromLineNum;
+
+        if (otherWorkLine.RecId)
+        {
+            InventTrans fromTrans;
+            InventTransOrigin fromTransOrigin;
+            WHSWorkLine extraWorkLine;
+            WHSWorkInventTrans otherWorkInventTrans;
+
+            // Sum the qty that has already been put down relating to the previous pick.
+            select sum(Qty), sum(PdsCWQty) from fromTrans
+                exists join extraWorkLine
+                    where extraWorkLine.WorkId          == _workLine.WorkId
+                        && extraWorkLine.ItemId         == _workLine.ItemId
+                        && extraWorkLine.InventTransId  == _workLine.InventTransId
+                        && extraWorkLine.WorkType       == WHSWorkType::Put
+                        && extraWorkLine.LineNum         > _fromLineNum
+                        && (extraWorkLine.WorkStatus    == WHSWorkStatus::Closed
+                        || extraWorkLine.LineNum        == _workLine.LineNum)
+                exists join otherWorkInventTrans
+                    where otherWorkInventTrans.WorkId   == extraWorkLine.WorkId
+                        && otherWorkInventTrans.LineNum == extraWorkLine.LineNum
+                exists join fromTransOrigin
+                    where fromTransOrigin.RecId          == fromTrans.InventTransOrigin
+                        && fromTransOrigin.InventTransId == otherWorkInventTrans.InventTransIdFrom
+                        && fromTrans.inventDimId         == _inventTrans.inventDimId
+                        && fromTrans.StatusIssue         == StatusIssue::Sold;
+                        
+            tmpHandlingQty = _isCWItem ? _inventTrans.PdsCWQty + fromTrans.PdsCWQty : _inventTrans.Qty + fromTrans.Qty;
+        }
+        // If the work line hasn't been split to multiple locations, but some has already been put to a different license plate
+        // Need to sum what has already been put down
+        else if (_workLine.InventQtyRemain != _workLine.InventQtyWork)
+        {
+            InventTrans fromTrans;
+            InventTransOrigin fromTransOrigin;
+
+            select sum(Qty), sum(PdsCWQty) from fromTrans
+                exists join fromTransOrigin
+                    where fromTrans.InventTransOrigin   == fromTransOrigin.RecId
+                    && fromTrans.inventDimId         == _inventTrans.inventDimId
+                    && fromTrans.StatusIssue         == StatusIssue::Sold
+                    && fromTransOrigin.InventTransId == _workInventTrans.InventTransIdFrom;
+
+            tmpHandlingQty = _isCWItem ? _inventTrans.PdsCWQty + fromTrans.PdsCWQty : _inventTrans.Qty + fromTrans.Qty;
+        }
+        else
+        {
+            tmpHandlingQty = _isCWItem ? _inventTrans.PdsCWQty : _inventTrans.Qty;
+        }
+
+        return tmpHandlingQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateWorkStatusCheckWorkLineStatus</Name>
+				<Source><![CDATA[
+    private void updateWorkStatusCheckWorkLineStatus(
+        WHSWorkId   _workId,
+        LineNum     _lineNum,
+        WHSUserId   _userId)
+    {
+        if (!WHSWorkExecuteUpdateWorkStatusContext::current())
+        {
+            using (var context = WHSWorkExecuteUpdateWorkStatusContext::newFromParameters(true))
+            {
+                this.updateWorkStatus(_workId, _lineNum, _userId);
+            }
+        }
+        else
+        {
+            this.updateWorkStatus(_workId, _lineNum, _userId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateWorkStatus</Name>
+				<Source><![CDATA[
+    private void updateWorkStatus(
+        WHSWorkId   _workId,
+        LineNum     _lineNum,
+        WHSUserId   _userId)
+    {
+        if (isProcessingDeferredPut && !WHSWorkProcessingTimeCalculationStrategyContext::current())
+        {
+            using (var context = WHSWorkProcessingTimeCalculationStrategyContext::newFromStrategyType(WHSWorkProcessingTimeCalculationStrategyType::DeferredPutProcessingTask))
+            {
+                whsWorkExecute.updateWorkStatus(_workId, _lineNum, _userId);
+            }
+        }
+        else
+        {
+            whsWorkExecute.updateWorkStatus(_workId, _lineNum, _userId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateMoveAllPutAway</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate the catch weight quantity and the inventory quantity to be moved for a WHS work line in a move all put away scenario.
+    /// </summary>
+    /// <param name = "_workLine">A WHS work line to calculate quantity for.</param>
+    /// <param name = "_workInventTrans">A WHS work inventory transaction.</param>
+    /// <param name = "_qtyDataCarrier">The quantities associated with a work line.</param>
+    /// <param name = "_fromInventDim">An inventory dimension from where we perform a put away.</param>
+    /// <returns>A container with the calculated quantities.</returns>
+    private PmfQtyDataCarrier calculateMoveAllPutAway(
+        WHSWorkLine         _workLine,
+        WHSWorkInventTrans  _workInventTrans,
+        PmfQtyDataCarrier   _qtyDataCarrier,
+        InventDim           _fromInventDim)
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightItemLogic(funcName(), _workInventTrans.ItemId))
+        {
+            return this.calculateMoveAllPutAwayQuantities(_workLine, _workInventTrans, _qtyDataCarrier, _fromInventDim);
+        }
+
+        return PmfQtyDataCarrier::newStandard(this.calculateMoveAllPutAwayQuantity(_workLine, _workInventTrans, _qtyDataCarrier, _fromInventDim));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateMoveAllPutAwayQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates a quantity to be moved for a WHS work line in a move all put away scenario.
+    /// </summary>
+    /// <param name = "_workLine">A WHS work line to calculate quantity for.</param>
+    /// <param name = "_workInventTrans">A WHS work inventory transaction.</param>
+    /// <param name = "_qtyDataCarrier">The quantities associated with a work line.</param>
+    /// <param name = "_fromInventDim">An inventory dimension from where we perform a put away.</param>
+    /// <returns>A calculated quantity.</returns>
+    final internal InventQty calculateMoveAllPutAwayQuantity(
+        WHSWorkLine         _workLine,
+        WHSWorkInventTrans  _workInventTrans,
+        PmfQtyDataCarrier   _qtyDataCarrier,
+        InventDim           _fromInventDim)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), _workInventTrans.ItemId);
+
+        PmfQtyDataCarrier dataCarrier = this.calculateMoveAllPutAwayQuantities(_workLine, _workInventTrans, _qtyDataCarrier, _fromInventDim);
+
+        return dataCarrier.parmInventQty();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateMoveAllPutAwayQuantities</Name>
+				<Source><![CDATA[
+    private PmfQtyDataCarrier calculateMoveAllPutAwayQuantities(
+        WHSWorkLine         _workLine,
+        WHSWorkInventTrans  _workInventTrans,
+        PmfQtyDataCarrier   _qtyDataCarrier,
+        InventDim           _fromInventDim)
+    {
+        InventQty       inventQty   = _qtyDataCarrier.parmInventQty();
+        PdsCWInventQty  cwQty       = _qtyDataCarrier.parmCwQty();
+
+        if (_workLine.InventQtyRemain != _workLine.InventQtyWork)
+        {
+            InventTrans         fromTrans;
+            InventTransOrigin   fromTransOrigin;
+   
+            select sum(Qty), sum(PdsCWQty) from fromTrans
+                join fromTransOrigin
+                    where fromTrans.InventTransOrigin       == fromTransOrigin.RecId
+                        && fromTrans.InventDimId            == _fromInventDim.inventDimId
+                        && fromTrans.StatusIssue            == StatusIssue::Sold
+                        && fromTransOrigin.InventTransId    == _workInventTrans.InventTransIdFrom;
+
+            // fromTrans quantities will be negative
+            cwQty       += fromTrans.PdsCWQty;
+            inventQty   += fromTrans.Qty;
+        }
+
+        return PmfQtyDataCarrier::newStandard(inventQty, cwQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>putAwayToLocationGetTempQuantities</Name>
+				<Source><![CDATA[
+    private PmfQtyDataCarrier putAwayToLocationGetTempQuantities(
+        InventHandlingQty               _inventTransTotal,
+        InventHandlingQty               _workInventTransTotal,
+        WHSTransWeight                  _workInventTransWeight,
+        UnitOfMeasureDecimalPrecision   _weightUnitDecimalPrecision,
+        boolean                         _isCWItem,
+		InventQty						_inventoryWeight = 0,		
+		boolean							_consumeInventoryWeight = false)
+    {
+        InventQty       inventQty;
+        PdsCWInventQty  cwQty;
+
+        if (_isCWItem)
+        {
+            if (_consumeInventoryWeight)
+            {
+                inventQty = _inventoryWeight;
+                cwQty = _inventTransTotal;
+            }
+			else
+            {
+				cwQty = min(_inventTransTotal, _workInventTransTotal);
+
+				if (cwQty < _workInventTransTotal)
+				{
+					inventQty = WHSCatchWeightHelper::calculateAverageWeight(cwQty, _workInventTransTotal, _workInventTransWeight, _weightUnitDecimalPrecision);
+				}
+				else
+				{
+					inventQty = _workInventTransWeight;
+				}
+            }
+        }
+        else
+        {
+            inventQty = min(_inventTransTotal, _workInventTransTotal);
+        }
+
+        return PmfQtyDataCarrier::newStandard(InventQty, cwQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTagStatusPickCompleted</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the tag status to pick completed.
+    /// </summary>
+    /// <param name = "_workId">Work ID associated with the work being completed.</param>
+    /// <param name = "_lineNum">Line number of the work line.</param>
+    private void updateTagStatusPickCompleted(WHSWorkId _workId, LineNum _lineNum)
+    {
+        if (!WHSCatchWeightTagCache::construct().isCatchWeightTagFeatureUsed())
+        {
+            return;
+        }
+
+        WHSWorkLine localWorkLine = WHSWorkLine::find(_workId, _lineNum);
+        
+        if (localWorkLine.WorkType == WHSWorkType::Put
+            && localWorkLine.WorkStatus == WHSWorkStatus::Closed
+            && WHSWorkTable::hasCatchWeightItems(_workId))
+        {
+            WHSCatchWeightTagLastRegistration lastRegistration;
+            WHSWorkLine tagWorkLine;
+
+            WHSCatchWeightTagRegistrationEvent origEvent;
+            WHSCatchWeightTagRegistrationEvent newEvent;
+            [origEvent, newEvent] = this.tagRegistrationEventsBasedOnWorkDirection(_workId);
+
+            WHSCatchWeightTagEventRegistration tagRegistration = WHSCatchWeightTagEventRegistration::instantiateFromTagRegistration(newEvent);
+            tagRegistration.parmStorageInventDim(localWorkLine.getToStorageDimensions());
+
+            if (!localWorkLine.isLastWorkLine())
+            {
+                tagRegistration.parmInventTransId(localWorkLine.InventTransId);
+            }
+
+            while select TagNumber, WorkLine from lastRegistration
+                where lastRegistration.RegistrationEvent == origEvent
+                exists join tagWorkLine
+                    where tagWorkLine.WorkId == _workId
+                        && tagWorkLine.RecId == lastRegistration.WorkLine
+            {
+                tagRegistration.parmWorkLineRecId(lastRegistration.WorkLine);
+                tagRegistration.registerEvent(WHSCatchWeightTag::find(lastRegistration.TagNumber));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tagRegistrationEventsBasedOnWorkDirection</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the registration event based on the work direction (inbound or outbound).
+    /// </summary>
+    /// <param name = "_workId">Work ID associated with the work.</param>
+    /// <returns>A container with the registration events.</returns>
+    private container tagRegistrationEventsBasedOnWorkDirection(WHSWorkId _workId)
+    {
+        WHSWorkTable workTable = WHSWorkTable::find(_workId);
+
+        // Movement by template shows an inbound transaction but this needs to be processed here as outbound work
+        if (workTable.WorkTransType != WHSWorkTransType::Invent
+            && workTable.isInbound())
+        {
+            return [WHSCatchWeightTagRegistrationEvent::PickingStarted, WHSCatchWeightTagRegistrationEvent::PickingCompleted];
+        }
+
+        return [WHSCatchWeightTagRegistrationEvent::OutboundPickingStarted, WHSCatchWeightTagRegistrationEvent::OutboundPickingCompleted];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePackedContainerLocation</Name>
+				<Source><![CDATA[
+    private void updatePackedContainerLocation(WHSWorkLine _workLine)
+    {
+        WHSWorkTable workTable = _workLine.whsWorkTable();
+        if (workTable.WorkTransType == WHSWorkTransType::PackedContainerPicking)
+        {
+            WHSContainerTable::updateContainerOrContainerGroupLocation(workTable.TargetLicensePlateId, _workLine.WMSLocationId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPackingWorkFromPutawayWorkAndLocation</Name>
+				<Source><![CDATA[
+    private void createPackingWorkFromPutawayWorkAndLocation(WHSWorkTable _workTable, WMSLocationId _locationId)
+    {
+        WHSWorkTable    newWorkTable;
+        WHSWorkLine     closedWorkWorkLine;
+
+        ttsbegin;
+
+        newWorkTable.setWorkId();
+        newWorkTable.initFromWorkTable(_workTable);
+        newWorkTable.WorkTransType = WHSWorkTransType::Packing;
+        newWorkTable.WorkTemplateCode = '';
+        newWorkTable.TargetLicensePlateId = _workTable.TargetLicensePlateId;
+
+        newWorkTable.insert();
+
+        if (WHSParameters::find().ToteReuse)
+        {
+            WHSToteReuseTable newToteReuseTable, oldToteReuseTable;
+            WHSWorkId newWorkId = newWorkTable.WorkId;
+
+            insert_recordset newToteReuseTable (WorkId, ToteId, TmpToteId)
+                select newWorkId, ToteId, TmpToteId from oldToteReuseTable
+                where oldToteReuseTable.WorkId == _workTable.WorkId 
+                   && oldToteReuseTable.ToteId == _workTable.TargetLicensePlateId;
+        }
+
+        while select forupdate closedWorkWorkLine
+            where closedWorkWorkLine.WorkId == _workTable.WorkId
+                && closedWorkWorkLine.WorkStatus == WHSWorkStatus::Closed
+        {
+            if ((closedWorkWorkLine.WorkType == WHSWorkType::Pick
+                    && closedWorkWorkLine.LoadLineRefRecId)
+                ||(closedWorkWorkLine.WorkType == WHSWorkType::Put
+                    && closedWorkWorkLine.LineNum == WHSWorkLine::lastLineNum(_workTable.WorkId)))
+            {
+                WHSPackingWorkHelper::createPackingWorkLineFromWorkLine(closedWorkWorkLine, _workTable, newWorkTable.WorkId, _locationId);
+
+                closedWorkWorkLine.LoadLineRefRecId = 0;
+                closedWorkWorkLine.update();
+            }
+            else if (closedWorkWorkLine.WorkType == WHSWorkType::Pick 
+                     && !closedWorkWorkLine.LoadLineRefRecId 
+                     && _workTable.HasWorkLineLoadLineDetails)
+            {
+                WHSConsolidatedWorkLineVisitorPackingCreator visitor = WHSConsolidatedWorkLineVisitorPackingCreator::newForWork(_workTable, newWorkTable.WorkId, _locationId);
+                WHSConsolidatedWorkLineTraverser traverser = WHSConsolidatedWorkLineTraverser::newForVisitor(visitor);
+                traverser.traverseRun(closedWorkWorkLine);
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createProdPickListJournal</Name>
+				<Source><![CDATA[
+    private void createProdPickListJournal(WHSWorkLine _workLine)
+    {
+        if (_workLine.whsWorkTable().WorkTransType == WHSWorkTransType::ProdPick
+        &&	!_workLine.isPickLineAfter())
+        {
+            WHSPostProdJournal postProdJournal = WHSPostProdJournal::newFromWorkLine(_workLine);
+            postProdJournal.postProdBOMPick();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>putAwayAllQuantityToLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Puts away the complete quantity to a location.
+    /// </summary>
+    /// <param name = "_inventDimId">The dimensions of the product.</param>
+    /// <param name = "_qtyInventTransDataCarrier">The quantity being moved.</param>
+    /// <param name = "_locationId">The location the quantity is being moved to.</param>
+    /// <param name = "_newStatusId">The new status for the product</param>
+    /// <param name = "_targetLicensePlate">The target license plate.</param>
+    /// <returns>The quantity moved.</returns>
+    protected Qty putAwayAllQuantityToLocation(
+        InventDimId         _inventDimId,
+        PmfQtyDataCarrier   _qtyInventTransDataCarrier,        
+        WMSLocationId       _locationId,
+        WHSInventStatusId   _newStatusId,
+        WHSLicensePlateId   _targetLicensePlate)
+    {
+        using (var _ = this.activities().putAwayAllQuantityToLocation())
+        {
+            WHSLicensePlateId   sourceLicensePlateId;
+            WHSLicensePlateId   targetLicensePlateId = _targetLicensePlate;
+
+            if (handleByLP)
+            {
+                sourceLicensePlateId = WHSWorkLine::find(workLine.WorkId, loopWorkInventTrans.LineNum).LocatedLPId;
+                targetLicensePlateId = sourceLicensePlateId;
+            }
+
+            // Finally prep Dim Ids and move qty
+            InventDim fromInventDim = this.preparePutAwayFromInventDim(_inventDimId, _locationId, sourceLicensePlateId, _newStatusId);
+            InventDim toInventDim = this.preparePutAwayToInventDim(workLine.WorkId, _inventDimId, _locationId, targetLicensePlateId, _newStatusId);
+
+            PmfQtyDataCarrier qtyDataCarrier = this.calculateMoveAllPutAway(workLine, workInventTrans, _qtyInventTransDataCarrier, fromInventDim);
+
+            if (qtyDataCarrier
+            && qtyDataCarrier.parmInventQty())
+            {
+                WHSInvent::moveWorkQuantities(workInventTrans, fromInventDim.InventDimId, toInventDim.InventDimId, qtyDataCarrier.parmInventQty(), qtyDataCarrier.parmCwQty(), whsWorkExecute.inventCostOnhandCache(), ledgerVoucher, workMovement);
+
+                return qtyDataCarrier.qty(isCWItem);
+            }
+
+            return 0;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>putAwaySplitQuantityToLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Puts away the split quantity to a location.
+    /// </summary>
+    /// <param name = "_inventTrans">The inventory transaction.</param>
+    /// <param name = "_fromLineNum">The work line number.</param>
+    /// <param name = "_fromInventDim">The inventory dimension that the item is moved from.</param>
+    /// <param name = "_toInventDim">The inventory dimension that the item is moved to.</param>
+    /// <param name = "_weightUnitDecimalPrecision">The decimal precision of the weight unit.</param>
+    /// <param name = "_consumeInventoryWeight">A Boolean value that indicates whether to consume the inventory weight.</param>
+    /// <returns>The quantity moved.</returns>
+    private Qty putAwaySplitQuantityToLocation(
+        InventTrans         _inventTrans,
+        LineNum             _fromLineNum,
+        InventDim           _fromInventDim,
+        InventDim           _toInventDim,
+        UnitOfMeasureDecimalPrecision _weightUnitDecimalPrecision,
+		boolean			    _consumeInventoryWeight = false)
+    {
+        using (var _ = this.activities().putAwaySplitQuantityToLocation(_inventTrans.RecId))
+        {
+            // tmpHandlingQty is NOT weight here - eaches, pieces
+            InventHandlingQty tmpHandlingQty = this.calculateTotalHandlingQty(workLine,
+                            workInventTrans,
+                            _inventTrans,
+                            _fromLineNum,
+                            isCWItem);
+
+            PmfQtyDataCarrier dataCarrier = this.putAwayToLocationGetTempQuantities(tmpHandlingQty,
+                            workInventTrans.InventQtyRemain,
+                            workInventTrans.RemainingTransactionWeight,
+                            _weightUnitDecimalPrecision,
+                            isCWItem,
+                            _inventTrans.Qty,
+                            _consumeInventoryWeight);
+
+            if (dataCarrier
+            && dataCarrier.parmInventQty() > 0) // for CW enabled warehouse items it is still fine to check the invent qty
+            {
+                WHSInvent::moveWorkQuantities(workInventTrans, _fromInventDim.InventDimId, _toInventDim.InventDimId, dataCarrier.parmInventQty(), dataCarrier.parmCwQty(), whsWorkExecute.inventCostOnhandCache(), ledgerVoucher, workMovement);
+
+                return dataCarrier.qty(isCWItem);
+            }
+
+            return 0;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preparePutAwayFromInventDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Prepares 'from' inventory dimension for put away scenario when the status is being changed during work.
+    /// </summary>
+    /// <param name = "_inventDimId">An inventory dimension of the transaction.</param>
+    /// <param name = "_locationId">Location inventory id to be put into.</param>
+    /// <param name = "_sourceLicensePlateId">Source license plate.</param>
+    /// <param name = "_inventStatusId">The status that the inventory was changed during the work.</param>
+    /// <returns>A 'from' inventory dimension.</returns>
+    public InventDim preparePutAwayFromInventDim(
+        InventDimId         _inventDimId,
+        WMSLocationId       _locationId,
+        WHSLicensePlateId   _sourceLicensePlateId,
+        WHSInventStatusId   _inventStatusId)
+    {
+        InventDim fromInventDim = InventDim::find(_inventDimId);
+
+        if (_sourceLicensePlateId)
+        {
+            fromInventDim.LicensePlateId = _sourceLicensePlateId;
+        }
+
+        if (!fromInventDim.wmsLocation().whsLocationIsLPControlled())
+        {
+            fromInventDim.LicensePlateId = '';
+        }
+
+        if (_inventStatusId)
+        {
+            fromInventDim.InventStatusId = _inventStatusId;
+        }
+
+        fromInventDim = InventDim::findOrCreate(fromInventDim);
+
+        return fromInventDim;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preparePutAwayToInventDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Prepares 'to' inventory dimension for put away scenario when the status is being changed during work.
+    /// </summary>
+    /// <param name = "_workId">Work id associated with an action.</param>
+    /// <param name = "_inventDimId">An inventory dimension of the transaction.</param>
+    /// <param name = "_locationId">Location inventory id to be put into.</param>
+    /// <param name = "_targetLicensePlateId">Target license plate.</param>
+    /// <param name = "_inventStatusId">The status that the inventory was changed during the work.</param>
+    /// <returns>A 'to' inventory dimension.</returns>
+    public InventDim preparePutAwayToInventDim(
+        WHSWorkId           _workId,
+        InventDimId         _inventDimId,
+        WMSLocationId       _locationId,
+        WHSLicensePlateId   _targetLicensePlateId,
+        WHSInventStatusId   _inventStatusId)
+    {
+        InventDim toInventDim = InventDim::find(_inventDimId);
+        toInventDim.wmsLocationId = _locationId;
+
+        if (_targetLicensePlateId)
+        {
+            WHSWorkTable workTable = WHSWorkTable::find(_workId);
+
+            if (workTable.WorkTransType != WHSWorkTransType::PackedContainerPicking)
+            {
+                toInventDim.LicensePlateId = _targetLicensePlateId;
+            }
+        }
+
+        if (!toInventDim.wmsLocation().whsLocationIsLPControlled())
+        {
+            toInventDim.LicensePlateId = '';
+        }
+
+        if (_inventStatusId)
+        {
+            toInventDim.InventStatusId = _inventStatusId;
+        }
+
+        toInventDim = InventDim::findOrCreate(toInventDim);
+
+        return toInventDim;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromWorkExecute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of the <c>WhsWorkExecutePutAwayToLocation</c> class.
+    /// </summary>
+    /// <param name = "_workExecute">The work execute class</param>
+    /// <returns>The new instance.</returns>
+    public static WhsWorkExecutePutAwayToLocation newFromWorkExecute(WhsWorkExecute _workExecute)
+    {
+        WhsWorkExecutePutAwayToLocation instance = new WhsWorkExecutePutAwayToLocation();
+        instance.whsWorkExecute = _workExecute;
+        return instance;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newDeferredPut</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of the <c>WhsWorkExecutePutAwayToLocation</c> class which will be specific to updates based on deferred put operations.
+    /// </summary>
+    /// <param name = "_workExecute">The work execute class</param>
+    /// <returns>The new instance.</returns>
+    [Hookable(false)]
+    internal static WhsWorkExecutePutAwayToLocation newDeferredPut()
+    {
+        WhsWorkExecutePutAwayToLocation instance = WhsWorkExecutePutAwayToLocation::newFromWorkExecute(WhsWorkExecutePutAwayToLocation::newWhsWorkExecute());
+        instance.isProcessingDeferredPut  = true;
+        return instance;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newWhsWorkExecute</Name>
+				<Source><![CDATA[
+    private static WhsWorkExecute newWhsWorkExecute()
+    {
+        return WhsWorkExecute::construct();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>activities</Name>
+				<Source><![CDATA[
+    private WhsWorkExecutePutAwayToLocationInstrumentationActivities activities()
+    {
+        if (!logger)
+        {
+            logger = WHSInstrumentationLogger::createLogger(classStr(WhsWorkExecutePutAwayToLocation));
+        }
+
+        return logger.workExecutePutAwayToLocation();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

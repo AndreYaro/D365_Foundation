@@ -1,0 +1,387 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxTable xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSQualityCheckTemplate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class WHSQualityCheckTemplate extends common
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>find</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static WHSQualityCheckTemplate find(
+        WHSQualityCheckTemplateName _qualityCheckTemplateName, 
+        boolean                     _forUpdate = false)
+    {
+        WHSQualityCheckTemplate qualityCheckTemplate;
+    
+        if (_qualityCheckTemplateName)
+        {
+            if (_forUpdate)
+            {
+                qualityCheckTemplate.selectForUpdate(_forUpdate);
+            }
+
+            select firstOnly qualityCheckTemplate
+                where qualityCheckTemplate.QualityCheckTemplateName == _qualityCheckTemplateName;
+        }
+    
+        return qualityCheckTemplate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findByWorkLine</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static WHSQualityCheckTemplate findByWorkLine(WHSWorkLine _workLine)
+    {
+        WHSQualityCheckTemplate qualityCheckTemplate;
+    
+        if (_workLine.WorkType == WHSWorkType::QualityCheck)
+        {
+            WHSWorkTemplateLine workTemplateLine;
+
+            select firstOnly qualityCheckTemplate
+                exists join workTemplateLine
+                where  workTemplateLine.QualityCheckTemplateName == qualityCheckTemplate.QualityCheckTemplateName
+                    && workTemplateLine.RecId                    == _workLine.WorkTemplateLineRecId;
+        }
+    
+        return qualityCheckTemplate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createQualityOrderFromQualityCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create quality orders based on a quality check during work execution.
+    /// </summary>
+    /// <param name = "_qualityCheckWorkLine">The <c>WHSWorkLine</c> to use.</param>
+    /// <returns>A <c>List</c> of quality order ID's.</returns>
+    [Hookable(false)]
+    internal static List createQualityOrderFromQualityCheck(WHSWorkLine _qualityCheckWorkLine)
+    {
+        // if quality managemement is not enabled then return.
+        if (!InventParameters::find().UseQualityManagement)
+        {
+            return null;
+        }
+
+        WHSWorkTemplateLine workTemplateLine = WHSWorkTemplateLine::findByRecId(_qualityCheckWorkLine.WorkTemplateLineRecId);
+        WHSQualityCheckTemplate qualityCheckTemplate = WHSQualityCheckTemplate::find(workTemplateLine.QualityCheckTemplateName);
+
+        WHSInstrumentationLogger instrumentationLogger = WHSQualityCheckTemplate::instrumentationLogger();
+
+        using (var activityContext = instrumentationLogger.qualityCheckActivities().createQualityOrders(qualityCheckTemplate.ProcessingPolicy))
+        {
+            instrumentationLogger.logRecordInformation(qualityCheckTemplate);
+
+            // If we didn't find a qualityCheckTemplate or the template does not require us to create a quality order then return.
+            if (qualityCheckTemplate.ProcessingPolicy != WHSQualityProcessingPolicy::CreateQualityOrder)
+            {
+                return null;
+            }
+    
+            if (!workTemplateLine.validateQualityCheckTemplateForWorkTransType())
+            {
+                throw error(strFmt("@WAX:InvalidQCTemplateForSpecificWorkOrderType", workTemplateLine.QualityCheckTemplateName, workTemplateLine.WorkTransType));
+            }
+
+            List qualityOrderIdList = new List(Types::String);
+    
+            ttsbegin;
+    
+            NumberSeq numberSeq = NumberSeq::newGetNumFromId(InventParameters::numRefQualityOrderId().NumberSequenceId);
+        
+            WHSWorkLine         workLine;
+            WHSWorkInventTrans  workInventTrans;
+            boolean             destructiveTest = InventTestGroup::find(qualityCheckTemplate.InventTestGroupId).TestDestructive;
+
+            // Loop over workLines and WITs to create quality orders for each item/order combination
+            while select WorkId, LineNum from workLine
+                order by LineNum
+                where workLine.WorkId        == _qualityCheckWorkLine.WorkId
+                        && workLine.LineNum   < _qualityCheckWorkLine.LineNum
+                        && (workLine.WorkType == WHSWorkType::Pick
+                        ||  workLine.WorkType == WHSWorkType::Put)
+                join workInventTrans
+                    where workInventTrans.WorkId   == workLine.WorkId
+                        && workInventTrans.LineNum == workLine.LineNum
+            {
+                // Don't include staging workLines
+                if (workLine.WorkType == WHSWorkType::Put)
+                {
+                    break;
+                }
+    
+                InventTransOrigin inventTransOrigin = InventTransOrigin::findByInventTransId(workInventTrans.InventTransIdParent);
+                Common originBuffer = inventTransOrigin.originator();
+                InventQualityReferenceType referenceType = InventQualityReferenceType::newFromBuffer(originBuffer);
+    
+                // Can't create quality orders with destructive testing for some reference types.
+                if (destructiveTest
+                    && !referenceType.isEligibleForDestructiveTest())
+                {
+                    continue;
+                }
+    
+                InventQualityOrderTable qualityOrderTable;
+
+                if (numberSeq)
+                {
+                    qualityOrderTable.QualityOrderId = numberSeq.num();
+                }
+    
+                qualityOrderTable.initFromReference(referenceType);
+                qualityOrderTable.initFromWorkLine(_qualityCheckWorkLine);
+    
+                qualityOrderTable.Qty = workInventTrans.Qty;
+
+                if (referenceType.supportsInventoryBlocking())
+                {
+                    qualityOrderTable.BlockingQty = workInventTrans.Qty;
+                }
+    
+                qualityOrderTable.TestGroupId = qualityCheckTemplate.InventTestGroupId;
+                qualityOrderTable.initFromInventTestGroup();
+            
+                qualityOrderTable.insert();
+            
+                qualityOrderIdList.addEnd(qualityOrderTable.QualityOrderId);
+    
+                // Reserve inventory blocking and quality order transactions at status level
+                InventBlockingQualityOrder::findInventBlockingByQualityOrderId(qualityOrderTable.QualityOrderId).reserveBlockingAtStatusLevel();
+
+                if (qualityOrderTable.TestDestructive)
+                {
+                    qualityOrderTable.reserveQualityOrderAtStatusLevel();
+                }
+    
+                // Store related inventory for the quality order
+                WHSQualityOrderInventory::createFromWorkInventTrans(qualityOrderTable.QualityOrderId, workInventTrans);
+            }
+    
+            ttscommit;
+
+            instrumentationLogger.qualityCheckActivities().createdQualityOrders(activityContext, qualityOrderIdList.elements());
+    
+            return qualityOrderIdList;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    private static WHSInstrumentationLogger instrumentationLogger()
+    {
+        return WHSInstrumentationLogger::createLogger(tableStr(WHSQualityCheckTemplate));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldThrowExceptionOnZeroDelete</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if concurrent deletes should throw exception.
+    /// </summary>
+    /// <returns>true if exception should be thrown; otherwise false.</returns>
+    [Hookable(false)]
+    public boolean shouldThrowExceptionOnZeroDelete()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFieldValue</Name>
+				<Source><![CDATA[
+    public boolean validateFieldValue(FieldName _fieldName, int _arrayIndex = 1)
+    {
+        boolean ret = super(_fieldName, _arrayIndex);
+
+        switch (_fieldName)
+        {
+            case fieldStr(WHSQualityCheckTemplate, ProcessingPolicy):
+                
+                if (!this.validateQualityCheckTemplateForWorkTransType())
+                {
+                    ret = checkFailed(strFmt("@WAX:InvalidQCTemplateForSpecificWorkOrderType", this.QualityCheckTemplateName, WHSWorkTransType::TransferReceipt));
+                }
+
+                break;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateQualityCheckTemplateForWorkTransType</Name>
+				<Source><![CDATA[
+    private boolean validateQualityCheckTemplateForWorkTransType()
+    {
+        WHSWorkTemplateLine workTemplateLine;
+
+        if (this.QualityCheckTemplateName
+            && this.ProcessingPolicy == WHSQualityProcessingPolicy::CreateQualityOrder)
+        {
+            select firstonly RecId from workTemplateLine
+                where workTemplateLine.QualityCheckTemplateName == this.QualityCheckTemplateName
+                   && workTemplateLine.WorkType == WHSWorkType::QualityCheck
+                   && workTemplateLine.WorkTransType == WHSWorkTransType::TransferReceipt;
+        }
+
+        return workTemplateLine.RecId == 0;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+	<ConfigurationKey>WHSandTMS</ConfigurationKey>
+	<DeveloperDocumentation>@WAX:QualityCheckTemplateDocumentation</DeveloperDocumentation>
+	<FormRef>WHSQualityCheckTemplate</FormRef>
+	<Label>@WAX:QualityCheckTemplate</Label>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
+	<TableGroup>Main</TableGroup>
+	<TitleField1>QualityCheckTemplateName</TitleField1>
+	<TitleField2>ProcessingPolicy</TitleField2>
+	<CacheLookup>FoundAndEmpty</CacheLookup>
+	<ClusteredIndex>QualityCheckTemplateNameIdx</ClusteredIndex>
+	<ModifiedBy>Yes</ModifiedBy>
+	<ModifiedDateTime>Yes</ModifiedDateTime>
+	<Modules>Inventory</Modules>
+	<ReplacementKey>QualityCheckTemplateNameIdx</ReplacementKey>
+	<TableContents>BaseData</TableContents>
+	<DeleteActions />
+	<FieldGroups>
+		<AxTableFieldGroup>
+			<Name>AutoReport</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoLookup</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoIdentification</Name>
+			<AutoPopulate>Yes</AutoPopulate>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>QualityCheckTemplateName</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoSummary</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoBrowse</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>All</Name>
+			<Label>@WAX2277</Label>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>ProcessingPolicy</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>AcceptancePolicy</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>QualityCheckTemplateName</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>InventTestGroupId</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+	</FieldGroups>
+	<Fields>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>QualityCheckTemplateName</Name>
+			<AllowEdit>No</AllowEdit>
+			<AssetClassification>Customer Content</AssetClassification>
+			<ExtendedDataType>WHSQualityCheckTemplateName</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
+			<Mandatory>Yes</Mandatory>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>InventTestGroupId</Name>
+			<AssetClassification>Customer Content</AssetClassification>
+			<ExtendedDataType>InventTestGroupId</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldEnum">
+			<Name>AcceptancePolicy</Name>
+			<AssetClassification>Customer Content</AssetClassification>
+			<EnumType>WHSQualityCheckAcceptancePolicy</EnumType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldEnum">
+			<Name>ProcessingPolicy</Name>
+			<AssetClassification>Customer Content</AssetClassification>
+			<EnumType>WHSQualityProcessingPolicy</EnumType>
+		</AxTableField>
+	</Fields>
+	<FullTextIndexes />
+	<Indexes>
+		<AxTableIndex>
+			<Name>QualityCheckTemplateNameIdx</Name>
+			<AlternateKey>Yes</AlternateKey>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>QualityCheckTemplateName</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+		<AxTableIndex>
+			<Name>InventTestGroupIdx</Name>
+			<AllowDuplicates>Yes</AllowDuplicates>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>InventTestGroupId</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+	</Indexes>
+	<Mappings />
+	<Relations>
+		<AxTableRelation>
+			<Name>InventTestGroup</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<OnDelete>Restricted</OnDelete>
+			<RelatedTable>InventTestGroup</RelatedTable>
+			<RelatedTableCardinality>ZeroOne</RelatedTableCardinality>
+			<RelationshipType>Association</RelationshipType>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>InventTestGroupId</Name>
+					<Field>InventTestGroupId</Field>
+					<RelatedField>TestGroupId</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+		</AxTableRelation>
+	</Relations>
+	<StateMachines />
+</AxTable>

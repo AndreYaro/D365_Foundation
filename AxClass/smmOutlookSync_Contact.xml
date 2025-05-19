@@ -1,0 +1,1460 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SmmOutlookSync_Contact</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[SysObsolete('Microsoft discontinued support for synchronizing contacts, appointments, and tasks between Dynamics 365 Supply Chain Management and Outlook.', false, 01\12\2023)]
+class SmmOutlookSync_Contact extends smmOutlookSync
+{
+    ContactPerson               contactPerson;
+    smmOutlookSyncType          outlookSyncType;
+    DirPartyTable               dirPartyTable;
+    SysIMAPIExContact           mapiExContact;
+    str                         contactEntryId;
+    DirPartyPostalAddressView   businessAddress;
+    DirPartyPostalAddressView   homeAddress;
+    DirPartyPostalAddressView   otherAddress;
+    DirPartyPostalAddressView   mailingAddress;
+    LogisticsPostalAddress      primaryAddress;
+    smmSelectedMailingAddress   selectedMailingAddress;
+    ContactPersonSyncEntity     contactPersonEntity;
+    DirPartyContactInfoView     contactInfoView;
+    Map                         contactFieldsRecordMap;
+    LogisticsAddressCountryRegionTranslation countryRegionTranslation;
+    smmIContact                                 outlookItem;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkFieldsUpdated</Name>
+				<Source><![CDATA[
+    private boolean checkFieldsUpdated(smmContactPersonSynchronize _contactPersonSynchronize, DirPartyRecId _party)
+    {
+        DirPersonName                   personName;
+        LogisticsPostalAddress          postalAddress;
+        LogisticsElectronicAddress      contactInfo;
+        smmContactPersonSynchronizeFieldMapping syncFieldMapping;
+
+        // Check if any mapping has changed
+        select firstonly RecId from syncFieldMapping
+            where syncFieldMapping.UserId == _contactPersonSynchronize.UserId &&
+                  syncFieldMapping.ContactPersonId == _contactPersonSynchronize.ContactPersonId &&
+                  syncFieldMapping.ModifiedDateTime > _contactPersonSynchronize.LastSyncAxDateTime;
+
+        if (syncFieldMapping.RecId)
+        {
+            return true;
+        }
+
+        // Check if person name has changed
+        select RecId from personName
+            where personName.Person == _party &&
+            personName.ValidFrom > _contactPersonSynchronize.LastSyncAxDateTime;
+
+        if (personName.RecId)
+        {
+            return true;
+        }
+
+        // Check if any postal address have changed based on location
+        select firstonly RecId from syncFieldMapping
+                where syncFieldMapping.ContactPersonId == _contactPersonSynchronize.ContactPersonId &&
+                      syncFieldMapping.UserId == _contactPersonSynchronize.UserId
+            exists join postalAddress
+                where postalAddress.ValidFrom > DateTimeUtil::addSeconds(_contactPersonSynchronize.LastSyncAxDateTime, -2) &&
+                      postalAddress.Location == syncFieldMapping.Location;
+
+        if (syncFieldMapping.RecId)
+        {
+            return true;
+        }
+
+        // Check if any electronic address have changed based on location
+        select firstonly RecId from syncFieldMapping
+                where syncFieldMapping.ContactPersonId == _contactPersonSynchronize.ContactPersonId &&
+                      syncFieldMapping.UserId == _contactPersonSynchronize.UserId
+            exists join contactInfo
+                where contactInfo.RecId == syncFieldMapping.Location
+                && contactInfo.modifiedDateTime > DateTimeUtil::addSeconds(_contactPersonSynchronize.LastSyncAxDateTime, -2);
+
+        if (syncFieldMapping.RecId)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Clears the address views to prepare for the next contact record.
+    /// </summary>
+    private void clearAddress()
+    {
+        businessAddress.clear();
+        homeAddress.clear();
+        otherAddress.clear();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearContactFieldsRecordMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Clears the record mapping for the contact fields.
+    /// </summary>
+    private void clearContactFieldsRecordMap()
+    {
+        contactFieldsRecordMap = new Map(Types::Enum, Types::Record);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearOutlookEntries</Name>
+				<Source><![CDATA[
+    public void clearOutlookEntries()
+    {
+        ContactPerson                   contact;
+        Counter                         deletedContacts = 0;
+        smmContactPersonSynchronize     smmContactPersonSynchronize;
+        container                       con;
+        int                             i;
+
+        // Synchronize to Outlook
+        setprefix("@SYS81116");
+        // Traverse all synchronization entries for the current employee
+        while select contact join smmContactPersonSynchronize where smmContactPersonSynchronize.ContactPersonId == contact.ContactPersonId && smmContactPersonSynchronize.UserId == curuserid()
+        {
+            // Synchronizing contact : %1 - %2
+            setprefix(strfmt("@SYS86367", contact.ContactPersonId, contact.personName()));
+
+            // Find the contact in Outlook
+            if (smmContactPersonSynchronize.EntryId && this.getOulookItemFromOutlook(smmContactPersonSynchronize.EntryId))
+            {
+                // Delete the contact in Outlook
+                this.deleteItemInOutlook();
+            }
+
+            con += [smmContactPersonSynchronize.ContactPersonId];
+            deletedContacts++;
+        }
+
+        ttsbegin;
+        for (i = 1; i <= conlen(con) ; i++)
+        {
+            smmContactPersonSynchronize = smmContactPersonSynchronize::findCont(conpeek(con,i),true);
+            smmContactPersonSynchronize.EntryId = '';
+            smmContactPersonSynchronize.update();
+        }
+        ttscommit;
+
+        // %1 contact(s) have been deleted.
+        info(strfmt("@SYS90023", deletedContacts));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearSynchronizationFields</Name>
+				<Source><![CDATA[
+    private void clearSynchronizationFields(smmContactPersonSynchronize _contactPersonSynchronize)
+    {
+        if (smmOutlookSyncDeprecationHandler::isOutlookSyncDisabled())
+        {
+            smmOutlookSyncDeprecationHandler::logSyncSkipMessageToTelemetry();
+            return;
+        }
+
+        smmAxaptaOutlookMapping syncMapping;
+        OutlookSyncParameters parameters = OutlookSyncParameters::find();
+
+        // Only clear fields depending on the parameter
+        if (parameters.OutlookContactDeleteAction != smmOutlookContactDeleteAction::Clear || _contactPersonSynchronize.OutlookSyncType != smmOutlookSyncType::EditContact)
+        {
+            return;
+        }
+
+        while select OutlookContactField from syncMapping where
+            syncMapping.OutlookMappingType == smmOutlookMappingTypes::Contacts &&
+            syncMapping.OutlookSyncDirections == smmOutlookSyncDirections::OutlookToAxaptaOnly
+        {
+            switch (syncMapping.OutlookContactField)
+            {
+                case smmOutlookContactFields::Anniversary                   :
+                    contactPersonEntity.parmAnniversaryMonth(0);
+                    contactPersonEntity.parmAnniversaryDay(0);
+                    contactPersonEntity.parmAnniversaryYear(0);
+                    break;
+                case smmOutlookContactFields::AssistantName                 : contactPersonEntity.parmAssistantName(''); break;
+                case smmOutlookContactFields::AssistantTelephoneNumber      : contactPersonEntity.parmAssistantTelephoneNumber(''); break;
+                case smmOutlookContactFields::Billinginformation            : contactPersonEntity.parmBillingInformation(''); break;
+                case smmOutlookContactFields::BirthDay                      :
+                    contactPersonEntity.parmBirthMonth(0);
+                    contactPersonEntity.parmBirthDay(0);
+                    contactPersonEntity.parmBirthYear(0);
+                    break;
+                case smmOutlookContactFields::Body                          : contactPersonEntity.parmContactMemo(''); break;
+                case smmOutlookContactFields::Gender                        : contactPersonEntity.parmGender(Gender::Unknown); break;
+                case smmOutlookContactFields::GovernmentIDName              : contactPersonEntity.parmGovernmentIDNumber(''); break;
+                case smmOutlookContactFields::Hobby                         : contactPersonEntity.parmHobbies(''); break;
+                case smmOutlookContactFields::Categories                    : contactPersonEntity.parmOutlookCategories(''); break;
+                case smmOutlookContactFields::Children                      : contactPersonEntity.parmChildrenNames(''); break;
+                case smmOutlookContactFields::ComputerNetworkName           : contactPersonEntity.parmComputerNetworkName(''); break;
+                case smmOutlookContactFields::Department                    : contactPersonEntity.parmDepartment(''); break;
+                case smmOutlookContactFields::FirstName                     : contactPersonEntity.parmFirstName(''); break;
+                case smmOutlookContactFields::JobTitle                      : contactPersonEntity.parmProfessionalTitle(''); break;
+                case smmOutlookContactFields::Language                      : contactPersonEntity.parmLanguageId(''); break;
+                case smmOutlookContactFields::Mileage                       : contactPersonEntity.parmMileage(''); break;
+                case smmOutlookContactFields::NickName                      : contactPersonEntity.parmNickName(''); break;
+                case smmOutlookContactFields::OfficeLocation                : contactPersonEntity.parmOfficeLocation(''); break;
+                case smmOutlookContactFields::OrganizationalIdName          : contactPersonEntity.parmOrganizationalIDNumber(''); break;
+                case smmOutlookContactFields::Initials                      : contactPersonEntity.parmInitials(''); break;
+                case smmOutlookContactFields::Profession                    : contactPersonEntity.parmProfession(''); break;
+                case smmOutlookContactFields::Sensitivity                   : contactPersonEntity.parmSensitivity(smmSensitivity::Normal); break;
+                case smmOutlookContactFields::Spouse                        : contactPersonEntity.parmSpouse(''); break;
+                case smmOutlookContactFields::Suffix                        : contactPersonEntity.parmPersonalSuffix(''); break;
+                case smmOutlookContactFields::Title                         : contactPersonEntity.parmPersonalTitle(''); break;
+
+                // Business address
+                case smmOutlookContactFields::BusinessAddress               :
+                    businessAddress = this.getAddress(smmOutlookContactFields::BusinessAddress);
+                    if (!businessAddress.IsPrimary)
+                    {
+                        businessAddress.CountryRegionId = '';
+                    }
+                    break;
+
+                // Home address
+                case smmOutlookContactFields::HomeAddress                   :
+                    homeAddress = this.getAddress(smmOutlookContactFields::HomeAddress);
+                    if (!homeAddress.IsPrimary)
+                    {
+                        homeAddress.CountryRegionId = '';
+                    }
+                    break;
+
+                // Other address
+                case smmOutlookContactFields::OtherAddress                  :
+                    otherAddress = this.getAddress(smmOutlookContactFields::OtherAddress);
+                    if (!otherAddress.IsPrimary)
+                    {
+                        otherAddress.CountryRegionId = '';
+                    }
+                    break;
+
+                // Contact info
+                case smmOutlookContactFields::Business2TelephoneNumber      :
+                case smmOutlookContactFields::BusinessFaxNumber             :
+                case smmOutlookContactFields::BusinessHomePage              :
+                case smmOutlookContactFields::BusinessTelephoneNumber       :
+                case smmOutlookContactFields::CallbackTelephoneNumber       :
+                case smmOutlookContactFields::CarTelephoneNumber            :
+                case smmOutlookContactFields::Email1Address                 :
+                case smmOutlookContactFields::Email2Address                 :
+                case smmOutlookContactFields::Email3Address                 :
+                case smmOutlookContactFields::FTPSite                       :
+                case smmOutlookContactFields::HomeFaxNumber                 :
+                case smmOutlookContactFields::HomeTelephoneNumber           :
+                case smmOutlookContactFields::IMAddress                     :
+                case smmOutlookContactFields::InternetFreeBusyAddress       :
+                case smmOutlookContactFields::ISDNNumber                    :
+                case smmOutlookContactFields::MobileTelephoneNumber         :
+                case smmOutlookContactFields::OtherFaxNumber                :
+                case smmOutlookContactFields::OtherTelephoneNumber          :
+                case smmOutlookContactFields::PagerNumber                   :
+                case smmOutlookContactFields::PersonalHomePage              :
+                case smmOutlookContactFields::PrimaryTelephoneNumber        :
+                case smmOutlookContactFields::RadioTelephoneNumber          :
+                case smmOutlookContactFields::TelexNumber                   :
+                case smmOutlookContactFields::TTYTDDTelephoneNumber         :
+                case smmOutlookContactFields::HomeTelephoneNumber2          :
+                case smmOutlookContactFields::WebPage                       :
+                    this.setContactInfoFields(syncMapping.OutlookContactField, '');
+                    break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeOutlookObject</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Closes Outlook objects that were opened by mapiEx.
+    /// </summary>
+    /// <param name="_save">
+    /// A Boolean value that specifies whether to save.
+    /// </param>
+    void closeOutlookObject(boolean _save = false)
+    {
+        if (mapiExContact)
+        {
+            if (_save)
+            {
+                mapiExContact.save();
+            }
+            mapiExContact.finalize();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInOutlook</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an item in Outlook.
+    /// </summary>
+    protected void createInOutlook()
+    {
+        outlookItem = folder.createContact();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createMappingField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the <c>mappint</c> fields.
+    /// </summary>
+    /// <param name="_smmAxaptaOutlookMapping">
+    /// <c>Mappint</c> Axapta fields in Outlook.
+    /// </param>
+    protected void createMappingField(smmAxaptaOutlookMapping _smmAxaptaOutlookMapping)
+    {
+        // Create a container with matching Axapta and Outlook field ids
+        fieldMapping = fieldMapping + [[_smmAxaptaOutlookMapping.OutlookContactField, _smmAxaptaOutlookMapping.OutlookSyncDirections]];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAddress</Name>
+				<Source><![CDATA[
+    private DirPartyPostalAddressView getAddress(smmOutlookContactFields _contactField)
+    {
+        DirPartyPostalAddressView address;
+
+        address = contactPersonEntity.getPostalAddress(smmContactPersonSynchronizeFieldMapping::find(currentUser, contactPersonEntity.parmContactPersonId(), _contactField).Location);
+        if (address.IsPrimary)
+        {
+            selectedMailingAddress = ContactPerson::contactFieldToSelectedMailing(_contactField);
+            mailingAddress = address;
+        }
+
+        return address;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getContactFieldsRecordMap</Name>
+				<Source><![CDATA[
+    public Map getContactFieldsRecordMap()
+    {
+        return contactFieldsRecordMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getContactInfo</Name>
+				<Source><![CDATA[
+    private LogisticsElectronicAddressLocator getContactInfo(smmOutlookContactFields _outlookContactFields)
+    {
+        contactInfoView = contactPersonEntity.getContactInfo(smmContactPersonSynchronizeFieldMapping::find(currentUser, contactPersonEntity.parmContactPersonId(), _outlookContactFields).Location);
+
+        return contactInfoView.Locator;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new()
+    {
+        // Set mapping type
+        outlookMappingType = smmOutlookMappingTypes::Contacts;
+
+        contactFieldsRecordMap = new Map(Types::Enum, Types::Record);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setAddress</Name>
+				<Source><![CDATA[
+    private DirPartyPostalAddressView setAddress(smmOutlookContactFields _outlookContactFields, DirPartyPostalAddressView _address, LogisticsLocationRoleRecId _role)
+    {
+        DirPartyPostalAddressView address;
+        boolean expired = false;
+
+        if (_address.IsLocationOwner || !_address.Location) // Only update address that is owned by the contact or allow create if new
+        {
+            if (_address.CountryRegionId && (_address.Street || _address.ZipCode || _address.City || _address.State || _address.Address))
+            {
+                if (!_address.LocationName)
+                {
+                    _address.LocationName = enum2Value(_outlookContactFields);
+                }
+            }
+            else
+            {
+                if (_address.Location)
+                {
+                    // Put an end date if location exist in AX
+                    _address = _address.orig();
+                    _address.ValidTo = DateTimeUtil::utcNow();
+                    expired = true;
+                }
+                else
+                {
+                    return null;
+                }
+            }
+
+            address = contactPersonEntity.createOrUpdatePostalAddress(_address, [_role], expired ? ValidTimeStateUpdate::Correction : ValidTimeStateUpdate::CreateNewTimePeriod);
+
+            if (address.Location)
+            {
+                contactFieldsRecordMap.insert(_outlookContactFields, address);
+            }
+
+            // Update mapping field value for location
+            smmContactPersonSynchronizeFieldMapping::updateLocation(_outlookContactFields, _address.Party, expired ? 0 : address.Location, _address.Location);
+        }
+
+        return address;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setContactInfoFields</Name>
+				<Source><![CDATA[
+    private void setContactInfoFields(smmOutlookContactFields _outlookContactFields, LogisticsElectronicAddressLocator _locator)
+    {
+        LogisticsLocationRecId  location = smmContactPersonSynchronizeFieldMapping::find(currentUser, contactPersonEntity.parmContactPersonId(), _outlookContactFields).Location;
+
+        contactInfoView = contactPersonEntity.getContactInfo(location);
+        contactInfoView.Party = contactPersonEntity.getPartyRecId();
+        contactInfoView.ElectronicAddress = location;
+
+        if (!_locator && !contactInfoView.ElectronicAddress)
+        {
+            // Do not create a record if there's no locator value
+            return;
+        }
+        else
+        {
+            contactInfoView.LocationName = enum2Value(_outlookContactFields);
+            contactInfoView.Type = smmContactPersonSynchronizeFieldMapping::contactField2MethodType(_outlookContactFields);
+            contactInfoView.Locator = _locator;
+            contactInfoView.IsPrimary = (_outlookContactFields == smmOutlookContactFields::PrimaryTelephoneNumber);
+        }
+        contactFieldsRecordMap.insert(_outlookContactFields, contactInfoView);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setContactPerson</Name>
+				<Source><![CDATA[
+    public void setContactPerson(ContactPerson _contactPerson)
+    {
+        contactPerson = _contactPerson;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setContactPersonEntity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the <c>ContactPersonSyncEntity</c> object.
+    /// </summary>
+    /// <param name="ContactPersonSyncEntity">
+    /// An instance of the <c>ContactPersonSyncEntity</c> class.
+    /// </param>
+    public void setContactPersonEntity(ContactPersonSyncEntity _contactPersonEntity)
+    {
+        contactPersonEntity = _contactPersonEntity;
+
+        // clear Map when new contact person is set.
+        this.clearContactFieldsRecordMap();
+        // clear addresses when new contact person is set.
+        this.clearAddress();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setFieldsInOutlook</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the Outlook fields from Microsoft Dynamics AX.
+    /// </summary>
+    public void setFieldsInOutlook()
+    {
+        int                         i;
+        smmOutlookContactFields     outlookContactFields;
+        smmOutlookSyncDirections    syncDirection;
+
+        businessAddress = this.getAddress(smmOutlookContactFields::BusinessAddress);
+        homeAddress = this.getAddress(smmOutlookContactFields::HomeAddress);
+        otherAddress = this.getAddress(smmOutlookContactFields::OtherAddress);
+
+        // Traverse through the field mapping container
+        for (i = 1; i <= conlen(fieldMapping); i++)
+        {
+            // Find Outlook contact field id
+            outlookContactFields = conpeek(conpeek(fieldMapping, i), 1);
+
+            // Find synchronization direction
+            syncDirection        = conpeek(conpeek(fieldMapping, i), 2);
+
+            // Do not copy if the field is only meant to be copied from Outlook to Axapta
+            if (syncDirection != smmOutlookSyncDirections::OutlookToAxaptaOnly && syncDirection != smmOutlookSyncDirections::None)
+            {
+                // Set the Outlook field values
+                this.setFieldValuesInOutlook(outlookContactFields);
+            }
+        }
+
+        // Save the Outlook contact
+        outlookItem = outlookItem.saveItem();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setFieldValuesInAX</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the Microsoft Dynamics AX field values from Outlook.
+    /// </summary>
+    /// <param name="_outlookContactFields">
+    /// A <c>smmOutlookContactFields</c> enumeration value that is based on Outlook fields.
+    /// </param>
+    void setFieldValuesInAX(smmOutlookContactFields _outlookContactFields)
+    {
+        date tmpDate;
+
+        switch (_outlookContactFields)
+        {
+            case smmOutlookContactFields::Anniversary                   :
+                tmpDate = outlookItem.getAnniversary();
+                contactPersonEntity.parmAnniversaryMonth(mthofyr(tmpDate));
+                contactPersonEntity.parmAnniversaryDay(dayofmth(tmpDate));
+                contactPersonEntity.parmAnniversaryYear(year(tmpDate));
+                break;
+            case smmOutlookContactFields::AssistantName                 : contactPersonEntity.parmAssistantName(outlookItem.getAssistantName()); break;
+            case smmOutlookContactFields::AssistantTelephoneNumber      : contactPersonEntity.parmAssistantTelephoneNumber(outlookItem.getAssistantTelephoneNumber()); break;
+            case smmOutlookContactFields::Billinginformation            : contactPersonEntity.parmBillingInformation(outlookItem.getBillingInformation()); break;
+            case smmOutlookContactFields::BirthDay                      :
+                tmpDate = outlookItem.getBirthDay();
+                contactPersonEntity.parmBirthMonth(mthofyr(tmpDate));
+                contactPersonEntity.parmBirthDay(dayofmth(tmpDate));
+                contactPersonEntity.parmBirthYear(year(tmpDate));
+                break;
+            case smmOutlookContactFields::Body :
+                if (mapiExContact)
+                {
+                    contactPersonEntity.parmContactMemo(mapiExContact.Body());
+                }
+                else
+                {
+                    contactPersonEntity.parmContactMemo(outlookItem.getBody());
+                }
+                break;
+            case smmOutlookContactFields::Gender :
+                this.setAXGender(outlookItem.getGender());
+            break;
+
+            case smmOutlookContactFields::GovernmentIDName              : contactPersonEntity.parmGovernmentIDNumber(outlookItem.getGovernmentIDNumber()); break;
+            case smmOutlookContactFields::Hobby                         : contactPersonEntity.parmHobbies(outlookItem.getHobby()); break;
+            case smmOutlookContactFields::Categories                    :
+                contactPersonEntity.parmOutlookCategories(outlookItem.getCategories());
+                break;
+            case smmOutlookContactFields::Children                      :
+                contactPersonEntity.parmChildrenNames(outlookItem.getChildren());
+                break;
+            case smmOutlookContactFields::ComputerNetworkName           : contactPersonEntity.parmComputerNetworkName(outlookItem.getComputerNetworkName()); break;
+            case smmOutlookContactFields::Department                    : contactPersonEntity.parmDepartment(outlookItem.getDepartment()); break;
+            case smmOutlookContactFields::FirstName                     :
+                if (outlookItem.getFullName() == '')
+                {
+                    throw error("@SYS325867");
+                }
+                contactPersonEntity.parmFirstName(outlookItem.getFirstName());
+                break;
+            case smmOutlookContactFields::FullName                      :
+                if (outlookItem.getFullName() == '')
+                {
+                    throw error("@SYS325867");
+                }
+                break;
+            case smmOutlookContactFields::JobTitle                      : contactPersonEntity.parmProfessionalTitle(outlookItem.getJobTitle()); break;
+            case smmOutlookContactFields::Language                      : contactPersonEntity.parmLanguageId(outlookItem.getLanguage()); break;
+            case smmOutlookContactFields::LastName                      :
+                if (outlookItem.getFullName() == '')
+                {
+                    throw error("@SYS325867");
+                }
+                contactPersonEntity.parmLastName(outlookItem.getLastName());
+                break;
+            case smmOutlookContactFields::MiddleName                    :
+                if (outlookItem.getFullName() == '')
+                {
+                    throw error("@SYS325867");
+                }
+                contactPersonEntity.parmMiddleName(outlookItem.getMiddleName());
+                break;
+            case smmOutlookContactFields::Mileage                       : contactPersonEntity.parmMileage(outlookItem.getMileage()); break;
+            case smmOutlookContactFields::NickName                      : contactPersonEntity.parmNickName(outlookItem.getNickName()); break;
+            case smmOutlookContactFields::OfficeLocation                : contactPersonEntity.parmOfficeLocation(outlookItem.getOfficeLocation()); break;
+            case smmOutlookContactFields::OrganizationalIdName          : contactPersonEntity.parmOrganizationalIDNumber(outlookItem.getOrganizationalIdNumber()); break;
+            case smmOutlookContactFields::Initials                      : contactPersonEntity.parmInitials(outlookItem.getInitials()); break;
+            case smmOutlookContactFields::Profession                    : contactPersonEntity.parmProfession(outlookItem.getProfession()); break;
+            case smmOutlookContactFields::Sensitivity                   : contactPersonEntity.parmSensitivity(outlookItem.getSensitivity()); break;
+            case smmOutlookContactFields::Spouse                        : contactPersonEntity.parmSpouse(outlookItem.getSpouse()); break;
+            case smmOutlookContactFields::Suffix                        :
+                if (outlookItem.getSuffix() && DirNameAffix::find(DirNameAffixType::PersonalSuffix, outlookItem.getSuffix()).RecId == 0)
+                {
+                    throw error(strFmt("@SYS112224", outlookItem.getSuffix(), fieldId2pname(tableNum(DirNameAffix),fieldNum(DirNameAffix, Affix)), tableId2pname(tableNum(DirNameAffix))));
+                }
+                contactPersonEntity.parmPersonalSuffix(outlookItem.getSuffix());
+                break;
+            case smmOutlookContactFields::Title                         :
+                if (outlookItem.getTitle() && DirNameAffix::find(DirNameAffixType::PersonalPrefix, outlookItem.getTitle()).RecId == 0)
+                {
+                    throw error(strFmt("@SYS112224", outlookItem.getTitle(), fieldId2pname(tableNum(DirNameAffix),fieldNum(DirNameAffix, Affix)), tableId2pname(tableNum(DirNameAffix))));
+                }
+                contactPersonEntity.parmPersonalTitle(outlookItem.getTitle());
+                break;
+
+            // Business address
+            case smmOutlookContactFields::BusinessAddress               : businessAddress.Address = outlookItem.getBusinessAddress(); break;
+            case smmOutlookContactFields::BusinessAddressCity           : businessAddress.City = outlookItem.getBusinessAddressCity(); break;
+            case smmOutlookContactFields::BusinessAddressPostalCode     : businessAddress.ZipCode = outlookItem.getBusinessAddressPostalCode(); break;
+            case smmOutlookContactFields::BusinessAddressStreet         : businessAddress.Street = outlookItem.getBusinessAddressStreet(); break;
+            case smmOutlookContactFields::BusinessAddressPOBox          : businessAddress.PostBox = outlookItem.getBusinessAddressPostOfficeBox(); break;
+            case smmOutlookContactFields::BusinessAddressCountry        :
+                if (businessAddress.Address == '' || this.validateAddressCountry(outlookItem.getBusinessAddressCountry()))
+                {
+                    businessAddress.CountryRegionId = countryRegionTranslation.CountryRegionId;
+                }
+                break;
+            case smmOutlookContactFields::BusinessAddressState          :
+                if (this.validateAddressState(businessAddress.CountryRegionId, outlookItem.getBusinessAddressState()))
+                {
+                    businessAddress.State = outlookItem.getBusinessAddressState();
+                }
+                break;
+
+            // Home address
+            case smmOutlookContactFields::HomeAddress                   : homeAddress.Address = outlookItem.getHomeAddress(); break;
+            case smmOutlookContactFields::HomeAddressCity               : homeAddress.City = outlookItem.getHomeAddressCity(); break;
+            case smmOutlookContactFields::HomeAddressPostalCode         : homeAddress.ZipCode = outlookItem.getHomeAddressPostalCode(); break;
+            case smmOutlookContactFields::HomeAddressStreet             : homeAddress.Street = outlookItem.getHomeAddressStreet(); break;
+            case smmOutlookContactFields::HomeAddressPostOfficeBox      : homeAddress.PostBox = outlookItem.getHomeAddressPostOfficeBox(); break;
+            case smmOutlookContactFields::HomeAddressCountry            :
+                if (homeAddress.Address == '' || this.validateAddressCountry(outlookItem.getHomeAddressCountry()))
+                {
+                    homeAddress.CountryRegionId = countryRegionTranslation.CountryRegionId;
+                }
+                break;
+            case smmOutlookContactFields::HomeAddressState              :
+                if (this.validateAddressState(homeAddress.CountryRegionId, outlookItem.getHomeAddressState()))
+                {
+                    homeAddress.State = outlookItem.getHomeAddressState();
+                }
+                break;
+
+            // Other address
+            case smmOutlookContactFields::OtherAddress                  : otherAddress.Address = outlookItem.getOtherAddress(); break;
+            case smmOutlookContactFields::OtherAddressCity              : otherAddress.City = outlookItem.getOtherAddressCity(); break;
+            case smmOutlookContactFields::OtherAddressPostalCode        : otherAddress.ZipCode = outlookItem.getOtherAddressPostalCode(); break;
+            case smmOutlookContactFields::OtherAddressStreet            : otherAddress.Street = outlookItem.getOtherAddressStreet(); break;
+            case smmOutlookContactFields::OtherAddressPostOfficeBox     : otherAddress.PostBox = outlookItem.getOtherAddressPostOfficeBox(); break;
+            case smmOutlookContactFields::OtherAddressCountry           :
+                if (otherAddress.Address == '' || this.validateAddressCountry(outlookItem.getOtherAddressCountry()))
+                {
+                    otherAddress.CountryRegionId = countryRegionTranslation.CountryRegionId;
+                }
+                break;
+            case smmOutlookContactFields::OtherAddressState             :
+                if (this.validateAddressState(otherAddress.CountryRegionId, outlookItem.getOtherAddressState()))
+                {
+                    otherAddress.State = outlookItem.getOtherAddressState();
+                }
+                break;
+
+            case smmOutlookContactFields::SelectedMailingAddress        :
+                // Get preffered mailing address from outlook
+                switch (selectedMailingAddress)
+                {
+                    case smmSelectedMailingAddress::Business :
+                        businessAddress.IsPrimary = true;
+                        break;
+
+                    case smmSelectedMailingAddress::Home :
+                        homeAddress.IsPrimary = true;
+                        break;
+
+                    case smmSelectedMailingAddress::Other :
+                        otherAddress.IsPrimary = true;
+                        break;
+                }
+                break;
+
+            // Contact info
+            case smmOutlookContactFields::Business2TelephoneNumber      : this.setContactInfoFields(_outlookContactFields, outlookItem.getBusiness2TelephoneNumber()); break;
+            case smmOutlookContactFields::BusinessFaxNumber             : this.setContactInfoFields(_outlookContactFields, outlookItem.getBusinessFaxNumber()); break;
+            case smmOutlookContactFields::BusinessHomePage              : this.setContactInfoFields(_outlookContactFields, outlookItem.getBusinessHomePage()); break;
+            case smmOutlookContactFields::BusinessTelephoneNumber       : this.setContactInfoFields(_outlookContactFields, outlookItem.getBusinessTelephoneNumber()); break;
+            case smmOutlookContactFields::CallbackTelephoneNumber       : this.setContactInfoFields(_outlookContactFields, outlookItem.getCallbackTelephoneNumber()); break;
+            case smmOutlookContactFields::CarTelephoneNumber            : this.setContactInfoFields(_outlookContactFields, outlookItem.getCarTelephoneNumber()); break;
+            case smmOutlookContactFields::Email1Address                 : this.setContactInfoFields(_outlookContactFields, mapiExContact ? mapiExContact.Email1DisplayName() : any2str(outlookItem.getEmail1Address())); break;
+            case smmOutlookContactFields::Email2Address                 : this.setContactInfoFields(_outlookContactFields, mapiExContact ? mapiExContact.Email2DisplayName() : any2str(outlookItem.getEmail2Address())); break;
+            case smmOutlookContactFields::Email3Address                 : this.setContactInfoFields(_outlookContactFields, mapiExContact ? mapiExContact.Email3DisplayName() : any2str(outlookItem.getEmail3Address())); break;
+            case smmOutlookContactFields::FTPSite                       : this.setContactInfoFields(_outlookContactFields, outlookItem.getFtpSite()); break;
+            case smmOutlookContactFields::HomeFaxNumber                 : this.setContactInfoFields(_outlookContactFields, outlookItem.getHomeFaxNumber()); break;
+            case smmOutlookContactFields::HomeTelephoneNumber           : this.setContactInfoFields(_outlookContactFields, outlookItem.getHomeTelephoneNumber()); break;
+            case smmOutlookContactFields::IMAddress                     : this.setContactInfoFields(_outlookContactFields, mapiExContact ? mapiExContact.IMAddress() : any2str(outlookItem.getImAddress())); break;
+            case smmOutlookContactFields::InternetFreeBusyAddress       : this.setContactInfoFields(_outlookContactFields, outlookItem.getInternetFreeBusyAddress()); break;
+            case smmOutlookContactFields::ISDNNumber                    : this.setContactInfoFields(_outlookContactFields, outlookItem.getIsdnNumber()); break;
+            case smmOutlookContactFields::MobileTelephoneNumber         : this.setContactInfoFields(_outlookContactFields, outlookItem.getMobileTelephoneNumber()); break;
+            case smmOutlookContactFields::OtherFaxNumber                : this.setContactInfoFields(_outlookContactFields, outlookItem.getOtherFaxNumber()); break;
+            case smmOutlookContactFields::OtherTelephoneNumber          : this.setContactInfoFields(_outlookContactFields, outlookItem.getOtherTelephoneNumber()); break;
+            case smmOutlookContactFields::PagerNumber                   : this.setContactInfoFields(_outlookContactFields, outlookItem.getPagerNumber()); break;
+            case smmOutlookContactFields::PersonalHomePage              : this.setContactInfoFields(_outlookContactFields, outlookItem.getPersonalHomePage()); break;
+            case smmOutlookContactFields::PrimaryTelephoneNumber        : this.setContactInfoFields(_outlookContactFields, outlookItem.getPrimaryTelephoneNumber()); break;
+            case smmOutlookContactFields::RadioTelephoneNumber          : this.setContactInfoFields(_outlookContactFields, outlookItem.getRadioTelephoneNumber()); break;
+            case smmOutlookContactFields::TelexNumber                   : this.setContactInfoFields(_outlookContactFields, outlookItem.getTelexNumber()); break;
+            case smmOutlookContactFields::TTYTDDTelephoneNumber         : this.setContactInfoFields(_outlookContactFields, outlookItem.getTtytddTelephoneNumber()); break;
+            case smmOutlookContactFields::HomeTelephoneNumber2          : this.setContactInfoFields(_outlookContactFields, outlookItem.getHome2TelephoneNumber()); break;
+            case smmOutlookContactFields::WebPage                       : this.setContactInfoFields(_outlookContactFields, outlookItem.getWebPage()); break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setFieldValuesInOutlook</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the Outlook field values from Microsoft Dynamics AX.
+    /// </summary>
+    /// <param name="_outlookContactFields">
+    /// A <c>smmOutlookContactFields</c> enumeration value that is based on Outlook fields.
+    /// </param>
+    void setFieldValuesInOutlook(smmOutlookContactFields _outlookContactFields)
+    {
+        switch (_outlookContactFields)
+        {
+            case smmOutlookContactFields::Account                       :
+                if (DirPartyTableHelper::isCustomer(contactPersonEntity.parmContactForParty()))
+                {
+                    outlookItem.setAccount(CustTable::findByPartyRecId(contactPersonEntity.parmContactForParty()).AccountNum);
+                }
+                else if (DirPartyTableHelper::isvendor(contactPersonEntity.parmContactForParty()))
+                {
+                    outlookItem.setAccount(VendTable::findByPartyRecId(contactPersonEntity.parmContactForParty()).AccountNum);
+                }
+                else if (DirPartyTableHelper::isRelation(contactPersonEntity.parmContactForParty()))
+                {
+                    outlookItem.setAccount(smmBusRelTable::findByParty(contactPersonEntity.parmContactForParty()).BusRelAccount);
+                }
+                break;
+            case smmOutlookContactFields::Anniversary                   :
+                outlookItem.setAnniversary(mkDate(contactPersonEntity.parmAnniversaryDay(), contactPersonEntity.parmAnniversaryMonth(), contactPersonEntity.parmAnniversaryYear()));
+                break;
+            case smmOutlookContactFields::AssistantName                 : outlookItem.setAssistantName(contactPersonEntity.parmAssistantName()); break;
+            case smmOutlookContactFields::AssistantTelephoneNumber      : outlookItem.setAssistantTelephoneNumber(contactPersonEntity.parmAssistantTelephoneNumber()); break;
+            case smmOutlookContactFields::Billinginformation            : outlookItem.setBillingInformation(contactPersonEntity.parmBillingInformation()); break;
+            case smmOutlookContactFields::BirthDay                      :
+                outlookItem.setBirthDay(mkDate(contactPersonEntity.parmBirthDay(), contactPersonEntity.parmBirthMonth(), contactPersonEntity.parmBirthYear()));
+                break;
+            case smmOutlookContactFields::Body                          : outlookItem.setBody(contactPersonEntity.parmContactMemo()); break;
+            case smmOutlookContactFields::Categories                    : outlookItem.setCategories(contactPersonEntity.parmOutlookCategories()); break;
+            case smmOutlookContactFields::Children                      : outlookItem.setChildren(contactPersonEntity.parmChildrenNames()); break;
+            case smmOutlookContactFields::CompanyName                   : outlookItem.setCompanyName(contactPersonEntity.parmContactPerson().partyName()); break;
+            case smmOutlookContactFields::ComputerNetworkName           : outlookItem.setComputerNetworkName(contactPersonEntity.parmComputerNetworkName()); break;
+            case smmOutlookContactFields::CustomerId                    : outlookItem.setCustomerId(contactPersonEntity.parmContactPerson().getCustAccount()); break;
+            case smmOutlookContactFields::Department                    : outlookItem.setDepartment(contactPersonEntity.parmDepartment()); break;
+            case smmOutlookContactFields::FirstName                     : outlookItem.setFirstName(contactPersonEntity.parmFirstName()); break;
+            case smmOutlookContactFields::Gender                        : this.setOutlookGender(contactPersonEntity.parmGender()); break;
+            case smmOutlookContactFields::GovernmentIDName              : outlookItem.setGovernmentIDNumber(contactPersonEntity.parmGovernmentIDNumber()); break;
+            case smmOutlookContactFields::Hobby                         : outlookItem.setHobby(contactPersonEntity.parmHobbies()); break;
+            case smmOutlookContactFields::Initials                      : outlookItem.setInitials(contactPersonEntity.parmInitials()); break;
+            case smmOutlookContactFields::JobTitle                      : outlookItem.setJobTitle(contactPersonEntity.parmProfessionalTitle()); break;
+            case smmOutlookContactFields::Language                      : outlookItem.setLanguage(contactPersonEntity.parmLanguageId()); break;
+            case smmOutlookContactFields::LastName                      : outlookItem.setLastName(contactPersonEntity.parmLastName()); break;
+            case smmOutlookContactFields::ManagerName                   : outlookItem.setManagerName(DirPartyTable::getName(ContactPerson::find(contactPersonEntity.parmContactPerson().ContactPersonParentId).Party)); break;
+            case smmOutlookContactFields::MiddleName                    : outlookItem.setMiddleName(contactPersonEntity.parmMiddleName()); break;
+            case smmOutlookContactFields::Mileage                       : outlookItem.setMileage(contactPersonEntity.parmMileage()); break;
+            case smmOutlookContactFields::NickName                      : outlookItem.setNickName(contactPersonEntity.parmNickName()); break;
+            case smmOutlookContactFields::OfficeLocation                : outlookItem.setOfficeLocation(contactPersonEntity.parmOfficeLocation()); break;
+            case smmOutlookContactFields::OrganizationalIdName          : outlookItem.setOrganizationalIdNumber(contactPersonEntity.parmOrganizationalIDNumber()); break;
+            case smmOutlookContactFields::Profession                    : outlookItem.setProfession(contactPersonEntity.parmProfession()); break;
+            case smmOutlookContactFields::Sensitivity                   : outlookItem.setSensitivity(contactPersonEntity.parmSensitivity()); break;
+            case smmOutlookContactFields::Spouse                        : outlookItem.setSpouse(contactPersonEntity.parmSpouse()); break;
+            case smmOutlookContactFields::Suffix                        : outlookItem.setSuffix(contactPersonEntity.parmPersonalSuffix()); break;
+
+            case smmOutlookContactFields::Title                         : outlookItem.setTitle(contactPersonEntity.parmPersonalTitle()); break;
+            case smmOutlookContactFields::User1                         : outlookItem.setUser1(contactPersonEntity.parmLoyalty()); break;
+            case smmOutlookContactFields::User2                         : outlookItem.setUser2(contactPersonEntity.parmDecision()); break;
+            case smmOutlookContactFields::User3                         : outlookItem.setUser3(contactPersonEntity.parmCharacter()); break;
+            case smmOutlookContactFields::User4                         : outlookItem.setUser4(strFmt("@SYS90024", contactPersonEntity.parmTimeAvailableFrom(), contactPersonEntity.parmTimeAvailableTo())); break;
+
+            // Selected mailing address
+            case smmOutlookContactFields::SelectedMailingAddress        :
+                outlookItem.setSelectedMailingAddress(selectedMailingAddress);
+                break;
+
+            // Business address
+            case smmOutlookContactFields::BusinessAddress               : outlookItem.setBusinessAddress(businessAddress.Address); break;
+            case smmOutlookContactFields::BusinessAddressCity           : outlookItem.setBusinessAddressCity(businessAddress.City); break;
+            case smmOutlookContactFields::BusinessAddressCountry        : outlookItem.setBusinessAddressCountry(LogisticsAddressCountryRegionTranslation::find(businessAddress.CountryRegionId).ShortName); break;
+            case smmOutlookContactFields::BusinessAddressPostalCode     : outlookItem.setBusinessAddressPostalCode(businessAddress.ZipCode); break;
+            case smmOutlookContactFields::BusinessAddressState          : outlookItem.setBusinessAddressState(businessAddress.State); break;
+            case smmOutlookContactFields::BusinessAddressStreet         : outlookItem.setBusinessAddressStreet(businessAddress.Street); break;
+            case smmOutlookContactFields::BusinessAddressPOBox          : outlookItem.setBusinessAddressPostOfficeBox(businessAddress.PostBox); break;
+
+            // Home address
+            case smmOutlookContactFields::HomeAddress                   : outlookItem.setHomeAddress(homeAddress.Address); break;
+            case smmOutlookContactFields::HomeAddressCity               : outlookItem.setHomeAddressCity(homeAddress.City); break;
+            case smmOutlookContactFields::HomeAddressCountry            : outlookItem.setHomeAddressCountry(LogisticsAddressCountryRegionTranslation::find(homeAddress.CountryRegionId).ShortName); break;
+            case smmOutlookContactFields::HomeAddressPostalCode         : outlookItem.setHomeAddressPostalCode(homeAddress.ZipCode); break;
+            case smmOutlookContactFields::HomeAddressState              : outlookItem.setHomeAddressState(homeAddress.State); break;
+            case smmOutlookContactFields::HomeAddressStreet             : outlookItem.setHomeAddressStreet(homeAddress.Street); break;
+            case smmOutlookContactFields::HomeAddressPostOfficeBox      : outlookItem.setHomeAddressPostOfficeBox(homeAddress.PostBox); break;
+
+            // Other address
+            case smmOutlookContactFields::OtherAddress                  : outlookItem.setOtherAddress(otherAddress.Address); break;
+            case smmOutlookContactFields::OtherAddressCity              : outlookItem.setOtherAddressCity(otherAddress.City); break;
+            case smmOutlookContactFields::OtherAddressCountry           : outlookItem.setOtherAddressCountry(LogisticsAddressCountryRegionTranslation::find(otherAddress.CountryRegionId).ShortName); break;
+            case smmOutlookContactFields::OtherAddressPostalCode        : outlookItem.setOtherAddressPostalCode(otherAddress.ZipCode); break;
+            case smmOutlookContactFields::OtherAddressState             : outlookItem.setOtherAddressState(otherAddress.State); break;
+            case smmOutlookContactFields::OtherAddressStreet            : outlookItem.setOtherAddressStreet(otherAddress.Street); break;
+            case smmOutlookContactFields::OtherAddressPostOfficeBox     : outlookItem.setOtherAddressPostOfficeBox(otherAddress.PostBox); break;
+
+            case smmOutlookContactFields::Business2TelephoneNumber      : outlookItem.setBusiness2TelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::BusinessFaxNumber             : outlookItem.setBusinessFaxNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::BusinessHomePage              : outlookItem.setBusinessHomePage(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::BusinessTelephoneNumber       : outlookItem.setBusinessTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::CallbackTelephoneNumber       : outlookItem.setCallbackTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::CarTelephoneNumber            : outlookItem.setCarTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::CompanyMainTelephoneNumber    : outlookItem.setCompanyMainTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::Email1Address                 : outlookItem.setEmail1Address(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::Email2Address                 : outlookItem.setEmail2Address(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::Email3Address                 : outlookItem.setEmail3Address(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::FTPSite                       : outlookItem.setFtpSite(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::HomeFaxNumber                 : outlookItem.setHomeFaxNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::HomeTelephoneNumber           : outlookItem.setHomeTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::IMAddress                     : outlookItem.setImAddress(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::InternetFreeBusyAddress       : outlookItem.setInternetFreeBusyAddress(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::ISDNNumber                    : outlookItem.setIsdnNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::MobileTelephoneNumber         : outlookItem.setMobileTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::OtherFaxNumber                : outlookItem.setOtherFaxNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::OtherTelephoneNumber          : outlookItem.setOtherTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::PagerNumber                   : outlookItem.setPagerNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::PersonalHomePage              : outlookItem.setPersonalHomePage(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::PrimaryTelephoneNumber        : outlookItem.setPrimaryTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::RadioTelephoneNumber          : outlookItem.setRadioTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::TelexNumber                   : outlookItem.setTelexNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::TTYTDDTelephoneNumber         : outlookItem.setTtytddTelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::HomeTelephoneNumber2          : outlookItem.setHome2TelephoneNumber(this.getContactInfo(_outlookContactFields)); break;
+            case smmOutlookContactFields::WebPage                       : outlookItem.setWebPage(this.getContactInfo(_outlookContactFields)); break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOutlookFolder</Name>
+				<Source><![CDATA[
+    protected void setOutlookFolder()
+    {
+        OutlookUserSetup    outlookUserSetup = OutlookUserSetup::findByUser(currentUser);
+        // Get folder entryid and store id from the current employee
+        str folderEntryId =  outlookUserSetup.OutlookContactFolderEntryID;
+        str folderStoreId =  outlookUserSetup.OutlookContactFolderStoreID;
+
+        this.setFolder(folderEntryId, folderStoreId, #olContactItem, #olFolderContacts);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOutlookItemType</Name>
+				<Source><![CDATA[
+    protected void setOutlookItemType()
+    {
+        outlookItemType = smmOutlookMappingTypes::Contacts;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>synchronize</Name>
+				<Source><![CDATA[
+    public boolean synchronize()
+    {
+        if (smmOutlookSyncDeprecationHandler::isOutlookSyncDisabled())
+        {
+            smmOutlookSyncDeprecationHandler::logSyncSkipMessageToTelemetry();
+            throw error(strFmt("@SYS19306",funcName()));
+        }
+
+        smmOutlookSyncDeprecationHandler::showDeprecationMessage();
+
+        smmIItem                        item;
+        ContactPerson                   contact;
+        Counter                         updatedContacts = 0;
+        Counter                         deletedContacts = 0;
+        smmContactPersonSynchronize     smmContactPersonSynchronize;
+        boolean                         contactExistInOutlook;
+        container                       con;
+        smmOutlookUpdateAction          updateAction;
+        smmDateTimeLastSynchronized     outlookLastDateTimeSynchronized;
+        int                             counter;
+        smmContactPersonOutlookEntryID  entryId;
+        boolean                         errorInSync, anyFieldsUpdated;
+
+        try
+        {
+            // Synchronize to Outlook
+            setprefix("@SYS81116");
+            // Delete contacts in outlook which were deleted in axapta
+            while select forupdate smmContactPersonSynchronize where smmContactPersonSynchronize.UserId == currentUser && smmContactPersonSynchronize.Deleted
+            {
+                // Find the contact in Outlook
+                if (this.getOulookItemFromOutlook(smmContactPersonSynchronize.EntryId))
+                {
+                    // Delete the contact in Outlook
+                    this.deleteItemInOutlook();
+                    smmContactPersonSynchronize.delete();
+                }
+                updateAction = smmOutlookUpdateAction::Delete;
+                entryId      = '';
+                contact      = null;
+                con = con + [[smmContactPersonSynchronize.ContactPersonId, entryId, contact, updateAction]];
+                deletedContacts++;
+            }
+
+            // Traverse all synchronization entries for the current employee
+            while select contact join smmContactPersonSynchronize
+                where smmContactPersonSynchronize.ContactPersonId == contact.ContactPersonId &&
+                      smmContactPersonSynchronize.UserId == currentUser &&
+                     !smmContactPersonSynchronize.Deleted
+            {
+                updateAction = smmOutlookUpdateAction::None;
+
+                // Synchronizing contact : %1 - %2
+                setprefix(strfmt("@SYS86367", contact.ContactPersonId, contact.personName()));
+
+                // Set contact person in the Outlook sync class
+                this.setContactPerson(contact);
+                contactPersonEntity = ContactPersonSyncEntity::construct(contact);
+                this.setContactPersonEntity(contactPersonEntity);
+
+                // Is the contact not synchronized before
+                if (!smmContactPersonSynchronize.EntryId)
+                {
+                    // Create the contact item in Outlook
+                    this.createInOutlook();
+
+                    this.setFieldsInOutlook();
+
+                    updateAction = smmOutlookUpdateAction::Create;
+
+                    updatedContacts++;
+                }
+                else
+                {
+                    // Search for the contact person in Outlook
+                    contactExistInOutlook = this.getOulookItemFromOutlook(strupr(smmContactPersonSynchronize.EntryId), false);
+
+                    if (contactExistInOutlook)
+                    {
+                        anyFieldsUpdated = this.checkFieldsUpdated(smmContactPersonSynchronize, contact.Party);
+
+                        // Get last Outlook modified date and time
+                        outlookLastDateTimeSynchronized = DateTimeUtil::removeTimeZoneOffset(outlookItem.lastModificationTime(),outlookTimeZone);
+
+                        // Is the contact person syncrhonized as view
+                        if (smmContactPersonSynchronize.OutlookSyncType == smmOutlookSyncType::ViewContact)
+                        {
+                            // Is contact changed in Axapta since last synchronization
+                            if (smmContactPersonSynchronize.LastSyncAxDateTime < contact.LastEditAxDateTime ||
+                                anyFieldsUpdated)
+                            {
+                                // Update in Outlook
+                                this.setFieldsInOutlook();
+
+                                updatedContacts++;
+                            }
+                        }
+                        else
+                        if (smmContactPersonSynchronize.OutlookSyncType == smmOutlookSyncType::EditContact)
+                        {
+                            // Is contact changed in Axapta since last synchronization
+                            if (smmContactPersonSynchronize.LastSyncAxDateTime < contact.LastEditAxDateTime ||
+                                anyFieldsUpdated)
+                            {
+                                    // Update in Outlook
+                                    this.setFieldsInOutlook();
+
+                                    updatedContacts++;
+                            }
+                            else
+                            {
+                                // Is contact changed in Outlook since last syncrhonization
+                                if (smmContactPersonSynchronize.LastSyncAxDateTime < outlookLastDateTimeSynchronized)
+                                {
+                                    // Insert update store action
+                                    updateAction = smmOutlookUpdateAction::Update;
+
+                                    updatedContacts++;
+                                }
+                            }
+                        }
+                    }
+                    // If contact has been deleted in outlook
+                    else
+                    {
+                        // If force sync , then deleted contact is created again in outlook
+                        if (forceSync)
+                        {
+                            // Create the contact item in Outlook
+                            this.createInOutlook();
+
+                            this.setFieldsInOutlook();
+
+                            updateAction = smmOutlookUpdateAction::Create;
+
+                            updatedContacts++;
+                        }
+                        // Clear the link for contact between axapta and outlook if it is normal sync
+                        else
+                        {
+                            updateAction = smmOutlookUpdateAction::Delete;
+
+                            deletedContacts++;
+                        }
+                    }
+                }
+
+                if (updateAction != smmOutlookUpdateAction::None)
+                {
+                    if (updateAction == smmOutlookUpdateAction::Delete)
+                    {
+                        entryId = '';
+                    }
+                    else
+                    {
+                        item = this.getItem();
+                        entryId = item.entryId();
+                    }
+
+                    con = con + [[contact.ContactPersonId, entryId, contact, updateAction]];
+                }
+            }
+
+            if (updatedContacts == 0 && deletedContacts == 0)
+            {
+                // No candidates for synchronizing found
+                info("@SYS81113");
+            }
+            else
+            {
+                syncDateTime = DateTimeUtil::utcNow();
+
+                ttsbegin;
+
+                for (counter = 1; counter <= conlen(con); counter++)
+                {
+                    updateAction = conpeek(conpeek(con, counter), 4);
+
+                    if (updateAction == smmOutlookUpdateAction::Delete)
+                    {
+                        smmContactPersonSynchronize = smmContactPersonSynchronize::findContUser(conpeek(conpeek(con, counter), 1), curuserid(), true);
+                        if (smmContactPersonSynchronize)
+                        {
+                            this.setContactPerson(ContactPerson::find(conpeek(conpeek(con, counter), 1), true));
+                            this.setContactPersonEntity(ContactPersonSyncEntity::construct(contactPerson));
+                            this.clearSynchronizationFields(smmContactPersonSynchronize);
+                            contactPerson.LastEditAxDateTime = syncDateTime;
+                            contactPersonEntity.write();
+                            this.updateLocations();
+                            smmContactPersonSynchronize.delete();
+                        }
+                    }
+                    else
+                    if (updateAction == smmOutlookUpdateAction::Update)
+                    {
+                        contact = ContactPerson::find(conpeek(conpeek(con, counter), 1), true);
+                        this.setContactPerson(contact);
+                        contactPersonEntity = ContactPersonSyncEntity::construct(contact);
+                        this.setContactPersonEntity(contactPersonEntity);
+
+                        // Get the contact from outlook
+                        this.getOulookItemFromOutlook(conpeek(conpeek(con, counter), 2),false);
+
+                        contactEntryId = conpeek(conpeek(con, counter),2);
+                        this.updateAXContact();
+                        contactPerson.LastEditAxDateTime = syncDateTime;
+                        contactPersonEntity.write();
+                        this.updateLocations();
+                    }
+                    else
+                    if (updateAction == smmOutlookUpdateAction::Create)
+                    {
+                        smmContactPersonSynchronize = smmContactPersonSynchronize::findContUser(conpeek(conpeek(con, counter), 1), curuserid(), true);
+                        smmContactPersonSynchronize.EntryId = conpeek(conpeek(con, counter), 2);
+                        smmContactPersonSynchronize.update();
+                    }
+                }
+
+                update_recordset smmContactPersonSynchronize
+                    setting LastSyncAxDateTime = syncDateTime
+                    where smmContactPersonSynchronize.UserId == curuserid();
+
+                ttscommit;
+
+                if (updatedContacts)
+                {
+                    // %1 contact(s) have been synchronized.
+                    info(strfmt("@SYS83521", updatedContacts));
+                }
+
+                if (deletedContacts)
+                {
+                    // %1 contact(s) have been deleted.
+                    info(strfmt("@SYS90023", deletedContacts));
+                }
+            }
+
+            // Closing the connection object after successful sync
+            this.closeMapiEx();
+        }
+        catch
+        {
+            errorInSync = true;
+        }
+
+        return !errorInSync;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAXContact</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates Microsoft Dynamics AX contact information from Outlook.
+    /// </summary>
+    /// <returns>
+    /// A Boolean value that indicates whether the update is successful.
+    /// </returns>
+    public boolean updateAXContact()
+    {
+        int                         i;
+        smmOutlookContactFields     outlookContactFields;
+        smmOutlookSyncDirections    syncDirection;
+
+        businessAddress = this.getAddress(smmOutlookContactFields::BusinessAddress);
+        homeAddress = this.getAddress(smmOutlookContactFields::HomeAddress);
+        otherAddress = this.getAddress(smmOutlookContactFields::OtherAddress);
+
+        if (mapiInitialised && mapiEx)
+        {
+            mapiExContact =  mapiEx.getContactFromEntryId(outlookItem.entryId());
+        }
+
+        selectedMailingAddress = outlookItem.getSelectedMailingAddress();
+
+        // Traverse through the field mapping container
+        for (i = 1; i <= conlen(fieldMapping); i++)
+        {
+            // Find Outlook contact field id
+            outlookContactFields = conpeek(conpeek(fieldMapping, i), 1);
+
+            // Find synchronization direction
+            syncDirection        = conpeek(conpeek(fieldMapping, i), 2);
+
+            // Do not copy if the field in only meant to be copied from Axapta to Outlook
+            if (syncDirection != smmOutlookSyncDirections::AxaptaToOutlookOnly  && syncDirection != smmOutlookSyncDirections::None)
+            {
+                // Set the Axapta field values
+                this.setFieldValuesInAX(outlookContactFields);
+            }
+        }
+
+        this.closeOutlookObject();
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLocations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the postal and electronic address information.
+    /// </summary>
+    void updateLocations()
+    {
+        MapEnumerator contactFieldMapEnum = contactFieldsRecordMap.getEnumerator();
+        Common common;
+        DirPartyContactInfoView newContactInfoView;
+        LogisticsLocationRoleRecId roleBusiness, roleHome, roleOther, role;
+
+        roleBusiness = LogisticsLocationRole::findBytype(LogisticsLocationRoleType::Business).RecId;
+        roleHome = LogisticsLocationRole::findBytype(LogisticsLocationRoleType::Home).RecId;
+        roleOther = LogisticsLocationRole::findBytype(LogisticsLocationRoleType::Other).RecId;
+
+        // Contact info
+        while (contactFieldMapEnum.moveNext())
+        {
+            common = contactFieldMapEnum.currentValue();
+
+            if (common.TableId == tablenum(DirPartyContactInfoView))
+            {
+                contactInfoView = common;
+                if ((contactInfoView.IsLocationOwner  || !contactInfoView.ElectronicAddress) && (contactInfoView.Locator || contactInfoView.ElectronicAddress)) // Only update address that is owned by the contact or allow create if new
+                {
+                    role = LogisticsLocationRole::findBytype(smmContactPersonSynchronizeFieldMapping::contactField2RoleType(contactFieldMapEnum.currentKey())).RecId;
+                    newContactInfoView = contactPersonEntity.createOrUpdateContactInfo(contactInfoView, [role]);
+
+                    contactFieldsRecordMap.insert(contactFieldMapEnum.currentKey(), newContactInfoView);
+                    smmContactPersonSynchronizeFieldMapping::updateLocation(contactFieldMapEnum.currentKey(), contactInfoView.Party, newContactInfoView.ElectronicAddress, contactInfoView.ElectronicAddress);
+                }
+            }
+        }
+
+        // Postal addresses
+        this.setAddress(smmOutlookContactFields::BusinessAddress, businessAddress, roleBusiness);
+        this.setAddress(smmOutlookContactFields::HomeAddress, homeAddress, roleHome);
+        this.setAddress(smmOutlookContactFields::OtherAddress, otherAddress, roleOther);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateAddressCountry</Name>
+				<Source><![CDATA[
+    private boolean validateAddressCountry(LogisticsAddressCountryRegionShortName _countryRegion)
+    {
+        countryRegionTranslation.clear();
+
+        if (!_countryRegion)
+        {
+            throw error("@SYS342463");
+        }
+
+        countryRegionTranslation = LogisticsAddressCountryRegionTranslation::findByShortName(_countryRegion);
+
+        if (!countryRegionTranslation)
+        {
+            countryRegionTranslation = LogisticsAddressCountryRegionTranslation::findByLongName(_countryRegion);
+        }
+
+        if (!countryRegionTranslation.RecId)
+        {
+            throw error(strfmt("@SYS112224", _countryRegion, fieldid2pname(tablenum(LogisticsAddressCountryRegion),fieldnum(LogisticsAddressCountryRegion, CountryRegionId)), tableid2pname(tablenum(LogisticsAddressCountryRegion))));
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateAddressState</Name>
+				<Source><![CDATA[
+    private boolean validateAddressState(LogisticsAddressCountryRegionId _country, LogisticsAddressStateId _stateId)
+    {
+        if (_stateId && !LogisticsAddressState::exist(_country, _stateId))
+        {
+            throw error(strfmt("@SYS112224", _stateId, fieldid2pname(tablenum(LogisticsAddressState),fieldnum(LogisticsAddressState, StateId)), tableid2pname(tablenum(LogisticsAddressState))));
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteItemInOutlook</Name>
+				<Source><![CDATA[
+    public void deleteItemInOutlook()
+    {
+        outlookItem.delete();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getItem</Name>
+				<Source><![CDATA[
+    public smmIItem getItem()
+    {
+        return outlookItem;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOulookItemFromOutlook</Name>
+				<Source><![CDATA[
+    public boolean getOulookItemFromOutlook(str _outlookEntryId, boolean _echoErrorMessage = true)
+    {
+        int         lines = infologLine();
+        boolean     ret = true;
+
+        try
+        {
+            outlookItem = mapiEx.getItemFromId(strUpr(_outlookEntryId), outlookItemType);
+
+            if (outlookItem)
+            {
+                if (outlookItem.parentFolderId() != folder.entryId())
+                {
+                    ret = false;
+                }
+            }
+            else
+            {
+                ret = false;
+            }
+        }
+        catch (Exception::Error)
+        {
+            // Remove unwanted system error message
+            infolog.clear(lines);
+
+            if (_echoErrorMessage)
+            {
+                // Outlook item not found.
+                error("@SYS86365");
+            }
+
+            return false;
+        }
+
+        CodeAccessPermission::revertAssert();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>outlookItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the <c>smmIItem</c> represented by the current contact.
+    /// </summary>
+    /// <returns>
+    /// A <c>smmIItem</c> which contains the current contact.
+    /// </returns>
+    public smmIItem outlookItem()
+    {
+        return outlookItem;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setItem</Name>
+				<Source><![CDATA[
+    public void setItem(smmIItem _item)
+    {
+        outlookItem = _item;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setAXGender</Name>
+				<Source><![CDATA[
+    protected void setAXGender(int _outlookGenderValue)
+    {
+        // Outlook only knows 3 values
+        // 0 = Unspecified
+        // 1 = Female
+        // 2 = Male
+
+        const int outlookUnspecified = 0;
+        const int outlookFemale = 1;
+        const int outlookMale = 2;
+
+        switch (_outlookGenderValue)
+        {
+            case outlookUnspecified:
+                contactPersonEntity.parmGender(Gender::Unknown);
+                break;
+
+            case outlookFemale:
+                contactPersonEntity.parmGender(Gender::Female);
+                break;
+
+            case outlookMale:
+                contactPersonEntity.parmGender(Gender::Male);
+                break;
+
+            default:
+                contactPersonEntity.parmGender(Gender::NonSpecific);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOutlookGender</Name>
+				<Source><![CDATA[
+    protected void setOutlookGender(Gender _gender)
+    {
+        // Outlook only knows 3 values
+        // 0 = Unspecified
+        // 1 = Female
+        // 2 = Male
+
+        int outlookUnspecified = 0;
+        int outlookFemale = 1;
+        int outlookMale = 2;
+
+        switch (_gender)
+        {
+            case Gender::Female:
+                outlookItem.setGender(outlookFemale);
+                break;
+
+            case Gender::Male:
+                outlookItem.setGender(outlookMale);
+                break;
+
+            default:
+                outlookItem.setGender(outlookUnspecified);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

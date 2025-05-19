@@ -1,0 +1,2528 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailStatementCalculate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Calculates the Retail Statement for a particular store for the specified time.
+/// </summary>
+/// <remarks>
+/// This class runs in batch framework for a particular store.
+/// </remarks>
+[SysObsolete('This class is obsolete. Use RetailEodStatementCalculateDriver instead.', true, 30\11\2019)]
+[SysOperationJournaledParameters(false)]
+class RetailStatementCalculate extends RunBaseBatch implements BatchRetryable
+{
+    RetailStatementTable   statementTable;
+
+    RetailTenderTypeId  lastTenderType;
+    AmountMST           totalAmountMST;
+    CurrencyCode        lastCurrencyCode;
+    RetailStatementCode lastStatementCode;
+    RetailCardTypeId    lastCardTypeId;
+    RetailTerminalId    lastTerminalId;
+    AmountMST           totalAmountStore;
+    AmountCur           totalAmountCur;
+    AmountMST           totalRemovedAmount;
+    AmountMST           totalAddedAmount;
+    AmountMST           totalChangeAmount;
+
+    AmountMST           totalBankedAmountMST;
+    AmountMST           totalBankedAmountStore;
+    AmountCur           totalBankedAmountCur;
+
+    AmountMST           totalSafeAmountMST;
+    AmountMST           totalSafeAmountStore;
+    AmountMST           totalSafeAmountCur;
+
+    AmountMST           totalCardFeeAmountCur;
+
+    #macro.isInBatch
+    (
+            ( ! statementTable.transFromDate
+                || %1.CloseDate > statementTable.transFromDate
+                || (%1.CloseDate == statementTable.transFromDate
+                    && (! statementTable.transFromTime
+                        || %1.CloseTime >= statementTable.transFromTime)))
+            && (! statementTable.transToDate
+                || %1.CloseDate < statementTable.transToDate
+                || (%1.CloseDate == statementTable.transToDate
+                    && (! statementTable.transToTime
+                        || %1.CloseTime <= statementTable.transToTime)))
+            && (! statementTable.staffOrTerminal
+                || (statementTable.statementMethod == RetailStaffTerminalTotal::Terminal
+                    && %1.TerminalId == statementTable.staffOrTerminal)
+                || (statementTable.statementMethod == RetailStaffTerminalTotal::Shift
+                    && %1.TerminalId == RetailStatementLine::getBatchTerminalId(statementTable.staffOrTerminal)
+                    && %1.BatchId == RetailStatementLine::getBatchId(statementTable.staffOrTerminal)))
+        )
+        #endmacro
+
+    RetailStoreId          storeId;
+    RetailStaffId          staffId;
+    RetailTerminalId       terminalId;
+    RetailUniqueShiftId    uniqueShiftId;
+    TransDate              businessDate;
+
+    #define.CurrentVersion(1)
+
+    #localmacro.CurrentList
+        storeId,
+        staffId,
+        terminalId,
+        uniqueShiftId,
+        businessDate
+#endmacro
+
+
+    #ISOCountryRegionCodes
+    #EECountryRegionCodes
+
+    boolean                     countryRegion_W;
+    boolean                     countryRegion_RU;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>calculateAndMarkTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the statement and mark the transactions for the statement posting.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// An instance of <c>RetailStatementTable</c>
+    /// </param>
+    /// <returns>
+    /// Number of transactions which are marked by this statement.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// If the statment store Id is missing.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// If the statements transaction date is missing.
+    /// </exception>
+    public int calculateAndMarkTransactions(RetailStatementTable _statementTable)
+    {
+        RetailStoreTable                storeTable = RetailStoreTable::find(_statementTable.storeId);
+        RetailTerminalTable             terminalTable;
+        RetailTransactionTable          transactionTable;
+        RetailTransactionSalesTrans     salesTrans;
+        InventTransOrigin               inventTransOrigin;
+        CustTable                       custTable;
+        DimensionDefault                transDefaultDimension;
+        int                             recordCounter;
+        RetailParameters                parameters = RetailParameters::find();
+        
+        str                 timeFromTxt;
+        str                 timeToTxt;
+        str                 dialogTxt;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        // Validate the version
+        RetailEodStatementVersionValidator::validateVersion(_statementTable, RetailEodCodeVersion::V1);
+
+        /// <summary>
+        /// Stamp the transaction table with statement id in the scope of this statement.
+        /// </summary>
+        /// <returns>
+        /// Number of transactions selected for this statement calculation.
+        /// </returns>
+        int StampRetailTransactionWithStatementId()
+        {
+            if (_statementTable.closingMethod == RetailClosingMethodType::DateTime)
+            {
+                this.stampRetailTransactionTable(_statementTable);
+            }
+            else if (_statementTable.closingMethod == RetailClosingMethodType::PosBatch)
+            {
+                RetailPosBatchTable                         rBOPosBatchTable;
+                RetailTransactionConsistencyCheckerStatus   enableConsistencyChecker = !RetailParameters::find().DisableTransactionConsistencyChecker;
+
+                // Selecting the applicable RetailEx3 Batches
+                while select forupdate rBOPosBatchTable
+                where
+                    rBOPosBatchTable.Posted == NoYes::No
+                    && #isInBatch(rBOPosBatchTable)
+                    && rBOPosBatchTable.Status == RetailPosBatchStatus::Closed
+                    && rBOPosBatchTable.StatementId == ''
+                    && rBOPosBatchTable.StoreId == _statementTable.storeId
+                {
+                    ttsbegin;
+
+                    // check for number of transactions for the batch
+                    // only those batches will be processed, for which all transactions
+                    // have been already uploaded.
+                    // Close shift transaction is generated after the count is set on
+                    // RetailPosBatchTable so it is not part of the count.
+                    select count(recid) from transactionTable
+                    where   transactionTable.BatchID            == rBOPosBatchTable.BatchID
+                        &&  transactionTable.BatchTerminalId    == rBOPosBatchTable.TerminalId
+                        &&  transactionTable.store              == rBOPosBatchTable.StoreId
+                        &&  transactionTable.type               != RetailTransactionType::CloseShift
+                        &&  !transactionTable.statementId;
+
+                    if (transactionTable.RecId == rBOPosBatchTable.TransactionsCount)
+                    {
+                        this.checkInvalidTransactionsForShift(rBOPosBatchTable.BatchID, rBOPosBatchTable.TerminalId, rBOPosBatchTable.StoreId);
+
+                        // all transactions should be uploaded to AX by now and all sales transactions are valid
+                        rBOPosBatchTable.StatementId = _statementTable.statementId;
+                        rBOPosBatchTable.update();
+                    }
+
+                    ttscommit;
+                }
+
+                // extract the transactions participating in this statement and update statement id and IsTaxIncludedInPrice
+                while select forupdate transactionTable
+                    where   transactionTable.store == _statementTable.storeId
+                    &&  !transactionTable.statementId
+                join rBOPosBatchTable
+                    where transactionTable.BatchID == rBOPosBatchTable.BatchID
+                        && transactionTable.BatchTerminalId == rBOPosBatchTable.TerminalId
+                        // The shift is only marked with the statement id if all transactions are ok
+                        && rBOPosBatchTable.StatementId == _statementTable.statementId
+                        && transactionTable.entryStatus != RetailEntryStatus::Voided
+                        && transactionTable.entryStatus != RetailEntryStatus::Training
+                {
+                    ttsbegin;
+
+                    transactionTable.IsTaxIncludedInPrice = RetailTransactionTaxTrans::readPriceInclTaxConfiguration(transactionTable);
+                    transactionTable.statementId = _statementTable.statementId;
+                    transactionTable.update();
+
+                    ttscommit;
+                }
+
+            }
+
+            select count(RecId) from transactionTable
+                where   transactionTable.statementId    == _statementTable.statementId
+                    &&  transactionTable.store          == _statementTable.storeId
+                    &&  transactionTable.entryStatus    != RetailEntryStatus::Voided
+                    &&  transactionTable.entryStatus    != RetailEntryStatus::Training
+                    &&  (!_statementTable.transFromDate || _statementTable.transFromDate <= transactionTable.transDate)
+                    &&  (!_statementTable.transToDate   || _statementTable.transToDate >= transactionTable.transDate);
+
+            // It is not possible to use transactionTable.rowCount() anymore, since, when closing method = Date and Time, there is
+            // no update_recordset (there is an iteration through transactionTable to verify if the record fits on statement criteria).
+            int rowCounter = int642int(transactionTable.RecId);
+
+            if (rowCounter)
+            {
+                update_recordset
+                    transactionTable
+                setting
+                    toAccount       = NoYes::Yes,
+                    amountToAccount = transactionTable.PaymentAmount - transactionTable.SalesOrderAmount - transactionTable.SalesInvoiceAmount
+                where   !transactionTable.custAccount
+                    &&  transactionTable.store          == _statementTable.storeId
+                    &&  transactionTable.statementId    == _statementTable.statementId;
+
+                // Avoid race condition when the transaction is scheduled to post inventory
+                // but isn't processed after they are marked with statement Id.
+                update_recordset
+                    transactionTable
+                setting
+                    entryStatus = RetailEntryStatus::None
+                where   transactionTable.store          == _statementTable.storeId
+                    &&  transactionTable.statementId    == _statementTable.statementId
+                    &&  transactionTable.entryStatus    == RetailEntryStatus::CreatingOrder;
+            }
+
+            return rowCounter;
+        }
+
+        /// <summary>
+        /// Stamp transaction sales lines table with statement id in the scope of this statement.
+        /// </summary>
+        int StampRetailTransactionSalesLinesWithStatementId()
+        {
+            update_recordset salesTrans
+            setting
+                statementId = transactionTable.statementId,
+                currency = transactionTable.currency
+            join statementId, custAccount, currency from transactionTable
+                where   transactionTable.store          == _statementTable.storeId
+                    &&  transactionTable.statementId    == _statementTable.statementId
+                    &&  salesTrans.transactionId        == transactionTable.transactionId
+                    &&  salesTrans.store                == transactionTable.Store
+                    &&  salesTrans.terminalId           == transactionTable.Terminal
+                    &&  !salesTrans.statementId;
+
+            return any2int(salesTrans.RowCount());
+        }
+        // StampRetailTransactionSalesLinesWithStatementId
+
+        /// <summary>
+        /// Stamp invent transaction table with statement id in the scope of this statement.
+        /// </summary>
+        void StampInventTransWithStatementId()
+        {
+            update_recordSet inventTransOrigin
+            setting
+                ReferenceId = statementTable.statementId
+            join salesTrans
+            where
+                // TransIdIdx index fields
+                salesTrans.store            == _statementTable.storeId
+                &&  salesTrans.inventTransId    == inventTransOrigin.InventTransId
+                &&  salesTrans.statementId      == _statementTable.statementId
+                &&  !inventTransOrigin.ReferenceId;
+        }
+        
+        if (!_statementTable.storeId)
+        {
+            throw error("@RET4133");
+        }
+
+        if (!_statementTable.transToDate)
+        {
+            throw error("@RET4134");
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementCalculateStart(0, "", "", "", 0);
+        _statementTable.statementMethod = storeTable.statementMethod;
+
+        if (!_statementTable.skipConfirmation)
+        {
+            if (_statementTable.transToTime || _statementTable.transFromTime)
+            {
+                timeFromTxt = time2str(_statementTable.transFromTime,1,1);
+                timeToTxt   = time2str(_statementTable.transToTime,1,1);
+            }
+            else
+            {
+                timeFromTxt = time2str(0, 1, 1);
+                timeToTxt   = time2str(86399, 1, 1);
+            }
+
+            if (_statementTable.transFromDate == dateNull())
+            {
+                dialogTxt = strfmt("@RET4135", _statementTable.transToDate, timeFromTxt, timeToTxt);
+            }
+            else
+            {
+                if (_statementTable.transFromDate == _statementTable.transToDate)
+                {
+                    dialogTxt = strfmt("@RET4135", _statementTable.transToDate, timeFromTxt, timeToTxt);
+                }
+                else
+                {
+                    dialogTxt = strfmt("@RET4136", _statementTable.transFromDate, _statementTable.transToDate, timeFromTxt, timeToTxt);
+                }
+            }
+
+            if (! this.parmStoreId() && box::yesNo(dialogTxt, DialogButton::Yes, "@RET3863") == DialogButton::No)
+            {
+                Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementCalculateEnd(0, "", "", "", 0);
+                return 0;
+            }
+        }
+
+        ttsbegin;
+
+        _statementTable.calculatedDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        _statementTable.calculatedTime = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+
+        //
+        // function beginning proper
+        //
+        // bring over participating transactions into the working table
+        recordCounter = StampRetailTransactionWithStatementId();
+
+        if (0 == recordCounter)
+        {
+            Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementCalculateEnd(0, "", "", "", 0);
+
+            // Closing transaction scope.
+            ttscommit;
+
+            return 0;
+        }
+
+        if (TaxSolutionScopeIntegrationUtil::isCompanyEnabled())
+        {
+            this.calculateGTESpecific(parameters.aggregateBeforePosting, _statementTable.statementId);
+            this.skipAggregationForNamedCustomerOrder(parameters.aggregateBeforePosting, _statementTable.statementId, storeTable);
+        }
+
+        // bring over associated payment and sales lines
+        // Important -- this method has to be called after PopulateTransactionWorkingTable()
+        int slaeTransCounter = StampRetailTransactionSalesLinesWithStatementId();
+        if (slaeTransCounter)
+        {
+            // Processes kit disassembly transactions and updates the inventory of disassembled kits before processing sales
+            RetailKitAssemblyOrder::processKitTransactions(RetailStoreTable::find(_statementTable.storeId));
+        }
+
+        // Need to assign the statement id to InventTrans when the InventTrans is generated
+        // by Post inventory operation before statement calculation.
+        StampInventTransWithStatementId();
+
+        // Mark retail transaction tables with statement code and statement Id.
+        RetailStatementCalculate::markRecords(_statementTable);
+
+        // Share code with post inventory to make reservation of inventory
+        RetailTransactionSalesTransMark salesTransMarker = new RetailTransactionSalesTransMark();
+        salesTransMarker.parmStoreId(_statementTable.storeId);
+        salesTransMarker.parmStatementId(_statementTable.statementId);
+        salesTransMarker.runOperation();
+
+        // If aggregation is set to true, skip aggregation for the return transactions with original unposted and not in this statement.
+        if (parameters.aggregateBeforePosting)
+        {
+            this.markSkipAggregateReturnTransactionsWithOriginalUnposted( _statementTable);
+        }
+
+        ttscommit;  //Release the lock.
+
+        ttsbegin;
+
+        this.insertPaymentLines(_statementTable);
+        this.insertBankedTender( _statementTable);
+        this.insertSafeTender(_statementTable);
+        this.insertTenderDeclarationLines(_statementTable);
+        this.updateCountedAmounts(_statementTable);
+
+        _statementTable.CalculatedLines = recordCounter;
+
+        _statementTable.update();
+
+        ttscommit;
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementCalculateEnd(0, "", "", "", 0);
+
+        return recordCounter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkInvalidTransactionForDateAndTimeStatement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if there is any invalid sales transaction for a date and time statement and adds a warning message for the user.
+    /// </summary>
+    private void checkInvalidTransactionForDateAndTimeStatement(RetailStatementTable _statementTable)
+    {
+        RetailTransactionTable                      transactionTable;
+        RetailTransactionConsistencyCheckerStatus   enableConsistencyChecker = !RetailParameters::find().DisableTransactionConsistencyChecker;
+
+        if (enableConsistencyChecker)
+        {
+            select count(RecId) from transactionTable
+                where   transactionTable.store == _statementTable.storeId
+                    &&  !transactionTable.statementId
+                    &&  transactionTable.type == RetailTransactionType::Sales
+                    &&  transactionTable.entryStatus == RetailEntryStatus::None
+                    &&	transactionTable.ValidationStatus != RetailTransactionValidationStatus::Ok;
+
+            if (transactionTable.RecId > 0)
+            {
+                checkFailed(strFmt("@Retail:RetailEodCalculateDateTimeNotValidTransactions", transactionTable.RecId, _statementTable.statementId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkInvalidTransactionsForShift</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Given that all transactions for a given shift are already uploaded, this method checks if all sales transactions are valid.
+    /// </summary>
+    /// <param name = "_rBOPosBatchId">Shift id.</param>
+    /// <param name = "_rBOPosTerminal">Shift terminal.</param>
+    /// <param name = "_rBOPosStoreId">Shift store.</param>
+    /// <remarks>This method will throw error if there is any invalid transaction.</remarks>
+    private void checkInvalidTransactionsForShift(RetailPosBatchID _rBOPosBatchId, RetailTerminalId _rBOPosTerminal, RetailStoreId _rBOPosStoreId)
+    {
+        RetailTransactionTable                      transactionTable;
+        RetailTransactionConsistencyCheckerStatus   enableConsistencyChecker = !RetailParameters::find().DisableTransactionConsistencyChecker;
+
+        // Verify if there are transactions that would be part of this statement, but are not validated successfully.
+        if (enableConsistencyChecker)
+        {
+            select count(recid) from transactionTable
+                        where   transactionTable.BatchID            == _rBOPosBatchId
+                            &&  transactionTable.BatchTerminalId    == _rBOPosTerminal
+                            &&  transactionTable.store              == _rBOPosStoreId
+                            &&  !transactionTable.statementId
+                            &&  transactionTable.type               == RetailTransactionType::Sales
+                            &&  transactionTable.entryStatus        == RetailEntryStatus::None
+                            &&  transactionTable.ValidationStatus   != RetailTransactionValidationStatus::Ok;
+
+            if (transactionTable.RecId > 0)
+            {
+                str errorMessage = strFmt("@Retail:RetailEodCalculateShiftNotValidTransactions", transactionTable.RecId, _rBOPosBatchId, _rBOPosTerminal);
+
+                throw Error(errorMessage);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markRecords</Name>
+				<Source><![CDATA[
+    private static void markRecords(RetailStatementTable _statementTable)
+    {
+        RetailSalesPaymentDifference            salesPaymentDifference;
+        RetailStatementCode                     transStatementCode, salesTransStatementCode, bankDropStatementCode, safeDropStatementCode, tenderDeclarationStatementCode;
+        RetailStatementMethod                   statementMethod;
+        RetailTransactionCode                   transactionCode;
+        RetailTransactionTable                  retailTransactionTable;
+        RetailTransactionBankedTenderTrans      transactionBankedTenderTrans;
+        RetailTransactionIncomeExpenseTrans     transactionIncomeExpenseTrans;
+        RetailTransactionInfocodeTrans          transactionInfocodeTrans;
+        RetailTransactionOrderInvoiceTrans      transactionOrderInvoiceTrans;
+        RetailTransactionPaymentTrans           transactionPaymentTrans;
+        RetailTransactionSafeTenderTrans        transactionSafeTenderTrans;
+        RetailTransactionSalesTrans             transactionSalesTrans;
+        RetailTransactionTenderDeclarationTrans transactionTenderDeclarationTrans;
+        RetailTerminalId                        lastTerminalId = '';
+        RetailTerminalTable                     terminalTable;
+
+        while select forUpdate retailTransactionTable
+            order by retailTransactionTable.terminal
+            where   retailTransactionTable.store       == _statementTable.storeId
+                &&  retailTransactionTable.statementId == _statementTable.statementId
+        {
+            [salesPaymentDifference, transactionCode] = RetailStatementCalculate::getTransactionSalesPaymentDifferenceAndTransCode(retailTransactionTable);
+
+            if (retailTransactionTable.terminal != lastTerminalId)
+            {
+                // determine statement code
+                terminalTable = RetailTerminalTable::find(retailTransactionTable.Terminal);
+
+                statementMethod = terminalTable.statementMethod;
+
+                if (!statementMethod)
+                {
+                    statementMethod = RetailStoreTable::find(retailTransactionTable.store).statementMethod;
+                }
+
+                lastTerminalId = retailTransactionTable.terminal;
+            }
+
+            [transStatementCode, salesTransStatementCode, bankDropStatementCode, safeDropStatementCode, tenderDeclarationStatementCode] = RetailStatementCalculate::getStatementCodes(retailTransactionTable, statementMethod);
+
+            retailTransactionTable.statementCode            = transStatementCode;
+            retailTransactionTable.salesPaymentDifference   = salesPaymentDifference;
+            retailTransactionTable.transCode                = transactionCode;
+
+            retailTransactionTable.update();
+
+            // mark RetailTransactionSalesTrans with statement code. Statement Id will be set by <c>RetailTransactionSalesTransMark</c>
+            update_recordset transactionSalesTrans
+                setting
+                    statementCode   = salesTransStatementCode
+                where
+                        transactionSalesTrans.transactionId == retailTransactionTable.transactionId
+                    &&  transactionSalesTrans.store         == retailTransactionTable.store
+                    &&  transactionSalesTrans.terminalId    == retailTransactionTable.Terminal
+                    &&  transactionSalesTrans.Channel       == retailTransactionTable.Channel;
+
+            // mark RetailTransactionPaymentTrans with statement code, statement Id and business date
+            update_recordset transactionPaymentTrans
+                setting
+                    statementCode   = transStatementCode,
+                    statementId     = retailTransactionTable.statementId,
+                    businessDate    = retailTransactionTable.businessDate
+                where
+                        transactionPaymentTrans.transactionId == retailTransactionTable.transactionId
+                    &&  transactionPaymentTrans.store         == retailTransactionTable.store
+                    &&  transactionPaymentTrans.terminal      == retailTransactionTable.Terminal
+                    &&  transactionPaymentTrans.Channel       == retailTransactionTable.Channel
+                    &&  transactionPaymentTrans.staff         == retailTransactionTable.staff;
+
+            // mark RetailTransactionBankedTenderTrans with statement code, statement Id and business date
+            update_recordset transactionBankedTenderTrans
+                setting
+                    StatementCode   = bankDropStatementCode,
+                    statementId     = retailTransactionTable.statementId,
+                    businessDate    = retailTransactionTable.businessDate
+                where
+                        transactionBankedTenderTrans.transactionStatus  == RetailEntryStatus::None
+                    &&
+                    (
+                        transactionBankedTenderTrans.statusType         == RetailBankedStatusTypeBase::Override
+                    ||  transactionBankedTenderTrans.statusType         == RetailBankedStatusTypeBase::RetailEx3
+                    )
+                    &&  transactionBankedTenderTrans.transactionId      == retailTransactionTable.transactionId
+                    &&  transactionBankedTenderTrans.store              == retailTransactionTable.store
+                    &&  transactionBankedTenderTrans.terminal           == retailTransactionTable.terminal
+                    &&  transactionBankedTenderTrans.Channel            == retailTransactionTable.Channel;
+
+            // mark RetailTransactionSafeTenderTrans with statement code, statement Id and business date
+            update_recordset transactionSafeTenderTrans
+                setting
+                    StatementCode   = safeDropStatementCode,
+                    statementId     = retailTransactionTable.statementId,
+                    businessDate    = retailTransactionTable.businessDate
+                where
+                        transactionSafeTenderTrans.transactionStatus    == RetailEntryStatus::None
+                    &&  (
+                        transactionSafeTenderTrans.statusType           == RetailSafeStatusTypeBase::Override
+                    ||  transactionSafeTenderTrans.statusType           == RetailSafeStatusTypeBase::RetailEx3
+                        )
+                    &&  transactionSafeTenderTrans.transactionId        == retailTransactionTable.transactionId
+                    &&  transactionSafeTenderTrans.store                == retailTransactionTable.store
+                    &&  transactionSafeTenderTrans.terminal             == retailTransactionTable.terminal
+                    &&  transactionSafeTenderTrans.Channel              == retailTransactionTable.Channel;
+
+            // mark RetailTransactionIncomeExpenseTrans with statement Id and business date
+            update_recordset transactionIncomeExpenseTrans
+                setting
+                    statementId     = retailTransactionTable.statementId,
+                    businessDate    = retailTransactionTable.businessDate
+                where
+                        transactionIncomeExpenseTrans.transactionStatus == RetailEntryStatus::None
+                    &&  transactionIncomeExpenseTrans.transactionId     == retailTransactionTable.transactionId
+                    &&  transactionIncomeExpenseTrans.store             == retailTransactionTable.store
+                    &&  transactionIncomeExpenseTrans.terminal          == retailTransactionTable.terminal
+                    &&  transactionIncomeExpenseTrans.Channel           == retailTransactionTable.Channel;
+
+            // mark RetailTransactionInfocodeTrans with statement Id and business date
+            update_recordset transactionInfocodeTrans
+                setting
+                    statementId     = retailTransactionTable.statementId,
+                    businessDate    = retailTransactionTable.businessDate
+                where
+                        transactionInfocodeTrans.transactionStatus  == RetailEntryStatus::None
+                    &&  transactionInfocodeTrans.transactionId      == retailTransactionTable.transactionId
+                    &&  transactionInfocodeTrans.store              == retailTransactionTable.store
+                    &&  transactionInfocodeTrans.terminal           == retailTransactionTable.terminal
+                    &&  transactionInfocodeTrans.Channel            == retailTransactionTable.Channel;
+
+            // mark RetailTransactionTenderDeclarationTrans with statement code, statement Id and business date
+            update_recordset transactionTenderDeclarationTrans
+                setting
+                    statementCode   = tenderDeclarationStatementCode,
+                    statementId     = retailTransactionTable.statementId,
+                    businessDate    = retailTransactionTable.businessDate
+                where
+                        transactionTenderDeclarationTrans.transactionStatus == RetailEntryStatus::None
+                    &&  transactionTenderDeclarationTrans.transactionId     == retailTransactionTable.transactionId
+                    &&  transactionTenderDeclarationTrans.store             == retailTransactionTable.store
+                    &&  transactionTenderDeclarationTrans.terminal          == retailTransactionTable.terminal
+                    &&  transactionTenderDeclarationTrans.Channel           == retailTransactionTable.Channel;
+
+            // mark RetailTransactionOrderInvoiceTrans with statement Id and business date
+            update_recordset transactionOrderInvoiceTrans
+                setting
+                    statementId = _statementTable.statementId
+                where
+                        transactionOrderInvoiceTrans.transactionStatus  == RetailEntryStatus::None
+                    &&  transactionOrderInvoiceTrans.transactionId      == retailTransactionTable.transactionId
+                    &&  transactionOrderInvoiceTrans.storeId            == retailTransactionTable.store
+                    &&  transactionOrderInvoiceTrans.terminalId         == retailTransactionTable.terminal
+                    &&  transactionOrderInvoiceTrans.Channel            == retailTransactionTable.Channel;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getStatementCodes</Name>
+				<Source><![CDATA[
+    private static container getStatementCodes(RetailTransactionTable _retailTransactionTable, RetailStaffTerminalTotal _statementMethod)
+    {
+        RetailStatementCode transStatementCode, salesTransStatementCode, bankDropStatementCode, safeDropStatementCode, tenderDeclarationStatementCode;
+
+        switch (_statementMethod)
+        {
+            case RetailStaffTerminalTotal::Staff:
+                transStatementCode = _retailTransactionTable.Staff;
+                break;
+
+            case RetailStaffTerminalTotal::Terminal:
+                transStatementCode = _retailTransactionTable.Terminal;
+                break;
+
+            case RetailStaffTerminalTotal::Shift:
+                transStatementCode = RetailStatementLine::makeUniqueShiftId(_retailTransactionTable.BatchTerminalId, _retailTransactionTable.BatchId);
+                break;
+
+            case RetailStaffTerminalTotal::Total:
+                transStatementCode = '';
+                break;
+        }
+
+        switch (_retailTransactionTable.type)
+        {
+            case RetailTransactionType::Sales:
+                salesTransStatementCode = transStatementCode;
+                break;
+            case RetailTransactionType::BankDrop:
+                bankDropStatementCode   = transStatementCode;
+                break;
+            case RetailTransactionType::SafeDrop:
+                safeDropStatementCode   = transStatementCode;
+                break;
+            case RetailTransactionType::TenderDeclaration:
+                tenderDeclarationStatementCode  = transStatementCode;
+                break;
+            default:
+                break;
+        }
+
+        return [transStatementCode, salesTransStatementCode, bankDropStatementCode, safeDropStatementCode, tenderDeclarationStatementCode];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransactionSalesPaymentDifferenceAndTransCode</Name>
+				<Source><![CDATA[
+    private static container getTransactionSalesPaymentDifferenceAndTransCode(RetailTransactionTable _retailTransactionTable)
+    {
+        CustTable                       custTable;
+        RetailSalesPaymentDifference    salesPaymentDifference;
+        RetailTransCode                 transCode;
+
+        RetailMaxDifferenceAmount maxDifferenceAmount = RetailStoreTable::find(_retailTransactionTable.store).MaxTransactionDifferenceAmount;
+
+        // Stamp transCode for each transaction in the statement
+        custTable = CustTable::find(_retailTransactionTable.CustAccount);
+
+        // Check that customer is blocked for invoce
+        if (custTable && (custTable.Blocked == CustVendorBlocked::Invoice || custTable.Blocked == CustVendorBlocked::All))
+        {
+            transCode = RetailTransactionCode::BlockedCustomer;
+        }
+        else
+        {
+            // Check sales/payment difference for sales transactions
+            if (_retailTransactionTable.type == RetailTransactionType::Sales)
+            {
+                salesPaymentDifference = _retailTransactionTable.GrossAmount + _retailTransactionTable.PaymentAmount + _retailTransactionTable.IncomeExpenseAmount;
+
+                // Check that sales/payment difference exceeds the maximum difference settings in store
+                if (salesPaymentDifference > maxDifferenceAmount)
+                {
+                    transCode = RetailTransactionCode::SalesPaymentDifference;
+                }
+                else
+                {
+                    transCode = RetailTransactionCode::None;
+                }
+            }
+            else
+            {
+                transCode = RetailTransactionCode::None;
+            }
+        }
+
+        return [salesPaymentDifference, transCode];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateGTESpecific</Name>
+				<Source><![CDATA[
+    private void calculateGTESpecific(boolean _aggregateBeforePosting, RetailStatementId _statementId)
+    {
+        RetailTransactionTable rboHeaders;
+    
+        if (_aggregateBeforePosting && this.statementHasGTEAndNonGTETransactions(_statementId))
+        {
+            //We should skip aggregation if GTE engine is on and statement contains both GTE and nonGTE tran
+            update_recordSet rboHeaders
+            setting SkipAggregation = NoYes::Yes
+            where  rboHeaders.type == RetailTransactionType::Sales
+                && rboHeaders.incomeExpenseAmount == 0
+                && (!rboHeaders.invoiceId)
+                && (!rboHeaders.salesOrderId)
+                && rboHeaders.entryStatus == RetailEntryStatus::None
+                && rboHeaders.SkipAggregation == NoYes::No
+                && rboHeaders.statementId == _statementId;
+    
+            warning("@RetailGTE:WarningMessageWhenStatementContainsMixedTransactions");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markSkipAggregateReturnTransactionsWithOriginalUnposted</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Skip aggregation for the return transactions with the unposted original transactions.
+    /// </summary>
+    /// <param name = "_statementTable">The statement table.</param>
+    internal void markSkipAggregateReturnTransactionsWithOriginalUnposted(RetailStatementTable _statementTable)
+    {
+        RetailTracer::Info('Posting', 'RetailStatementCalculate::markSkipAggregateReturnTransactionsWithOriginalUnposted()', 'Skip the aggregation for return transactions for which original transactions are not posted.');
+           
+        RetailTransactionTable transactionTable;
+
+        while select forupdate transactionId, Channel, SkipAggregation, store, terminal
+            from transactionTable
+            where   transactionTable.type == RetailTransactionType::Sales
+                &&  transactionTable.statementId    == _statementTable.statementId
+                &&  transactionTable.store          == _statementTable.storeId
+                &&  transactionTable.saleIsReturnSale == NoYes::Yes
+        {
+            RetailTransactionSalesTrans returnSalesTrans;
+            select firstonly returnTransactionId, returnStore, returnTerminalId, returnLineNum
+                    from returnSalesTrans
+                    where  returnSalesTrans.Channel == transactionTable.Channel
+                        && returnSalesTrans.Store == transactionTable.Store
+                        && returnSalesTrans.TerminalId == transactionTable.Terminal
+                        && returnSalesTrans.transactionId == transactionTable.transactionId
+                        && returnSalesTrans.returnTransactionId
+                        && returnSalesTrans.returnStore
+                        && returnSalesTrans.returnTerminalId
+                        && returnSalesTrans.returnLineNum;
+
+            if (returnSalesTrans.returnTransactionId)
+            {
+                RetailTransactionTable originalTransactionTable;
+                select firstonly invoiceId, statementId
+                    from originalTransactionTable
+                    where originalTransactionTable.transactionId == returnSalesTrans.returnTransactionId
+                        && originalTransactionTable.store == returnSalesTrans.returnStore
+                        && originalTransactionTable.terminal == returnSalesTrans.returnTerminalId;
+                
+                // Any return transactions for which the original transaction is not posted and is not in the same statement, should not be aggregated.
+                // These transactions should be posted as part of non aggregation task.
+                if (originalTransactionTable && !originalTransactionTable.invoiceId && originalTransactionTable.statementId != _statementTable.statementId)
+                {
+                    RetailTracer::Info('Posting', 'RetailStatementCalculate::markSkipAggregateReturnTransactionsWithOriginalUnposted()', strFmt('Skip the aggregation for transaction %1 since the original transaction %2 (in statement %3) is not posted', transactionTable.transactionId, originalTransactionTable.transactionId, originalTransactionTable.statementId));
+
+                    transactionTable.SkipAggregation = NOYes::Yes;
+                    transactionTable.update();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canGoBatch</Name>
+				<Source><![CDATA[
+    public boolean canGoBatch()
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromArgs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>RetailStatementTable</c> with the caller record.
+    /// </summary>
+    /// <param name="_args">
+    /// Details of the caller datasource.
+    /// </param>
+    /// <remarks>
+    /// Calls the <c>StatementTable</c> method to initialize the table.
+    /// </remarks>
+    /// <exception cref="Exception::Error">
+    /// The caller dataset is not <c>RetailStatementTable</c> table.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Must be called with statement
+    /// </exception>
+    void initFromArgs(Args _args)
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        if (_args && _args.dataset())
+        {
+            switch (_args.dataset())
+            {
+                case tablenum(RetailStatementTable) :
+                    this.statementTable(_args.record());
+                    break;
+                default :
+                    throw error ("@RET4137");
+            }
+        }
+        else
+        {
+            throw error ("@RET4137");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertBankedTender</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the StatementLines based on the statementMethod (staff/terminal/none) of the caller datasource.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The caller datasource initialized to the <c>RetailStatmentTable</c>.
+    /// </param>
+    /// <remarks>
+    /// Calls the <c>updateBankLine</c> method to update StatementLines.
+    /// </remarks>
+    void insertBankedTender(RetailStatementTable _statementTable)
+    {
+        RetailTransactionBankedTenderTrans transactionBankedTenderTrans, bankedTenderTrans;
+
+        RetailTerminalTable                terminalTable;
+        RetailTransactionTable             transactionTable, retailTransactionTable, lastBankDropTransactionTable;
+        System.String                      lineType;
+        str                                scope;
+        totalBankedAmountStore = 0;
+        totalBankedAmountCur = 0;
+        totalBankedAmountMST = 0;
+        scope = '';
+        lineType = 'BankedTender';
+        RetailStoreTable store = RetailStoreTable::find(_statementTable.storeId);
+        RetailBankDropCalculationBase bankDropCalculationMode  = store.bankDropCalculation;
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        switch (_statementTable.statementMethod)
+        {
+            case RetailStaffTerminalTotal::Staff       :
+                // calculate all bank drop transactions for a shift by a staff id per tendertype and currency combination
+                while select sum(AmountCur),sum(AmountTendered),sum(AmountMST) from transactionBankedTenderTrans
+                group by TenderType, Currency, Staff
+                where   transactionBankedTenderTrans.Store            == _statementTable.storeId
+                    &&  transactionBankedTenderTrans.StatementId      == _statementTable.statementId
+                    && transactionBankedTenderTrans.TransactionStatus == RetailEntryStatus::None
+                {
+                    this.updateBankLine(_statementTable, transactionBankedTenderTrans);
+                }
+                scope = 'Staff';
+
+                break;
+
+            case RetailStaffTerminalTotal::Terminal    :
+                RecId storeRecId = RetailStoreTable::Find(_statementTable.storeId).RecId;
+
+                // calculate all bank drop transactions for a shift on a terminal per tendertype and currency combination
+                while select sum(AmountCur),sum(AmountTendered),sum(AmountMST) from transactionBankedTenderTrans
+                    group by TenderType, Currency, Terminal
+                    where  transactionBankedTenderTrans.Store              == _statementTable.storeId
+                        && transactionBankedTenderTrans.StatementId        == _statementTable.statementId
+                        && transactionBankedTenderTrans.TransactionStatus == RetailEntryStatus::None
+                    exists join terminalTable
+                    where  terminalTable.StoreRecId    == storeRecId
+                        && terminalTable.terminalId    == transactionBankedTenderTrans.Terminal
+                {
+                    this.updateBankLine(_statementTable, transactionBankedTenderTrans);
+                }
+                scope = 'Terminal';
+
+                break;
+
+            case RetailStaffTerminalTotal::Shift    :
+                // calculate all bank drop transactions for a shift per tendertype and currency combination
+                if (bankDropCalculationMode == RetailBankDropCalculationBase::SumBankDrop)
+                {
+                    while select sum(AmountCur),sum(AmountTendered),sum(AmountMST) from transactionBankedTenderTrans
+                        group by TenderType, Currency
+                        where  transactionBankedTenderTrans.Store              == _statementTable.storeId
+                            && transactionBankedTenderTrans.StatementId        == _statementTable.statementId
+                            && transactionBankedTenderTrans.TransactionStatus  == RetailEntryStatus::None
+                        join transactionId from transactionTable
+                        group by batchTerminalId, batchId
+                        where  transactionTable.transactionId == transactionBankedTenderTrans.TransactionId
+                            && transactionTable.store         == transactionBankedTenderTrans.Store
+                            && transactionTable.terminal      == transactionBankedTenderTrans.Terminal
+                            && transactionTable.Channel       == transactionBankedTenderTrans.Channel
+                    {
+                        this.updateBankLine(_statementTable, transactionBankedTenderTrans, RetailStatementLine::makeUniqueShiftId(transactionTable.BatchTerminalId, transactionTable.BatchID));
+                    }
+                }
+
+                // calculate last bank drop transaction for a shift per tendertype and currency combination
+                else if (bankDropCalculationMode == RetailBankDropCalculationBase::LastBankDrop)
+                {
+                    // Get all the shifts for this statement which has bank drop of status none.
+                    while select lastBankDropTransactionTable
+                        group by BatchID, BatchTerminalId
+                        where lastBankDropTransactionTable.statementId == _statementTable.statementId
+                           && lastBankDropTransactionTable.store == _statementTable.storeId
+                           && lastBankDropTransactionTable.ENTRYSTATUS == RetailEntryStatus::None
+                           && lastBankDropTransactionTable.TYPE == RetailTransactionType::BankDrop
+                    {
+                        // Now get last bank drop transaction id for each shift.
+                        select firstonly retailTransactionTable
+                        order by TRANSDATE desc, TRANSTIME desc
+                        where retailTransactionTable.statementId == _statementTable.statementId
+                            && retailTransactionTable.store == _statementTable.storeId
+                            && retailTransactionTable.ENTRYSTATUS == RetailEntryStatus::None
+                            && retailTransactionTable.TYPE == RetailTransactionType::BankDrop
+                            && retailTransactionTable.BatchID == lastBankDropTransactionTable.BatchID
+                            && retailTransactionTable.BatchTerminalId == lastBankDropTransactionTable.BatchTerminalId;
+
+                        // Now loop over each currency of that transaction
+                        while select transactionBankedTenderTrans
+                            where transactionBankedTenderTrans.transactionStatus == RetailEntryStatus::None
+                            && transactionBankedTenderTrans.transactionId == retailTransactionTable.transactionId
+                            && transactionBankedTenderTrans.store == retailTransactionTable.store
+                            && transactionBankedTenderTrans.terminal == retailTransactionTable.terminal
+                            &&  transactionBankedTenderTrans.Channel == retailTransactionTable.Channel
+                        {
+                            this.updateBankLine(_statementTable, transactionBankedTenderTrans, RetailStatementLine::makeUniqueShiftId(retailTransactionTable.BatchTerminalId, retailTransactionTable.BatchID));
+                        }
+                    }
+                }
+                scope = 'Shift';
+
+                break;
+
+            case RetailStaffTerminalTotal::Total       :
+                // calculate all bank drop transactions for a shift per tendertype and currency combination
+                while select sum(AmountCur),sum(AmountTendered),sum(AmountMST) from transactionBankedTenderTrans
+                group by TenderType, Currency
+                where  transactionBankedTenderTrans.Store             == _statementTable.storeId
+                    && transactionBankedTenderTrans.StatementId       == _statementTable.statementId
+                    && transactionBankedTenderTrans.TransactionStatus == RetailEntryStatus::None
+                {
+                    this.updateBankLine(_statementTable, transactionBankedTenderTrans);
+                }
+                scope = 'Total';
+
+                break;
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineInfo(0, scope, lineType, "", 0);
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertBankLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Based on the StatementTable and <c>RetailTransactionBankedTenderTrans</c> passed as parameters to the method,
+    /// the record gets inserted to the StatementLine.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <param name="_transactionBankedTenderTrans">
+    /// The current record of <c>RetailTransactionTenderTrans</c> table.
+    /// </param>
+    /// <param name="_uniqueShiftId">
+    /// Unique shift ID
+    /// </param>
+    void insertBankLine(RetailStatementTable _statementTable, RetailTransactionBankedTenderTrans _transactionBankedTenderTrans, RetailUniqueShiftId _uniqueShiftId = '')
+    {
+        RetailStatementLine        tmpStatementLine;
+        str                        scope = "";
+        str                        lineType = 'BankLine';
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        tmpStatementLine.selectForUpdate(true);
+
+        tmpStatementLine.initFromStatementTable(_statementTable);
+
+        switch (_statementTable.statementMethod)
+        {
+            case RetailStaffTerminalTotal::Staff       :
+                tmpStatementLine.staffId    = _transactionBankedTenderTrans.Staff;
+                scope = 'Staff';
+                break;
+
+            case RetailStaffTerminalTotal::Terminal    :
+                tmpStatementLine.terminalId = _transactionBankedTenderTrans.Terminal;
+                scope = 'Terminal';
+                break;
+
+            case RetailStaffTerminalTotal::Shift    :
+                tmpStatementLine.uniqueShiftId = _uniqueShiftId;
+                scope = 'Shift';
+                break;
+        }
+
+        tmpStatementLine.lineNum            = RetailStatementLine::lastLineNum(_statementTable.statementId) + 1.0;
+        tmpStatementLine.tenderTypeId       = _transactionBankedTenderTrans.TenderType;
+        tmpStatementLine.currency           = _transactionBankedTenderTrans.Currency;
+        tmpStatementLine.bankedAmount       = _transactionBankedTenderTrans.AmountCur;
+        tmpStatementLine.bankedAmountStore  = _transactionBankedTenderTrans.AmountTendered;
+        tmpStatementLine.bankedAmountMST    = _transactionBankedTenderTrans.amountMST;
+
+        if (tmpStatementLine.bankedAmount)
+        {
+            tmpStatementLine.storeExchRate = (tmpStatementLine.bankedAmountStore / tmpStatementLine.bankedAmount) * 100;
+            tmpStatementLine.realExchRate = (tmpStatementLine.bankedAmountMST / tmpStatementLine.bankedAmount) * 100;
+        }
+        else
+        {
+            tmpStatementLine.storeExchRate = 0;
+            tmpStatementLine.realExchRate = 0;
+        }
+
+        tmpStatementLine.insert();
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineInfo(0, scope, lineType, "", 0);
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Based on the StatementTable and StatementMethod passed as parameters to the method,
+    /// the record gets inserted to the StatementLine.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <param name="_statementMethod">
+    /// The current value of the <c>RetailStatementMethod</c> field of <c>RetailStatementTable</c> table.
+    /// </param>
+    void insertLine(RetailStatementTable _statementTable, RetailStatementMethod _statementMethod)
+    {
+        boolean                     countingRequired = true;
+        RetailStatementLine            statementLine;
+        str                            lineType = 'Line';
+
+        RetailTransactionTenderDeclarationTrans    tenderDeclarationTrans;
+        RetailTransactionTenderDeclarationTrans    transactionTenderDeclarationTrans;
+        RetailTransactionTable                     bTransactionTable;
+        Map                                        mapBatchId = new Map(Types::Int64, Types::String);
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        statementLine.initFromStatementTable(_statementTable);
+        statementLine.lineNum = RetailStatementLine::lastLineNum(statementLine.statementId) + 1.0;
+
+        switch (_statementMethod)
+        {
+            case RetailStaffTerminalTotal::Staff       :   statementLine.staffId = lastStatementCode;
+                statementLine.terminalId = "";
+                statementLine.uniqueShiftId ="";
+                break;
+
+            case RetailStaffTerminalTotal::Terminal    :   statementLine.staffId = "";
+                statementLine.terminalId = lastStatementCode;
+                statementLine.uniqueShiftId ="";
+                break;
+
+            case RetailStaffTerminalTotal::Shift      :   statementLine.staffId = "";
+                statementLine.terminalId = "";
+                statementLine.uniqueShiftId =lastStatementCode;
+                break;
+        }
+
+        statementLine.statementCode = lastStatementCode;
+        statementLine.tenderTypeId = lastTenderType;
+        statementLine.cardTypeId = lastCardTypeId;
+        statementLine.currency = lastCurrencyCode;
+        statementLine.transAmount = totalAmountCur;
+        statementLine.transAmountMST = totalAmountMST;
+        statementLine.transAmountStore = totalAmountStore;
+
+        statementLine.countedAmount = 0;
+        statementLine.countedAmountStore = 0;
+        statementLine.countedAmountMST = 0;
+
+        if (totalAmountCur)
+        {
+            statementLine.storeExchRate = (totalAmountStore / totalAmountCur) * 100;
+            statementLine.realExchRate = (totalAmountMST / totalAmountCur) * 100;
+        }
+        else
+        {
+            statementLine.storeExchRate = 0;
+            statementLine.realExchRate = 0;
+        }
+
+        statementLine.addedToDrawer = totalAddedAmount;
+        statementLine.removedFromDrawer = totalRemovedAmount;
+        statementLine.changeTender = totalChangeAmount;
+        statementLine.cardFeeAmount = totalCardFeeAmountCur;
+
+        if (RetailStoreTable::find(statementTable.storeId).tenderDeclarationCalculation == RetailTenderDeclarationCalculationBase::LastTender)
+        {
+            while select amountCur, amountTendered, amountMST, transactionId  from transactionTenderDeclarationTrans
+                order by TransDate desc, transTime desc
+                where   transactionTenderDeclarationTrans.store             == _statementTable.storeId
+                    &&  transactionTenderDeclarationTrans.statementId       == _statementTable.statementId
+                    &&  transactionTenderDeclarationTrans.statementCode     == statementLine.statementCode
+                    &&  transactionTenderDeclarationTrans.tenderType        == statementLine.tenderTypeId
+                    &&  transactionTenderDeclarationTrans.cardId            == statementLine.cardTypeId
+                    &&  transactionTenderDeclarationTrans.currency          == statementLine.currency
+                    &&  transactionTenderDeclarationTrans.transactionStatus == RetailEntryStatus::None
+                join BatchId, terminal from bTransactionTable
+                    where   transactionTenderDeclarationTrans.transactionId == bTransactionTable.transactionId
+                        &&  transactionTenderDeclarationTrans.store         == bTransactionTable.store
+                        &&  transactionTenderDeclarationTrans.terminal      == bTransactionTable.terminal
+                        &&  transactionTenderDeclarationTrans.Channel       == bTransactionTable.Channel
+            {
+                if (!(mapBatchId.exists(bTransactionTable.BatchID) && mapBatchId.lookup(bTransactionTable.BatchID) == bTransactionTable.terminal))
+                {
+                    select firstOnly transactionId from tenderDeclarationTrans
+                   order by TransDate desc, transTime desc
+                        where       tenderDeclarationTrans.store                == _statementTable.storeId
+                                &&  tenderDeclarationTrans.statementId          == _statementTable.statementId
+                                &&  tenderDeclarationTrans.statementCode        == statementLine.statementCode
+                                &&  tenderDeclarationTrans.transactionStatus    == RetailEntryStatus::None
+                                &&  tenderDeclarationTrans.terminal             == bTransactionTable.terminal;
+
+                    if (tenderDeclarationTrans.transactionId == transactionTenderDeclarationTrans.transactionId)
+                    {
+                        mapBatchId.insert(bTransactionTable.BatchID, bTransactionTable.terminal);
+                        if (transactionTenderDeclarationTrans.amountCur)
+                        {
+                            statementLine.countedAmount         += transactionTenderDeclarationTrans.amountCur;
+                            statementLine.countedAmountStore    += transactionTenderDeclarationTrans.amountTendered;
+                            statementLine.countedAmountMST      += transactionTenderDeclarationTrans.amountMST;
+                        }
+                        else
+                        {
+                            statementLine.countedAmount         += transactionTenderDeclarationTrans.amountTendered;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            select sum(amountCur), sum(amountTendered), sum(amountMST) from transactionTenderDeclarationTrans
+                group by store, statementId, statementCode, tenderType, cardId, currency, transactionStatus
+                    where   transactionTenderDeclarationTrans.store             == _statementTable.storeId
+                        &&  transactionTenderDeclarationTrans.statementId       == _statementTable.statementId
+                        &&  transactionTenderDeclarationTrans.statementCode     == statementLine.statementCode
+                        &&  transactionTenderDeclarationTrans.tenderType        == statementLine.tenderTypeId
+                        &&  transactionTenderDeclarationTrans.cardId            == statementLine.cardTypeId
+                        &&  transactionTenderDeclarationTrans.currency          == statementLine.currency
+                        &&  transactionTenderDeclarationTrans.transactionStatus == RetailEntryStatus::None;
+
+            if (transactionTenderDeclarationTrans.amountCur)
+            {
+                statementLine.countedAmount         = transactionTenderDeclarationTrans.amountCur;
+                statementLine.countedAmountStore    = transactionTenderDeclarationTrans.amountTendered;
+                statementLine.countedAmountMST      = transactionTenderDeclarationTrans.amountMST;
+            }
+            else
+            {
+                statementLine.countedAmount = transactionTenderDeclarationTrans.amountTendered;
+            }
+        }
+
+        if (!statementLine.transAmount && !statementLine.bankedAmount && ! statementLine.safeAmount)
+        {
+            if (statementLine.countedAmount)
+            {
+                statementLine.storeExchRate = (statementLine.countedAmountStore / statementLine.countedAmount) * 100;
+                statementLine.realExchRate = (statementLine.countedAmountMST / statementLine.countedAmount) * 100;
+            }
+            else
+            {
+                statementLine.storeExchRate = 0;
+                statementLine.realExchRate = 0;
+            }
+        }
+
+        statementLine.insert();
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertPaymentLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Selects the payment transactions from the <c>RetailTransactionPaymentTrans</c> table and inserts the record in StatementLines.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of the <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <remarks>
+    /// calculates the amounts based on the payments transactions in the table and inserts the sum amount into StatementLine.
+    /// </remarks>
+    void insertPaymentLines(RetailStatementTable _statementTable)
+    {
+        RetailStatementLine             statementLine;
+        RetailTransactionPaymentTrans   transactionPaymentTrans;
+        RetailTransactionTable          transactionTable;
+        RetailStatementMethod           statementMethod;
+        RetailStatementCode             currentStatementCode;
+        RetailTerminalTable             terminalTable;
+        int                             recordCounter;
+        str                             lineType = 'PaymentLine';
+        RetailStoreTable                storeTable = RetailStoreTable::find(_statementTable.storeId);
+        AmountMST                       lastStartAmount, lastStartAmountMST, lastStartAmountStore;
+        AmountCur                       lastStartAmountCur;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        // Update amounts.
+        void updateAmounts (AmountCur amountCur, AmountMST amountMST, AmountMST amountStore)
+        {
+            totalAmountMST   += amountMST;
+            totalAmountStore += amountStore;
+            totalAmountCur   += amountCur;
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        delete_from statementLine
+            where statementLine.statementId == _statementTable.statementId;
+
+        lastTenderType = "";
+        lastCurrencyCode = "";
+        lastStatementCode = "";
+        lastCardTypeId = "";
+        lastTerminalId = "";
+        totalAmountMST = 0;
+        totalAmountStore = 0;
+        totalAmountCur = 0;
+        totalRemovedAmount = 0;
+        totalAddedAmount = 0;
+        totalChangeAmount = 0;
+        totalCardFeeAmountCur = 0;
+        lastStartAmount = 0;
+        lastStartAmountCur = 0;
+        lastStartAmountMST = 0;
+        lastStartAmountStore = 0;
+
+        // Loop over all the transactions marked for current statement.
+        // The loop has transactions in ascending order so we save the last start amount transaction when calculation is set to last.
+        while select transactionPaymentTrans
+            index hint statementTenderCardCurIdx
+            order by statementId, statementCode, tenderType, cardTypeId, currency, TransDate, transTime
+            where transactionPaymentTrans.store == _statementTable.storeId
+                && transactionPaymentTrans.statementId == _statementTable.statementId
+                && transactionPaymentTrans.transactionStatus == RetailEntryStatus::None
+        {
+            recordCounter++;
+
+            transactionTable = RetailTransactionTable::find(transactionPaymentTrans.transactionId,transactionPaymentTrans.store,transactionPaymentTrans.terminal);
+
+            if (lastTerminalId != transactionPaymentTrans.terminal)
+            {
+                terminalTable = RetailTerminalTable::find(transactionPaymentTrans.terminal);
+                statementMethod = terminalTable.statementMethod ? terminalTable.statementMethod : storeTable.statementMethod;
+            }
+
+            currentStatementCode = statementMethod == RetailStaffTerminalTotal::Total ? "" : transactionPaymentTrans.statementCode;
+
+            if (currentStatementCode != lastStatementCode ||
+                transactionPaymentTrans.tenderType != lastTenderType ||
+                transactionPaymentTrans.cardTypeId != lastCardTypeId ||
+                transactionPaymentTrans.currency != lastCurrencyCode)
+            {
+                // Insert the current tender type amounts before moving to next tender type.
+                if (lastTenderType)
+                {
+                    // Add the last start amount if any before inserting the last line.
+                    if (lastStartAmount != 0)
+                    {
+                        totalAddedAmount += lastStartAmount;
+
+                        updateAmounts(lastStartAmountCur, lastStartAmountMST, lastStartAmountStore);
+                    }
+
+                    this.insertLine(_statementTable, statementMethod);
+                }
+
+                lastTenderType = transactionPaymentTrans.tenderType;
+                lastCurrencyCode = transactionPaymentTrans.currency;
+                lastTerminalId = transactionPaymentTrans.terminal;
+
+                if (statementMethod != RetailStaffTerminalTotal::Total)
+                {
+                    lastStatementCode = transactionPaymentTrans.statementCode;
+                }
+
+                lastCardTypeId = transactionPaymentTrans.cardTypeId;
+
+                // Set amounts to 0 before moving to next tender type
+                totalAmountStore = 0;
+                totalAmountMST = 0;
+                totalAmountCur = 0;
+                totalRemovedAmount = 0;
+                totalAddedAmount = 0;
+                totalChangeAmount = 0;
+                totalCardFeeAmountCur = 0;
+                lastStartAmount = 0;
+                lastStartAmountCur = 0;
+                lastStartAmountMST = 0;
+                lastStartAmountStore = 0;
+
+            }
+            
+            // If start amount calculation on store form is set to sum then all transactions for a shift should be considered for calculation
+            if (transactionTable.type != RetailTransactionType::StartingAmount || (transactionTable.type == RetailTransactionType::StartingAmount && storeTable.startAmountCalculation == RetailStartAmountCalculationBase::SumStartAmount))
+            {
+                updateAmounts(transactionPaymentTrans.amountCur, transactionPaymentTrans.amountMST, transactionPaymentTrans.amountTendered);
+
+                switch (transactionTable.type)
+                {
+                    case RetailTransactionType::RemoveTender:
+                        totalRemovedAmount += transactionPaymentTrans.amountTendered;
+                        break;
+                    case RetailTransactionType::StartingAmount:
+                    case RetailTransactionType::FloatEntry:
+                        totalAddedAmount += transactionPaymentTrans.amountTendered;
+                        break;
+                    case RetailTransactionType::ChangeTender:
+                        totalChangeAmount += transactionPaymentTrans.amountTendered;
+                        break;
+                }
+            }
+
+            // If start amount calculation on store form is set to last then only last transaction for a shift should be considered for calculation
+            // So set the last start amount variables until next tender type.
+            if (transactionTable.type == RetailTransactionType::StartingAmount && storeTable.startAmountCalculation == RetailStartAmountCalculationBase::LastStartAmount)
+            {
+                lastStartAmount = transactionPaymentTrans.amountTendered;
+                lastStartAmountCur = transactionPaymentTrans.amountCur;
+                lastStartAmountMST = transactionPaymentTrans.amountMST;
+                lastStartAmountStore = transactionPaymentTrans.amountTendered;
+            }
+
+
+            totalCardFeeAmountCur += transactionPaymentTrans.calcCardFeeAmount();
+        }
+
+        if (lastTenderType)
+        {
+            // Add the last start amount if any before inserting the last line.
+            if (lastStartAmount != 0)
+            {
+                totalAddedAmount += lastStartAmount;
+
+                updateAmounts(lastStartAmountCur, lastStartAmountMST, lastStartAmountStore);
+            }
+
+            //Insert the last line.
+            this.insertLine(_statementTable, statementMethod);
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertSafeLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Based on the StatementTable and <c>RetailTransactionSafeTenderTrans</c> passed as parameters to the method,
+    /// the record gets inserted to the StatementLine.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <param name="_transactionSafeTenderTrans">
+    /// The current record of <c>RetailTransactionSafeTenderTrans</c> table.
+    /// </param>
+    /// <param name="_uniqueShiftId">
+    /// Unique shift ID
+    /// </param>
+    void insertSafeLine(RetailStatementTable _statementTable, RetailTransactionSafeTenderTrans _transactionSafeTenderTrans, RetailUniqueShiftId _uniqueShiftId = '')
+    {
+        RetailStatementLine        tmpStatementLine;
+        str                        lineType = 'SafeLine';
+        ;
+        
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        tmpStatementLine.selectForUpdate(true);
+
+        tmpStatementLine.initFromStatementTable(_statementTable);
+
+        switch (_statementTable.statementMethod)
+        {
+            case RetailStaffTerminalTotal::Staff       :
+                tmpStatementLine.staffId    = _transactionSafeTenderTrans.Staff;
+                break;
+
+            case RetailStaffTerminalTotal::Terminal    :
+                tmpStatementLine.terminalId = _transactionSafeTenderTrans.Terminal;
+                break;
+
+            case RetailStaffTerminalTotal::Shift    :
+                tmpStatementLine.uniqueShiftId = _uniqueShiftId;
+                break;
+        }
+
+        tmpStatementLine.lineNum            = RetailStatementLine::lastLineNum(_statementTable.statementId) + 1.0;
+        tmpStatementLine.tenderTypeId       = _transactionSafeTenderTrans.TenderType;
+        tmpStatementLine.currency           = _transactionSafeTenderTrans.Currency;
+
+        tmpStatementLine.safeAmount       = _transactionSafeTenderTrans.AmountCur;
+        tmpStatementLine.safeAmountStore  = _transactionSafeTenderTrans.AmountTendered;
+        tmpStatementLine.safeAmountMST    = _transactionSafeTenderTrans.amountMST;
+
+        if (tmpStatementLine.safeAmount)
+        {
+            tmpStatementLine.storeExchRate = (tmpStatementLine.safeAmountStore / tmpStatementLine.safeAmount) * 100;
+            tmpStatementLine.realExchRate = (tmpStatementLine.safeAmountMST / tmpStatementLine.safeAmount) * 100;
+        }
+        else
+        {
+            tmpStatementLine.storeExchRate = 0;
+            tmpStatementLine.realExchRate = 0;
+        }
+
+        tmpStatementLine.insert();
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertSafeTender</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the record in the StatementLine based on the current StatementTable and the transactions in <c>RetailTransactionSafeTenderTrans</c> table.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of StatementTable.
+    /// </param>
+    /// <remarks>
+    /// The method updates the SafeAmount fields of the <c>RetailStatementLine</c> table.
+    /// </remarks>
+    void insertSafeTender(RetailStatementTable _statementTable)
+    {
+        RetailTransactionSafeTenderTrans   transactionSafeTenderTrans;
+        RetailTerminalTable                terminalTable;
+        RetailTransactionTable             transactionTable;
+        str                                lineType = 'SafeTender';
+
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        totalSafeAmountStore = 0;
+        totalSafeAmountCur = 0;
+        totalSafeAmountMST = 0;
+
+        switch (_statementTable.statementMethod)
+        {
+            case RetailStaffTerminalTotal::Staff       :
+
+                while select sum(AmountCur),sum(AmountTendered),sum(AmountMST) from transactionSafeTenderTrans
+                    group by TenderType, Currency, Staff
+                        where   transactionSafeTenderTrans.Store                == _statementTable.storeId
+                            &&  transactionSafeTenderTrans.StatementId          == _statementTable.statementId
+                            &&  transactionSafeTenderTrans.TransactionStatus    == RetailEntryStatus::None
+                {
+                    this.updateSafeLine(_statementTable, transactionSafeTenderTrans);
+                }
+
+                break;
+
+            case RetailStaffTerminalTotal::Terminal    :
+
+                while select sum(AmountCur),sum(AmountTendered),sum(AmountMST),count(RecId) from transactionSafeTenderTrans
+                    group by TenderType, Currency, Terminal
+                        where   transactionSafeTenderTrans.Store                == _statementTable.storeId
+                            &&  transactionSafeTenderTrans.StatementId          == _statementTable.statementId
+                            &&  transactionSafeTenderTrans.TransactionStatus    == RetailEntryStatus::None
+                {
+                    this.updateSafeLine(_statementTable, transactionSafeTenderTrans);
+                }
+
+                break;
+
+            case RetailStaffTerminalTotal::Shift    :
+
+                while select sum(AmountCur),sum(AmountTendered),sum(AmountMST) from transactionSafeTenderTrans
+                    group by TenderType, Currency
+                        where   transactionSafeTenderTrans.Store                == _statementTable.storeId
+                            &&  transactionSafeTenderTrans.StatementId          == _statementTable.statementId
+                            &&  transactionSafeTenderTrans.TransactionStatus    == RetailEntryStatus::None
+                join transactionId from transactionTable
+                    group by batchTerminalId, batchId
+                        where   transactionTable.transactionId  == transactionSafeTenderTrans.TransactionId
+                            &&  transactionTable.store          == transactionSafeTenderTrans.Store
+                            &&  transactionTable.terminal       == transactionSafeTenderTrans.Terminal
+                            &&  transactionTable.Channel        == transactionSafeTenderTrans.Channel
+                {
+                    this.updateSafeLine(_statementTable, transactionSafeTenderTrans, RetailStatementLine::makeUniqueShiftId(transactionTable.BatchTerminalId, transactionTable.BatchID));
+                }
+
+                break;
+
+            case RetailStaffTerminalTotal::Total       :
+
+                    while select sum(AmountCur),sum(AmountTendered),sum(AmountMST),count(RecId) from transactionSafeTenderTrans
+                    group by TenderType, Currency
+                        where   transactionSafeTenderTrans.Store                == _statementTable.storeId
+                            &&  transactionSafeTenderTrans.StatementId          == _statementTable.statementId
+                            &&  transactionSafeTenderTrans.TransactionStatus    == RetailEntryStatus::None
+                {
+                    this.updateSafeLine(_statementTable, transactionSafeTenderTrans);
+                }
+
+                break;
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTenderDeclarationLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Selects the transactions from the <c>RetailTransactionTenderDeclarationTrans</c> table, finds the current statement code and inserts the record in StatementLines.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of the <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <remarks>
+    /// Based on the variables currentStatementCode and lastStatementCode the record is inserted to the StatementLines.
+    /// </remarks>
+    void insertTenderDeclarationLines(RetailStatementTable _statementTable)
+    {
+        RetailTransactionTenderDeclarationTrans     transactionTenderDeclarationTrans;
+        RetailTransactionPaymentTrans               transactionPaymentTrans;
+        RetailStatementCode                         currentStatementCode;
+        RetailTerminalTable                         terminalTable;
+        int                                         recordCounter;
+        str                                         lineType = 'TenderDeclarationLine';
+        RetailStoreTable                            storeTable = RetailStoreTable::find(_statementTable.storeId);
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        totalAmountStore = 0;
+        totalAmountCur = 0;
+        totalRemovedAmount = 0;
+        totalAddedAmount = 0;
+        totalChangeAmount = 0;
+
+        lastTenderType = "";
+        lastCurrencyCode = "";
+        lastStatementCode = "";
+        lastCardTypeId = "";
+
+        while select statementId, terminal, statementCode, tenderType, cardId, currency from transactionTenderDeclarationTrans
+            where   transactionTenderDeclarationTrans.store         == _statementTable.storeId
+                &&  transactionTenderDeclarationTrans.statementId   == _statementTable.statementId
+        {
+            recordCounter++;
+
+            terminalTable = RetailTerminalTable::find(transactionTenderDeclarationTrans.terminal);
+            RetailStatementMethod statementMethod = terminalTable.statementMethod ? terminalTable.statementMethod : storeTable.statementMethod;
+
+            currentStatementCode = (statementMethod == RetailStaffTerminalTotal::Total) ? "" : transactionTenderDeclarationTrans.statementCode;
+
+            if (currentStatementCode != lastStatementCode ||
+                transactionTenderDeclarationTrans.tenderType != lastTenderType ||
+                transactionTenderDeclarationTrans.cardId != lastCardTypeId ||
+                transactionTenderDeclarationTrans.currency != lastCurrencyCode)
+            {
+                lastTenderType = transactionTenderDeclarationTrans.tenderType;
+                lastCurrencyCode = transactionTenderDeclarationTrans.currency;
+
+                if (statementMethod != RetailStaffTerminalTotal::Total)
+                {
+                    lastStatementCode = transactionTenderDeclarationTrans.statementCode;
+                }
+
+                lastCardTypeId = transactionTenderDeclarationTrans.cardId;
+
+                select sum(AmountCur), sum(amountTendered) from transactionPaymentTrans
+                    group by statementId, statementCode, tendertype, cardTypeId, currency
+                    where   transactionPaymentTrans.store               == _statementTable.storeId
+                        &&  transactionPaymentTrans.statementId         == _statementTable.statementId
+                        &&  transactionPaymentTrans.tenderType          == lastTenderType
+                        &&  transactionPaymentTrans.transactionStatus   == RetailEntryStatus::None
+                        &&  (!lastCardTypeId || transactionPaymentTrans.cardTypeId == lastCardTypeId)
+                        &&  (!lastCurrencyCode || transactionPaymentTrans.currency == lastCurrencyCode)
+                        &&  (!lastStatementCode || transactionPaymentTrans.statementCode == lastStatementCode);
+
+                if (!transactionPaymentTrans.amountCur && !transactionPaymentTrans.amountTendered)
+                {
+                    this.insertLine(_statementTable, statementMethod);
+                }
+            }
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    void new()
+    {
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        super();
+
+        #AviFiles
+
+        countryRegion_W = SysCountryRegionCode::isLegalEntityInCountryRegion(#easternEuropeAllandRU);
+        countryRegion_RU = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStaffId</Name>
+				<Source><![CDATA[
+    public RetailStaffId parmStaffId(RetailStaffId _staffId = staffId)
+    {
+        ;
+
+    // If the flag to suppress obsolete errors is not set, then throw an error.
+    RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        staffId = _staffId;
+
+        return staffId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStoreId</Name>
+				<Source><![CDATA[
+    public RetailStoreId parmStoreId(RetailStoreId _storeId = storeId)
+    {
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        storeId = _storeId;
+
+        return storeId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTerminalId</Name>
+				<Source><![CDATA[
+    public RetailTerminalId parmTerminalId(RetailTerminalId _TerminalId = TerminalId)
+    {
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        TerminalId = _TerminalId;
+
+        return TerminalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUniqueShiftId</Name>
+				<Source><![CDATA[
+    public RetailUniqueShiftId parmUniqueShiftId(RetailUniqueShiftId _uniqueShiftId = uniqueShiftId)
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        uniqueShiftId = _uniqueShiftId;
+
+        return uniqueShiftId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBusinessDate</Name>
+				<Source><![CDATA[
+    public TransDate parmBusinessDate(TransDate _businessDate = businessDate)
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        businessDate = _businessDate;
+
+        return businessDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new record in the <c>RetailStatementtable</c> for a particular store.
+    /// </summary>
+    /// <exception cref="Exception::UpdateConflictNotRecovered">
+    /// Any other user is trying to update the record at the same time.
+    /// </exception>
+    /// <exception cref="Exception::UpdateConflict">
+    /// Any other user is trying to update the record at the same time.
+    /// </exception>
+    public void run()
+    {
+        #OCCRetryCount
+        RetailStatementTable   rboStatementTable, origStatementTable;
+        date                transToDate;
+        InfoLogData         infoLogData;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementCreateSingleStart(0, "", "", "", 0);
+
+        try
+        {
+            super();
+
+            if (this.parmStoreId())
+            {
+                RetailStoreTable storeTable;
+
+                ttsbegin;
+
+                // This class is running inside batch framework for a particular store so create a new
+                // record in RboStatementTable.
+                rboStatementTable.initValue();
+                rboStatementTable.initFromStoreTable(RetailStoreTable::find(this.parmStoreId()));
+
+                // The new statement should pick all transactions from the past, but none after the transaction-end-time
+                // specified in Store settings.
+
+                storeTable = RetailStoreTable::find(this.parmStoreId());
+
+                // If BusinessDate parameter is set, we set start date/time and end date/time for the statement
+                if (this.parmBusinessDate() != dateNull())
+                {
+                    rboStatementTable.setBusinessDate(this.parmBusinessDate());
+                }
+                else
+                {
+                    transToDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+
+                    rboStatementTable.transToDate = transToDate;
+                    rboStatementTable.transToTime = storeTable.stmtCalcBatchEndTime;
+                }
+
+                if (! rboStatementTable.transToDate)
+                {
+                    ttscommit;
+                    return;
+                }
+
+                switch (rboStatementTable.statementMethod)
+                {
+                    case RetailStaffTerminalTotal::Staff:
+                        rboStatementTable.staffOrTerminal = this.parmStaffId();
+                        break;
+
+                    case RetailStaffTerminalTotal::Terminal:
+                        rboStatementTable.staffOrTerminal = this.parmTerminalId();
+                        break;
+
+                    case RetailStaffTerminalTotal::Shift:
+                        rboStatementTable.staffOrTerminal = this.parmUniqueShiftId();
+                        break;
+                }
+
+                this.statementTable(rboStatementTable);
+                
+                RetailTransactionTable transactionTable;
+
+                if (!this.retailTransactionTableHasRecords(statementTable))
+                {
+                    ttscommit;
+                    return;
+                }
+
+                rboStatementTable.insert();
+                ttscommit;
+            }
+
+            // keeping the original buffer information so we can reload it in a retry logic
+            origStatementTable = statementTable.data();
+
+            try
+            {
+                statementTable.data(origStatementTable);
+
+                ttsbegin;
+
+                int transactionCount = this.calculateAndMarkTransactions(statementTable);
+
+                if (transactionCount == 0 && this.isInBatch())
+                {
+                    // Remove empty statement for batch jobs
+                    statementTable.doDelete();
+                }
+                else
+                {
+                    infoLogData = InfoLog.export();
+
+                    statementTable.selectForUpdate(true);
+                    statementTable.stmtCalcInfoLog = infoLogData;
+                    statementTable.doUpdate();
+                }
+                ttscommit;
+            }
+            catch (Exception::Deadlock)
+            {
+                RetailTracer::Info('Posting', 'RetailStatementCalculate::run()', "@SYS65063"); // Deadlock detected
+                retry;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        RetailTracer::Info('Posting', 'RetailStatementCalculate::run()', "@SYS107548"); // Update conflicts
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+        }
+        catch
+        {
+            ttsbegin;
+            statementTable.reread();
+            if (statementTable.RecId)
+            {
+                infoLogData = InfoLog.export();
+                statementTable.selectForUpdate(true);
+                statementTable.stmtCalcInfoLog = infoLogData;
+                statementTable.doUpdate();
+            }
+            ttscommit;
+            throw Exception::Error;
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementCreateSingleEnd(0, "", "", "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>skipAggregationForNamedCustomerOrder</Name>
+				<Source><![CDATA[
+    private void skipAggregationForNamedCustomerOrder(boolean _aggregateBeforePosting, RetailStatementId _statementId, RetailStoreTable _storeTable = null)
+    {
+        RetailTransactionTable  rboHeaders;
+        boolean                 countryRegion_IN    = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]);
+    
+        if (_aggregateBeforePosting && countryRegion_IN  && RetailParameters::find().UpdateGSTTransactionId_IN)
+        {
+            //We should skip aggregation for named customer sales transactions when GST is enabled.
+            update_recordSet rboHeaders
+            setting SkipAggregation = NoYes::Yes
+            where  rboHeaders.type == RetailTransactionType::Sales
+                && rboHeaders.incomeExpenseAmount == 0
+                && (!rboHeaders.invoiceId)
+                && (!rboHeaders.salesOrderId)
+                && rboHeaders.entryStatus == RetailEntryStatus::None
+                && rboHeaders.SkipAggregation == NoYes::No
+                && rboHeaders.statementId == _statementId
+                && (rboHeaders.custAccount != ''
+                    && rboHeaders.custAccount != _storeTable.DefaultCustAccount);
+            
+            if (rboHeaders.RowCount() > 0)
+            {
+                warning("@RetailGTE:UpdatePOSInvoiceNumberWarningMessage");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>statementHasGTEAndNonGTETransactions</Name>
+				<Source><![CDATA[
+    private boolean statementHasGTEAndNonGTETransactions(RetailStatementId _statementId)
+    {
+        RetailTransactionTable rboHeaders;
+    
+        select firstOnly RecId
+        from rboHeaders
+        where  rboHeaders.type == RetailTransactionType::Sales
+            && rboHeaders.incomeExpenseAmount == 0
+            && (!rboHeaders.invoiceId)
+            && (!rboHeaders.salesOrderId)
+            && rboHeaders.entryStatus == RetailEntryStatus::None
+            && rboHeaders.SkipAggregation == NoYes::No
+            && rboHeaders.TaxCalculationType != TaxCalculationType::GTE
+            && rboHeaders.statementId == _statementId;
+    
+    
+        if (rboHeaders.RecId)
+        {
+            select firstOnly RecId
+            from rboHeaders
+            where  rboHeaders.type == RetailTransactionType::Sales
+                && rboHeaders.incomeExpenseAmount == 0
+                && (!rboHeaders.invoiceId)
+                && (!rboHeaders.salesOrderId)
+                && rboHeaders.entryStatus == RetailEntryStatus::None
+                && rboHeaders.SkipAggregation == NoYes::No
+                && rboHeaders.TaxCalculationType == TaxCalculationType::GTE
+                && rboHeaders.statementId == _statementId;
+        }
+    
+        return rboHeaders.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>statementTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns the current record of the <c>RetailStatementTable</c> table to the variable statementTable.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of the <c>RetailStatementTable</c> table
+    /// </param>
+    /// <returns>
+    /// Returns the variable statementTable after assigning the current record of <c>RetailStatementTable</c> table.
+    /// </returns>
+    public RetailStatementTable statementTable(RetailStatementTable _statementTable = statementTable)
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        statementTable = _statementTable;
+
+        return statementTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Integer         version        = conpeek(_packedClass,1);
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = _packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBankLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the StatementLine record based on the StatementTable and <c>RetailTransactionBankedTenderTrans</c> table passed as parameter.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <param name="_transactionBankedTenderTrans">
+    /// The current record of <c>RetailTransactionBankedTenderTrans</c> table.
+    /// </param>
+    /// <param name="_uniqueShiftId">
+    /// Unique shift ID
+    /// </param>
+    /// <remarks>
+    /// The amount values for the StatementTable is updated with the amounts in transactionBankedTenderTrans record.
+    /// </remarks>
+    void updateBankLine(RetailStatementTable _statementTable, RetailTransactionBankedTenderTrans _transactionBankedTenderTrans, RetailUniqueShiftId _uniqueShiftId = '')
+    {
+        RetailStatementLine statementLine;
+        str                 lineType = 'BankLine';
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        totalBankedAmountCur    = _transactionBankedTenderTrans.AmountCur;
+        totalBankedAmountStore  = _transactionBankedTenderTrans.AmountTendered;
+        totalBankedAmountMST    = _transactionBankedTenderTrans.amountMST;
+
+        select FORUPDATE statementLine
+            where statementLine.TenderTypeId    == _transactionBankedTenderTrans.TenderType
+            && statementLine.Currency           == _transactionBankedTenderTrans.Currency
+            && statementLine.StatementId        == _statementTable.StatementId
+            && (
+                (statementTable.statementMethod == RetailStaffTerminalTotal::Staff && statementLine.staffId == _transactionBankedTenderTrans.Staff)
+                ||
+                (statementTable.statementMethod == RetailStaffTerminalTotal::Shift && statementLine.uniqueShiftId == _uniqueShiftId)
+                ||
+                (statementTable.statementMethod == RetailStaffTerminalTotal::Terminal && statementLine.terminalId == _transactionBankedTenderTrans.Terminal)
+                ||
+                (statementTable.statementMethod == RetailStaffTerminalTotal::Total)
+            );
+
+        if (statementLine.RecId)
+        {
+            statementLine.selectForUpdate(true);
+            statementLine.bankedAmount      = totalBankedAmountCur;
+            statementLine.bankedAmountStore = totalBankedAmountStore;
+            statementLine.bankedAmountMST   = totalBankedAmountMST;
+            statementLine.update();
+        }
+        else
+        {
+            this.insertBankLine(_statementTable, _transactionBankedTenderTrans, _uniqueShiftId);
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCountedAmounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the <c>CountedAmount</c> field of StatementLine based on the StatementTable passed as parameter.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <remarks>
+    /// The counting fields are updated based on the values of <c>RetailStoreTenderTypeTable</c> table and <c>RetailStoreTenderTypeCardTable</c> table.
+    /// </remarks>
+    void updateCountedAmounts(RetailStatementTable _statementTable)
+    {
+        RetailStatementLine            statementLine;
+        RetailStoreTenderTypeTable     storeTenderTypeTable;
+        RetailStoreTenderTypeCardTable storeTenderTypeCardTable;
+        Boolean                     countingRequired;
+        str                            lineType = 'CountedAmounts';
+        RetailStoreTable            retailStoreTable;
+        RetailParameters            retailParameters = RetailParameters::find();
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        while select forUpdate statementLine
+        where   statementLine.statementId == _statementTable.statementId
+            join RecId from retailStoreTable
+                where retailStoreTable.StoreNumber == statementLine.storeId
+        {
+            // Get the flag counting required is disabled or not from retail parameters.
+            countingRequired = !retailParameters.DisableCountingRequired;
+
+            // Calculate the flag counting required on each tender type based only if it is not disabled in RetailParameters.
+            if (countingRequired)
+            {
+                if (statementLine.cardTypeId)
+                {
+                    storeTenderTypeCardTable = RetailStoreTenderTypeCardTable::find(retailStoreTable.RecId, statementLine.tenderTypeId, statementLine.cardTypeId);
+
+                    if (storeTenderTypeCardTable)
+                    {
+                        // If counting required is not disabled in the RetailParameters, override this flag value from the tender type table.
+                        countingRequired = storeTenderTypeCardTable.countingRequired;
+                    }
+                    else
+                    {
+                        storeTenderTypeTable = RetailStoreTenderTypeTable::find(retailStoreTable.RecId, statementLine.tenderTypeId);
+
+                        if (storeTenderTypeTable)
+                        {
+                            // If counting required is not disabled in the RetailParameters, override this flag value from the tender type table.
+                            countingRequired = storeTenderTypeTable.countingRequired;
+                        }
+                        else
+                        {
+                            // If the store tender type is not found, set the counting required to false.
+                            countingRequired = false;
+                        }
+                    }
+                }
+                else
+                {
+                    storeTenderTypeTable = RetailStoreTenderTypeTable::find(retailStoreTable.RecId, statementLine.tenderTypeId);
+
+                    if (storeTenderTypeTable)
+                    {
+                        // If counting required is not disabled in the RetailParameters, override this flag value from the tender type table.
+                        countingRequired = storeTenderTypeTable.countingRequired;
+                    }
+                    else
+                    {
+                        // If the store tender type is not found, set the counting required to false.
+                        countingRequired = false;
+                    }
+                }
+            }
+
+            // If counting required is disabled in RetailParameters or false for this tender type.
+            if (!countingRequired)
+            {
+                statementLine.countedAmount = statementLine.transAmount - statementLine.bankedAmount - statementLine.safeAmount;
+                statementLine.validateField(fieldnum(RetailStatementLine, countedAmount));
+            }
+
+            statementLine.countingRequired = countingRequired;
+            statementLine.doUpdate();
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineEnd(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSafeLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the Safe amount fields of StatementLine based on the StatementTable and <c>RetailTransactionSafeTenderTrans</c> passed as parameter.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The current record of <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <param name="_transactionSafeTenderTrans">
+    /// The current record of <c>RetailTransactionSafeTenderTrans</c> table.
+    /// </param>
+    /// <param name="_uniqueShiftId">
+    /// Unique shift ID
+    /// </param>
+    /// <remarks>
+    /// The safeAmounts are updated if the record already exists in StatementLine table otherwise inserts the record into the same.
+    /// </remarks>
+    void updateSafeLine(RetailStatementTable _statementTable, RetailTransactionSafeTenderTrans _transactionSafeTenderTrans, RetailUniqueShiftId _uniqueShiftId = '')
+    {
+        RetailStatementLine statementLine;
+        str                 lineType = 'SafeLine';
+        ;
+
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+
+        totalSafeAmountCur    = _transactionSafeTenderTrans.AmountCur;
+        totalSafeAmountStore  = _transactionSafeTenderTrans.AmountTendered;
+        totalSafeAmountMST    = _transactionSafeTenderTrans.amountMST;
+
+        select * from statementLine
+            where statementLine.TenderTypeId    == _transactionSafeTenderTrans.TenderType
+            && statementLine.Currency           == _transactionSafeTenderTrans.Currency
+            && statementLine.StatementId        == _statementTable.StatementId
+            && (
+                (statementTable.statementMethod == RetailStaffTerminalTotal::Staff && statementLine.staffId == _transactionSafeTenderTrans.Staff)
+                ||
+                (statementTable.statementMethod == RetailStaffTerminalTotal::Shift && statementLine.uniqueShiftId == _uniqueShiftId)
+                ||
+                (statementTable.statementMethod == RetailStaffTerminalTotal::Terminal && statementLine.terminalId == _transactionSafeTenderTrans.Terminal)
+                ||
+                (statementTable.statementMethod == RetailStaffTerminalTotal::Total)
+            );
+
+        if (statementLine.RecId)
+        {
+            statementLine.selectForUpdate(true);
+            statementLine.SafeAmount      = totalSafeAmountCur;
+            statementLine.SafeAmountStore = totalSafeAmountStore;
+            statementLine.SafeAmountMST   = totalSafeAmountMST;
+
+            statementLine.update();
+        }
+        else
+        {
+            this.insertSafeLine(_statementTable, _transactionSafeTenderTrans, _uniqueShiftId);
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementInsertUpdateLineStart(0, "", lineType, "", 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        if (isConfigurationkeyEnabled(configurationKeyNum(RetailEOD)) || RetailEodTrickleFeedFeatureExposure::isEnabled())
+        {
+            str dictMenuLabel = "@Retail:RetailEodRetailStatementsLabel";
+
+            // Your system is configured to use the new statement posting process. Please use the form "Open statement" to execute using the new process.
+            throw error (strFmt("@Retail:RetailEodKeyEnabledFormError", dictMenuLabel));
+        }
+
+        RetailStatementCalculate statementCalculate = new RetailStatementCalculate();
+
+        statementCalculate.initFromArgs(_args);
+        statementCalculate.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Describes whether the class is designed for execution in a new session.
+    /// </summary>
+    /// <returns>
+    /// false.
+    /// </returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retailTransactionTableHasRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if there are POS transactions to be added in the retail statement.
+    /// </summary>
+    /// <param name = "_statementTable">The retail statement.</param>
+    /// <returns>True if there are POS transactions for the statement; otherwise; false.</returns>
+    public boolean retailTransactionTableHasRecords(RetailStatementTable _statementTable)
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        return this.updateRetailTransactionTableOrCheckIfRecordsExist(_statementTable, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stampRetailTransactionTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the statement Id for all POS transactions that satisfies the retail statement conditions.
+    /// </summary>
+    /// <param name = "_statementTable">The retail statement.</param>
+    public void stampRetailTransactionTable(RetailStatementTable _statementTable)
+    {
+        // If the flag to suppress obsolete errors is not set, then throw an error.
+        RetailStatementFeatureControl::checkAndThrowIfLegacyObsoleteErrorsEnabled(funcName());
+
+        this.updateRetailTransactionTableOrCheckIfRecordsExist(_statementTable, true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRetailTransactionTableOrCheckIfRecordsExist</Name>
+				<Source><![CDATA[
+    private boolean updateRetailTransactionTableOrCheckIfRecordsExist(RetailStatementTable _statementTable, boolean _updateRetailTransactionTable)
+    {
+        #macro.baseStatementRecordsCriteria(
+                    !transactionTable.statementId                                   &&
+                    transactionTable.store          == _statementTable.storeId      &&
+                    transactionTable.entryStatus    != RetailEntryStatus::Voided    &&
+                    transactionTable.entryStatus    != RetailEntryStatus::Training  &&
+                    (   transactionTable.type != RetailTransactionType::Sales ||
+                        (transactionTable.type == RetailTransactionType::Sales &&
+                            (   !enableConsistencyChecker ||
+                                (enableConsistencyChecker && transactionTable.ValidationStatus == RetailTransactionValidationStatus::Ok)
+                            )
+                        )
+                    )
+            )
+        #endmacro
+
+        RetailTransactionTable                      transactionTable;
+        boolean                                     containsRecordsInThisStatement = false;
+        RetailTransactionConsistencyCheckerStatus   enableConsistencyChecker = !RetailParameters::find().DisableTransactionConsistencyChecker;
+
+        boolean updateStatementId()
+        {
+            // Verify if the table contains the transactions that are going to be included in this statement.
+            boolean containsRecords = false;
+            
+            // If transactions are found in the time interval for the statement.
+            if (transactionTable.isInDateTimeInterval(_statementTable.transFromDate, _statementTable.transFromTime, _statementTable.transToDate, _statementTable.transToTime))
+            {
+                // Update the transaction table.
+                if (_updateRetailTransactionTable)
+                {
+                    transactionTable.IsTaxIncludedInPrice = RetailTransactionTaxTrans::readPriceInclTaxConfiguration(transactionTable);
+                    transactionTable.statementId = _statementTable.statementId;
+                    transactionTable.update();
+                }
+
+                // Return that the records exist for this statement.
+                containsRecords = true;
+            }
+
+            return containsRecords;
+        }
+
+        this.checkInvalidTransactionForDateAndTimeStatement(_statementTable);
+
+        // If the aggregation method is not staff or terminal.
+        if (!_statementTable.staffOrTerminal)
+        {
+            // Find all transactions in this statement and store.
+            while select forupdate transactionTable
+                where #baseStatementRecordsCriteria
+            {
+                // Stamp the records and return if there are records found for this statement.
+                containsRecordsInThisStatement = updateStatementId();
+
+                // Return if there is no update and we have found a record in the transaction table.
+                if (!_updateRetailTransactionTable && containsRecordsInThisStatement)
+                {
+                    return containsRecordsInThisStatement;
+                }
+            }
+        }
+        else if (_statementTable.statementMethod == RetailStaffTerminalTotal::Staff)
+        {
+            // Find all transactions for the staff if the statement method is staff.
+            while select forupdate transactionTable
+                where   #baseStatementRecordsCriteria
+                    &&  transactionTable.staff == _statementTable.staffOrTerminal
+            {
+                // Stamp the records and return if there are records found for this statement.
+                containsRecordsInThisStatement = updateStatementId();
+
+                // Return if there is no update and we have found a record in the transaction table.
+                if (!_updateRetailTransactionTable && containsRecordsInThisStatement)
+                {
+                    return containsRecordsInThisStatement;
+                }
+            }
+        }
+        else if (_statementTable.statementMethod == RetailStaffTerminalTotal::Shift)
+        {
+            // Find all transactions for the shift if the statement method is shift.
+            RetailTerminalId    batchTerminalId = RetailStatementLine::getBatchTerminalId(_statementTable.staffOrTerminal);
+            RetailPosBatchID    batchId = RetailStatementLine::getBatchId(_statementTable.staffOrTerminal);
+
+            while select forupdate transactionTable
+                where   #baseStatementRecordsCriteria
+                    &&  transactionTable.BatchTerminalId    == batchTerminalId
+                    &&  transactionTable.BatchId            == batchId
+            {
+                // Stamp the records and return if there are records found for this statement.
+                containsRecordsInThisStatement = updateStatementId();
+
+                // Return if there is no update and we have found a record in the transaction table.
+                if (!_updateRetailTransactionTable && containsRecordsInThisStatement)
+                {
+                    return containsRecordsInThisStatement;
+                }
+            }
+        }
+        else if (_statementTable.statementMethod == RetailStaffTerminalTotal::Terminal)
+        {
+            // Find all transactions for the terminal if the statement method is terminal.
+            while select forupdate transactionTable
+                where   #baseStatementRecordsCriteria
+                    &&  transactionTable.Terminal == _statementTable.staffOrTerminal
+            {
+                // Stamp the records and return if there are records found for this statement.
+                containsRecordsInThisStatement = updateStatementId();
+
+                // Return if there is no update and we have found a record in the transaction table.
+                if (!_updateRetailTransactionTable && containsRecordsInThisStatement)
+                {
+                    return containsRecordsInThisStatement;
+                }
+            }
+        }
+
+        return containsRecordsInThisStatement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

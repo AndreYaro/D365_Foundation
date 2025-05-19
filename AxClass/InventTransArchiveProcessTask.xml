@@ -1,0 +1,1651 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventTransArchiveProcessTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>InventTransArchiveProcessTask</c> class is used to run inventory transaction archiving process in batch using multiple batch tasks.
+/// </summary>
+public class InventTransArchiveProcessTask extends RunBaseBatch implements BatchRetryable
+{
+    private SysGuidString sessionId;
+    private InventTransArchiveProcessHistoryTable inventTransArchiveProcessHistoryTable;
+    private InventInstrumentationLogger logger;
+    private Set fieldsSetFromInventTransArchiveGroup;
+    private boolean isAverageCostModel;
+    private boolean isWHSItem;
+    private container transTypeOnlyAffectsLocationAndBelowContainer;
+    private Map       itemIdTransTypeToTransOriginRecIdMap;
+    private FromDate    fromDate;
+    private ToDate      toDate;
+
+    private boolean bundleMustBeClosed;
+    private boolean bundleIsTransTypeOnlyAffectsLocationAndBelow;
+
+    private static boolean isSkipInsertSumZeroFlightEnabled = InventTransArchiveSkipInsertSumZeroFlight::instance().isEnabled();
+    private static boolean isInventTransArchiveCleanUpTransWithBatchSizeEnabled = InventTransArchiveCleanUpTransWithBatchSizeFlight::instance().isEnabled();
+    private static boolean isInventTransArchiveCleanUpWithRegularTableEnabled = InventTransArchiveCleanUpWithRegularTableFlight::instance().isEnabled();
+    private static boolean isInventTransArchiveCleanUpWithLoopJoinEnabled = InventTransArchiveCleanUpWithLoopJoinFlight::instance().isEnabled();
+
+    private const str PartitionParameterName = identifierStr(Partition);
+    private const str DataAreaParameterName  = identifierStr(DataAreaId);
+    private const str SessionIdParameterName = identifierStr(SessionId);
+
+    private System.Diagnostics.Stopwatch stopWatch;
+
+    #DEFINE.CurrentVersion(1)
+    #LOCALMACRO.CurrentList
+        sessionId
+    #Endmacro
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>canGoBatchJournal</Name>
+				<Source><![CDATA[
+    public boolean canGoBatchJournal()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    public ClassDescription caption()
+    {
+        return InventTransArchiveProcessTask::description();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSessionId</Name>
+				<Source><![CDATA[
+    public SysGuidString parmSessionId(SysGuidString _sessionId = sessionId)
+    {
+        sessionId = _sessionId;
+
+        return sessionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processByBundle</Name>
+				<Source><![CDATA[
+    public void processByBundle()
+    {
+        #OCCRetryCount
+
+        boolean processContinue;
+        int64   currentBundleId;
+
+        do
+        {
+            inventTransArchiveProcessHistoryTable = InventTransArchiveProcessHistoryTable::findBySessionId(sessionId);
+
+            processContinue = inventTransArchiveProcessHistoryTable
+                && inventTransArchiveProcessHistoryTable.StopRunning == NoYes::No
+                && !inventTransArchiveProcessHistoryTable.IsReverse;
+
+            fromDate = inventTransArchiveProcessHistoryTable.FromDateOfClosedPeriod;
+            toDate   = inventTransArchiveProcessHistoryTable.EndDateOfClosedPeriod;
+
+            currentBundleId = InventTransArchiveTaskBundleHelper::getNextBundle(sessionId);
+            if (!processContinue || currentBundleId < 1)
+            {
+                break;
+            }
+
+            try
+            {
+                ttsbegin;
+                // Per bundle process, no need to reset archving task state
+                this.processArchivingBundle(currentBundleId);
+                this.removeProcessedBundle(currentBundleId);
+                ttscommit;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                retry;
+            }
+            catch (Exception::UpdateConflictNotRecovered)
+            {
+                // Skip the error and move ahead to calculate the next available task.
+            }
+            catch (Exception::Deadlock)
+            {
+                retry;
+            }
+            catch (Exception::CLRError)
+            {
+                this.handleError();
+            }
+
+        }
+        while (processContinue);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        try
+        {
+            stopwatch = new System.Diagnostics.Stopwatch();
+            stopwatch.Start();
+
+            this.processByBundle();
+        }
+        finally
+        {
+            stopWatch.Stop();
+            InventTransArchiveTaskBundleHelper::trackProcessingTime(sessionId, stopWatch.ElapsedMilliseconds);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processByTask</Name>
+				<Source><![CDATA[
+    [SysObsolete('Method is obsoleted. Use processByBundle instead.', false, 20\4\2024)]
+    public void processByTask()
+    {
+        #OCCRetryCount
+
+        InventTransArchiveTask inventTransArchiveTask;
+        boolean processContinue;
+
+        do
+        {
+            try
+            {
+                inventTransArchiveProcessHistoryTable = InventTransArchiveProcessHistoryTable::findBySessionId(sessionId);
+                processContinue = inventTransArchiveProcessHistoryTable &&
+                                    inventTransArchiveProcessHistoryTable.StopRunning == NoYes::No &&
+                                    !inventTransArchiveProcessHistoryTable.IsReverse;
+                
+                if (processContinue)
+                {
+                    ttsbegin;
+
+                    inventTransArchiveTask = InventTransArchiveTask::getNextTask(sessionId);
+                    if (!inventTransArchiveTask.RecId)
+                    {
+                        ttsabort;
+                    }
+                    else
+                    {
+                        InventTable inventTable = InventTable::find(inventTransArchiveTask.ItemId);
+                        inventTransArchiveTask.InventTransArchiveState = InventTransArchiveState::Processing;
+                        inventTransArchiveTask.ArchivedTransCounts = 0;
+                        inventTransArchiveTask.update();
+                        ttscommit;
+
+                        int64 archivedRecords;
+                        boolean isReceiptArchiveCompleted;
+                        boolean isIssueArchiveCompleted;
+
+                        isAverageCostModel = false;
+                        if (inventTransArchiveTask.MustBeClosed)
+                        {
+                            InventModelGroup inventModelGroup = InventTable::modelGroupByItemId(inventTable.ItemId, inventTable.DataAreaId);
+                            if (inventModelGroup.Inventmodel == InventModel::AverageCost        ||
+                                inventModelGroup.InventModel == InventModel::AverageCostDate    ||
+                                inventModelGroup.InventModel == InventModel::MonthlyAverageCost)
+                            {
+                                isAverageCostModel = true;
+                            }
+                        }
+
+                        isWHSItem = false;
+                        if (inventTransArchiveTask.IsTransTypeOnlyAffectsLocationAndBelow ||
+                            WHSInventEnabled::exist(inventTable.ItemId))
+                        {
+                            isWHSItem = true;
+                        }
+
+                        archivedRecords = this.processArchivingTask(inventTransArchiveTask);
+
+                        ttsbegin;
+
+                        inventTransArchiveTask.reread();
+
+                        if (!inventTransArchiveTask.selectForUpdate())
+                        {
+                            inventTransArchiveTask.selectForUpdate(true);
+                        }
+
+                        inventTransArchiveTask.skipTTSCheck(true);
+                        inventTransArchiveTask.doDelete();
+                        ttscommit;
+
+                    }
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                retry;
+            }
+            catch (Exception::UpdateConflictNotRecovered)
+            {
+                // Skip the error and move ahead to calculate the next available task.
+            }
+            catch (Exception::Deadlock)
+            {
+                retry;
+            }
+        } while (inventTransArchiveTask.RecId && processContinue);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processArchivingTask</Name>
+				<Source><![CDATA[
+    private int64 processArchivingTask(InventTransArchiveTask _inventTransArchiveTask)
+    {        
+        #OCCRetryCount
+
+        int64 archivedRecords;
+        try
+        {
+            ttsbegin;
+            // Generate query object for inserting into InventTransArchive from InventTrans which will be archived.
+            SysDaInsertObject inventTransArchiveInsertObj = this.buildInventTransArchiveInsertObject();
+            SysDaQueryObject inventTransArchiveQueryObj = this.buildInventTransQueryObjectWithProjectionFields();
+
+            archivedRecords = this.archiveInventTrans(_inventTransArchiveTask,
+                    inventTransArchiveInsertObj,
+                    inventTransArchiveQueryObj,
+                    _inventTransArchiveTask.IsTransTypeOnlyAffectsLocationAndBelow);
+
+            if (!archivedRecords)
+            {
+                // Stop to process when no records are archived
+                ttsabort;
+                return 0;
+            }
+
+            // Generate query object for consolidating archived inventTrans records into single inventTrans
+            InventTrans consolidateInventTrans;
+            SysDaQueryObject consolidateInventTransQueryObj = this.buildConsolidateInventTransQueryObjectWithProjectionFields(consolidateInventTrans);
+            InventTransOrigin inventTransOrigin;                                   
+            this.buildConsolidateInventTransQueryObject(consolidateInventTransQueryObj, inventTransOrigin, _inventTransArchiveTask, _inventTransArchiveTask.IsTransTypeOnlyAffectsLocationAndBelow);
+
+            SysDaSearchObject consolidateInventTransSearchObject = new SysDaSearchObject(consolidateInventTransQueryObj);
+            SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+
+            while (searchStatement.findNext(consolidateInventTransSearchObject))
+            {
+                this.insertInventTransSummation(consolidateInventTrans, _inventTransArchiveTask, _inventTransArchiveTask.IsTransTypeOnlyAffectsLocationAndBelow);
+            }
+
+            this.cleanUpArchivedInventTrans(_inventTransArchiveTask);
+
+            ttscommit;
+              
+            return archivedRecords;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    this.handleError();
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                this.handleError();
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                this.handleError();
+                throw;
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            ApplicationUnhandledExceptionLogger::processUnhandledCLRException();
+            archivedRecords = 0;
+            this.handleError();
+        }
+        catch
+        {
+            archivedRecords = 0;
+            this.handleError();
+        }
+
+        return archivedRecords;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>archiveInventTransByBundle</Name>
+				<Source><![CDATA[
+    private int64 archiveInventTransByBundle(int64 _bundleId)
+    {
+        SysDaQueryObject inventTransArchiveTaskQueryObject;
+        SysDaInsertObject inventTransArchiveInsertObj = this.buildInventTransArchiveInsertObject();
+        SysDaQueryObject  inventTransArchiveQueryObj  = this.buildInventTransQueryObjectWithProjectionFields();
+
+        inventTransArchiveQueryObj.whereClause(
+            this.buildInventTransQueryObjectWhereClauseByBundle(inventTransArchiveQueryObj.table()));
+
+        inventTransArchiveTaskQueryObject = this.buildInventTransArchiveTaskQueryObject(inventTransArchiveQueryObj.table(), _bundleId);
+
+        InventTransOrigin inventTransOriginArchive;
+        SysDaQueryObject inventTransOriginArchiveQueryObject;
+
+        if (isWHSItem)
+        {
+            if (conLen(transTypeOnlyAffectsLocationAndBelowContainer) == 0)
+            {
+                transTypeOnlyAffectsLocationAndBelowContainer = InventTransOrigin::buildTransTypeOnlyAffectsLocationAndBelowContainer();
+            }
+
+            if (conLen(transTypeOnlyAffectsLocationAndBelowContainer) == 0)
+            {
+                throw error("@SCM:NoReferenceOnlyAffectsLocationAndBelowFetched");
+            }
+
+            if (bundleIsTransTypeOnlyAffectsLocationAndBelow)
+            {
+                inventTransOriginArchiveQueryObject = this.buildInventTransOriginQueryObjectWithTransTypeOnlyAffectsLocationAndBelow(inventTransOriginArchive, inventTransArchiveQueryObj.table());
+            }
+            else
+            {
+                inventTransOriginArchiveQueryObject = this.buildInventTransOriginQueryObject(inventTransOriginArchive, inventTransArchiveQueryObj.table());
+                inventTransOriginArchiveQueryObject = this.excludeTransTypeOnlyAffectsLocationAndBelow(inventTransOriginArchiveQueryObject);
+            }
+        }
+        else
+        {
+            inventTransOriginArchiveQueryObject = this.buildInventTransOriginQueryObject(inventTransOriginArchive, inventTransArchiveQueryObj.table());
+        }
+
+        inventTransArchiveQueryObj
+            .joinClause(SysDaJoinKind::ExistsJoin, inventTransArchiveTaskQueryObject)
+            .joinClause(SysDaJoinKind::ExistsJoin, inventTransOriginArchiveQueryObject);
+
+        return this.insertRecords(inventTransArchiveQueryObj, inventTransArchiveInsertObj);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>archiveInventTrans</Name>
+				<Source><![CDATA[
+    private int64 archiveInventTrans(
+        InventTransArchiveTask _inventTransArchiveTask,
+        SysDaInsertObject      _inventTransArchiveInsertObj,
+        SysDaQueryObject       _inventTransArchiveQueryObj,
+        boolean                _isConsidertransTypeOnlyAffectsLocationAndBelow)
+    {
+        SysDaQueryObject inventTransArchiveTaskQueryObject;
+
+        _inventTransArchiveQueryObj.whereClause(
+            this.buildInventTransQueryObjectWhereClauseByBundle(_inventTransArchiveQueryObj.table()));
+
+        inventTransArchiveTaskQueryObject = this.buildInventTransArchiveTaskQueryObject(
+            _inventTransArchiveQueryObj.table(),
+            _inventTransArchiveTask.BundleId);
+
+        InventTransOrigin inventTransOriginArchive;
+        SysDaQueryObject inventTransOriginArchiveQueryObject;
+
+        if (isWHSItem)
+        {
+            if (conLen(transTypeOnlyAffectsLocationAndBelowContainer) == 0)
+            {
+                transTypeOnlyAffectsLocationAndBelowContainer = InventTransOrigin::buildTransTypeOnlyAffectsLocationAndBelowContainer();
+            }
+
+            if (conLen(transTypeOnlyAffectsLocationAndBelowContainer) == 0)
+            {
+                throw error("@SCM:NoReferenceOnlyAffectsLocationAndBelowFetched");
+            }
+
+            if (_isConsidertransTypeOnlyAffectsLocationAndBelow)
+            {
+                inventTransOriginArchiveQueryObject = this.buildInventTransOriginQueryObjectWithTransTypeOnlyAffectsLocationAndBelow(inventTransOriginArchive, _inventTransArchiveQueryObj.table());
+            }
+            else
+            {
+                inventTransOriginArchiveQueryObject = this.buildInventTransOriginQueryObject(inventTransOriginArchive, _inventTransArchiveQueryObj.table());
+                inventTransOriginArchiveQueryObject = this.excludeTransTypeOnlyAffectsLocationAndBelow(inventTransOriginArchiveQueryObject);
+            }
+        }
+        else
+        {
+            inventTransOriginArchiveQueryObject = this.buildInventTransOriginQueryObject(inventTransOriginArchive, _inventTransArchiveQueryObj.table());
+        }
+
+        _inventTransArchiveQueryObj
+            .joinClause(SysDaJoinKind::ExistsJoin, inventTransOriginArchiveQueryObject)
+            .joinClause(SysDaJoinKind::ExistsJoin, inventTransArchiveTaskQueryObject);
+
+        return this.insertRecords(_inventTransArchiveQueryObj, _inventTransArchiveInsertObj);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventTransArchiveTaskQueryObject</Name>
+				<Source><![CDATA[
+    private SysDaQueryObject buildInventTransArchiveTaskQueryObject(InventTrans _inventTrans, int64 _bundleId)
+    {
+        InventTransArchiveTask  inventTransOriginArchiveTask;
+
+        SysDaQueryExpression whereClause =
+            new SysDaEqualsExpression(
+                new SysDaFieldExpression(inventTransOriginArchiveTask, fieldStr(InventTransArchiveTask, ItemId)),
+                new SysDaFieldExpression(_inventTrans, fieldStr(InventTrans, ItemId)))
+            .and(new SysDaEqualsExpression(
+                new SysDaFieldExpression(inventTransOriginArchiveTask, fieldStr(InventTransArchiveTask, InventDimId)),
+                new SysDaFieldExpression(_inventTrans, fieldStr(InventTrans, InventDimId))))
+            .and(new SysDaEqualsExpression(
+                new SysDaFieldExpression(inventTransOriginArchiveTask, fieldStr(InventTransArchiveTask, BundleId)),
+                new SysDaValueExpression(_bundleId)))
+            .and(new SysDaEqualsExpression(
+                 new SysDaFieldExpression(inventTransOriginArchiveTask, fieldStr(InventTransArchiveTask, SessionId)),
+                 new SysDaValueExpression(sessionId)));
+
+        SysDaQueryObject sysDaQueryObjectInventTransArchiveTask = new SysDaQueryObject(inventTransOriginArchiveTask);
+        sysDaQueryObjectInventTransArchiveTask.whereClause(whereClause);
+
+        return sysDaQueryObjectInventTransArchiveTask;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildConsolidateInventTransQueryObjectByBundle</Name>
+				<Source><![CDATA[
+    private void buildConsolidateInventTransQueryObjectByBundle(SysDaQueryObject _consolidateInventTransQueryObj, int64 _bundleId)
+    {
+        InventTrans consolidateInventTrans = _consolidateInventTransQueryObj.table();
+        InventTransOrigin   inventTransOrigin;
+
+        _consolidateInventTransQueryObj
+            .groupByClause(this.consolidateInventTransGroupByClause());
+
+        _consolidateInventTransQueryObj
+            .whereclause(this.buildInventTransQueryObjectWhereClauseByBundle(consolidateInventTrans));
+
+        SysDaQueryObject inventTransArchiveTaskQueryObject =
+            this.buildInventTransArchiveTaskQueryObject(consolidateInventTrans, _bundleId);
+
+        SysDaQueryObject sysDaQueryObjectInventTransOrigin;
+
+        if (isWHSItem)
+        {
+            if (bundleIsTransTypeOnlyAffectsLocationAndBelow)
+            {
+                sysDaQueryObjectInventTransOrigin = this.buildInventTransOriginQueryObjectWithTransTypeOnlyAffectsLocationAndBelow(inventTransOrigin, consolidateInventTrans);
+            }
+            else
+            {
+                sysDaQueryObjectInventTransOrigin = this.buildInventTransOriginQueryObject(inventTransOrigin, consolidateInventTrans);
+                sysDaQueryObjectInventTransOrigin = this.excludeTransTypeOnlyAffectsLocationAndBelow(sysDaQueryObjectInventTransOrigin);
+            }
+        }
+        else
+        {
+            sysDaQueryObjectInventTransOrigin = this.buildInventTransOriginQueryObject(inventTransOrigin, consolidateInventTrans);
+        }
+
+        _consolidateInventTransQueryObj
+            .joinClause(SysDaJoinKind::ExistsJoin, inventTransArchiveTaskQueryObject)
+            .joinClause(SysDaJoinKind::ExistsJoin, sysDaQueryObjectInventTransOrigin);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>consolidateInventTransGroupByClause</Name>
+				<Source><![CDATA[
+    protected SysDaGroupBys consolidateInventTransGroupByClause()
+    {
+        SysDaGroupBys inventTransGroupBys = new SysDaGroupBys()
+            .add(fieldStr(InventTrans, ItemId))
+            .add(fieldStr(InventTrans, InventDimId));
+
+        return inventTransGroupBys;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildConsolidateInventTransQueryObject</Name>
+				<Source><![CDATA[
+    private void buildConsolidateInventTransQueryObject(
+        SysDaQueryObject        _consolidateInventTransQueryObj,
+        InventTransOrigin       _inventTransOrigin,
+        InventTransArchiveTask  _inventTransArchiveTask,
+        boolean                 _isConsidertransTypeOnlyAffectsLocationAndBelow)
+    {
+        InventTrans consolidateInventTrans = _consolidateInventTransQueryObj.table();
+        _consolidateInventTransQueryObj.whereclause(this.buildInventTransQueryObjectWhereClause(consolidateInventTrans, _inventTransArchiveTask));
+
+        SysDaQueryObject sysDaQueryObjectInventTransOrigin;
+
+        if (isWHSItem)
+        {
+            if (_isConsidertransTypeOnlyAffectsLocationAndBelow)
+            {
+                sysDaQueryObjectInventTransOrigin = this.buildInventTransOriginQueryObjectWithTransTypeOnlyAffectsLocationAndBelow(_inventTransOrigin, consolidateInventTrans);
+            }
+            else
+            {
+                sysDaQueryObjectInventTransOrigin = this.buildInventTransOriginQueryObject(_inventTransOrigin, consolidateInventTrans);
+                sysDaQueryObjectInventTransOrigin = this.excludeTransTypeOnlyAffectsLocationAndBelow(sysDaQueryObjectInventTransOrigin);
+            }
+        }
+        else
+        {
+            sysDaQueryObjectInventTransOrigin = this.buildInventTransOriginQueryObject(_inventTransOrigin, consolidateInventTrans);
+        }
+
+        _consolidateInventTransQueryObj.joinClause(SysDaJoinKind::ExistsJoin, sysDaQueryObjectInventTransOrigin);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpArchivedInventTrans</Name>
+				<Source><![CDATA[
+    protected void cleanUpArchivedInventTrans(InventTransArchiveTask _inventTransArchiveTask)
+    {
+        InventTransArchive inventTransArchive;
+        InventTrans        inventTrans;
+
+        inventTrans.skipDataMethods(true);
+        inventTrans.skipEvents(true);
+        inventTrans.skipDatabaseLog(true);
+        inventTrans.skipDeleteActions(true);
+
+        delete_from inventTrans
+            where inventTrans.InventDimId == _inventTransArchiveTask.InventDimId
+                && inventTrans.ItemId      == _inventTransArchiveTask.ItemId
+            exists join inventTransArchive
+                where inventTransArchive.SessionId    == sessionId
+                   && inventTransArchive.InventTrans  == inventTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleError</Name>
+				<Source><![CDATA[
+    private void handleError()
+    {        
+        ttsbegin;
+        inventTransArchiveProcessHistoryTable = InventTransArchiveProcessHistoryTable::findBySessionId(sessionId, true);
+
+        inventTransArchiveProcessHistoryTable.StopRunning = NoYes::Yes;
+        inventTransArchiveProcessHistoryTable.update();
+        ttscommit;
+
+        error("@SCM:InventTransArchiveErrorV2");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runsImpersonated</Name>
+				<Source><![CDATA[
+    public boolean runsImpersonated()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Integer version = RunBase::getVersion(_packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = _packedClass;
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    private static InventTransArchiveProcessTask construct()
+    {
+        return new InventTransArchiveProcessTask();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        if (InventTransArchiveFeatureHelper::isFeatureEnabled())
+        {
+            return "@SCM:InventTransArchiveProcessDescriptionV2";
+        }
+
+        return "@SCM:InventTransArchiveProcessDescription";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromParameters</Name>
+				<Source><![CDATA[
+    public static InventTransArchiveProcessTask newFromParameters(SysGuidString _sessionId)
+    {
+        InventTransArchiveProcessTask inventTransArchiveProcessTask;
+
+        if (!_sessionId)
+        {
+            throw error(Error::wrongUseOfFunction(funcname()));
+        }
+
+        inventTransArchiveProcessTask = InventTransArchiveProcessTask::construct();
+        inventTransArchiveProcessTask.getLast();
+
+        inventTransArchiveProcessTask.parmSessionId(_sessionId);
+
+        return inventTransArchiveProcessTask;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventTransArchiveInsertObject</Name>
+				<Source><![CDATA[
+    private SysDaInsertObject buildInventTransArchiveInsertObject()
+    {
+        InventTransArchive destInventTransArchive;
+        destInventTransArchive.skipDataMethods(true);
+        destInventTransArchive.skipDatabaseLog(true);
+        destInventTransArchive.skipEvents(true);
+
+        SysDaInsertObject inventTransArchiveInsertObject = new SysDaInsertObject(destInventTransArchive);
+        SysDaSelection selectionObject = inventTransArchiveInsertObject.fields();
+        this.addInventTransArchiveFields(selectionObject);
+        this.addLiteralFieldsToInventTransArchiveInsertObject(selectionObject);
+        return inventTransArchiveInsertObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addInventTransArchiveFields</Name>
+				<Source><![CDATA[
+    protected void addInventTransArchiveFields(SysDaSelection _selectionObject)
+    { 
+        _selectionObject.add(fieldStr(InventTransArchive, InventTrans))
+            .add(fieldStr(InventTransArchive, InventTransModifiedDateTime));
+
+        if (!fieldsSetFromInventTransArchiveGroup)
+        {
+            fieldsSetFromInventTransArchiveGroup = InventTransArchiveSqlStatementHelper::contruct().getInventTransFieldsSet();
+        }
+        SetEnumerator fieldsEnumerator = fieldsSetFromInventTransArchiveGroup.getEnumerator();
+        FieldName inventTransFieldName;
+        FieldId inventTransArchiveFieldId;
+        SysDictField dictField;
+        while (fieldsEnumerator.moveNext())
+        {
+            dictField = new SysDictField(tableNum(InventTrans), fieldsEnumerator.current());
+            if (dictField.saveContents())
+            {
+                inventTransFieldName = dictField.name();
+                inventTransArchiveFieldId = fieldName2Id(tableNum(InventTransArchive), inventTransFieldName);
+                if (!inventTransArchiveFieldId)
+                {
+                    throw error(strFmt("@SCM:ArchivingFieldsMissedInInventTransArchiveTable", inventTransFieldName));
+                }
+                _selectionObject.add(fieldId2Name(tableNum(InventTransArchive), inventTransArchiveFieldId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addLiteralFieldsToInventTransArchiveInsertObject</Name>
+				<Source><![CDATA[
+    protected void addLiteralFieldsToInventTransArchiveInsertObject(SysDaSelection _selectionObject)
+    {
+        _selectionObject.add(fieldStr(InventTransArchive, SessionId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventTransQueryObjectWithProjectionFields</Name>
+				<Source><![CDATA[
+    private SysDaQueryObject buildInventTransQueryObjectWithProjectionFields()
+    {
+        InventTrans sourceInventTrans;
+        
+        SysDaQueryObject inventTransQueryObject = new SysDaQueryObject(sourceInventTrans);
+        this.addInventTransFields(inventTransQueryObject.projection());
+        this.addLiteralFieldsToQueryObject(inventTransQueryObject.projection());
+        return inventTransQueryObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addInventTransFields</Name>
+				<Source><![CDATA[
+    protected void addInventTransFields(SysDaSelection _selectionObject)
+    {
+        _selectionObject.add(fieldStr(InventTrans, RecId))
+            .add(fieldStr(InventTrans, ModifiedDateTime));
+
+        if (!fieldsSetFromInventTransArchiveGroup)
+        {
+            fieldsSetFromInventTransArchiveGroup = InventTransArchiveSqlStatementHelper::contruct().getInventTransFieldsSet();
+        }
+
+        SetEnumerator fieldsEnumerator = fieldsSetFromInventTransArchiveGroup.getEnumerator();
+        SysDictField dictField;
+        while (fieldsEnumerator.moveNext())
+        {
+            dictField = new SysDictField(tableNum(InventTrans), fieldsEnumerator.current());
+            if (dictField.saveContents())
+            {
+                _selectionObject.add(fieldId2Name(tableNum(InventTrans), fieldsEnumerator.current()));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addLiteralFieldsToQueryObject</Name>
+				<Source><![CDATA[
+    protected void addLiteralFieldsToQueryObject(SysDaSelection _selectionObject)
+    {
+        _selectionObject.addValue(this.parmSessionId()); //InventTransArchive.SessionId
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildConsolidateInventTransQueryObjectWithProjectionFields</Name>
+				<Source><![CDATA[
+    private SysDaQueryObject buildConsolidateInventTransQueryObjectWithProjectionFields(InventTrans _sourceInventTrans)
+    {
+        SysDaQueryObject inventTransQueryObject = new SysDaQueryObject(_sourceInventTrans);
+        this.buildConsolidateInventTransQueryProjection(inventTransQueryObject.projection());
+        return inventTransQueryObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildConsolidateInventTransQueryProjection</Name>
+				<Source><![CDATA[
+    protected void buildConsolidateInventTransQueryProjection(SysDaSelection _selectionObject)
+    {
+        _selectionObject
+            .addSum(fieldStr(InventTrans, Qty))
+            .addSum(fieldStr(InventTrans, PdsCWQty))
+            .addSum(fieldStr(InventTrans, QtySettled))
+            .addSum(fieldStr(InventTrans, PdsCWSettled))
+            .addSum(fieldStr(InventTrans, QTYSETTLEDSECCUR_RU))
+            .addSum(fieldStr(InventTrans, CostAmountAdjustment))
+            .addSum(fieldStr(InventTrans, CostAmountOperations))
+            .addSum(fieldStr(InventTrans, CostAmountPhysical))
+            .addSum(fieldStr(InventTrans, CostAmountPosted))
+            .addSum(fieldStr(InventTrans, CostAmountSecCurAdjustment_RU))
+            .addSum(fieldStr(InventTrans, CostAmountSecCurPhysical_RU))
+            .addSum(fieldStr(InventTrans, CostAmountSecCurPosted_RU))
+            .addSum(fieldStr(InventTrans, CostAmountSettled))
+            .addSum(fieldStr(InventTrans, CostAmountSettledSecCur_RU))
+            .addSum(fieldStr(InventTrans, CostAmountStd))
+            .addSum(fieldStr(InventTrans, CostAmountStdSecCur_RU));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventTransQueryObjectWhereClauseByBundle</Name>
+				<Source><![CDATA[
+    private SysDaQueryExpression buildInventTransQueryObjectWhereClauseByBundle(InventTrans _sourceInventTrans)
+    {
+        SysDaQueryExpression queryExpression = new SysDaEqualsExpression(
+            new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, ProjId)), new SysDaValueExpression(''));
+
+        if (bundleMustBeClosed)
+        {
+            queryExpression = queryExpression.and(new SysDaEqualsExpression(
+                new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, ValueOpen)),
+                new SysDaValueExpression(InventTransOpen::No)));
+        }
+
+        // Treats already financial updated when transacton has financial date
+        var returnQuery = queryExpression
+            .and(new SysDaGreaterThanOrEqualsExpression(
+                new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, DateFinancial)), new SysDaValueExpression(fromDate)))
+            .and(new SysDaLessThanOrEqualsExpression(
+                new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, DateFinancial)), new SysDaValueExpression(toDate)));
+
+        return returnQuery;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventTransQueryObjectWhereClause</Name>
+				<Source><![CDATA[
+    private SysDaQueryExpression buildInventTransQueryObjectWhereClause(InventTrans _sourceInventTrans, InventTransArchiveTask _inventTransArchiveTask)
+    {
+        SysDaQueryExpression queryExpression = new SysDaEqualsExpression(
+             new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, ItemId)), new SysDaValueExpression(_inventTransArchiveTask.ItemId))
+            .and(new SysDaEqualsExpression(
+                new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, InventDimId)), new SysDaValueExpression(_inventTransArchiveTask.InventDimId)))
+            .and(new SysDaEqualsExpression(
+                new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, ProjId)), new SysDaValueExpression('')));
+                
+        if (_inventTransArchiveTask.MustBeClosed)
+        {
+            queryExpression = queryExpression.and(new SysDaEqualsExpression(
+                new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, ValueOpen)), new SysDaValueExpression(InventTransOpen::No)));
+        }
+
+        // Treats already financial updated when transacton has financial date
+        return queryExpression
+            .and(new SysDaGreaterThanOrEqualsExpression(
+                new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, DateFinancial)), new SysDaValueExpression(fromDate)))
+            .and(new SysDaLessThanOrEqualsExpression(
+                new SysDaFieldExpression(_sourceInventTrans, fieldStr(InventTrans, DateFinancial)), new SysDaValueExpression(toDate)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecords</Name>
+				<Source><![CDATA[
+    private int64 insertRecords(SysDaQueryObject _queryObject, SysDaInsertObject _insertObject)
+    {
+        _insertObject.query(_queryObject);
+
+        SysDaInsertStatement insertStatement = new SysDaInsertStatement();
+
+        insertStatement.insert(_insertObject);
+        InventTransArchive inventTransArchive = _insertObject.target() as InventTransArchive;
+        return inventTransArchive.RowCount();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertInventTransSummation</Name>
+				<Source><![CDATA[
+    protected void insertInventTransSummation(
+        InventTrans            _consolidateInventTrans,
+        InventTransArchiveTask _inventTransArchiveTask,
+        boolean                _isConsidertransTypeOnlyAffectsLocationAndBelow = false)
+    {
+        InventTrans inventTransSum = this.initInventTransSummation(_consolidateInventTrans, _inventTransArchiveTask);
+
+        InventTransOrigin inventTransOrigin;
+        inventTransOrigin.ItemId = inventTransSum.ItemId;
+
+        if (_isConsidertransTypeOnlyAffectsLocationAndBelow)
+        {
+            inventTransOrigin.ReferenceCategory = InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow;
+        }
+        else
+        {
+            inventTransOrigin.ReferenceCategory = InventTransType::InventTransArchive;
+        }
+
+        if (_inventTransArchiveTask.MustBeClosed || _isConsidertransTypeOnlyAffectsLocationAndBelow)
+        {
+            inventTransSum.ValueOpen = InventTransOpen::No;
+            // <GEERU>
+            inventTransSum.ValueOpenSecCur_RU = InventTransOpen::No;
+            // </GEERU>
+            inventTransSum.DateClosed = toDate;
+            inventTransSum.DateClosedSecCur_RU = toDate;
+        }
+        else
+        {
+            inventTransSum.ValueOpen = InventTransOpen::Yes;
+            // <GEERU>
+            inventTransSum.ValueOpenSecCur_RU = InventTransOpen::Yes;
+            // </GEERU>
+            inventTransSum.setClosedOpen();
+            inventTransSum.setClosedOpenSecCur_RU();
+        }
+
+        if (inventTransSum.Qty > 0 || inventTransSum.PdsCWQty > 0 || (inventTransSum.CostAmountPosted + inventTransSum.CostAmountAdjustment) > 0)
+        {
+            inventTransSum.StatusReceipt = StatusReceipt::Purchased;
+        }
+        else
+        {
+            inventTransSum.StatusIssue = StatusIssue::Sold;
+        }
+
+        // If map not created or the map elements has been over the max count
+        if (!itemIdTransTypeToTransOriginRecIdMap || itemIdTransTypeToTransOriginRecIdMap.elements() >= this.getItemIdTransTypeToTransOriginRecIdMapMaxCount())
+        {
+            itemIdTransTypeToTransOriginRecIdMap = new Map(Types::String, Types::Int64);
+        }
+
+        str mapKey = inventTransSum.ItemId + '#'  + enum2Value(inventTransOrigin.ReferenceCategory);
+        RecId inventTransOriginRecid;
+
+        // If exists in the map, lookup the inventTransOriginRecId by the key
+        if (itemIdTransTypeToTransOriginRecIdMap.exists(mapKey))
+        {
+            inventTransOriginRecId = itemIdTransTypeToTransOriginRecIdMap.lookup(mapKey);
+        }
+        else
+        {
+            InventTrans inventTrans;
+            InventTransOrigin inventTransOriginLocal;
+
+            select firstonly RecId from inventTransOriginLocal
+            where inventTransOriginLocal.ItemId == inventTransOrigin.ItemId
+                && inventTransOriginLocal.ReferenceCategory == inventTransOrigin.ReferenceCategory
+            exists join inventTrans
+            where inventTrans.ItemId            == inventTransOrigin.ItemId
+                && inventTrans.DatePhysical      == toDate
+                && inventTrans.DateFinancial     == toDate
+                && inventTrans.InventTransOrigin == inventTransOriginLocal.RecId;
+
+            if (inventTransOriginLocal.RecId)
+            {
+                inventTransOriginRecid = inventTransOriginLocal.RecId;
+            }
+            else
+            {
+                inventTransOrigin.InventTransId = NumberSeq::newGetNum(InventParameters::numRefInventTransId()).num();
+                inventTransOrigin.doInsert();
+                inventTransOriginRecid = inventTransOrigin.RecId;
+            }
+
+            // If not exists, create inventTransOrigin and put into map.
+            itemIdTransTypeToTransOriginRecIdMap.add(mapKey, inventTransOriginRecid);
+        }
+
+        inventTransSum.InventTransOrigin = inventTransOriginRecid;
+
+        inventTransSum.doInsert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertInventTransSummationByBundle</Name>
+				<Source><![CDATA[
+    protected void insertInventTransSummationByBundle(InventTrans _consolidateInventTrans)
+    {
+        InventTrans inventTransSum = this.initInventTransSummationByBundle(_consolidateInventTrans);
+
+        InventTransOrigin inventTransOrigin;
+        inventTransOrigin.ItemId = inventTransSum.ItemId;
+
+        if (bundleIsTransTypeOnlyAffectsLocationAndBelow)
+        {
+            inventTransOrigin.ReferenceCategory = InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow;
+        }
+        else
+        {
+            inventTransOrigin.ReferenceCategory = InventTransType::InventTransArchive;
+        }
+       
+        if (bundleMustBeClosed || bundleIsTransTypeOnlyAffectsLocationAndBelow)
+        {
+            inventTransSum.ValueOpen = InventTransOpen::No;
+            // <GEERU>
+            inventTransSum.ValueOpenSecCur_RU = InventTransOpen::No;
+            // </GEERU>
+            inventTransSum.DateClosed = toDate;
+            inventTransSum.DateClosedSecCur_RU = toDate;
+        }
+        else
+        {
+            inventTransSum.ValueOpen = InventTransOpen::Yes;
+            // <GEERU>
+            inventTransSum.ValueOpenSecCur_RU = InventTransOpen::Yes;
+            // </GEERU>
+            inventTransSum.setClosedOpen();
+            inventTransSum.setClosedOpenSecCur_RU();
+        }
+
+        if (inventTransSum.Qty > 0 || inventTransSum.PdsCWQty > 0 || (inventTransSum.CostAmountPosted + inventTransSum.CostAmountAdjustment) > 0)
+        {
+            inventTransSum.StatusReceipt = StatusReceipt::Purchased;
+        }
+        else
+        {
+            inventTransSum.StatusIssue = StatusIssue::Sold;
+        }
+
+        // If map not created or the map elements has been over the max count
+        if (!itemIdTransTypeToTransOriginRecIdMap || itemIdTransTypeToTransOriginRecIdMap.elements() >= this.getItemIdTransTypeToTransOriginRecIdMapMaxCount())
+        {
+            itemIdTransTypeToTransOriginRecIdMap = new Map(Types::String, Types::Int64);
+        }
+
+        str mapKey = inventTransSum.ItemId + '#'  + enum2Value(inventTransOrigin.ReferenceCategory);
+        RecId inventTransOriginRecid;
+
+        // If exists in the map, lookup the inventTransOriginRecId by the key
+        if (itemIdTransTypeToTransOriginRecIdMap.exists(mapKey))
+        {
+            inventTransOriginRecId = itemIdTransTypeToTransOriginRecIdMap.lookup(mapKey);
+        }
+        else
+        {
+            InventTrans inventTrans;
+            InventTransOrigin inventTransOriginLocal;
+
+            select firstonly RecId from inventTransOriginLocal
+            where inventTransOriginLocal.ItemId == inventTransOrigin.ItemId
+                && inventTransOriginLocal.ReferenceCategory == inventTransOrigin.ReferenceCategory
+            exists join inventTrans
+            where inventTrans.ItemId            == inventTransOrigin.ItemId
+                && inventTrans.DatePhysical      == toDate
+                && inventTrans.DateFinancial     == toDate
+                && inventTrans.InventTransOrigin == inventTransOriginLocal.RecId;
+
+            if (inventTransOriginLocal.RecId)
+            {
+                inventTransOriginRecid = inventTransOriginLocal.RecId;
+            }
+            else
+            {
+                inventTransOrigin.InventTransId = NumberSeq::newGetNum(InventParameters::numRefInventTransId()).num();
+                inventTransOrigin.doInsert();
+                inventTransOriginRecid = inventTransOrigin.RecId;
+            }
+
+            // If not exists, create inventTransOrigin and put into map.
+            itemIdTransTypeToTransOriginRecIdMap.add(mapKey, inventTransOriginRecid);
+        }
+
+        inventTransSum.InventTransOrigin = inventTransOriginRecid;
+
+        inventTransSum.doInsert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getItemIdTransTypeToTransOriginRecIdMapMaxCount</Name>
+				<Source><![CDATA[
+    protected int getItemIdTransTypeToTransOriginRecIdMapMaxCount()
+    {
+        return 20000;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldSkipInsertInventTrans</Name>
+				<Source><![CDATA[
+    private boolean shouldSkipInsertInventTrans(InventTrans _consolidateInventTrans)
+    {
+        return _consolidateInventTrans.Qty                           == 0
+            && _consolidateInventTrans.PdsCWQty                      == 0
+            && _consolidateInventTrans.QtySettled                    == 0
+            && _consolidateInventTrans.PdsCWSettled                  == 0
+            && _consolidateInventTrans.QtySettledSecCur_RU           == 0
+            && _consolidateInventTrans.CostAmountAdjustment          == 0
+            && _consolidateInventTrans.CostAmountOperations          == 0
+            && _consolidateInventTrans.CostAmountPhysical            == 0
+            && _consolidateInventTrans.CostAmountPosted              == 0
+            && _consolidateInventTrans.CostAmountSecCurAdjustment_RU == 0
+            && _consolidateInventTrans.CostAmountSecCurPhysical_RU   == 0
+            && _consolidateInventTrans.CostAmountSecCurPosted_RU     == 0
+            && _consolidateInventTrans.CostAmountSettled             == 0
+            && _consolidateInventTrans.CostAmountSettledSecCur_RU    == 0
+            && _consolidateInventTrans.CostAmountStd                 == 0
+            && _consolidateInventTrans.CostAmountStdSecCur_RU        == 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initInventTransSummationByBundle</Name>
+				<Source><![CDATA[
+    private InventTrans initInventTransSummationByBundle(InventTrans _consolidateInventTrans)
+    {
+        InventTrans inventTransSum = null;
+
+        inventTransSum.data(_consolidateInventTrans);
+        inventTransSum.DatePhysical  = toDate;
+        inventTransSum.DateFinancial = toDate;
+        inventTransSum.DateExpected  = toDate;
+        inventTransSum.DateInvent    = toDate;
+        inventTransSum.DateStatus    = toDate;
+
+        return inventTransSum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initInventTransSummation</Name>
+				<Source><![CDATA[
+    private InventTrans initInventTransSummation(InventTrans _consolidateInventTrans, InventTransArchiveTask _inventTransArchiveTask)
+    {
+        InventTrans inventTransSum = null;
+
+        inventTransSum.data(_consolidateInventTrans);
+        inventTransSum.ItemId        = _inventTransArchiveTask.ItemId;
+        InventTransSum.InventDimId   = _inventTransArchiveTask.InventDimId;
+        inventTransSum.DatePhysical  = toDate;
+        inventTransSum.DateFinancial = toDate;
+        inventTransSum.DateExpected  = toDate;
+        inventTransSum.DateInvent    = toDate;
+        inventTransSum.DateStatus    = toDate;
+
+        return inventTransSum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventTransOriginQueryObject</Name>
+				<Source><![CDATA[
+    private SysDaQueryObject buildInventTransOriginQueryObject(InventTransOrigin _inventTransOrigin, InventTrans _inventTrans)
+    {
+        SysDaQueryExpression whereClause =
+            new SysDaEqualsExpression(
+                new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, RecId)),
+                new SysDaFieldExpression(_inventTrans, fieldStr(InventTrans, InventTransOrigin)))
+            .and(new SysDaEqualsExpression(new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, IsExcludedFromInventoryValue)), new SysDaValueExpression(NoYes::No)));
+        
+        whereClause = whereClause
+            .and(new SysDaNotEqualsExpression(new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, ReferenceCategory)), 
+                                              new SysDaValueExpression(InventTransType::InventTransArchive)));
+        if (isWHSItem)
+        {
+            whereClause = whereClause
+                .and(new SysDaNotEqualsExpression(new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, ReferenceCategory)), 
+                                              new SysDaValueExpression(InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow)));
+        }
+
+        if (isAverageCostModel || bundleMustBeClosed)
+        {
+            whereClause = whereClause.and(new SysDaNotEqualsExpression(new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, ReferenceCategory)), 
+                                                                       new SysDaValueExpression(InventTransType::SummedUp)));
+        }
+
+        SysDaQueryObject sysDaQueryObjectInventTransOrigin = new SysDaQueryObject(_inventTransOrigin);
+        sysDaQueryObjectInventTransOrigin.whereClause(whereClause);
+        return sysDaQueryObjectInventTransOrigin;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>excludeTransTypeOnlyAffectsLocationAndBelow</Name>
+				<Source><![CDATA[
+    private SysDaQueryObject excludeTransTypeOnlyAffectsLocationAndBelow(SysDaQueryObject _sysDaQueryObjectInventTransOrigin)
+    {
+        InventTransOrigin inventTransOrigin = _sysDaQueryObjectInventTransOrigin.table();
+ 
+        SysDaQueryExpression excludetransTypeQueryExpression;
+        for (int i = 1; i <= conLen(transTypeOnlyAffectsLocationAndBelowContainer); ++i)
+        {
+            InventTransType transType = conPeek(transTypeOnlyAffectsLocationAndBelowContainer, i);
+            if (i == 1)
+            {
+                excludetransTypeQueryExpression = new SysDaNotEqualsExpression(
+                    new SysDaFieldExpression(inventTransOrigin, fieldStr(InventTransOrigin, ReferenceCategory)),
+                    new SysDaValueExpression(transType));
+            }
+            else
+            {
+
+                excludetransTypeQueryExpression = excludetransTypeQueryExpression.and(
+                    new SysDaNotEqualsExpression(new SysDaFieldExpression(inventTransOrigin, fieldStr(InventTransOrigin, ReferenceCategory)),
+                    new SysDaValueExpression(transType)));
+            }
+        }
+        
+        SysDaQueryExpression whereClause = _sysDaQueryObjectInventTransOrigin.whereClause().and(excludetransTypeQueryExpression);
+        _sysDaQueryObjectInventTransOrigin.whereClause(whereClause);
+        return _sysDaQueryObjectInventTransOrigin;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventTransOriginQueryObjectWithTransTypeOnlyAffectsLocationAndBelow</Name>
+				<Source><![CDATA[
+    private SysDaQueryObject buildInventTransOriginQueryObjectWithTransTypeOnlyAffectsLocationAndBelow(InventTransOrigin _inventTransOrigin, InventTrans _inventTrans)
+    {
+        SysDaQueryObject sysDaQueryObjectInventTransOrigin = new SysDaQueryObject(_inventTransOrigin);
+        SysDaQueryExpression whereClause = new SysDaEqualsExpression(
+                new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, RecId)),
+                new SysDaFieldExpression(_inventTrans, FieldStr(InventTrans, InventTransOrigin)))
+            .and(new SysDaEqualsExpression(new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, IsExcludedFromInventoryValue)),
+                                           new SysDaValueExpression(NoYes::No)));
+
+        SysDaQueryExpression transTypeOnlyAffectsLocationAndBelowQueryExpression;
+        for (int i = 1; i <= conLen(transTypeOnlyAffectsLocationAndBelowContainer); ++i)
+        {
+            InventTransType transType = conPeek(transTypeOnlyAffectsLocationAndBelowContainer, i);
+            if (i == 1)
+            {
+                transTypeOnlyAffectsLocationAndBelowQueryExpression = new SysDaEqualsExpression(
+                    new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, ReferenceCategory)),
+                    new SysDaValueExpression(transType));
+            }
+            else
+            {
+
+                transTypeOnlyAffectsLocationAndBelowQueryExpression = transTypeOnlyAffectsLocationAndBelowQueryExpression.or(
+                    new SysDaEqualsExpression(new SysDaFieldExpression(_inventTransOrigin, fieldStr(InventTransOrigin, ReferenceCategory)),
+                                              new SysDaValueExpression(transType)));
+            }
+
+        }
+
+        whereclause = whereclause.and(transTypeOnlyAffectsLocationAndBelowQueryExpression);
+        sysDaQueryObjectInventTransOrigin.whereClause(whereclause);
+        return sysDaQueryObjectInventTransOrigin;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    final boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpArchivedInventTransByBundle</Name>
+				<Source><![CDATA[
+    protected void cleanUpArchivedInventTransByBundle(int64 _bundleId)
+    {
+        InventTransArchive      inventTransArchive;
+        InventTransArchiveTask  inventTransArchiveTask;
+
+        TmpRecIdFilter          tmpRecIdFilter;
+
+        insert_recordset tmpRecIdFilter (RefRecId)
+        select InventTrans from inventTransArchive
+            where inventTransArchive.SessionId == sessionId
+            exists join inventTransArchiveTask
+            where inventTransArchiveTask.ItemId == inventTransArchive.ItemId
+                && inventTransArchiveTask.InventDimId == inventTransArchive.InventDimId
+                && inventTransArchiveTask.BundleId == _bundleId
+                && inventTransArchiveTask.SessionId == sessionId;
+
+        int64 toBeDeletedRowCounts = tmpRecIdFilter.RowCount();
+
+        if (toBeDeletedRowCounts)
+        {
+            InventTrans             inventTrans;
+
+            inventTrans.skipDataMethods(true);
+            inventTrans.skipEvents(true);
+            inventTrans.skipDatabaseLog(true);
+            inventTrans.skipDeleteActions(true);
+
+            delete_from inventTrans
+                exists join tmpRecIdFilter
+                where inventTrans.RecId == tmpRecIdFilter.RefRecId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpArchivedInventTransWithBatchSize</Name>
+				<Source><![CDATA[
+    protected void cleanUpArchivedInventTransWithBatchSize()
+    {
+        int recordsToDeleteBatchSize = this.getRecordsToDeleteBatchSize();
+        str sqlStatement = this.buildSQLDeleteInventTransStr(recordsToDeleteBatchSize);
+        int deletedRows;
+
+        Map sqlParams = SqlParams::create();
+        sqlParams.add(PartitionParameterName, getCurrentPartitionRecId());
+        sqlParams.add(SessionIdParameterName, sessionId);
+        sqlParams.add(DataAreaParameterName,  curExt());
+
+        str directSQL = strFmt(sqlStatement,
+            /* %1 */ PartitionParameterName,
+            /* %2 */ DataAreaParameterName,
+            /* %3 */ SessionIdParameterName);
+
+        Connection connection = new Connection();
+        Statement statement = connection.createStatement();
+
+        try
+        {
+            connection.ttsbegin();
+
+            // Delete archived InventTrans
+            deletedRows = recordsToDeleteBatchSize;
+            while (deletedRows == recordsToDeleteBatchSize)
+            {
+                deletedRows =  statement.executeUpdateWithParameters(directSQL, sqlParams);
+            }
+            connection.ttscommit();
+        }
+        catch
+        {
+            if (connection != null)
+            {
+                connection.ttsabort();
+            }
+
+            throw;
+        }
+        finally
+        {
+            statement.close();
+            connection.finalize();
+            connection = null;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSQLDeleteInventTransStr</Name>
+				<Source><![CDATA[
+    private str buildSQLDeleteInventTransStr(int _recordsToDeleteBatchSize)
+    {
+        /* Build up the following SQL statement
+        DELETE TOP(%1) T1 FROM INVENTTRANS T1
+        JOIN INVENTTRANSARCHIVE T2
+        ON T2.INVENTTRANS=T1.RECID
+            WHERE T2.PARTITION=@%1 AND T2.DATAAREAID=@%2 AND T2.SESSIONID=@%3
+        OPTION(LOOP JOIN)
+        */
+
+        SqlSystem sqlSystem = new SqlSystem();
+
+        str directSQL = strFmt('DELETE TOP(%1) T1 FROM INVENTTRANS T1', sqlSystem.sqlLiteral(_recordsToDeleteBatchSize, true));
+
+        directSQL += strFmt(
+            ' JOIN INVENTTRANSARCHIVE T2 ON T2.INVENTTRANS=T1.RECID' +
+            ' WHERE T2.PARTITION = @%1 AND T2.DATAAREAID = @%2 AND T2.SessionId = @%3'
+            );
+
+        if (isInventTransArchiveCleanUpWithLoopJoinEnabled)
+        {
+            directSQL += ' OPTION(LOOP JOIN)';
+        }
+
+        return directSQL;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRecordsToDeleteBatchSize</Name>
+				<Source><![CDATA[
+    protected int getRecordsToDeleteBatchSize()
+    {
+        return 100000; // Reduce this number if the same error occurs.
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeProcessedBundle</Name>
+				<Source><![CDATA[
+    private void removeProcessedBundle(int64 _bundleId)
+    {
+        InventTransArchiveTask inventTransArchiveTask;
+
+        delete_from inventTransArchiveTask
+            where InventTransArchiveTask.BundleId == _bundleId
+               && InventTransArchiveTask.SessionId == sessionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processArchivingBundle</Name>
+				<Source><![CDATA[
+    private void processArchivingBundle(int64 _bundleId)
+    {
+        #OCCRetryCount
+
+        int64 archivedRecords;
+        InventTransArchiveTask inventTransArchiveTaskLocal;
+
+        select firstonly IsTransTypeOnlyAffectsLocationAndBelow, IsWHSItem, MustBeClosed from inventTransArchiveTaskLocal
+            where inventTransArchiveTaskLocal.SessionId == sessionId
+               && inventTransArchiveTaskLocal.BundleId  == _bundleId;
+
+        bundleIsTransTypeOnlyAffectsLocationAndBelow = inventTransArchiveTaskLocal.IsTransTypeOnlyAffectsLocationAndBelow;
+        bundleMustBeClosed = inventTransArchiveTaskLocal.MustBeClosed;
+
+        try
+        {
+            isWHSItem = inventTransArchiveTaskLocal.IsWHSItem;
+
+            archivedRecords = this.archiveInventTransByBundle(_bundleId);
+
+            if (!archivedRecords)
+            {
+                return;
+            }
+
+            InventTrans         consolidateInventTrans;
+            SysDaQueryObject    consolidateInventTransQueryObj =
+                this.buildConsolidateInventTransQueryObjectWithProjectionFields(consolidateInventTrans);
+
+            this.buildConsolidateInventTransQueryObjectByBundle(consolidateInventTransQueryObj, _bundleId);
+
+            SysDaSearchObject       consolidateInventTransSearchObject  = new SysDaSearchObject(consolidateInventTransQueryObj);
+            SysDaSearchStatement    searchStatement                     = new SysDaSearchStatement();
+
+            while (searchStatement.findNext(consolidateInventTransSearchObject))
+            {
+                if (!(this.shouldSkipInsertInventTrans(consolidateInventTrans) && isSkipInsertSumZeroFlightEnabled))
+                {
+                    this.insertInventTransSummationByBundle(consolidateInventTrans);
+                }
+            }
+
+            if (!isInventTransArchiveCleanUpTransWithBatchSizeEnabled)
+            {
+                if (isInventTransArchiveCleanUpWithRegularTableEnabled)
+                {
+                    this.cleanUpArchivedInventTransByBundleWithRegularTable(_bundleId);
+                }
+                else
+                {
+                    this.cleanUpArchivedInventTransByBundle(_bundleId);
+                }
+            }
+            else
+            {
+                this.cleanUpArchivedInventTransWithBatchSize();
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    this.handleError();
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                this.handleError();
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpArchivedInventTransByBundleWithRegularTable</Name>
+				<Source><![CDATA[
+    protected void cleanUpArchivedInventTransByBundleWithRegularTable(int64 _bundleId)
+    {
+        InventTransArchive      inventTransArchive;
+        InventTransArchiveTask  inventTransArchiveTask;
+
+        InventTransArchiveRecIdFilter RecIdFilter;
+
+        insert_recordset RecIdFilter (RefRecId, SessionId)
+        select InventTrans, SessionId from inventTransArchive
+            where inventTransArchive.SessionId == sessionId
+            exists join inventTransArchiveTask
+            where inventTransArchiveTask.ItemId == inventTransArchive.ItemId
+                && inventTransArchiveTask.InventDimId == inventTransArchive.InventDimId
+                && inventTransArchiveTask.BundleId == _bundleId
+                && inventTransArchiveTask.SessionId == sessionId;
+
+        int64 toBeDeletedRowCounts = RecIdFilter.RowCount();
+
+        if (toBeDeletedRowCounts)
+        {
+            Map sqlParams = SqlParams::create();
+            sqlParams.add(PartitionParameterName, getCurrentPartitionRecId());
+            sqlParams.add(SessionIdParameterName, sessionId);
+            sqlParams.add(DataAreaParameterName,  curExt());
+
+            str sqlStatement = strFmt('DELETE T1 FROM INVENTTRANS T1' +
+                ' JOIN InventTransArchiveRecIdFilter T2' +
+                ' ON T2.RefRecId = T1.RecId' +
+                ' WHERE T2.PARTITION = @%1 AND T2.DATAAREAID = @%2 AND T2.SessionId = @%3'
+                );
+
+            if (isInventTransArchiveCleanUpWithLoopJoinEnabled)
+            {
+                sqlStatement += ' OPTION(LOOP JOIN)';
+            }
+
+            str directSQL = strFmt(sqlStatement,
+            /* %1 */ PartitionParameterName,
+            /* %2 */ DataAreaParameterName,
+            /* %3 */ SessionIdParameterName);
+
+            Connection connection = new Connection();
+            Statement statement = connection.createStatement();
+
+            try
+            {
+                connection.ttsbegin();
+                statement.executeUpdateWithParameters(directSQL, sqlParams);
+                connection.ttscommit();
+            }
+            catch
+            {
+                if (connection != null)
+                {
+                    connection.ttsabort();
+                }
+
+                throw;
+            }
+            finally
+            {
+                delete_from RecIdFilter where RecIdFilter.SessionId == sessionId;
+
+                statement.close();
+                connection.finalize();
+                connection = null;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

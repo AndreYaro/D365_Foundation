@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqScheduleParallelFirmingService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The service class that triggers parallel firming.
+/// </summary>
+internal class ReqScheduleParallelFirmingService extends SysOperationServiceBase
+{
+    private ReqPlanVersion planVersion;
+    private ReqPlanId planId;
+    private ReqPlanId dynamicPlanId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>mustDisqualifyReqTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines if a given record must be disqualified.
+    /// </summary>
+    /// <param name="_reqTrans">
+    ///    The <c>ReqTrans</c> record to validate.
+    /// </param>
+    /// <returns>
+    ///    true if the record must be disqualified; otherwise, false.
+    /// </returns>
+    internal boolean mustDisqualifyReqTrans(ReqTrans _reqTrans)
+    {
+        return _reqTrans.IsDerivedDirectly == NoYes::Yes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mapReqTransMark</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Maps a container of ReqTrans into a Map containing ReqTrans RecId as key, and
+    /// reqTans record as value.
+    /// Filtering out disqualified reqTrans based on IsDerivedDirectly flag,
+    /// and setting planVersion to the first available planVersion.
+    /// </summary>
+    /// <param name = "_conReqTransMark">The container of ReqTrans</param>
+    /// <returns>
+    /// The ReqTrans map with key: RecId, value: the record.
+    /// </returns>
+    internal Map mapReqTransMark(container _conReqTransMark)
+    {
+        Map mapReqTransMark = _conReqTransMark ? Map::create(_conReqTransMark) : new Map(typeName2Type(extendedTypeStr(recId)), Types::Record);
+
+        if (mapReqTransMark.elements())
+        {
+            var mapReqTransMarkFinal = new Map(mapReqTransMark.keyType(), mapReqTransMark.valueType());
+            var reqTransMapEnumerator = mapReqTransMark.getEnumerator();
+
+            while (reqTransMapEnumerator.moveNext())
+            {
+                ReqTrans reqTrans = reqTransMapEnumerator.currentValue();
+
+                if (!planVersion)
+                {
+                    planVersion = ReqPlanVersion::find(reqTrans.PlanVersion);
+                    planId = planVersion.ReqPlanId;
+                    dynamicPlanId = ReqPlanSched::defaultDynamicId();
+                }
+
+                if (!this.mustDisqualifyReqTrans(reqTrans))
+                {
+                    mapReqTransMarkFinal.insert(reqTransMapEnumerator.currentKey(), reqTrans);
+                }
+            }
+
+            mapReqTransMark = mapReqTransMarkFinal;
+        }
+
+        return mapReqTransMark;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>scheduleFirming</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Schedules parallel firming for the specified planned orders.
+    /// </summary>
+    /// <param name = "_contract">The contract that holds the parameters used to determine how many threads and which planned orders to schedule firming for.</param>
+    internal void scheduleFirming(ReqScheduleParallelFirmingContract _contract)
+    {
+        var instrumentationLogger = ReqInstrumentationLogger::createLogger(classStr(ReqCalcParallelFirming));
+        using (var activityContext = instrumentationLogger.parallelFirming().scheduleFirming())
+        {
+            this.validateScheduleFirming(_contract);
+            ReqProcessNumThreads numberOfThreads = this.initializeNumberOfThreads(_contract);
+        
+            ttsbegin;
+
+            Map markedRecordsMap = this.mapReqTransMark(_contract.parmConReqTransMark());
+     
+            if (!planVersion)
+            {
+                return;
+            }
+
+            numberOfThreads = this.minimizeNumberOfThreads(markedRecordsMap, numberOfThreads);
+
+            TodaysDate todaysDate = DateTimeUtil::date(ReqPlanData::currentDateTime());
+       
+            ReqFirmingRunId firmingRunId = this.doScheduleFirming(
+            planVersion,
+            planId,
+            numberOfThreads,
+            todaysDate,
+            _contract,
+            markedRecordsMap);
+
+            instrumentationLogger.parallelFirming().firmingRunId(activityContext, firmingRunId);
+        
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doScheduleFirming</Name>
+				<Source><![CDATA[
+    private ReqFirmingRunId doScheduleFirming(
+        ReqPlanVersion                      _planVersion,
+        ReqPlanId                           _planId,
+        ReqProcessNumThreads                _numberOfThreads,
+        TodaysDate                          _todaysDate,
+        ReqScheduleParallelFirmingContract  _contract,
+        Map                                 _markedRecordsMap)
+    {
+        ReqCalcParallelFirmingParameters parameters = ReqCalcParallelFirmingParameters::construct(
+            _planVersion,
+            _planId,
+            _numberOfThreads,
+            _todaysDate,
+            _contract);
+
+        ReqCalcParallelFirming mrpRun = ReqCalcParallelFirming::newFromParameters(parameters);
+
+        ReqProcessId processId = mrpRun.parmProcessId();
+
+        ReqProcessList::beginProcess(processId, mrpRun.packThreadData(), _numberOfThreads, classNum(ReqCalcParallelFirming), _planId, _todaysDate, ReqCalcUpdate::Regeneration);
+
+        ReqProcessAutoFirmingRun firmingRun = ReqProcessAutoFirmingRun::initNewRunForProcessId(processId);
+
+        ReqCalcTaskController controller = this.initializeReqCalcTaskController(processId, _planId);
+
+        ReqTransPoAutoFirmPartitioner::construct(null).createBundles(_markedRecordsMap, processId, controller);
+
+        this.scheduleThreads(processId, _planId, _numberOfThreads);
+
+        return firmingRun.FirmingRunId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>scheduleThreads</Name>
+				<Source><![CDATA[
+    private void scheduleThreads(ReqProcessId _processId, ReqPlanId _planId, int _numberOfThreads)
+    {
+        ReqProcessExternThread reqProcessExternThread;
+        int i = 0;
+
+        BatchHeader batchHeader = this.getCurrentBatchHeader();
+
+        ReqScheduleParallelFirmingFinalize cleanup = new ReqScheduleParallelFirmingFinalize(_processId, _planId);
+        batchHeader.addRunTimeTask(cleanup, this.getCurrentBatchTask().RecId);
+
+        do
+        {
+            using (var activityContext = ReqInstrumentationLogger::createLogger(classStr(ReqCalcParallelFirming)).parallelFirming().createThread())
+            {
+                reqProcessExternThread = ReqProcessExternThread::newProcessId(_processId);
+                reqProcessExternThread.parmThrowOnError(true);
+
+                if (ReqCalcRestartResumeNativeToggle::isEnabled())
+                {
+                    reqProcessExternThread.batchInfo().parmRetriesOnFailure(ReqCalcScheduleItemTable::ThreadRetriesOnFailure);
+                }
+
+                reqProcessExternThread.batchInfo().resetBatchHeader();
+
+                batchHeader.addRunTimeTask(reqProcessExternThread, this.getCurrentBatchTask().RecId);
+                batchHeader.addDependency(cleanup, reqProcessExternThread, BatchDependencyStatus::FinishedOrError);
+                i++;
+            }
+        }
+        while (i < _numberOfThreads);
+
+        batchHeader.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeReqCalcTaskController</Name>
+				<Source><![CDATA[
+    private ReqCalcTaskController initializeReqCalcTaskController(ReqProcessId _processId, ReqPlanId _planId)
+    {
+        var controller = ReqCalcTaskController::newController(_planId, _processId, 'startup');
+        controller.insertTaskAndBundle(ReqProcessStatus::AutoFirming, ReqTransPoAutoFirmPartitioner::PartitionOrdersForPostProcessingBundlesLevel, ReqLevelState::PartitionOrdersForPostProcessing, 0);
+        controller.insertTaskAndBundle(ReqProcessStatus::AutoFirming, ReqTransPoAutoFirmPartitioner::MaxBundleLevel + 1, ReqLevelState::FinishedScheduling);
+
+        return controller;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>minimizeNumberOfThreads</Name>
+				<Source><![CDATA[
+    private ReqProcessNumThreads minimizeNumberOfThreads(Map _markedRecordsMap, ReqProcessNumThreads _numberOfThreads)
+    {
+        ReqProcessNumThreads originalNumberOfThreads = _numberOfThreads;
+
+        // minimize the number of threads based on the actual number of records that we have maximum number of available threads
+        int numberOfRecords = _markedRecordsMap.elements();
+        int numberOfAvailableThreads = max(1, ReqParameters::getMaxNumberOfAvailableThreads());
+        _numberOfThreads = min(_numberOfThreads, numberOfRecords);
+        _numberOfThreads = min(_numberOfThreads, numberOfAvailableThreads);
+
+        if (_numberOfThreads < originalNumberOfThreads)
+        {
+            info(strFmt("@SCMPlanning:ReqParallelFirmingNumberOfThreadsReduced", _numberOfThreads));
+        }
+
+        return _numberOfThreads;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeNumberOfThreads</Name>
+				<Source><![CDATA[
+    private ReqProcessNumThreads initializeNumberOfThreads(ReqScheduleParallelFirmingContract _contract)
+    {
+        ReqProcessNumThreads numberOfThreads = _contract.parmMaxChildThreads();
+        
+        if (numberOfThreads <= 0)
+        {
+            ReqParameters reqParameters = ReqParameters::find();
+            numberOfThreads = reqParameters.DefaultNumberOfThreads;
+            numberOfThreads = numberOfThreads <= 0 ? 1 : numberOfThreads;
+        }
+        return numberOfThreads;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateScheduleFirming</Name>
+				<Source><![CDATA[
+    private void validateScheduleFirming(ReqScheduleParallelFirmingContract _contract)
+    {
+        this.validateContract(_contract);
+        this.validateExecutingInBatch();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateContract</Name>
+				<Source><![CDATA[
+    private void validateContract(ReqScheduleParallelFirmingContract _contract)
+    {
+        if (!_contract)
+        {
+            throw Error(Error::wrongUseOfFunction(funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateExecutingInBatch</Name>
+				<Source><![CDATA[
+    private void validateExecutingInBatch()
+    {
+        if (!this.isExecutingInBatch())
+        {
+            throw error("@SCMPlanning:ReqScheduleParallelFirmingNotExecutingInBatchError");
+        }
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

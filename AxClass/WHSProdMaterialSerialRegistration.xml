@@ -1,0 +1,492 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSProdMaterialSerialRegistration</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class WHSProdMaterialSerialRegistration
+{
+    InventDim                       reservNoLocationInventDim;
+    InventDim                       inputLocationSerialInventDim;
+    InventDim                       prodJournalInventDim;
+    InventTrans                     inventTrans;
+    InventTrackingRegisterTrans     serialTracking;
+    ProdJournalBOM                  prodJournalBOM;
+    WHSWorkInventTrans              referenceWorkInventTrans;
+    InventMovement                  movement;
+    InventSerialId                  serial;
+    LineNum                         lineNum;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addSerialAndReserve</Name>
+				<Source><![CDATA[
+    private void addSerialAndReserve(boolean _canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange)
+    {
+        // Remove reservation on <c>WMSLocationId</c> so a serial can be included through an inventory movement
+        this.removeLocationReservation();
+
+        // Update inventory dimension with a serial
+        inputLocationSerialInventDim                 = InventDim::find(inventTrans.InventDimId);
+        inputLocationSerialInventDim.inventSerialId  = serial;
+        inputLocationSerialInventDim                 = InventDim::findOrCreate(inputLocationSerialInventDim);
+
+        // Creating work invent transaction to be used to attach the serial number to the warehouse inventory transaction.
+        WHSWorkInventTrans workInventTrans = this.createWorkInventoryTransaction();
+
+        this.ensureInventSerialExists(workInventTrans.ItemId, inputLocationSerialInventDim.InventSerialId);
+
+        if (WHSInventoryTransactionConfigurationProvider::shouldUseWarehouseInventoryTransactionStack(workInventTrans.WorkId))
+        {
+            InventDim inventDimFrom = InventDim::find(workInventTrans.InventDimIdFrom);
+            InventDim inventDimTo = InventDim::find(workInventTrans.InventDimIdTo);
+            // Updating the serial number of the warehouse inventory transaction using the work inventory transaction created above.
+            WHSInventoryTransactionWorkController::construct().updateTrackingDimesions(workInventTrans, inventDimFrom, inventDimTo, workInventTrans.Qty, 0);
+
+            // Move the work with the workId matching with the one from workInventTrans to archival.
+            WHSWorkTable work = WHSWorkTable::find(workInventTrans.WorkId);
+            if (work.WorkStatus == WHSWorkStatus::Closed)
+            {
+                WHSInventoryTransactionArchiveQueueEntry::addWorkToQueue(work);
+            }
+        }
+        else
+        {
+            // Inventory movement is used to attach a serial in an inventory dimension to a warehouse inventory transaction
+            WHSInvent::moveWorkQuantities(workInventTrans, workInventTrans.InventDimIdFrom, workInventTrans.InventDimIdTo, workInventTrans.Qty, 0);
+        }
+
+        this.reserveSerialAtInputLocation(_canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange);
+
+        this.updateSerialTracking(inputLocationSerialInventDim.inventDimId, prodJournalBOM);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWorkInventoryTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// A new work inventory transaction is created so that a serial can be added to an inventory transaction through an inventory movement.
+    /// </summary>
+    /// <returns>
+    /// <c>WHSWorkInventTrans</c> buffer for use within an inventory movement.
+    /// </returns>
+    private WHSWorkInventTrans createWorkInventoryTransaction()
+    {
+        WHSWorkInventTrans  localWorkInventTrans;
+
+        // Create a new transaction to be used for an inventory movement
+        localWorkInventTrans.clear();
+
+        // Increment or initialize line number based on its current value
+        lineNum = (lineNum >= 1) ? lineNum + 1 : 1;
+
+        // Use <c>WHSWorkInventTrans</c> if buffer exists
+        if (referenceWorkInventTrans)
+        {
+            localWorkInventTrans.initFromWorkInventTrans(referenceWorkInventTrans);
+        }
+        else
+        {
+            localWorkInventTrans.WorkId         = NumberSeq::newGetNum(WHSParameters::numRefWHSWorkId()).num();
+            localWorkInventTrans.ItemId         = inventTrans.ItemId;
+            localWorkInventTrans.TransDateTime  = DateTimeUtil::utcNow();
+        }
+
+        localWorkInventTrans.LineNum                = lineNum;
+        localWorkInventTrans.Qty                    = -serialTracking.Qty;
+        localWorkInventTrans.InventQtyRemain        = -serialTracking.Qty;
+        localWorkInventTrans.InventDimIdFrom        = inventTrans.InventDimId;
+        localWorkInventTrans.InventDimIdTo          = inputLocationSerialInventDim.inventDimId;
+        localWorkInventTrans.InventTransIdParent    = NumberSeq::newGetNum(InventParameters::numRefInventTransId()).num();
+
+
+        // The context must be used to pass down explicitly the default value of the inventory transaction mechanism to avoid the error 
+        // when the WHSInventoryTransactionConfigurationProvider.findShouldUseWarehouseInventoryTransactionStack() method defines the inventory transaction mechanism 
+        // for the case when localWorkInventTrans.WorkId is a newly generated value without the existing WHSWorkTable record.
+        // In the case when localWorkInventTrans is initialized from the referenceWorkInventTrans and localWorkInventTrans.WorkId contains the Id of the existing WHSWorkTable record,
+        // value from the WHSWorkTable record will be used to define the inventory transaction mechanism and context value will be ignored.
+        if (WHSProdMaterialSerialRegUseDefaultInventTransMechanismFlight::instance().isEnabled())
+        {      
+            using (var context = WHSEnforceInventoryTransactionMechanismContext::defaultInventoryTransactionMechanism(WHSInventoryTransactionMechanismEnum::InventTrans))
+            {
+                localWorkInventTrans.insert();
+            }
+        }
+        else
+        {
+            localWorkInventTrans.insert();
+        }
+
+        return localWorkInventTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ensureInventSerialExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method checks that <c>InventSerial</c> record exists for a particular item and serial. If it does not, a record is created.
+    /// </summary>
+    /// <param name="_itemId">
+    /// Item Id being compared.
+    /// </param>
+    /// <param name="_inventSerialId">
+    /// Serial being compared.
+    /// </param>
+    private void ensureInventSerialExists(ItemId _itemId, InventSerialId    _inventSerialId)
+    {
+        InventSerial    inventSerial;
+
+        if (!InventSerial::exist(_inventSerialId, _itemId))
+        {
+            inventSerial.clear();
+            inventSerial.ItemId         = _itemId;
+            inventSerial.InventSerialId = _inventSerialId;
+
+            if (!inventSerial.validateWrite())
+            {
+                throw error(strFmt("@WAX:WHSCannotInsertRecordInTable", tablePName(InventSerial)));
+            }
+            else
+            {
+                inventSerial.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmProdJournalBOM</Name>
+				<Source><![CDATA[
+    public ProdJournalBOM parmProdJournalBOM(ProdJournalBOM _prodJournalBOM = prodJournalBOM)
+    {
+        prodJournalBOM = _prodJournalBOM;
+
+        return prodJournalBOM;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pickFromInputLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Pick inventory from the production input location.
+    /// </summary>
+    private void pickFromInputLocation()
+    {
+        InventDimParm       pickedInventDimParm;
+        pickedInventDimParm.initFromInventDim(inputLocationSerialInventDim);
+
+        InventUpd_Picked picked = InventUpd_Picked::newParameters(movement,
+                                                 inputLocationSerialInventDim,
+                                                 pickedInventDimParm,
+                                                 inputLocationSerialInventDim,
+                                                 pickedInventDimParm,
+                                                 serialTracking.Qty);
+        picked.updateNow();
+
+        this.updateSerialTracking(inputLocationSerialInventDim.inventDimId, prodJournalBOM);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>negativePhysicalInventoryAllowed</Name>
+				<Source><![CDATA[
+    private boolean negativePhysicalInventoryAllowed()
+    {
+        InventLocation  InventLocation = InventLocation::find(prodJournalBOM.inventDim().InventLocationId);
+
+        InventModelGroup inventModelGroup = InventTable::find(prodJournalBOM.ItemId).modelGroup();          
+
+        return (inventModelGroup.NegativePhysical  || (inventLocation && inventLocation.RetailInventNegPhysical));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>availableQtyAboveLocationOfProdJournalBOMDimAllowsReserveSerial</Name>
+				<Source><![CDATA[
+    private boolean availableQtyAboveLocationOfProdJournalBOMDimAllowsReserveSerial()
+    {       
+        InventQty qtyNeededForSerialReservation = this.calculateQtyNeededForSerialReservation();
+
+        boolean negativePhysicalInventoryAllowed = this.negativePhysicalInventoryAllowed();
+
+        InventDim prodJournalInventDimAboveLocation         = InventDim::find(prodJournalBOM.InventDimId);
+        prodJournalInventDimAboveLocation.clearLocationAndBelowDim(prodJournalBOM.ItemId);
+        prodJournalInventDimAboveLocation                   = InventDim::findOrCreate(prodJournalInventDimAboveLocation);
+
+        InventOnHandQty inventOnHandQty = InventOnHandQty::newParameters(prodJournalBOM.ItemId, prodJournalInventDimAboveLocation);      
+        inventOnHandQty.parmSkipDisplayWarningIfWHSCheckReservationHandlingQtyFails(true);
+
+        return inventOnHandQty.checkReservation(qtyNeededForSerialReservation, negativePhysicalInventoryAllowed, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateQtyNeededForSerialReservation</Name>
+				<Source><![CDATA[
+    private InventQty calculateQtyNeededForSerialReservation()
+    {
+        InventTransOrigin               inventTransOrigin;
+        InventTrackingRegisterTrans     localSerialTracking;     
+
+        select RecId from inventTransOrigin
+            where inventTransOrigin.InventTransId       == prodJournalBOM.InventTransId
+               && inventTransOrigin.ReferenceId         == prodJournalBOM.ProdId
+               && inventTransOrigin.ReferenceCategory   == InventTransType::ProdLine
+        join minOf(Qty) from localSerialTracking
+            where localSerialTracking.InventTransOrigin  == inventTransOrigin.RecId;
+
+        return localSerialTracking.Qty;           
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerRawMaterialsAtConsumption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Registers serials for raw materials in production input location prior to consumption.
+    /// </summary>
+    public void registerRawMaterialsAtConsumption()
+    {
+        if (WHSInventTable::exist(prodJournalBOM.ItemId)
+            && PdsGlobal::pdsIsCWItem(prodJournalBOM.ItemId))
+        {
+            throw error(strFmt("@WAX:Error_TrackingGroupUsingConsumeSerialNotAllowedForWHSCatchWeightItem", prodJournalBOM.ItemId));
+        }
+        
+        InventTransOrigin               inventTransOrigin;
+        UnknownNoYes canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChangeCache = UnknownNoYes::Unknown;
+
+        // Iterate over <c>InventTrackingRegisterTrans</c> records associated with Picking List journal being posted
+        while select InventTransId, RecId from inventTransOrigin
+            where inventTransOrigin.InventTransId       == prodJournalBOM.InventTransId
+            &&    inventTransOrigin.ReferenceId         == prodJournalBOM.ProdId
+            &&    inventTransOrigin.ReferenceCategory   == InventTransType::ProdLine
+            join forUpdate serialTracking
+                order by InventDimId
+                where serialTracking.InventTransOrigin  == inventTransOrigin.RecId
+                &&    !serialTracking.PhysicalRefTableId 
+                &&    !serialTracking.PhysicalRefRecId
+        {
+            // Raw material will be reserved on location in the production input location
+            prodJournalInventDim = InventDim::find(prodJournalBOM.InventDimId);
+
+            // Production order inventory transaction for the inventory reserved only on <c>WMSLocationId</c> at production input location
+            select firstOnly forUpdate inventTrans
+                where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+                &&    inventTrans.StatusIssue       == StatusIssue::ReservPhysical
+                &&    inventTrans.inventDimId       == prodJournalInventDim.inventDimId
+                &&    inventTrans.TransChildRefId   == prodJournalBOM.InventTransChildRefId
+                &&    inventTrans.TransChildType    == prodJournalBOM.InventTransChildType
+                outer join firstOnly referenceWorkInventTrans
+                order by LineNum desc
+                    where referenceWorkInventTrans.InventTransIdParent == inventTransOrigin.InventTransId;
+
+            // <c>InventTrans</c> records could already be Picked
+            if (!inventTrans)
+            {
+                continue;
+            }
+
+            ttsBegin;
+
+            movement = inventTrans.inventMovementChild();
+
+            InventDim onHandInventDim = this.retrieveSerialDimensions();
+
+            if (!serial)
+            {
+                throw error(strFmt("@SCM:SerialDoesNotExistMessage", serialTracking.InventDimId));
+            }
+
+            // Check that the serial is available in production input location
+            if (WHSInventOnHand::onHandQty(inventTrans.ItemId, onHandInventDim.inventDimId))
+            {
+                inputLocationSerialInventDim = InventDim::find(onHandInventDim.inventDimId);
+
+                // Pick serial
+                this.pickFromInputLocation();
+            }
+            // Serial is not yet on-hand at production input location
+            else if (WHSInventOnHand::onHandQty(inventTrans.ItemId, inventTrans.inventDimId))
+            {
+                canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChangeCache =
+                    this.canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange(canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChangeCache);
+
+                this.addSerialAndReserve(canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChangeCache == UnknownNoYes::Yes ? true: false);
+            }
+
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeLocationReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Raw material reservations on location must be updated without the location dimension so that an inventory movement can be used to add a serial to the transaction.
+    /// </summary>
+    private void removeLocationReservation()
+    {
+        reservNoLocationInventDim                = InventDim::find(prodJournalInventDim.InventDimId);
+        reservNoLocationInventDim.wMSLocationId  = '';
+        reservNoLocationInventDim                = InventDim::findOrCreate(reservNoLocationInventDim);
+
+        InventDimParm inventDimParm;
+        inventDimParm.initFromInventDim(reservNoLocationInventDim);
+        inventDimParm.InventSerialIdFlag = NoYes::Yes;
+
+        InventUpd_ChangeDimension changeDimension = InventUpd_ChangeDimension::newParameters(
+            movement,
+            prodJournalInventDim,
+            inventDimParm,
+            reservNoLocationInventDim,
+            serialTracking.Qty);
+        changeDimension.parmOnlySelectReservPhysical(true);
+        changeDimension.updateNow();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveSerialAtInputLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update inventory transaction reservation to include the location and serial dimensions.
+    /// </summary>    
+    /// <param name="_canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange">
+    /// A boolean value that indicates whether serial reservation can be completed without removing reservation during the dimension change of inventory transaction.
+    /// </param>
+    private void reserveSerialAtInputLocation(boolean _canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange)
+    {
+        InventDimParm serialInventDimParm;
+        serialInventDimParm.initFromInventDim(inputLocationSerialInventDim);
+
+        // Reserve once again on the production input location
+        InventUpd_ChangeDimension changeDimension = InventUpd_ChangeDimension::newParameters(
+            movement,
+            reservNoLocationInventDim,
+            serialInventDimParm,
+            inputLocationSerialInventDim,
+            serialTracking.Qty);
+        changeDimension.parmOnlySelectReservPhysical(true);
+              
+        if (!_canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange)
+        {
+            changeDimension.parmAllowReserveReduction(true);
+        }
+
+        changeDimension.updateNow();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange</Name>
+				<Source><![CDATA[
+    private UnknownNoYes canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange(UnknownNoYes _canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange)
+    {    
+        if (_canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange != UnknownNoYes::Unknown)
+        {
+            return _canReserveSerialWithoutRemovingReservationDuringInventTransDimensionChange;
+        }
+
+        if (!WHSInventTable::exist(prodJournalBOM.ItemId))
+        {
+            return UnknownNoYes::Yes;          
+        }            
+
+        boolean canReserveSerialWithoutRemovingReservation = this.availableQtyAboveLocationOfProdJournalBOMDimAllowsReserveSerial();
+        return canReserveSerialWithoutRemovingReservation ? UnknownNoYes::Yes : UnknownNoYes::No;      
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveSerialDimensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves inventory dimensions for current <c>InventTrackingRegisterTrans</c> or <c>InventTrans</c> buffer
+    /// </summary>
+    /// <returns>
+    /// <c>InventDim</c> buffer for serial dimensions.
+    /// </returns>
+    private InventDim retrieveSerialDimensions()
+    {
+        InventDim inventDim = InventDim::find(serialTracking.InventDimId);
+        serial    = inventDim.inventSerialId;
+
+        // Depending on where the <c>InventTrackingRegisterTrans</c> record was created, inventory dimensions may only contain <c>InventSerialId</c>
+        if (!inventDim.wMSLocationId)
+        {
+            inventDim = InventDim::find(inventTrans.InventDimId);
+            inventDim.inventSerialId = serial;
+            inventDim = InventDim::findOrCreate(inventDim);
+        }
+
+        return inventDim;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSerialTracking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the <c>InventTrackingRegisterTrans</c> record with specified parameters.
+    /// </summary>
+    /// <param name="_inventDimId">
+    /// Inventory dimensions id.
+    /// </param>
+    /// <param name="_prodJournalBOM">
+    /// Production journal line record.
+    /// </param>
+    private void updateSerialTracking(InventDimId _inventDimId, ProdJournalBOM _prodJournalBOM)
+    {
+        serialTracking.InventDimId = _inventDimId;
+        serialTracking.PhysicalRefTableId = _prodJournalBOM.TableId;
+        serialTracking.PhysicalRefRecId   = _prodJournalBOM.RecId;
+        serialTracking.update();    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromProdJournalBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method creates an instance of the <c>WHSProdMaterialSerialRegistration</c> class and sets the <c>ProdJournalBOM</c> buffer.
+    /// </summary>
+    /// <param name="_prodJournalBOM">
+    /// The production journal line with serial item to register.
+    /// </param>
+    /// <returns>
+    /// Returns an instance of <c>WHSProdMaterialSerialRegistration</c> class.
+    /// </returns>
+    public static WHSProdMaterialSerialRegistration newFromProdJournalBOM(ProdJournalBOM _prodJournalBOM)
+    {
+        WHSProdMaterialSerialRegistration whsProdMaterialSerialRegistration = new WHSProdMaterialSerialRegistration();
+
+        whsProdMaterialSerialRegistration.parmProdJournalBOM(_prodJournalBOM);
+
+        return whsProdMaterialSerialRegistration;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,1723 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WmsJournalCheckPostReception</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class WmsJournalCheckPostReception extends WMSJournalCheckPost implements BatchRetryable
+{
+    TmpWMSJournalCheck  tmpWMSJournalCheck;
+    Map                 recId2TransIdMap;
+    Map                 inventReceiptForTestRegistratorMap;             //key : inventTransOriginId; Value : InventReceiptForTestRegistrator
+    Map                 tmpWMSJournalCheckSums;                         //key : inventtransId: Value [requestedQty,pdsRequestedCWQty]
+    boolean             mcrSkipMiscCharges;
+    boolean             dummy;
+
+    #DEFINE.CurrentVersion(1)
+    #LOCALMACRO.CurrentListSysLastValue
+        dummy
+    #ENDMACRO
+
+    #LOCALMACRO.CurrentListNewSession
+        #CurrentListSysLastValue,
+        mcrSkipMiscCharges
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        if (this.inGetSaveLast())
+        {
+            return [#CurrentVersion, #CurrentListSysLastValue, super()];
+        }
+        return [#CurrentVersion, #CurrentListNewSession, super()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        boolean         ret;
+        Integer         version    = RunBase::getVersion(_packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                container packedBase;
+                if (this.inGetSaveLast())
+                {
+                    [version, #CurrentListSysLastValue, packedBase] = _packedClass;
+                }
+                else
+                {
+                    [version, #CurrentListNewSession, packedBase] = _packedClass;
+                }
+                ret = super(packedBase);
+                break;
+
+            default:
+                ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkFromQuarantine</Name>
+				<Source><![CDATA[
+    private boolean checkFromQuarantine(
+        WMSJournalTrans         _wmsJournalTrans,
+        InventDim               _inventDim,
+        InventQuarantineOrder   _inventQuarantineOrder)
+    {
+        boolean                 ok = true;
+        WMSJournalTrans         otherTrans;
+        InventTrans             inventTrans;
+        InventTransOrigin       inventTransOrigin;
+        InventQty               qtyFromOtherTrans;
+        InventQty               inventTransQty;
+
+        select sum(Qty)
+            , sum(PdsCWQty)
+        from inventTrans
+            where inventTrans.StatusReceipt == StatusReceipt::Ordered && inventTrans.StatusIssue == StatusIssue::None
+        exists join inventTransOrigin
+            where inventTransOrigin.RecId           == inventTrans.InventTransOrigin
+            &&    inventTransOrigin.InventTransId   == _inventQuarantineOrder.InventTransId;
+        inventTransQty = inventTrans.Qty;
+        inventTransQty -= _wmsJournalTrans.Qty;
+
+        inventTrans.PdsCWQty -= _wmsJournalTrans.PdsCWQty;
+
+        if (inventTransQty < 0)
+        {
+            return checkFailed("@SYS51212");
+        }
+
+        //to hit the best index we include the current trans and lines with qty = 0
+        select sum(Qty)
+            , sum(PdsCWQty)
+        from otherTrans
+            where otherTrans.JournalId      == _wmsJournalTrans.JournalId
+              &&  otherTrans.InventTransId  == _wmsJournalTrans.InventTransId;
+
+        //subtract the current quantity since it was included in the select
+        qtyFromOtherTrans = (otherTrans.Qty - _wmsJournalTrans.Qty);
+        inventTrans.PdsCWQty -= _wmsJournalTrans.PdsCWQty;
+
+        inventTransQty -= qtyFromOtherTrans;
+
+        if (inventTransQty < 0)
+        {
+            return checkFailed("@SYS51212");
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkJournal</Name>
+				<Source><![CDATA[
+    public boolean checkJournal(JournalTransList _journalTransList)
+    {
+        boolean ret;
+
+        if (this.initJournal(_journalTransList))
+        {
+            // only check lines if initialization was ok
+            ret = super(_journalTransList);
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLocation</Name>
+				<Source><![CDATA[
+    private boolean checkLocation(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim)
+    {
+        boolean                     ok = true;
+        InventItemLocation          inventItemLocation;
+        InventLocationId            inventLocationId;
+        InventDim                   inventDimTest;
+
+        inventDimTest.data(_inventDim);
+
+        if (_wmsJournalTrans.CheckPickingLocation)
+        {
+            inventLocationId = this.destinationInventLocationId(_wmsJournalTrans, _inventDim);
+            if (_inventDim.InventLocationId == inventLocationId)
+            {
+                if (!_inventDim.wmsLocationId ||
+                    !WMSLocation::find(_inventDim.wmsLocationId, _inventDim.InventLocationId).isInboundDock())
+                {
+                    ok = checkFailed("@SYS54025");
+                }
+            }
+            inventDimTest.InventLocationId = inventLocationId;
+            inventDimTest.initFromInventLocation(inventDimTest.inventLocation());
+            inventDimTest = InventDim::findOrCreate(inventDimTest);
+
+            inventItemLocation = this.inventItemLocation(_wmsJournalTrans, inventDimTest);
+
+            if (!inventItemLocation.wmsPickingLocation)
+            {
+                ok = checkFailed(strFmt("@SYS50660", _wmsJournalTrans.ItemId, _wmsJournalTrans.inventDim().preFix(), inventLocationId));
+            }
+
+            WmsLocation wmsLocation = this.findNewLocation(_wmsJournalTrans, inventDimTest, false);
+            if (!wmsLocation)
+            {
+                ok = checkFailed(strFmt("@SYS70199", _wmsJournalTrans.ItemId, inventLocationId));
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkQuantities</Name>
+				<Source><![CDATA[
+    private boolean checkQuantities(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim)
+    {
+        InventMovement          inventMovement;
+        InventUpd_Arrived       inventUpd_Arrived;
+        InventUpd_Registered    inventUpd_Registered;
+        InventTable             inventTable;
+        boolean                 ret = true;
+
+        inventMovement = this.inventMovement(_wmsJournalTrans,false);
+        if (!inventMovement)
+        {
+            setPrefix(strFmt("@SYS14077", _wmsJournalTrans.ItemId));
+            return checkFailed("@SYS51092");
+        }
+
+        InventQty           requestedQty;
+        PdsCWInventQty      pdsRequestedCWQty;
+
+        [requestedQty, pdsRequestedCWQty] = this.getRequestedQuantities(inventMovement.transId());
+
+        inventUpd_Registered = InventUpd_Registered::newParameters(inventMovement,
+                                _inventDim, null, null,null,requestedQty
+                                , pdsRequestedCWQty
+                                , _wmsJournalTrans.transDate
+                                );
+        ret = inventUpd_Registered.check();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkQuarantine</Name>
+				<Source><![CDATA[
+    private boolean checkQuarantine(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim)
+    {
+        InventQuarantineOrder   inventQuarantineOrder;
+
+        if (_wmsJournalTrans.InventTransType != InventTransType::QuarantineOrder)
+        {
+            return this.checkToQuarantine(_wmsJournalTrans, _inventDim);
+        }
+
+        inventQuarantineOrder = InventQuarantineOrder::find(_wmsJournalTrans.InventTransRefId);
+        if (!inventQuarantineOrder)
+        {
+            return true;
+        }
+
+        switch (inventQuarantineOrder.Status)
+        {
+            case InventQuarantineStatus::Created:
+                return this.checkToQuarantine(_wmsJournalTrans, _inventDim);
+            case InventQuarantineStatus::Started:
+                return checkFailed(strFmt("@SYS58714", inventQuarantineOrder.QuarantineId));
+            case InventQuarantineStatus::ReportedFinished:
+                return this.checkFromQuarantine(_wmsJournalTrans, _inventDim, inventQuarantineOrder);
+            case InventQuarantineStatus::Ended:
+                return checkFailed(strFmt("@SYS58714", inventQuarantineOrder.QuarantineId));
+        }
+
+        return checkFailed(strFmt("@SYS19306", funcName()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkReference</Name>
+				<Source><![CDATA[
+    private boolean checkReference(
+        WMSJournalTrans     _wmsJournalTrans,
+        boolean             _errorText = true)
+    {
+        boolean             ok = true;
+        PurchTable          purchTable;
+        PurchLine           purchLine;
+        SalesTable          salesTable;
+
+        if (_wmsJournalTrans.VendAccount && _wmsJournalTrans.InventTransRefId)
+        {
+            switch (_wmsJournalTrans.InventTransType)
+            {
+                case InventTransType::Purch :
+                    if (!VendTable::exist(_wmsJournalTrans.VendAccount))
+                    {
+                        //Vendor %1 does not exist.
+                        return checkFailed(strFmt("@SYS11817", _wmsJournalTrans.VendAccount));
+                    }
+
+                    purchTable = PurchTable::find(_wmsJournalTrans.InventTransRefId);
+                    if (!purchTable)
+                    {
+                        //Purchase %1 does not exist.
+                        return checkFailed(strFmt("@SYS15741", _wmsJournalTrans.InventTransRefId));
+                    }
+                    if (purchTable.OrderAccount != _wmsJournalTrans.VendAccount)
+                    {
+                        //Purchase %1 was not placed with vendor %2.
+                        return checkFailed(strFmt("@SYS51073", _wmsJournalTrans.InventTransRefId, _wmsJournalTrans.VendAccount));
+                    }
+
+                    select firstonly purchLine 
+                        where purchLine.InventTransId == _wmsJournalTrans.inventTransId &&
+                              purchLine.PurchId       == _wmsJournalTrans.InventTransRefId;
+
+                    if (purchLine.IsDeleted &&
+                        purchTable.DocumentState == VersioningDocumentState::Draft)
+                    {
+                        // The journal can’t be posted because a line deletion has been requested on purchase order %1.
+                        return checkFailed(strFmt("@SCM:JournalPostingErrorWithPurchLineDeletion", _wmsJournalTrans.inventTransRefId));
+
+                    }
+
+                    if (purchTable.DocumentState == VersioningDocumentState::Draft
+                        && (purchLine.PurchStatus == PurchStatus::Backorder || purchLine.PurchStatus == PurchStatus::Canceled)
+                        && WMSJournalCheckPurchaseOrderNotDraftFlight::instance().isEnabled())
+                    {
+                        WMSJournalTrans wmsJournalTransSum;
+                        select sum(qty) from wmsJournalTransSum
+                            where wmsJournalTransSum.inventTransId == _wmsJournalTrans.inventTransId
+                            && wmsJournalTransSum.journalId == _wmsJournalTrans.journalId;
+
+                        if (purchLine.RemainInventPhysical < wmsJournalTransSum.qty)
+                        {
+                            // The journal cannot be posted because the purchase order is in draft status.
+                            return checkFailed(strFmt("@SCM:JournalPostingErrorWithDraftPurchTableWithOverQty", _wmsJournalTrans.inventTransRefId, purchLine.LineNumber, _wmsJournalTrans.itemId));
+                        }
+
+                    }
+
+                    break; 
+                case InventTransType::ConsignmentReplenishmentOrder :
+                    if (!VendTable::exist(_wmsJournalTrans.VendAccount))
+                    {
+                        return checkFailed(strFmt("@SYS11817", _wmsJournalTrans.VendAccount));
+                    }
+
+                    var consignmentReplenishmentOrderHeader = ConsignmentReplenishmentOrderHeader::find(_wmsJournalTrans.InventTransRefId);
+                    if (!consignmentReplenishmentOrderHeader)
+                    {
+                        return checkFailed(strFmt("@Consignment:MessageValidation_ConsignmentReplenishmentOrderNotExists", _wmsJournalTrans.InventTransRefId));
+                    }
+
+                    if (consignmentReplenishmentOrderHeader.OrderVendorAccountNumber != _wmsJournalTrans.VendAccount)
+                    {
+                        return checkFailed(strFmt("@Consignment:MessageValidation_VendorMatchesConsignmentReplenishmentOrder", _wmsJournalTrans.InventTransRefId, _wmsJournalTrans.VendAccount));
+                    }
+                    break;
+
+                case InventTransType::Sales :
+                    if (!CustTable::exist(_wmsJournalTrans.VendAccount))
+                    {
+                        //Customer %1 does not exist.
+                        return checkFailed(strFmt("@SYS4730", _wmsJournalTrans.VendAccount));
+                    }
+
+                    salesTable = SalesTable::find(_wmsJournalTrans.InventTransRefId);
+                    if (!salesTable)
+                    {
+                        //Sales %1 does not exist.
+                        return checkFailed(strFmt("@SYS115105", _wmsJournalTrans.InventTransRefId));
+                    }
+                    if (salesTable.CustAccount != _wmsJournalTrans.VendAccount)
+                    {
+                        //Sales %1 was not placed with customer %2.
+                        return checkFailed(strFmt("@SYS115107", _wmsJournalTrans.InventTransRefId, _wmsJournalTrans.VendAccount));
+                    }
+                    break;
+
+                default :
+                                        // Reference must be either Sales order or Purch order if Account number is specified.
+                                        return checkFailed("@SYS115358");
+            }
+        }
+
+        if (_wmsJournalTrans.InventTransId)
+        {
+            InventMovement inventMovement = this.inventMovement(_wmsJournalTrans, false);
+            Str inventoryTransactionError = this.inventoryTransactionError(_wmsJournalTrans, inventMovement);
+            if (inventoryTransactionError != '')
+            {
+                return _errorText ? checkFailed(inventoryTransactionError) : false;
+            }
+        }
+
+        if (!_wmsJournalTrans.InventTransRefId && !_wmsJournalTrans.InventTransId)
+        {
+            return _errorText ? checkFailed("@SYS55859") : false;
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>inventoryTransactionError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the error text results from validating the inventory transaction.
+    /// </summary>
+    /// <param name = "_wmsJournalTrans">
+    /// A <c>WMSJournalTrans</c> record.
+    /// </param>
+    /// <param name = "_inventMovement">
+    /// An <c>InventMovement</c> instance.
+    /// </param>
+    /// <returns>
+    /// The error text results from validating the inventory transaction.
+    /// </returns>
+    protected str inventoryTransactionError(WMSJournalTrans _wmsJournalTrans, InventMovement _inventMovement)
+    {
+        if (!_inventMovement)
+        {
+            return strFmt("@SYS53791", _wmsJournalTrans.Qty);
+        }
+
+        if (_wmsJournalTrans.InventTransRefId && _wmsJournalTrans.InventTransRefId != _inventMovement.transRefId())
+        {
+            return strFmt("@SYS51078", _wmsJournalTrans.InventTransType, _wmsJournalTrans.InventTransRefId);
+        }
+
+        if (_inventMovement.itemId() != _wmsJournalTrans.ItemId || !InventDim::isInventDimEqualConsistent(_inventMovement.inventDimGroupSetup(), _inventMovement.inventdim(), _wmsJournalTrans.inventDim()))
+        {
+            return strFmt("@SYS55290", _inventMovement.itemId(), _inventMovement.inventdim().preFix());
+        }
+
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkReturnOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs validation checks that are related to return orders.
+    /// </summary>
+    /// <param name="_wmsJournalTrans">
+    /// A <c>WMSJournalTrans</c> table buffer.
+    /// </param>
+    /// <returns>
+    /// true if all checks are successfully performed; otherwise, false.
+    /// </returns>
+    private boolean checkReturnOrder(WMSJournalTrans _wmsJournalTrans)
+    {
+        boolean                 ret = true;
+        WMSJournalTrans         wmsJournalTransMore;
+        ReturnExpectedRetQty    expectedRetQty;
+        PdsCWInventQty          expectedRetCWQty;
+        InventTransId           inventTransId;
+        InventTransId           inventTransIdReturn;
+
+        if (_wmsJournalTrans.ReturnItemNum && _wmsJournalTrans.InventTransType == InventTransType::Sales)
+        {
+            if (!_wmsJournalTrans.quarantineControl())
+            {
+                if (!_wmsJournalTrans.ReturnDispositionCodeId || !ReturnDispositionCode::exist(_wmsJournalTrans.ReturnDispositionCodeId))
+                {
+                    // Journal %1, line no: %2, item %3: Journal line is missing a disposition code.
+                    ret = checkFailed(strFmt("@SYS116531", _wmsJournalTrans.JournalId, _wmsJournalTrans.LineNum, _wmsJournalTrans.ItemId));
+                }
+            }
+
+            inventTransId = this.returnInventTransId(_wmsJournalTrans);
+            if (!inventTransId)
+            {
+                //  Lot id reference is missing for Journal %1, line no. %2.
+                ret = checkFailed(strFmt("@SYS116577", _wmsJournalTrans.JournalId, _wmsJournalTrans.LineNum));
+            }
+            else
+            {
+                InventQty           requestedQty;
+                PdsCWInventQty      pdsRequestedCWQty;
+                SalesLine           returnLine;
+
+                [requestedQty, pdsRequestedCWQty] = this.getRequestedQuantities(inventTransId);
+                if (PdsGlobal::pdsIsCWItem(_wmsJournalTrans.ItemId))
+                {
+                    select firstonly PdsCWExpectedRetQty from returnLine
+                        where returnLine.inventTransId == inventTransId
+                            && (returnLine.ReturnStatus == ReturnStatusLine::Awaiting || returnLine.ReturnStatus == ReturnStatusLine::Canceled);
+                    
+                    expectedRetCWQty = returnLine.PdsCWExpectedRetQty;
+                    if (pdsRequestedCWQty *-1 < expectedRetCWQty)
+                    {
+                        //Journal %1, line no: %2, item %3: Quantity is exceeding expected quantity to be returned.
+                        ret = checkFailed(strFmt("@PDS1589", _wmsJournalTrans.JournalId, _wmsJournalTrans.LineNum, _wmsJournalTrans.ItemId));
+                    }
+                }
+                else
+                {
+                    select firstonly QtyOrdered from returnLine
+                        where returnLine.inventTransId == inventTransId 
+                            && (returnLine.ReturnStatus == ReturnStatusLine::Awaiting || returnLine.ReturnStatus == ReturnStatusLine::Canceled);
+                    
+                    expectedRetQty = returnLine.QtyOrdered;
+                    if (requestedQty *-1 < expectedRetQty)
+                    {
+                        //Journal %1, line no: %2, item %3: Quantity is exceeding expected quantity to be returned.
+                        ret = checkFailed(strFmt("@SYS116578", _wmsJournalTrans.JournalId, _wmsJournalTrans.LineNum, _wmsJournalTrans.ItemId));
+                    }
+                }
+                select firstonly JournalId, LineNum, ItemId from wmsJournalTransMore where wmsJournalTransMore.InventTransId            == inventTransId &&
+                                                                                           wmsJournalTransMore.JournalId                == _wmsJournalTrans.JournalId &&
+                                                                                           wmsJournalTransMore.RecId                    != _wmsJournalTrans.RecId &&
+                                                                                           wmsJournalTransMore.ReturnDispositionCodeId  != _wmsJournalTrans.ReturnDispositionCodeId;
+
+                if (wmsJournalTransMore.RecId)
+                {
+                    //Journal %1, line no: %2, item %3: Journal line the same Lot id reference as line no %4, but the two lines have different disposition codes
+                    ret = checkFailed(strFmt("@SYS116580", wmsJournalTransMore.JournalId, wmsJournalTransMore.LineNum, wmsJournalTransMore.ItemId, _wmsJournalTrans.LineNum));
+                }
+
+                inventTransIdReturn = (select salesLine where salesLine.InventTransId == _wmsJournalTrans.InventTransId).InventTransIdReturn;
+                if (inventTransIdReturn) // Determines if the return order line has a reference to a sales order line.
+                {
+                    if (!SalesLine::canRegisterReturnQtyTrackingDim(inventTransIdReturn, _wmsJournalTrans.inventDim(), _wmsJournalTrans.Qty))
+                    {
+                        //The quantity that you have entered exceeds the quantity that it is possible to return for the batch or serial number.
+                        ret = checkFailed("@SYS341821");
+                    }
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkToQuarantine</Name>
+				<Source><![CDATA[
+    private boolean checkToQuarantine(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim)
+    {
+        boolean                 ok = true;
+
+        InventLocation          inventLocationRegistration = InventLocation::find(_inventDim.InventLocationId);
+        InventQuarantineControl inventQuarantineControl;
+
+        inventQuarantineControl = _wmsJournalTrans.quarantineControl();
+
+        if (inventLocationRegistration.InventLocationType == InventLocationType::Quarantine)
+        {
+            if (!inventQuarantineControl && _wmsJournalTrans.InventTransType != InventTransType::QuarantineOrder)
+            {
+                // Quarantine location is selected but quarantine order will not be created.
+                ok = checkFailed("@SYS117006");
+            }
+            return ok;
+        }
+
+        if (inventQuarantineControl && !inventLocationRegistration.InventLocationIdQuarantine)
+        {
+            ok = checkFailed(strFmt("@SYS69047", inventLocationRegistration.InventLocationId));
+        }
+
+        if (inventQuarantineControl)
+        {
+            if (!_wmsJournalTrans.CheckBufferLocation && !_wmsJournalTrans.CheckPickingLocation)
+            {
+                ok = checkFailed("@SYS58490");
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkTrans</Name>
+				<Source><![CDATA[
+    public boolean checkTrans(JournalTransData  _journalTransData)
+    {
+        boolean                 ok = true;
+        WMSJournalTrans         wmsJournalTrans;
+        InventDim               inventDim;
+
+        if (! super(_journalTransData))
+        {
+            return false;
+        }
+
+        wmsJournalTrans = _journalTransData.journalTrans();
+        inventDim       = wmsJournalTrans.inventDim();
+
+        setPrefix(strFmt("@SYS14077", wmsJournalTrans.ItemId));
+
+        if (    PdsGlobal::pdsIsCWItem(wmsJournalTrans.ItemId)
+            && (wmsJournalTrans.PdsCWQty == 0))
+        {
+            warning("@PDS1588");
+            return false;
+        }
+        if (wmsJournalTrans.Qty == 0)
+        {
+            warning("@SYS16660");
+            return false;
+        }
+
+        ok = this.checkLocation(wmsJournalTrans, inventDim)     && ok;
+
+        if (!this.checkReference(wmsJournalTrans))
+        {
+            ok = false;
+        }
+        else
+        {
+            ok = this.checkQuantities(wmsJournalTrans, inventDim) && ok;
+        }
+
+        ok = this.checkQuarantine(wmsJournalTrans, inventDim)   && ok;
+        ok = this.checkTransfer(wmsJournalTrans, inventDim)     && ok; 
+        ok = this.checkReturnOrder(wmsJournalTrans)             && ok;
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkTransfer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks that the shipped quantity is not less than the sum of already received qty and the total qty that is being updated.
+    /// </summary>
+    /// <param name = "_wmsJournalTrans">The journal line to validate.</param>
+    /// <param name = "_inventDim">The inventory dimensions.</param>
+    /// <returns>true, if successful.</returns>
+    private boolean checkTransfer(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim)
+    {
+        InventDim               inventDimTransfer;
+        InventDimParm           inventDimParm;
+        InventMovement          inventMovement;
+
+        if (_wmsJournalTrans.InventTransType == InventTransType::TransferOrderReceive)
+        {
+            inventMovement = this.inventMovement(_wmsJournalTrans);
+            if (!inventMovement)
+            {
+                setPrefix(strFmt("@SYS14077", _wmsJournalTrans.ItemId));
+                return checkFailed("@SYS51092");
+            }
+
+            inventDimParm.initDimTransferReceipt(_inventDim);
+
+            //find the sum based on transId and dimensions that confirms to the InventDimParm for transfer orders.
+            select sum(RequestedQty)
+                , sum(PdsRequestedCWQty)
+                from tmpWMSJournalCheck
+                where tmpWMSJournalCheck.InventTransId  == inventMovement.transId()
+                #InventDimExistsJoin(tmpWMSJournalCheck.InventDimId,inventDimTransfer,_inventDim,inventDimParm);
+
+            if      (PdsGlobal::pdsIsCWItem(_wmsJournalTrans.ItemId)
+                &&  (abs(InventTransferLine::pdsCWInventTransSumDimShipped(inventMovement.transId(),_inventDim))
+                    < InventTransferLine::pdsCWinventTransSumDimReceived(inventMovement.transId(),_inventDim) + tmpWMSJournalCheck.PdsRequestedCWQty))
+            {
+                return checkFailed(strFmt("@PDS1597", _wmsJournalTrans.ItemId));
+            }
+            else
+            if (abs(InventTransferLine::inventTransSumDimShipped(inventMovement.transId(),_inventDim)) < InventTransferLine::inventTransSumDimReceived(inventMovement.transId(),_inventDim) + tmpWMSJournalCheck.RequestedQty)
+            {
+                return checkFailed(strFmt("@SYS90627", _wmsJournalTrans.ItemId));
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>destinationInventLocationId</Name>
+				<Source><![CDATA[
+    private InventLocationId destinationInventLocationId(
+        WMSJournalTrans     _line,
+        InventDim           _lineDim = _line.inventDim())
+    {
+        InventLocation          inventLocationRegistration;
+        InventLocationId        inventLocationId;
+        InventQuarantineOrder   inventQuarantineOrder;
+
+        if (_line.InventTransType == InventTransType::QuarantineOrder)
+        {
+            inventQuarantineOrder = InventQuarantineOrder::find(_line.InventTransRefId);
+            if (!inventQuarantineOrder)
+            {
+                return _lineDim.InventLocationId;
+            }
+            switch (inventQuarantineOrder.Status)
+            {
+                case InventQuarantineStatus::Created:
+                    inventLocationId = inventQuarantineOrder.quarantineInventLocationId();
+                    break;
+                case InventQuarantineStatus::Started:
+                    return '';
+                case InventQuarantineStatus::ReportedFinished:
+                    break;
+                case InventQuarantineStatus::Ended:
+                    return '';
+            }
+            inventLocationId = (inventLocationId) ? inventLocationId : inventQuarantineOrder.standardInventLocationId();
+            return (inventLocationId) ? inventLocationId : _lineDim.InventLocationId;
+        }
+
+        if (!_line.quarantineControl())
+        {
+            return _lineDim.InventLocationId;
+        }
+
+        inventLocationRegistration = InventLocation::find(_lineDim.InventLocationId);
+        return inventLocationRegistration.InventLocationIdQuarantine ?
+                    inventLocationRegistration.InventLocationIdQuarantine :
+                    _lineDim.InventLocationId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findFreePickingLocation</Name>
+				<Source><![CDATA[
+    private WMSLocation findFreePickingLocation(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim)
+    {
+        WMSLocation     wmsLocation;
+        WMSLocation     wmsLocationEmpty;
+        InventTable     inventTable;
+        Volume          freeVolume;
+        InventDim       inventDimNew;
+        boolean         isCWItem = PdsGlobal::pdsIsCWItem(_wmsJournalTrans.ItemId);
+
+        inventTable = InventTable::find(_wmsJournalTrans.ItemId);
+
+        inventDimNew.data(_inventDim);
+        inventDimNew.InventLocationId = this.destinationInventLocationId(_wmsJournalTrans, _inventDim);
+        inventDimNew.initFromInventLocation(inventDimNew.inventLocation());
+        inventDimNew = InventDim::findOrCreate(inventDimNew);
+
+        wmsLocation = WMSLocation::findPickingLocation(_wmsJournalTrans.ItemId, inventDimNew);
+        if (!wmsLocation ||
+             wmsLocation.InputBlockingCauseId)
+        {
+            return wmsLocationEmpty;
+        }
+
+        freeVolume = wmsLocation.freeVolume();
+        if (freeVolume <= 0)
+        {
+            return wmsLocationEmpty;
+        }
+
+        if (isCWItem)
+        {
+            freeVolume -= _wmsJournalTrans.PdsCWQty * inventTable.grossVolume();
+        }
+        else
+        {
+            freeVolume -= _wmsJournalTrans.Qty * inventTable.grossVolume();
+        }
+
+        if (freeVolume <= 0)
+        {
+            return wmsLocationEmpty;
+        }
+
+        return wmsLocation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findNewLocation</Name>
+				<Source><![CDATA[
+    private WMSLocation findNewLocation(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim,
+        boolean             _throwIfFail = true)
+    {
+        WMSLocation         wmsLocation;
+
+        if (_wmsJournalTrans.CheckPickingLocation)
+        {
+            wmsLocation = this.findFreePickingLocation(_wmsJournalTrans, _inventDim);
+
+            if (!wmsLocation.RecId)
+            {
+                str errorMessage = strFmt("@SYS70199", _wmsJournalTrans.ItemId, this.destinationInventLocationId(_wmsJournalTrans));
+
+                if (_throwIfFail)
+                {
+                    throw (error(errorMessage));
+                }
+                else
+                {
+                    error(errorMessage);
+                }
+            }
+        }
+
+        return wmsLocation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateQualityOrders</Name>
+				<Source><![CDATA[
+    private void generateQualityOrders()
+    {
+        MapEnumerator   me;
+        if (inventReceiptForTestRegistratorMap)
+        {
+            me = inventReceiptForTestRegistratorMap.getEnumerator();
+            while (me.moveNext())
+            {
+                InventQualityManagementCreateHandler::createInventoryRegistration(
+                    me.currentKey(),
+                    me.currentValue());
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRegistrationSelectionParm</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the <c>InventDimParm</c> record that should be used when you select inventory transactions for
+    /// registration.
+    /// </summary>
+    /// <param name="_regDim">
+    /// The <c>InventDim</c> record that is used for registration.
+    /// </param>
+    /// <param name="_movement">
+    /// The <c>Inventmovement</c> object that is used for registration.
+    /// </param>
+    /// <param name="_qtyRegister">
+    /// The quantity that is being registered.
+    /// </param>
+    /// <param name="_cwQtyRegister">
+    /// The catch weight quantity that is being registered.
+    /// </param>
+    /// <returns>
+    /// An <c>InventDimParm</c> record that has the appropriate fields set.
+    /// </returns>
+    protected InventDimParm getRegistrationSelectionParm(
+        InventDim       _regDim,
+        InventMovement  _movement,
+        InventQty       _qtyRegister,
+        PdsCWInventQty  _cwQtyRegister = 0
+        )
+    {
+        InventDimParm   inventDimParmExtra;
+        InventDimParm   inventDimParmPrimary;
+
+        if (_movement.transType() == InventTransType::TransferOrderReceive)
+        {
+            //we must register exact match except for WMS dimensions
+            inventDimParmExtra.initDimTransferReceipt(_regDim);
+            return inventDimParmExtra;
+        }
+
+        _movement.inventDimGroupSetup().inventDimParmActivePrimaryDimension(inventDimParmPrimary);
+        inventDimParmExtra.initFromInventDim(_regDim);
+
+        /*
+            Since the journal lines can have more inventory dimensions than the primary, e.g serial numbers,
+            we examine if there is sufficient Inventtrans so the inventDimParm can be more specific.
+        */
+        if (!InventDimParm::isInventDimParmEqual(inventDimParmExtra,inventDimParmPrimary))
+        {
+            inventDimParmExtra = InventDimParm::orParms(inventDimParmExtra,inventDimParmPrimary);
+
+            if (PdsGlobal::pdsIsCWItem(_movement.itemId())
+                && (InventTransSum::newChildTypeInventDim().pdsCWidOrdered(_movement.inventTransOriginId(), _movement.transChildType(), _movement.transChildRefId(), _regDim, inventDimParmExtra) >= _cwQtyRegister))
+            {
+                return inventDimParmExtra;
+            }
+            else
+            if (InventTransSum::newChildTypeInventDim().originOrdered(_movement.inventTransOriginId(), _movement.transChildType(), _movement.transChildRefId(), _regDim, inventDimParmExtra) >= _qtyRegister)
+            {
+                return inventDimParmExtra;
+            }
+        }
+
+        return inventDimParmPrimary;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRequestedQuantities</Name>
+				<Source><![CDATA[
+    private container getRequestedQuantities(InventTransId _inventTransId)
+    {
+        container result;
+
+        if (!tmpWMSJournalCheckSums)
+        {
+            tmpWMSJournalCheckSums = new Map(Types::String,Types::Container);
+        }
+
+        if (!tmpWMSJournalCheckSums.exists(_inventTransId))
+        {
+            select sum(RequestedQty), sum(PdsRequestedCWQty)
+            from tmpWMSJournalCheck
+            where tmpWMSJournalCheck.InventTransId == _inventTransId;
+
+            result = [tmpWMSJournalCheck.requestedQty,tmpWMSJournalCheck.pdsRequestedCWQty];
+
+            tmpWMSJournalCheckSums.insert(_inventTransId,result);
+        }
+        else
+        {
+            result = tmpWMSJournalCheckSums.lookup(_inventTransId);
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the posting of the journal.
+    /// </summary>
+    /// <param name="_journalTransList">
+    /// A list that contains all lines in the journal.
+    /// </param>
+    /// <returns>
+    /// true if the initialization was successful; otherwise, false.
+    /// </returns>
+    protected boolean initJournal(JournalTransList _journalTransList)
+    {
+        boolean     res;
+
+        res = this.initTmpWMSJournalCheck(_journalTransList);
+
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTmpWMSJournalCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the temporary table, depending on all lines in the journal.
+    /// </summary>
+    /// <param name="_journalTransList">
+    /// A List that contains all lines in the journal.
+    /// </param>
+    /// <returns>
+    /// true if initialization was successful; otherwise, false.
+    /// </returns>
+    private boolean initTmpWMSJournalCheck(JournalTransList _journalTransList)
+    {
+        WMSJournalTrans     journalTrans;
+        boolean             res = true;
+        boolean             isCWItem;
+
+        recId2TransIdMap = new Map(typeName2Type(extendedTypeStr(RecId)), Types::String);
+        while (_journalTransList.next())
+        {
+            journalTrans        = _journalTransList.journalTransData().journalTrans();
+            isCWItem = PdsGlobal::pdsIsCWItem(journalTrans.ItemId);
+            if ((isCWItem && (journalTrans.PdsCWQty != 0)) || (!isCWItem && (journalTrans.Qty != 0)))
+            {
+                if (journalTrans.InventTransId)
+                {
+                    this.updateOrCreateTmpWMSJournalCheck(journalTrans, journalTrans.InventTransId);
+                }
+                else
+                {
+                    if (this.checkReference(journalTrans, false))
+                    {
+                        setPrefix(strFmt("@SYS55417", journalTrans.LineNum, journalTrans.ItemId));
+                        if (journalTrans.initInventTransId(true))
+                        {
+                            // Multiple lines exist for the same item.
+                            res = false;
+                        }
+                        if (journalTrans.InventTransId)
+                        {
+                            recId2TransIdMap.insert(journalTrans.RecId, journalTrans.InventTransId);
+                            tmpWMSJournalCheck = this.updateOrCreateTmpWMSJournalCheck(journalTrans, journalTrans.InventTransId);
+                        }
+                    }
+                }
+            }
+        }
+
+        _journalTransList.reset();
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>inventItemLocation</Name>
+				<Source><![CDATA[
+    private InventItemLocation inventItemLocation(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim,
+        boolean             _update = false)
+    {
+        return InventItemLocation::findFixedWarehouse(_wmsJournalTrans.ItemId, _inventDim.InventDimId, _update);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>inventMovement</Name>
+				<Source><![CDATA[
+    private InventMovement inventMovement(
+        WMSJournalTrans     _wmsJournalTrans,
+        boolean             _requireOrderedInventTrans = true)
+    {
+        InventTransId       inventTransId = _wmsJournalTrans.InventTransId;
+
+        if (!inventTransId)
+        {
+            if (!recId2TransIdMap || !recId2TransIdMap.exists(_wmsJournalTrans.RecId))
+            {
+                return null;
+            }
+            inventTransId = recId2TransIdMap.lookup(_wmsJournalTrans.RecId);
+        }
+
+        return _wmsJournalTrans.inventMovement(inventTransId, _requireOrderedInventTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+
+        inventReceiptForTestRegistratorMap = new Map(Types::Int64, Types::Class);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postJournal</Name>
+				<Source><![CDATA[
+    public void postJournal(JournalTransList _journalTransList)
+    {
+        this.initJournal(_journalTransList);
+        super(_journalTransList);
+
+        this.runPostJournalTransListEnded(_journalTransList);
+        this.generateQualityOrders();
+
+        if (WMSJournalTable::hasReturnLines(journalTableData.journalTable().JournalId))
+        {
+            this.returnOrderUpdate(_journalTransList);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runPostJournalTransListEnded</Name>
+				<Source><![CDATA[
+    delegate void runPostJournalTransListEnded(JournalTransList _journalTransList)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postTrans</Name>
+				<Source><![CDATA[
+    public void postTrans(JournalTransData _journalTransData)
+    {
+        super(_journalTransData);
+
+        WMSJournalTrans wmsJournalTrans = _journalTransData.journalTrans();
+        InventDim inventDim = wmsJournalTrans.inventDim();
+        InventDim inventDimSpecified;
+        inventDimSpecified.data(inventDim.data());
+
+        if (PdsGlobal::pdsIsCWItem(wmsJournalTrans.ItemId) && wmsJournalTrans.PdsCWQty == 0)
+        {
+            return;
+        }
+        if (wmsJournalTrans.Qty == 0)
+        {
+            return;
+        }
+        
+        InventDimParm inventDimParm;
+        inventDimParm.initFromInventDim(inventDim);
+
+        InventMovement inventMovement = this.inventMovement(wmsJournalTrans, false);
+
+        if (!inventMovement)
+        {
+            throw(error("@SYS51092"));
+        }
+
+        inventMovement.parmMustBeQuarantineControled(inventMovement.mustBeQuarantineControlled() || wmsJournalTrans.CreateQuarantineOrder == NoYes::Yes);
+
+        this.setRegistrationLocationId(wmsJournalTrans, inventDim);
+        inventDim = wmsJournalTrans.inventDim();
+        
+        InventDim inventDimArrive;
+        inventDimArrive.data(inventDim.data());
+
+        if (inventMovement.mustBeQuarantineControlled())
+        {
+            if (wmsJournalTrans.CheckBufferLocation || wmsJournalTrans.CheckPickingLocation)
+            {
+                inventDimArrive.InventLocationId    = inventDimSpecified.InventLocationId;
+                inventDimArrive.wmsLocationId       = inventDimSpecified.wmsLocationId;
+                inventDimArrive.initFromInventLocation(inventDimArrive.inventLocation());
+                inventDimArrive = InventDim::findOrCreate(inventDimArrive);
+                inventDimParm.clear();
+                inventDimParm.initFromInventDim(inventDimArrive);
+                InventUpd_Arrived inventUpd_Arrived = InventUpd_Arrived::newParameters(inventMovement, inventDimArrive, inventDimParm, wmsJournalTrans.Qty
+                    , null, null
+                    , wmsJournalTrans.PdsCWQty
+                    , wmsJournalTrans.transDate
+                    );
+                inventUpd_Arrived.updateNow();
+            }
+            else
+            {
+                if (inventDimSpecified.inventLocation().InventLocationType == InventLocationType::Quarantine)
+                {
+                    inventDimArrive = InventQuarantineOrder::inventDimArriveOrRegistration(inventDimArrive,inventMovement.inventdim(),inventMovement.itemId());
+
+                    inventDimParm.clear();
+                    inventDimParm.initFromInventDim(inventDimArrive);
+                    InventUpd_Arrived inventUpd_Arrived = InventUpd_Arrived::newParameters(inventMovement, inventDimArrive, inventDimParm, wmsJournalTrans.Qty
+                        , null, null
+                        , wmsJournalTrans.PdsCWQty
+                        , wmsJournalTrans.transDate
+                        );
+                    inventUpd_Arrived.updateNow();
+                }
+            }
+        }
+        
+        InventDim inventDimRegister;
+        inventDimRegister.data(inventDimArrive.data());
+
+        InventDimParm inventDimParmRegistrationSelect = this.getRegistrationSelectionParm(inventDimRegister, inventMovement,wmsJournalTrans.Qty, wmsJournalTrans.PdsCWQty);
+
+        InventUpd_Registered InventUpd_Registered = this.instantiateInventUpd_Registered(inventMovement, inventDimRegister, inventDimParm, inventDimArrive,
+                                                                                         inventDimParmRegistrationSelect, wmsJournalTrans, inventDim);
+
+        InventTransOriginId curInventTransOriginId = inventMovement.inventTransOriginId();
+        if (inventReceiptForTestRegistratorMap.exists(curInventTransOriginId))
+        {
+            InventReceiptForTestRegistrator inventReceiptForTestRegistrator = inventReceiptForTestRegistratorMap.lookup(curInventTransOriginId);
+            inventUpd_Registered.parmInventReceiptForTestRegistrator(inventReceiptForTestRegistrator);
+        }
+        
+        inventUpd_Registered.updateNow();
+
+        var inventReceiptForTestRegistrator = inventUpd_Registered.parmInventReceiptForTestRegistrator();
+
+        if (inventReceiptForTestRegistrator)
+        {
+            inventReceiptForTestRegistrator.parmCreateQualityItemSamplingWork(false);
+            inventReceiptForTestRegistrator.parmMustBeQuarantineControlled(inventMovement.mustBeQuarantineControlled());
+        }
+
+        inventReceiptForTestRegistratorMap.insert(curInventTransOriginId, inventReceiptForTestRegistrator);
+
+        if (wmsJournalTrans.InventTransType == InventTransType::QuarantineOrder)
+        {
+            InventQuarantineUpdEnd inventQuarantineUpdEnd = InventQuarantineUpdEnd::newQuarantineOrder(
+                    InventQuarantineOrder::find(wmsJournalTrans.InventTransRefId), wmsJournalTrans.Qty, wmsJournalTrans.PdsCWQty
+                    );
+            inventQuarantineUpdEnd.run();
+        }         
+
+        wmsJournalTrans.InventTransId = inventMovement.transId();
+        wmsJournalTrans.InventTransType = inventMovement.transType();
+        wmsJournalTrans.InventTransRefId = inventMovement.transRefId();
+        wmsJournalTrans.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instantiateInventUpd_Registered</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and initializes an <c>InventUpd_Registered</c> instance.
+    /// </summary>
+    /// <returns>An <c>InventUpd_Registered</c> instance.</returns>
+    protected InventUpd_Registered instantiateInventUpd_Registered(InventMovement _inventMovement, InventDim _inventDimRegister, 
+                                                                   InventDimParm _inventDimParm, InventDim _inventDimArrive,
+                                                                   InventDimParm _inventDimParmRegistrationSelect, WMSJournalTrans _wmsJournalTrans,
+                                                                   InventDim _inventDim)
+    {
+        InventUpd_Registered inventUpd_Registered = InventUpd_Registered::newParameters(_inventMovement,
+                                                        _inventDimRegister, _inventDimParm,_inventDimArrive,_inventDimParmRegistrationSelect,_wmsJournalTrans.Qty,
+                                                        _wmsJournalTrans.PdsCWQty,
+                                                        _wmsJournalTrans.transDate);
+
+        inventUpd_Registered.parmSkipQualityOrderCreation(true);  // We handle quality order creation after all trans are posted.
+
+        if (_inventMovement.mustBeQuarantineControlled())
+        {
+            inventUpd_Registered.parmAllowReservePhysical(false);
+
+            if (_inventDim.inventLocation().InventLocationType == InventLocationType::Quarantine)
+            {
+                inventUpd_Registered.parmInventDimQuarantine(_inventDim);
+            }
+        }
+
+        return inventUpd_Registered;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>returnInventTransId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Returns an <c>inventTransId</c> that identifies a return order.
+    /// </summary>
+    /// <param name="_wmsJournalTrans">
+    ///    A <c>WMSJournalTrans</c> table buffer.
+    /// </param>
+    /// <returns>
+    ///    An <c>InvenTransId</c> type.
+    /// </returns>
+    private InventTransId returnInventTransId(WMSJournalTrans _wmsJournalTrans)
+    {
+        if (_wmsJournalTrans.InventTransId)
+        {
+            return _wmsJournalTrans.InventTransId;
+        }
+
+        if (recId2TransIdMap && recId2TransIdMap.exists(_wmsJournalTrans.RecId))
+        {
+            return recId2TransIdMap.lookup(_wmsJournalTrans.RecId);
+        }
+
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmMCRSkipMiscCharges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets and retrieves the flag to skip miscellaneous charges.
+    /// </summary>
+    /// <param name="_mcrSkipMiscCharges">
+    /// The parameter value to skip miscellaneous charges.
+    /// </param>
+    /// <returns>
+    /// true if the parameter to skip miscellaneous charges is set; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    /// Utilized in the <c>returnOrderUpdate</c> method of the <c>WMSJournalCheckPostReception</c> class.
+    /// </remarks>
+    public boolean parmMCRSkipMiscCharges(boolean _mcrSkipMiscCharges = mcrSkipMiscCharges)
+    {
+        mcrSkipMiscCharges = _mcrSkipMiscCharges;
+        return mcrSkipMiscCharges;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReturnOrderUpdateSplit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the return order update can split the return line.
+    /// </summary>
+    /// <param name = "_salesLine">The return order line.</param>
+    /// <param name = "_wmsJournalTrans">The return journal transaction.</param>
+    /// <returns>true if can be split; otherwise, false.</returns>
+    protected boolean canReturnOrderUpdateSplit(SalesLine _salesLine, WMSJournalTrans _wmsJournalTrans)
+    {
+        boolean isCWItem = PdsGlobal::pdsIsCWItem(_salesLine.ItemId);
+
+        if ((isCWItem && (_salesLine.PdsCWExpectedRetQty < _wmsJournalTrans.PdsCWQty * -1)) || (!isCWItem && (_salesLine.QtyOrdered < _wmsJournalTrans.Qty * -1)))
+        {
+            return true;
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitReturnLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Splits a return order line into two return order lines.
+    /// </summary>
+    /// <param name = "_salesLine">The return line.</param>
+    /// <param name = "_wmsJournalTrans">The return journal transaction.</param>
+    /// <returns>
+    /// The inventory transaction ID for a new return order line.
+    /// </returns>
+    protected InventTransId splitReturnLine(SalesLine _salesLine, WMSJournalTrans _wmsJournalTrans)
+    {        
+        return SalesLine::splitReturnLine(
+            _salesLine.InventTransId,
+            _salesLine.QtyOrdered - (_wmsJournalTrans.Qty * -1),
+            _salesLine.PdsCWExpectedRetQty - (_wmsJournalTrans.PdsCWQty * -1));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setSplitInventTransIdToNextWHSMixedLicensePlateReceiptLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reset the next lines InventTransId in the <c>WHSMixedLicensePlateReceiptLine</c> after the sales line split.
+    /// </summary>
+    /// <param name = "_originalId">original sales line InventTransId.</param>
+    /// <param name = "_splitTransId">The split sales line InventTransId.</param>
+    /// <param name = "_inventDimId">The current trans InventDimId.</param>
+    private void setSplitInventTransIdToNextWHSMixedLicensePlateReceiptLines(
+        InventTransId   _originalId,
+        InventTransId   _splitTransId,
+        InventDimId     _inventDimId)
+    {
+        WHSMixedLicensePlateReceiptLine mixedLines;
+
+        update_recordset mixedLines
+            setting InventTransId = _splitTransId
+            where mixedLines.InventTransId == _originalId
+               && mixedLines.InventDimId   != _inventDimId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>returnOrderUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the return order lines when <c>WMSJournalTrans</c> records that are related to return
+    /// orders are posted.
+    /// </summary>
+    /// <param name="_journalTransList">
+    /// An instance of the <c>JournalTransList</c> class.
+    /// </param>
+    private void returnOrderUpdate(JournalTransList _journalTransList)
+    {
+        SalesLine               salesLine;
+        SalesTable              salesTable;
+        SalesId                 salesId            = '';
+        boolean                 isCreatedMarkUpTrans = false;
+
+        ReturnStatusLine setStatusLine(SalesLine _salesLine)
+        {
+            if (_salesLine.ReturnStatus == ReturnStatusLine::Awaiting)
+            {
+                return ReturnStatusLine::Registered;
+            }
+            return _salesLine.ReturnStatus;
+        }
+
+        _journalTransList.reset();
+        ttsbegin;
+        while (_journalTransList.next())
+        {
+            if (! journalTableData.journalErrorTransList().find(_journalTransList.item().LineNum))
+            {
+                WMSJournalTrans wmsJournalTrans = _journalTransList.journalTransData().journalTrans();
+                if (wmsJournalTrans && wmsJournalTrans.ReturnItemNum && (wmsJournalTrans.InventTransType == InventTransType::Sales || wmsJournalTrans.InventTransType == InventTransType::QuarantineOrder))
+                {
+                    if (wmsJournalTrans.InventTransType == InventTransType::Sales)
+                    {
+                        InventTransId inventTransId = this.returnInventTransId(wmsJournalTrans);
+                        salesLine = SalesLine::findInventTransId(inventTransId, true);
+                    }
+                    else if (wmsJournalTrans.InventTransType == InventTransType::QuarantineOrder)
+                    {
+                        salesLine = SalesLine::findInventTransId(InventQuarantineOrder::find(wmsJournalTrans.InventTransRefId).InventTransIdRef, true);
+                    }
+
+                    if (salesLine)
+                    {
+                        if (this.canReturnOrderUpdateSplit(salesLine, wmsJournalTrans))
+                        {
+                            InventTransId splitInventTransId = this.splitReturnLine(salesLine, wmsJournalTrans);
+                            salesLine = SalesLine::findInventTransId(salesLine.InventTransId, true);
+
+                            this.setSplitInventTransIdToNextWHSMixedLicensePlateReceiptLines(salesLine.InventTransId, splitInventTransId, wmsJournalTrans.inventDimId);
+
+                            SalesLine::deleteSplitReturnLineWithZeroExpectedReturnQty(splitInventTransId);
+
+                            // update return status in case only part of expected qty is sent to quarantine
+                            if (wmsJournalTrans.InventTransType == InventTransType::Sales && salesLine.ReturnStatus == ReturnStatusLine::Quarantine)
+                            {
+                                SalesLine salesLineSplit = SalesLine::findInventTransId(splitInventTransId, true);
+                                if (salesLineSplit && salesLineSplit.ReturnStatus == salesLine.ReturnStatus)
+                                {
+                                    salesLineSplit.ReturnStatus = ReturnStatusLine::Awaiting;
+                                    salesLineSplit.update();
+                                }
+                            }
+                        }
+
+                        // Process disposition code
+                        if (wmsJournalTrans.CreateQuarantineOrder == NoYes::Yes)
+                        {
+                            // disposition code is not taken into consideration
+                            wmsJournalTrans.ReturnDispositionCodeId = '';
+                            // delete all previous replacements for return order line that is sent to Quarantine
+                            ReturnReplaceItemRef::deleteReplaceSetup(salesLine.SalesId,salesLine.LineNum);
+                        }
+                        else
+                        {
+                            // create reservation sales line if required
+                            DispositionAction dispositionAction = ReturnDispositionCode::find(wmsJournalTrans.ReturnDispositionCodeId).DispositionAction;
+                            if (dispositionAction == DispositionAction::Scrap || dispositionAction == DispositionAction::ReplaceScrap || dispositionAction == DispositionAction::ReturnToCust)
+                            {
+                                if (dispositionAction == DispositionAction::ReturnToCust)
+                                {
+                                    salesLine.ReturnStatus = setStatusLine(salesLine);
+                                }
+                                salesLine.ReturnDispositionCodeId = wmsJournalTrans.ReturnDispositionCodeId;
+                                salesLine.createReturnMarkupTrans(salesLine.salesTable());
+                                salesLine.createReturnReservationLine();
+                                isCreatedMarkUpTrans = true;
+                            }
+                        }
+
+                        // update status and disposition code on return order line
+                        SalesLine salesLineUpdate = SalesLine::findInventTransId(salesLine.InventTransId,true);
+                        salesLineUpdate.ReturnStatus = setStatusLine(salesLineUpdate);
+                        salesLineUpdate.ReturnDispositionCodeId = wmsJournalTrans.ReturnDispositionCodeId;
+                        // If the parm is set to true, skip misc charge creation
+                        if (!mcrSkipMiscCharges
+                            ||  !RetailMCRChannelTable::mcrEnableOrderCompletion(salesLineUpdate.salesTable())
+                            &&  !isCreatedMarkUpTrans)
+                        {
+                            this.createReturnOrderLineReturnMarkupTrans(salesLineUpdate);
+                        }
+                        salesLineUpdate.ReturnArrivalDate = wmsJournalTrans.TransDate;
+                        salesLineUpdate.update();
+                    }
+                    else
+                    {
+                        //No Sales line related to Arrival journal %1, line number %2, exists.
+                        info(strFmt("@SYS116544", wmsJournalTrans.JournalId, wmsJournalTrans.LineNum));
+                    }
+
+                    if (wmsJournalTrans.quarantineControl() == NoYes::Yes)
+                    {
+                        InventQuarantineOrder quarantineOrder = InventQuarantineOrder::findInventTransIdRef(this.returnInventTransId(wmsJournalTrans));
+                        if (quarantineOrder.QuarantineId != '')
+                        {
+                            // Quarantine order %1, with reference to Return order %2, has been created.
+                            info(strFmt("@SYS120972", quarantineOrder.QuarantineId, wmsJournalTrans.ReturnItemNum), '',
+                                    SysInfoAction_Formrun::newFormnameDesc(formStr(InventQuarantineOrder), "@SYS105530"));
+                        }
+                    }
+
+                    if (salesLine && salesLine.SalesId != salesId)
+                    {
+                        salesTable = SalesTable::find(salesLine.SalesId, true);
+
+                        if (salesTable)
+                        {
+                            salesId = salesTable.SalesId;
+                            // Need to adjust payments just in case
+                            // disposition code had a miscellaneous charge associated to which
+                            // affected the sales total
+                            if (SalesTableType_ReturnItem::shouldAdjustReturnCredit(salesTable))
+                            {
+                                 SalesTableType_ReturnItem::MCRAdjustReturnCredit(salesTable);
+                            }
+                            if (salesTable.ReturnStatus == ReturnStatusHeader::Created)
+                            {
+                                salesTable.ReturnStatus = ReturnStatusHeader::Open;
+
+                                if (ReturnOrderHasRegisteredLineCalcEstimateFlight::instance().isEnabled())
+                                {
+                                    salesTable.setEstimate();
+                                }
+
+                                salesTable.update();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Need to adjust payments just in case
+        // disposition code had a miscellaneous charge associated to which
+        // affected the sales total
+        if ( salesTable
+            && SalesTableType_ReturnItem::shouldAdjustReturnCredit(salesTable))
+        {
+            SalesTableType_ReturnItem::MCRAdjustReturnCredit(salesTable);
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createReturnOrderLineReturnMarkupTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the return <c>MarkupTrans</c> records related to the specified return order line.
+    /// </summary>
+    /// <param name = "_returnOrderLine">The return order line for which charges are created.</param>
+    protected void createReturnOrderLineReturnMarkupTrans(SalesLine _returnOrderLine)
+    {
+        _returnOrderLine.createReturnMarkupTrans(_returnOrderLine.salesTable());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setRegistrationLocationId</Name>
+				<Source><![CDATA[
+    private void setRegistrationLocationId(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventDim           _inventDim)
+    {
+        WMSLocation         wmsLocation;
+        InventLocationId    inventLocationId;
+
+        inventLocationId = this.destinationInventLocationId(_wmsJournalTrans, _inventDim);
+        if (inventLocationId == _inventDim.InventLocationId)
+        {
+            wmsLocation = WMSLocation::find(_inventDim.wmsLocationId, _inventDim.InventLocationId);
+
+            if (!wmsLocation || !wmsLocation.isInboundDock())
+            {
+                return;
+            }
+        }
+
+        _inventDim.InventLocationId = inventLocationId;
+        _inventDim.initFromInventLocation(_inventDim.inventLocation());
+        _inventDim = InventDim::findOrCreate(_inventDim);
+        _wmsJournalTrans.InventDimId = _inventDim.InventDimId;
+
+        wmsLocation = this.findNewLocation(_wmsJournalTrans, _inventDim);
+
+        if (wmsLocation && (_inventDim.wmsLocationId != wmsLocation.wmsLocationId || _inventDim.InventLocationId != wmsLocation.InventLocationId))
+        {
+            //change the inventdim of the journal line so it matches the pallets location
+            _inventDim.InventLocationId = wmsLocation.InventLocationId;
+            _inventDim.wmsLocationId    = wmsLocation.wmsLocationId;
+            _inventDim.initFromInventLocation(_inventDim.inventLocation());
+            _inventDim = InventDim::findOrCreate(_inventDim);
+            _wmsJournalTrans.InventDimId = _inventDim.InventDimId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOrCreateTmpWMSJournalCheck</Name>
+				<Source><![CDATA[
+    private TmpWMSJournalCheck updateOrCreateTmpWMSJournalCheck(
+        WMSJournalTrans     _wmsJournalTrans,
+        InventTransId       _inventTransId)
+    {
+        select forupdate tmpWMSJournalCheck
+            where tmpWMSJournalCheck.InventTransId      == _inventTransId
+              &&  tmpWMSJournalCheck.InventDimId        == _wmsJournalTrans.InventDimId;
+
+        if (tmpWMSJournalCheck)
+        {
+            tmpWMSJournalCheck.RequestedQty += _wmsJournalTrans.Qty;
+            tmpWMSJournalCheck.PdsRequestedCWQty += _wmsJournalTrans.PdsCWQty;
+            tmpWMSJournalCheck.update();
+        }
+        else
+        {
+            tmpWMSJournalCheck.InventTransId    = _inventTransId;
+            tmpWMSJournalCheck.InventDimId      = _wmsJournalTrans.InventDimId;
+            tmpWMSJournalCheck.RequestedQty     = _wmsJournalTrans.Qty;
+            tmpWMSJournalCheck.PdsRequestedCWQty = _wmsJournalTrans.PdsCWQty;
+            tmpWMSJournalCheck.insert();
+        }
+
+        return tmpWMSJournalCheck;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of the <c>WMSJournalCheckPostReception</c> class.
+    /// </summary>
+    /// <returns>
+    ///    A new instance of the <c>WMSJournalCheckPostReception</c> class.
+    /// </returns>
+    public static WMSJournalCheckPostReception construct()
+    {
+        return new WMSJournalCheckPostReception();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        WMSJournalCheckPostReception    journalCheckPost;
+        JournalForm                     journalForm;
+
+        journalForm      = JournalForm::fromArgs(_args);
+        journalCheckPost = WMSJournalCheckPostReception::newFromForm(_args,journalForm);
+
+        journalForm.runbaseMainStart();
+
+        if (!journalCheckPost.prompt())
+        {
+            if (! journalCheckPost.batchInfo().parmBatch().RecId)
+            {
+                journalForm.runbaseMainCancel(journalCheckPost.parmJournalId());
+            }
+            return;
+        }
+
+        try
+        {
+            journalCheckPost.runOperation();
+            journalForm.runbaseMainEnd(journalCheckPost,false);
+        }
+        catch (Exception::Error)
+        {
+            journalForm.runbaseMainEnd(journalCheckPost,true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromForm</Name>
+				<Source><![CDATA[
+    public static WMSJournalCheckPostReception newFromForm(
+        Args            _args,
+        JournalForm     _journalForm)
+    {
+        WMSJournalTable journalTable = _journalForm.journalTable();
+
+        return WMSJournalCheckPostReception::newTypeJournalTable(_args.parmEnum(), journalTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newTypeJournalTable</Name>
+				<Source><![CDATA[
+    public static WMSJournalCheckPostReception newTypeJournalTable(
+        JournalCheckPostType    _journalCheckPostType,
+        WMSJournalTable         _wmsJournalTable)
+    {
+        WMSJournalCheckPostReception    journalCheckPost = WMSJournalCheckPostReception::construct();
+
+        journalCheckPost.getLast();
+        journalCheckPost.parmAutoBlock(false);
+        journalCheckPost.parmShowInfoResult(true);
+        journalCheckPost.parmJournalCheckPostType(_journalCheckPostType);
+        journalCheckPost.parmJournalTableId(_wmsJournalTable.TableId);
+        journalCheckPost.parmJournalId(_wmsJournalTable.JournalId);
+        return journalCheckPost;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

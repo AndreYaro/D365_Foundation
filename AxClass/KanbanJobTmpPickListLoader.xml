@@ -1,0 +1,745 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>KanbanJobTmpPickListLoader</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>KanbanJobTmpPickListLoader</c> class loads the picking list records for the process and
+/// transfer kanban boards.
+/// </summary>
+public abstract class KanbanJobTmpPickListLoader
+{
+    // input
+    container               containerKanbanJobs;
+    int                     numberOfJobs;
+
+    // current record
+    KanbanJob               kanbanJob;
+    KanbanEventQuantityMap  kanbanEventQuantityMap;
+    KanbanJobTmpPickList    kanbanJobTmpPickList;
+
+    // inventory
+    Map                     mapInventQuantity;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>aggregate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Aggregates the <c>KanbanJobTmpPickList</c> records by cumulating quantities.
+    /// </summary>
+    /// <returns>
+    /// A packed list of <c>KanbanJobTmpPickList</c> records.
+    /// </returns>
+    protected container aggregate()
+    {
+        KanbanJobTmpPickList    kanbanJobTmpPickListAvailable;
+        KanbanJobTmpPickList    kanbanJobTmpPickListNotAvailable;
+        List                    result = new List(Types::Record);
+
+        // add to result list
+        void add(KanbanJobTmpPickList _kanbanJobTmpPickList)
+        {
+            if (_kanbanJobTmpPickList.Quantity)
+            {
+                // the calculation fields are used for the initial calculation only
+                _kanbanJobTmpPickList.initCalculationFields();
+                result.addEnd(_kanbanJobTmpPickList);
+            }
+        }
+
+        // group records
+        while select sum(ReservedQuantity),sum(PostedQuantity),sum(NonInventoryQuantity),sum(AvailableQuantity),
+                     sum(ExpectedAvailableQuantity),sum(ExpectedNotAvailableQuantity),
+                     ItemId,InventDimId,ItemPegging,UnitId,SupplyStatus,LineType,Issue from kanbanJobTmpPickList
+            group by ItemId,InventDimId,ItemPegging,UnitId,SupplyStatus,LineType,Issue
+        {
+            if (kanbanJobTmpPickList.SupplyStatus == KanbanJobSupplyStatus::None)
+            {
+                kanbanJobTmpPickListAvailable.clear();
+                kanbanJobTmpPickListAvailable.data(kanbanJobTmpPickList);
+                kanbanJobTmpPickListAvailable.Quantity     = kanbanJobTmpPickList.NonInventoryQuantity;
+                kanbanJobTmpPickListAvailable.SupplyStatus = KanbanJobSupplyStatus::Available;
+
+                kanbanJobTmpPickListNotAvailable.clear();
+                kanbanJobTmpPickListNotAvailable.data(kanbanJobTmpPickList);
+                kanbanJobTmpPickListNotAvailable.Quantity     = kanbanJobTmpPickListNotAvailable.ExpectedNotAvailableQuantity;
+                kanbanJobTmpPickListNotAvailable.SupplyStatus = KanbanJobSupplyStatus::NotAvailable;
+
+                InventQty inventQtyRequired = kanbanJobTmpPickListAvailable.ExpectedAvailableQuantity
+                                              - kanbanJobTmpPickListAvailable.PostedQuantity
+                                              - kanbanJobTmpPickListAvailable.ReservedQuantity;
+
+                if (   kanbanJobTmpPickListAvailable.AvailableQuantity >= inventQtyRequired
+                    || inventQtyRequired                               <= 0)
+                {
+                    // entire quantity is available (or everything is already posted or reserved)
+                    kanbanJobTmpPickListAvailable.Quantity += kanbanJobTmpPickListAvailable.ExpectedAvailableQuantity;
+                }
+                else
+                {
+                    // add not available quantity
+                    InventQty inventQtyNotAvailable = inventQtyRequired
+                                                      - kanbanJobTmpPickListAvailable.AvailableQuantity;
+                    kanbanJobTmpPickListNotAvailable.Quantity += inventQtyNotAvailable;
+
+                    // set available quantity
+                    kanbanJobTmpPickListAvailable.Quantity    +=   kanbanJobTmpPickListAvailable.ExpectedAvailableQuantity
+                                                                 - inventQtyNotAvailable;
+                }
+
+                add(kanbanJobTmpPickListNotAvailable);
+                add(kanbanJobTmpPickListAvailable);
+            }
+            else
+            {
+                // entire quantity for supply status picked or available.
+                kanbanJobTmpPickList.Quantity =   kanbanJobTmpPickList.AvailableQuantity
+                                                + kanbanJobTmpPickList.NonInventoryQuantity;
+                add(kanbanJobTmpPickList);
+            }
+        }
+
+        return result.pack();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>availableQuantityItemInventDimId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the available inventory for a specified item at a specified dimension.
+    /// </summary>
+    /// <param name="_itemId">
+    /// The ID of the item.
+    /// </param>
+    /// <param name="_mapRequestedQuantities">
+    /// A <c>Map</c> object of requested quantities by inventory dimension.
+    /// </param>
+    /// <param name="_expectedNotAvailableQuantity">
+    /// A quantity that is not expected to be available and will not reduce the overall item availability.
+    /// </param>
+    /// <returns>
+    /// The available quantity.
+    /// </returns>
+    /// <remarks>
+    /// Available quantities are stored in a map and quantities available in the map are reduced so that
+    /// inventory is not allocated more than one time.
+    /// </remarks>
+    /// <exception cref="M:Exception::Error">
+    /// A null value was passed for the quantity map.
+    /// </exception>
+    /// <exception cref="M:Exception::Error">
+    /// A negative value was found in the quantity map.
+    /// </exception>
+    protected InventQty availableQuantityItemInventDimId(
+        ItemId        _itemId,
+        Map           _mapRequestedQuantities,
+        InventQty     _expectedNotAvailableQuantity = 0)
+    {
+        InventQty       inventQtyAvailable;
+        InventQty       inventQtyAvailableTotal;
+        //InventDimParm   inventDimParm;
+        InventDimId     inventDimIdRequested;
+        InventQty       inventQtyRequested;
+        InventQty       inventQtyShortage;
+        InventQty       inventQtyShortageTotal;
+        InventQty       inventQtyReduceNow;
+        container       mapKey;
+
+        if (!_mapRequestedQuantities)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        Map mapShortages = new Map(Types::String,Types::Real);
+
+        MapEnumerator me = _mapRequestedQuantities.getEnumerator();
+        while (me.moveNext())
+        {
+            inventDimIdRequested = me.currentKey();
+            inventQtyRequested   = me.currentValue();
+
+            if (inventQtyRequested < 0)
+            {
+                // sign is reversed, expect only issues in the map
+                throw error(Error::wrongUseOfFunction(funcName()));
+            }
+            else
+            {
+                // determine available inventory for item / inventDim through map lookup or inventSum
+                mapKey = [_itemId,inventDimIdRequested];
+                if (mapInventQuantity.exists(mapKey))
+                {
+                    // use instance map, avoid multiple allocation of the same inventory
+                    inventQtyAvailable = mapInventQuantity.lookup(mapKey);
+                }
+                else
+                {
+                    InventDim inventDim = InventDim::find(inventDimIdRequested);
+
+                    InventIAvailability availability = InventAvailabilityProvider::findByItemIdDim(_itemId,inventDim).parmInventAvailability();
+
+                    inventQtyAvailable =
+                        max(0,
+                        availability.availPhysical()
+                        )
+                        ;
+                    mapInventQuantity.insert(mapKey,inventQtyAvailable);
+                }
+            }
+
+            // track shortages
+            inventQtyShortage = inventQtyRequested - min(inventQtyRequested,inventQtyAvailable);
+
+            if (inventQtyShortage > 0)
+            {
+                inventQtyShortageTotal += inventQtyShortage;
+                mapShortages.insert(inventDimIdRequested,inventQtyShortage);
+            }
+        }
+
+        InventQty inventQtyExpectedNotAvailable = _expectedNotAvailableQuantity;
+        InventQty inventQtyExpectedNotAvailableUnallocated = max(0,inventQtyExpectedNotAvailable - inventQtyShortageTotal);
+
+        // now allocate requested to available quantities
+        me = _mapRequestedQuantities.getEnumerator();
+        while (me.moveNext())
+        {
+            inventDimIdRequested = me.currentKey();
+            inventQtyRequested   = me.currentValue();
+            inventQtyShortage    = mapShortages.exists(inventDimIdRequested) ? any2real(mapShortages.lookup(inventDimIdRequested)) : 0;
+
+            // reduce the requested quantity by the minimum of shortage quantity and expected not available quantity
+            // so that this quantity does not get allocated against existing inventory and remains available for other requests
+            if (inventQtyExpectedNotAvailable > 0)
+            {
+                inventQtyReduceNow             = min(inventQtyShortage,inventQtyExpectedNotAvailable);
+                inventQtyExpectedNotAvailable -= inventQtyReduceNow;
+                inventQtyShortage             -= inventQtyReduceNow;
+                inventQtyRequested            -= inventQtyReduceNow;
+            }
+
+            // if the quantity of expected not available quantities is higher than the total shortages, the requested quantities need
+            // to be reduced event further, so that inventory remains available for other requests
+            if (inventQtyExpectedNotAvailableUnallocated > 0)
+            {
+                inventQtyReduceNow                        = min(inventQtyRequested,inventQtyExpectedNotAvailableUnallocated);
+                inventQtyExpectedNotAvailable            -= inventQtyReduceNow;
+                inventQtyExpectedNotAvailableUnallocated -= inventQtyReduceNow;
+                inventQtyShortage                        -= min(inventQtyShortage,inventQtyReduceNow);
+                inventQtyRequested                       -= inventQtyReduceNow;
+            }
+
+            // take off any remaining shortage before updating the map
+            if (inventQtyShortage > 0)
+            {
+                inventQtyRequested -= inventQtyShortage;
+            }
+
+            // update map
+            if (inventQtyRequested)
+            {
+                mapKey              = [_itemId,inventDimIdRequested];
+                inventQtyAvailable  = mapInventQuantity.lookup(mapKey);
+                inventQtyAvailable -= inventQtyRequested;
+                mapInventQuantity.insert(mapKey,inventQtyAvailable);
+
+                // cumulate result
+                inventQtyAvailableTotal += inventQtyRequested;
+            }
+        }
+
+        return inventQtyAvailableTotal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkFlushPrincipleAndKanbanJobStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Kanban job status and its picking list flushing principle should be checked before setting supply status.
+    /// </summary>
+    /// <returns>
+    ///    true if kanban job status is consistent with its picking list flushing principle; otherwise, false.
+    /// </returns>
+    protected boolean checkFlushPrincipleAndKanbanJobStatus()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNext</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the next record.
+    /// </summary>
+    /// <returns>
+    /// true if a next record exists; otherwise, false.
+    /// </returns>
+    protected abstract boolean getNext()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasWHSWave</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether a record has Wave associated with it.
+    /// </summary>
+    /// <returns>
+    /// true if the record has wave; otherwise, false.
+    /// </returns>
+    protected abstract boolean hasWHSWave()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasWHSWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether a record has Work associated with it.
+    /// </summary>
+    /// <returns>
+    /// true if the record has work; otherwise, false.
+    /// </returns>
+    protected abstract boolean hasWHSWork()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasWMSOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether a record has an output order.
+    /// </summary>
+    /// <returns>
+    /// true if the record has an output order; otherwise, false.
+    /// </returns>
+    protected abstract boolean hasWMSOrder()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes class variables.
+    /// </summary>
+    protected void init()
+    {
+        numberOfJobs      = conLen(containerKanbanJobs);
+        mapInventQuantity = new Map(Types::Container,Types::Real);
+
+        delete_from kanbanJobTmpPickList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initAvailableQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the available quantity of a <c>kanbanJobTmpPickList</c> record.
+    /// </summary>
+    protected void initAvailableQuantity()
+    {
+        InventTrans         inventTrans;
+        InventQty           quantity                 = this.quantity();
+        ItemId              itemId                   = this.itemId();
+        InventTransOriginId issueInventTransOriginId = this.issueInventTransOriginId();
+
+        if (   quantity <= 0
+            || kanbanJobTmpPickList.SupplyStatus != KanbanJobSupplyStatus::None)
+        {
+            // sign is reversed, negative quantity means receipt
+            // for receipts and already picked lines, the full quantity is marked available
+            kanbanJobTmpPickList.AvailableQuantity = quantity;
+        }
+        else
+        {
+            if (issueInventTransOriginId)
+            {
+                InventQty expectedNotAvailableQuantity = kanbanJobTmpPickList.ExpectedNotAvailableQuantity;
+                Map mapRequestedQuantities = new Map(Types::String,Types::Real);
+
+                // inventory controlled issue, use specific inventDim
+                while select ItemId,InventDimId,Qty,TransChildType from inventTrans
+                    where inventTrans.InventTransOrigin    == issueInventTransOriginId
+                        && inventTrans.PackingSlipReturned == NoYes::No
+                        && inventTrans.Qty                 <  0
+                        && inventTrans.StatusReceipt       == StatusReceipt::None
+                        && (inventTrans.StatusIssue        == StatusIssue::OnOrder
+                        ||  inventTrans.StatusIssue        == StatusIssue::ReservOrdered)
+                {
+                    InventQty requestedQuantity = -inventTrans.Qty;
+                    if (inventTrans.TransChildType == InventTransChildType::None)
+                    {
+                        if (mapRequestedQuantities.exists(inventTrans.InventDimId))
+                        {
+                            requestedQuantity += mapRequestedQuantities.lookup(inventTrans.InventDimId);
+                        }
+                        mapRequestedQuantities.insert(inventTrans.InventDimId,requestedQuantity);
+                    }
+                    else
+                    {
+                        // exclude output orders from expected not available quantity,
+                        // since the mapping is already known, there is no need to include these in the availableQuantityItemInventDimId() call.
+                        expectedNotAvailableQuantity += inventTrans.Qty;
+                    }
+                }
+
+                kanbanJobTmpPickList.AvailableQuantity = this.availableQuantityItemInventDimId(kanbanJobTmpPickList.ItemId,
+                                                                                               mapRequestedQuantities,
+                                                                                               expectedNotAvailableQuantity);
+            }
+            else
+            {
+                if (kanbanJobTmpPickList.ItemPegging == KanbanItemPegging::Kanban)
+                {
+                    // non-inventory controlled pegged kanban. The available quantity equals the expected available quantity.
+                    kanbanJobTmpPickList.AvailableQuantity = kanbanJobTmpPickList.ExpectedAvailableQuantity;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initExpectedQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the supply status of a <c>kanbanJobTmpPickList</c> record.
+    /// </summary>
+    protected void initExpectedQuantities()
+    {
+        if (   kanbanJobTmpPickList.Issue
+            && kanbanJob.Status < LeanKanbanJobStatus::Prepared)
+        {
+            switch (kanbanJobTmpPickList.ItemPegging)
+            {
+                case KanbanItemPegging::Kanban:
+                    if (kanbanEventQuantityMap)
+                    {
+                        Map map = kanbanEventQuantityMap.mapKanbanQuantities();
+                        MapEnumerator me = map.getEnumerator();
+                        while (me.moveNext())
+                        {
+                            Kanban kanban = Kanban::find(me.currentKey());
+                            if (kanban.Status < LeanKanbanStatus::Received)
+                            {
+                                kanbanJobTmpPickList.ExpectedNotAvailableQuantity += me.currentValue();
+                            }
+                        }
+                    }
+                    break;
+                case KanbanItemPegging::WMSOrder:
+                    kanbanJobTmpPickList.ExpectedNotAvailableQuantity = this.wmsOrderQuantity();
+                    break;
+                case KanbanItemPegging::WHSWave:
+                case KanbanItemPegging::WHSWork:
+                    // For work or wave in progress the entire quantity is not available (until the work completes and pegging turns into Inventory)
+                    kanbanJobTmpPickList.ExpectedNotAvailableQuantity = this.quantity();
+                    break;
+            }
+        }
+
+        kanbanJobTmpPickList.ExpectedAvailableQuantity =   this.quantity()
+                                                         - kanbanJobTmpPickList.ExpectedNotAvailableQuantity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromCurrent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a <c>KanbanJobTmpPickList</c> record from a source record.
+    /// </summary>
+    protected void initFromCurrent()
+    {
+        kanbanJobTmpPickList.ItemId      = this.itemId();
+        kanbanJobTmpPickList.InventDimId = this.inventDimId();
+        kanbanJobTmpPickList.LineType    = this.lineType();
+        kanbanJobTmpPickList.UnitId      = this.unitId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initKanbanItemPegging</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the item pegging of a <c>kanbanJobTmpPickList</c> record.
+    /// </summary>
+    protected void initKanbanItemPegging()
+    {
+        if (   kanbanJobTmpPickList.LineType == KanbanJobPickingListLineType::Pegging
+            || (kanbanEventQuantityMap
+            &&  kanbanEventQuantityMap.totalQuantity(true) != 0))
+        {
+            kanbanJobTmpPickList.ItemPegging = KanbanItemPegging::Kanban;
+        }
+        else
+        {
+            if (this.hasWMSOrder())
+            {
+                kanbanJobTmpPickList.ItemPegging = KanbanItemPegging::WMSOrder;
+            }
+            else if (this.hasWHSWork())
+            {
+                kanbanJobTmpPickList.ItemPegging = KanbanItemPegging::WHSWork;
+            }
+            else if (this.hasWHSWave())
+            {
+                kanbanJobTmpPickList.ItemPegging = KanbanItemPegging::WHSWave;
+            }
+            else
+            {
+                kanbanJobTmpPickList.ItemPegging = KanbanItemPegging::Inventory;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initKanbanJobSupplyStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the supply status of a <c>kanbanJobTmpPickList</c> record.
+    /// </summary>
+    protected void initKanbanJobSupplyStatus()
+    {
+        if (kanbanJob.Status >= LeanKanbanJobStatus::Prepared && this.checkFlushPrincipleAndKanbanJobStatus())
+        {
+            kanbanJobTmpPickList.SupplyStatus = KanbanJobSupplyStatus::Picked;
+        }
+        else
+        {
+            kanbanJobTmpPickList.SupplyStatus = KanbanJobSupplyStatus::None;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the quantity fields of a <c>KanbanJobTmpPickList</c> record.
+    /// </summary>
+    protected void initQuantities()
+    {
+        InventTransOriginId     issueInventTransOriginId = this.issueInventTransOriginId();
+
+        // the quantity field remains zero during the initial calculation
+        // it is populated only in the aggregation phase
+        kanbanJobTmpPickList.Quantity = 0;
+        kanbanJobTmpPickList.initCalculationFields();
+
+        // picking list quantities are generally positive, may be negative for reverse picking lines
+        kanbanJobTmpPickList.Issue = this.quantity() >= 0;
+
+        if (   issueInventTransOriginId
+            || kanbanJobTmpPickList.ItemPegging == KanbanItemPegging::Kanban)
+        {
+            this.initExpectedQuantities();
+            this.initAvailableQuantity();
+
+            if (   issueInventTransOriginId
+                && kanbanJobTmpPickList.ExpectedAvailableQuantity > 0)
+            {
+                InventTransIdSum inventTransIdSum = InventTransIdSum::newTransIdNoChildType(issueInventTransOriginId);
+                kanbanJobTmpPickList.ReservedQuantity -= inventTransIdSum.reservPhysical();
+                kanbanJobTmpPickList.PostedQuantity   -=   inventTransIdSum.picked()
+                                                         + inventTransIdSum.registered()
+                                                         + inventTransIdSum.physical()
+                                                         + inventTransIdSum.financial();
+                kanbanJobTmpPickList.ReservedQuantity  = min(kanbanJobTmpPickList.ExpectedAvailableQuantity,kanbanJobTmpPickList.ReservedQuantity);
+                kanbanJobTmpPickList.PostedQuantity    = min(kanbanJobTmpPickList.ExpectedAvailableQuantity,kanbanJobTmpPickList.PostedQuantity);
+            }
+        }
+        else
+        {
+            kanbanJobTmpPickList.NonInventoryQuantity = this.quantity();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>inventDimId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves an inventory dimension ID.
+    /// </summary>
+    /// <returns>
+    /// The inventory dimension ID.
+    /// </returns>
+    protected abstract InventDimId inventDimId()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>issueInventTransOriginId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves an inventory transaction origin.
+    /// </summary>
+    /// <returns>
+    /// The inventory transaction origin.
+    /// </returns>
+    protected abstract InventTransOriginId issueInventTransOriginId()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>itemId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves an item ID.
+    /// </summary>
+    /// <returns>
+    /// The item ID.
+    /// </returns>
+    protected abstract ItemId itemId()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lineType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves an line type.
+    /// </summary>
+    /// <returns>
+    /// The line type.
+    /// </returns>
+    protected abstract KanbanJobPickingListLineType lineType()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>load</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Loads the <c>KanbanJobTmpPickList</c> records into a packed list.
+    /// </summary>
+    /// <returns>
+    /// A container that contains a packed list of <c>KanbanJobTmpPickList</c> records.
+    /// </returns>
+    public container load()
+    {
+        this.init();
+
+        // iterate input container
+        while (this.getNext())
+        {
+            kanbanJobTmpPickList.clear();
+            this.initFromCurrent();
+            this.initKanbanItemPegging();
+            this.initKanbanJobSupplyStatus();
+            this.initQuantities();
+
+            kanbanJobTmpPickList.insert();
+        }
+
+        // group records
+        container result = this.aggregate();
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmContainerKanbanJobs</Name>
+				<Source><![CDATA[
+    public container parmContainerKanbanJobs(container _containerKanbanJobs = containerKanbanJobs)
+    {
+        containerKanbanJobs = _containerKanbanJobs;
+        return containerKanbanJobs;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>quantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves a quantity.
+    /// </summary>
+    /// <returns>
+    /// The quantity.
+    /// </returns>
+    protected abstract InventQty quantity()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unitId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves a unit ID.
+    /// </summary>
+    /// <returns>
+    /// The unit ID.
+    /// </returns>
+    protected abstract UnitIDBase unitId()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wmsOrderQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the inventory quantity of open output orders related to a record.
+    /// </summary>
+    /// <returns>
+    /// The inventory quantity of output orders related to the record.
+    /// </returns>
+    protected abstract InventQty wmsOrderQuantity()
+    {
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

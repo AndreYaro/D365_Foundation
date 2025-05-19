@@ -1,0 +1,802 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>LeanWIPBalanceUpdate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class LeanWIPBalanceUpdate
+{
+    // Caller parameters
+    TransDate                       transDate;
+    TransDate                       previousTransDate;
+    LeanProductionFlowReference     productionFlow;
+
+    // Balance
+    ProdCalcTrans           prodCalcTrans;
+    RecordInsertList        prodCalcTransInsertList;
+
+    // Helpers
+    int                     lineNumFg, lineNumRaw, lineNumOther;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addDirectManufacturing</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void addDirectManufacturing()
+    {
+        ProdRouteTrans          prodRouteTrans;
+        RouteCostCategory       routeCostCategory;
+
+        SysDaSearchObject searchObject = new SysDaSearchObject(this.buildAddDirectManufacturingQuery(prodRouteTrans, routeCostCategory));
+        SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+
+        while (searchStatement.next(searchObject))
+        {
+            prodCalcTrans.clear();
+
+            prodCalcTrans.initFromProdFlow(productionFlow,
+                                       prodRouteTrans.WrkCtrId,
+                                       '',
+                                       routeCostCategory.CostGroupId,
+                                       InventCostLevel::Single,
+                                       ItemCalcType::Process);
+
+            // set the date to the backflush calculation running date
+            prodCalcTrans.TransDate = transDate;
+
+            prodCalcTrans.RealCostAmount = prodRouteTrans.Amount;
+            prodCalcTrans.RealConsump    = prodRouteTrans.Hours;
+            prodCalcTrans.UnitId         = BOMCalcTransMap::calcHourUnit();
+
+            this.addToInsertList();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDirectMaterial</Name>
+				<Source><![CDATA[
+    [Replaceable(true)]
+    protected void addDirectMaterial()
+    {
+        InventTrans                     inventTrans;
+        InventTransOrigin               inventTransOrigin;
+        InventDim                       inventDim;
+        InventCostTrans                 inventCostTrans;
+
+        while select sum(Qty), ItemId from inventTrans
+        group by inventTrans.ItemId, inventTransOrigin.ItemInventDimId, inventDim.InventSiteId, inventTransOrigin.ReferenceCategory
+        where (inventTrans.StatusIssue == StatusIssue::Deducted
+               && inventTrans.StatusReceipt == StatusReceipt::None)
+           || (inventTrans.StatusIssue == StatusIssue::None
+               && inventTrans.StatusReceipt == StatusReceipt::Received)
+           || (inventTrans.StatusReceipt           == StatusReceipt::Purchased
+               && inventTrans.StatusIssue          == StatusIssue::None
+               && (inventTrans.PackingSlipReturned == NoYes::Yes
+                   || inventTrans.InvoiceReturned  == NoYes::Yes)
+               && inventTrans.DateFinancial        >  previousTransDate)
+           || (inventTrans.StatusIssue             == StatusIssue::Sold
+               && inventTrans.StatusReceipt        == StatusReceipt::None
+               && (inventTrans.PackingSlipReturned == NoYes::Yes
+                   || inventTrans.InvoiceReturned  == NoYes::Yes)
+               && inventTrans.DateFinancial        >  previousTransDate)
+        join InventSiteId from inventDim
+        where inventDim.InventDimId    == inventTrans.InventDimId
+        join ReferenceCategory from inventTransOrigin
+        where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+        exists join inventCostTrans
+        where inventCostTrans.InventTransId     == inventTransOrigin.InventTransId
+           && inventCostTrans.Voucher           == inventTrans.VoucherPhysical
+           && inventCostTrans.TransDate         == inventTrans.DatePhysical
+           && inventCostTrans.CostTransRefType  == InventCostTransRefType::ProductionFlow
+           && inventCostTrans.TransRefId        == productionFlow.planReference().PlanName
+           && inventCostTrans.TransDate         <= transDate
+        {
+            this.addDirectMaterialHelper(inventTrans, inventTransOrigin, inventDim);           
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDirectMaterialHelper</Name>
+				<Source><![CDATA[
+    protected void addDirectMaterialHelper(InventTrans _inventTrans, InventTransOrigin _inventTransOrigin, InventDim _inventDim)
+    {
+        prodCalcTrans.clear();
+
+        // Find the current std cost price for this item / site
+        InventTable inventTable = _inventTrans.inventTable();
+            
+        //Get the product dimensions
+        InventDim inventItemDim = InventDim::find(_inventTransOrigin.ItemInventDimId);
+            
+        //Set site
+        inventItemDim.InventSiteId = _inventDim.InventSiteId;
+        inventItemDim = InventDim::findOrCreate(inventItemDim);
+
+        InventItemPrice inventItemPrice = InventItemPrice::stdCostFindDate(inventTable, transDate, '', inventItemDim);
+
+        prodCalcTrans.initFromProdFlow(productionFlow,
+                                       _inventTrans.ItemId,
+                                       inventItemDim.InventDimId,
+                                       inventItemPrice.costGroupId(),
+                                       0,
+                                       inventTable.inventItemType().calculationType());
+
+        boolean isSingleLevel;
+
+        switch (_inventTransOrigin.ReferenceCategory)
+        {
+            case InventTransType::KanbanEmptied,
+                 InventTransType::KanbanJobTransferIssue,
+                 InventTransType::KanbanJobPickingList:
+                isSingleLevel = true;
+                break;
+            case InventTransType::KanbanJobProcess,
+                 InventTransType::KanbanJobTransferReceipt:
+                isSingleLevel = false;
+                break;
+            case InventTransType::KanbanJobWIP:
+                isSingleLevel = _inventTrans.direction() == InventDirection::Issue;
+                break;
+            default:
+                throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        if (isSingleLevel)
+        {
+            // Consumed items
+            prodCalcTrans.CollectRefLevel = InventCostLevel::Single;
+            prodCalcTrans.RealConsump     = -_inventTrans.Qty;
+            prodCalcTrans.RealCostAmount  = prodCalcTrans.RealConsump * inventItemPrice.pcsPrice();
+            lineNumRaw ++;
+            prodCalcTrans.LineNum = lineNumRaw;
+        }
+        else
+        {
+            // Produced items
+            prodCalcTrans.CollectRefLevel = InventCostLevel::Total;
+            prodCalcTrans.CalcType        = ItemCalcType::Production;
+            prodCalcTrans.Production      = NoYes::Yes;
+            prodCalcTrans.RealQty         = _inventTrans.Qty;
+            prodCalcTrans.RealCostAmount  = _inventTrans.Qty * inventItemPrice.pcsPrice();
+            lineNumFG ++;
+            prodCalcTrans.LineNum = lineNumFG;
+        }
+
+        // set the date to the backflush calculation running date
+        prodCalcTrans.TransDate = transDate;
+
+        // Set the cost
+        prodCalcTrans.UnitId         = inventTable.inventTableModuleInvent().UnitId;
+
+        // Set BOM flag to no, will be reset when breakdown is added
+        prodCalcTrans.bom = NoYes::No;
+
+        // Now update the breakdown
+        CostBreakdownInsertionRule costBreakdownInsertionRule = CostBreakdownInsertionRule::construct();
+        costBreakdownInsertionRule.parmIsProduction(prodCalcTrans.Production);
+        costBreakdownInsertionRule.parmInventTable(inventTable);
+        if (costBreakdownInsertionRule.mustInsertCostBreakdown())
+        {
+            this.addDirectMaterialBreakdown(inventTable, inventItemPrice);
+        }
+
+        // add record to the list
+        prodCalcTransInsertList.add(prodCalcTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDirectMaterialBreakdown</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void addDirectMaterialBreakdown(
+    InventTable         _inventTable,
+    InventItemPrice     _inventItemPrice
+    )
+    {
+        ProdCalcTrans               prodCalcTransCostBreakdown;
+        InventItemCostGroupRollup   inventItemCostGroupRollup;
+
+        // Consumption should be only converted once, because
+        // it stays the same for all the breakdown records
+        Qty realConsumption = UnitOfMeasureConverter::convert(prodCalcTrans.realConsumptionTotal(), UnitOfMeasure::unitOfMeasureIdBySymbol(prodCalcTrans.UnitId), UnitOfMeasure::unitOfMeasureIdBySymbol(_inventItemPrice.UnitID), NoYes::Yes);
+
+        LineNum lineNumBreakdown = prodCalcTrans.LineNum;
+
+        while select sum(CostAmountStd), CostGroupId from inventItemCostGroupRollup
+        group by CostGroupId
+        where inventItemCostGroupRollup.InventItemPriceRefRecId == _inventItemPrice.RecId
+           && inventItemCostGroupRollup.CostLevel                > InventCostLevel::Total
+           && inventItemCostGroupRollup.Split                   == NoYes::No                // Only decomposed cost groups
+        {
+            prodCalcTransCostBreakdown.clear();
+
+            // Reset qty
+            CostAmount proportionalRealCostAmount = 0;
+
+            // Records will be inserted with split NO and only ONE level below
+            lineNumBreakdown += 0.00001;
+
+            // Init record
+            prodCalcTransCostBreakdown.initCostBreakdown(prodCalcTrans);
+            prodCalcTransCostBreakdown.LineNum      = lineNumBreakdown;
+            prodCalcTransCostBreakdown.CostGroupId  = inventItemCostGroupRollup.CostGroupId;
+
+            if (_inventItemPrice.priceQty())
+            {
+                proportionalRealCostAmount = (inventItemCostGroupRollup.CostAmountStd * (realConsumption / _inventItemPrice.priceQty()));
+            }
+
+            // Set cost
+            // For the cost Rollup assign the qty of the parent record
+            prodCalcTransCostBreakdown.RealCostAmount += proportionalRealCostAmount;
+            prodCalcTransCostBreakdown.RealConsump     = prodCalcTrans.RealConsump;
+
+            // add to insert list
+            prodCalcTransInsertList.add(prodCalcTransCostBreakdown);
+        }
+
+        if (prodCalcTrans.LineNum != lineNumBreakdown)
+        {
+            prodCalcTrans.bom = NoYes::Yes;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDirectOutsourcing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Adds direct outsourcing transactions to current work in progress.
+    /// </summary>
+    [Replaceable(true)]
+    protected void addDirectOutsourcing()
+    {
+        ProdRouteTrans          prodRouteTrans;
+        InventTable             inventTable;
+        InventDim               inventDim;
+
+        while select sum(Amount), sum(QtyGood), ServiceItemId, ServiceInventDimId from prodRouteTrans
+        group by prodRouteTrans.ServiceItemId, prodRouteTrans.ServiceInventDimId,
+            inventTable.CostGroupId, inventTable.ItemId
+        where prodRouteTrans.TransRefId   == productionFlow.planReference().PlanName
+           && prodRouteTrans.TransRefType == ProdTransRefType::ProductionFlow
+           && prodRouteTrans.Calculated   == NoYes::No
+           && prodRouteTrans.TransType    == ProdRouteTransType::Qty
+           && prodRouteTrans.JobType      == RouteJobType::Process
+           && prodRouteTrans.DateWIP      <= transDate
+        join CostGroupId, ItemId from inventTable
+            where inventTable.ItemId == prodRouteTrans.ServiceItemId
+        exists join inventDim
+            where inventDim.InventDimId == prodRouteTrans.ServiceInventDimId
+        {
+            this.initProdCalcTransFromDirectOutSourcing(prodRouteTrans, inventTable);            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProdCalcTransFromDirectOutSourcing</Name>
+				<Source><![CDATA[
+    protected void initProdCalcTransFromDirectOutSourcing(ProdRouteTrans _prodRouteTrans, InventTable _inventTable)
+    {
+        prodCalcTrans.clear();
+
+        prodCalcTrans.initFromProdFlow(productionFlow,
+                                       _prodRouteTrans.ServiceItemId,
+                                       _prodRouteTrans.ServiceInventDimId,
+                                       _inventTable.CostGroupId,
+                                       InventCostLevel::Single,
+                                       ItemCalcType::Service);
+
+        // set the date to the backflush calculation running date
+        prodCalcTrans.TransDate = transDate;
+
+        prodCalcTrans.RealCostAmount = _prodRouteTrans.Amount;
+        prodCalcTrans.RealConsump    = _prodRouteTrans.QtyGood;
+
+        prodCalcTrans.UnitId         = _inventTable.inventUnitId();
+
+        this.addToInsertList();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addIndirect</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void addIndirect()
+    {
+        ProdIndirectTrans       prodIndirectTrans;
+
+        SysDaSearchObject searchObject = new SysDaSearchObject(this.buildAddIndirectQuery(prodIndirectTrans));
+        SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+
+        while (searchStatement.next(searchObject))
+        {
+            prodCalcTrans.clear();
+
+            prodCalcTrans.initFromProdFlow(productionFlow,
+                                       prodIndirectTrans.Code,
+                                       '',
+                                       prodIndirectTrans.CostGroupId,
+                                       InventCostLevel::Single,
+                                       prodIndirectTrans.type2ItemCalcType());
+
+            // set the date to the backflush calculation running date
+            prodCalcTrans.TransDate = transDate;
+
+            prodCalcTrans.RealCostAmount = prodIndirectTrans.Amount;
+            prodCalcTrans.RealConsump    = prodIndirectTrans.Basis;
+
+            this.addToInsertList();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addToInsertList</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void addToInsertList()
+    {
+        // Set the line num and add record to the list
+        lineNumOther ++;
+        prodCalcTrans.LineNum = lineNumOther;
+        prodCalcTransInsertList.add(prodCalcTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildAddIndirectQuery</Name>
+				<Source><![CDATA[
+    protected SysDaQueryObject buildAddIndirectQuery(ProdIndirectTrans _prodIndirectTrans)
+    {
+        SysDaQueryObject queryProdIndirectTrans = new SysDaQueryObject(_prodIndirectTrans);
+        queryProdIndirectTrans.projection()
+            .addSum(fieldStr(ProdIndirectTrans, Amount))
+            .addSum(fieldStr(ProdIndirectTrans, Basis))
+            .add(fieldStr(ProdIndirectTrans, Code))
+            .add(fieldStr(ProdIndirectTrans, CostGroupId))
+            .add(fieldStr(ProdIndirectTrans, Type));
+
+        queryProdIndirectTrans = this.buildGroupByClauseForAddIndirectQuery(queryProdIndirectTrans);
+
+        SysDaQueryExpression whereClause = this.buildWhereClauseForAddIndirectQuery(_prodIndirectTrans);
+        queryProdIndirectTrans.whereClause(whereClause);
+
+        return queryProdIndirectTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildAddDirectManufacturingQuery</Name>
+				<Source><![CDATA[
+    protected SysDaQueryObject buildAddDirectManufacturingQuery(
+        ProdRouteTrans      _prodRouteTrans,
+        RouteCostCategory   _routeCostCategory)
+    {
+        SysDaQueryObject queryProdRouteTrans = new SysDaQueryObject(_prodRouteTrans);
+        queryProdRouteTrans.projection()
+            .addSum(fieldStr(ProdRouteTrans, Amount))
+            .addSum(fieldStr(ProdRouteTrans, Hours))
+            .add(fieldStr(ProdRouteTrans, WrkCtrId))
+            .add(fieldStr(ProdRouteTrans, TransType));
+
+        queryProdRouteTrans = this.buildGroupByClauseForAddDirectManufacturingQuery(queryProdRouteTrans);
+
+        SysDaQueryExpression whereClause = this.buildWhereClauseForAddDirectManufacturingQuery(_prodRouteTrans);
+        queryProdRouteTrans.whereClause(whereClause);
+
+        queryProdRouteTrans.joinClause(SysDaJoinKind::InnerJoin, this.buildRouteCostCategoryJoinClauseForAddDirectManufacturingQuery(_prodRouteTrans, _routeCostCategory));
+
+        return queryProdRouteTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGroupByClauseForAddIndirectQuery</Name>
+				<Source><![CDATA[
+    protected SysDaQueryObject buildGroupByClauseForAddIndirectQuery(SysDaQueryObject _queryProdIndirectTrans)
+    {
+        _queryProdIndirectTrans.groupByClause()
+            .add(fieldStr(ProdIndirectTrans, Code))
+            .add(fieldStr(ProdIndirectTrans, CostGroupId))
+            .add(fieldStr(ProdIndirectTrans, Type));
+
+        return _queryProdIndirectTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGroupByClauseForAddDirectManufacturingQuery</Name>
+				<Source><![CDATA[
+    protected SysDaQueryObject buildGroupByClauseForAddDirectManufacturingQuery(SysDaQueryObject _queryProdRouteTrans)
+    {
+        _queryProdRouteTrans.groupByClause()
+            .add(fieldStr(ProdRouteTrans, WrkCtrId))
+            .add(fieldStr(ProdRouteTrans, TransType));
+
+        return _queryProdRouteTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWhereClauseForAddIndirectQuery</Name>
+				<Source><![CDATA[
+    protected SysDaQueryExpression buildWhereClauseForAddIndirectQuery(ProdIndirectTrans _prodIndirectTrans)
+    {
+        SysDaQueryExpression addIndirectWhereClause =
+                         new SysDaEqualsExpression(new SysDaFieldExpression(_prodIndirectTrans, fieldStr(ProdIndirectTrans, TransRefId)), new SysDaValueExpression(productionFlow.planReference().PlanName))
+                    .and(new SysDaEqualsExpression(new SysDaFieldExpression(_prodIndirectTrans, fieldStr(ProdIndirectTrans, TransRefType)), new SysDaValueExpression(ProdTransRefType::ProductionFlow)))
+                    .and(new SysDaEqualsExpression(new SysDaFieldExpression(_prodIndirectTrans, fieldStr(ProdIndirectTrans, Calculated)), new SysDaValueExpression(NoYes::No)))
+                    .and(new SysDaEqualsExpression(new SysDaFieldExpression(_prodIndirectTrans, fieldStr(ProdIndirectTrans, Posted)), new SysDaValueExpression(NoYes::Yes)))
+                    .and(new SysDaLessThanOrEqualsExpression(new SysDaFieldExpression(_prodIndirectTrans, fieldStr(ProdIndirectTrans, DateEstimation)), new SysDaValueExpression(transDate)));
+    
+        return addIndirectWhereClause;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWhereClauseForAddDirectManufacturingQuery</Name>
+				<Source><![CDATA[
+    protected SysDaQueryExpression buildWhereClauseForAddDirectManufacturingQuery(ProdRouteTrans _prodRouteTrans)
+    {
+        SysDaQueryExpression addDirectManufacturingWhereClause =
+                         new SysDaEqualsExpression(new SysDaFieldExpression(_prodRouteTrans, fieldStr(ProdRouteTrans, TransRefId)), new SysDaValueExpression(productionFlow.planReference().PlanName))
+                    .and(new SysDaEqualsExpression(new SysDaFieldExpression(_prodRouteTrans, fieldStr(ProdRouteTrans, TransRefType)), new SysDaValueExpression(ProdTransRefType::ProductionFlow)))
+                    .and(new SysDaEqualsExpression(new SysDaFieldExpression(_prodRouteTrans, fieldStr(ProdRouteTrans, Calculated)), new SysDaValueExpression(NoYes::No)))
+                    .and(new SysDaEqualsExpression(new SysDaFieldExpression(_prodRouteTrans, fieldStr(ProdRouteTrans, TransType)), new SysDaValueExpression(ProdRouteTransType::Time)))
+                    .and(new SysDaEqualsExpression(new SysDaFieldExpression(_prodRouteTrans, fieldStr(ProdRouteTrans, JobType)), new SysDaValueExpression(RouteJobType::Process)))
+                    .and(new SysDaLessThanOrEqualsExpression(new SysDaFieldExpression(_prodRouteTrans, fieldStr(ProdRouteTrans, DateWIP)), new SysDaValueExpression(transDate)));
+    
+        return addDirectManufacturingWhereClause;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildRouteCostCategoryJoinClauseForAddDirectManufacturingQuery</Name>
+				<Source><![CDATA[
+    protected SysDaQueryObject buildRouteCostCategoryJoinClauseForAddDirectManufacturingQuery(
+        ProdRouteTrans          _prodRouteTrans,
+        RouteCostCategory       _routeCostCategory)
+    {
+        SysDaQueryObject queryRouteCostCategory = new SysDaQueryObject(_routeCostCategory);
+        queryRouteCostCategory.projection().add(fieldStr(RouteCostCategory, CostGroupId));
+        queryRouteCostCategory.groupByClause().add(fieldStr(RouteCostCategory, CostGroupId));
+
+        queryRouteCostCategory.whereClause(new SysDaEqualsExpression(new SysDaFieldExpression(_routeCostCategory, fieldStr(RouteCostCategory, CostCategoryId)), new SysDaFieldExpression(_prodRouteTrans, fieldStr(ProdRouteTrans, CategoryId))));
+        
+        return queryRouteCostCategory;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteBalances</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void deleteBalances()
+    {
+        // Get ride of the previous values
+        delete_from prodCalcTrans
+        where prodCalcTrans.TransRefId   == productionFlow.planReference().PlanName
+           && prodCalcTrans.TransRefType == ProdTransRefType::ProductionFlow;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void init()
+    {
+        lineNumFg = 0;
+        lineNumRaw = 100000;
+        lineNumOther = 1000000;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertToDatabase</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void insertToDatabase()
+    {
+        ttsbegin;
+        prodCalcTransInsertList.insertDatabase();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void new()
+    {
+        prodCalcTransInsertList = new RecordInsertList(tableNum(ProdCalcTrans));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPreviousTransDate</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected TransDate parmPreviousTransDate(TransDate _previousTransDate = previousTransDate)
+    {
+        previousTransDate = _previousTransDate;
+
+        return previousTransDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmProductionFlow</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected LeanProductionFlowReference parmProductionFlow(LeanProductionFlowReference _productionFlow = productionFlow)
+    {
+        productionFlow = _productionFlow;
+
+        return productionFlow;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTransDate</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected TransDate parmTransDate(TransDate _transDate = transDate)
+    {
+        transDate = _transDate;
+
+        return transDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateNow</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateNow()
+    {
+        try
+        {
+            // 0.) Init the helpers
+            this.init();
+
+            // 1.) Delete the balances
+            this.deleteBalances();
+
+            // 2.) Add Material
+            this.addDirectMaterial();
+
+            // 3.) Add Route
+            this.addDirectManufacturing();
+            this.addDirectOutsourcing();
+
+            // 4.) Add Indirect
+            this.addIndirect();
+
+            // 5.) Write the records to the DB
+            this.insertToDatabase();
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLeanWIPBalanceUpdated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Indicates whether WIP transactions related to a production flow exist.
+    /// </summary>
+    /// <param name="_productionFlowName">
+    ///    The name of a production flow.
+    /// </param>
+    /// <returns>
+    ///    true if all the WIP transactions related to the production flow are updated; otherwise, false.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static boolean checkLeanWIPBalanceUpdated(PlanName _productionFlowName)
+    {
+        ProdIndirectTrans   prodIndirectTrans;
+        ProdRouteTrans      prodRouteTrans;
+        InventCostTrans     inventCostTrans;
+
+        Debug::assert(_productionFlowName != "");
+
+        select firstonly RecId
+        from prodIndirectTrans
+        where prodIndirectTrans.TransRefType == ProdTransRefType::ProductionFlow
+            && prodIndirectTrans.TransRefId == _productionFlowName
+            && prodIndirectTrans.Calculated == NoYes::No;
+
+        select firstonly RecId
+        from prodRouteTrans
+        where prodRouteTrans.TransRefType == ProdTransRefType::ProductionFlow
+            && prodRouteTrans.TransRefId == _productionFlowName
+            && prodRouteTrans.Calculated == NoYes::No;
+
+        select firstonly RecId
+        from inventCostTrans
+        where inventCostTrans.CostTransRefType == InventCostTransRefType::ProductionFlow
+            && inventCostTrans.TransRefId == _productionFlowName
+            && inventCostTrans.CostTransState == InventCostTransState::Physical;
+
+        return !(prodIndirectTrans.RecId || prodRouteTrans.RecId || inventCostTrans.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected static LeanWIPBalanceUpdate construct()
+    {
+        return new LeanWIPBalanceUpdate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromParameters</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected static LeanWIPBalanceUpdate newFromParameters(
+        LeanProductionFlowReference _productionFlow,
+        TransDate                   _transDate         = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
+        TransDate                   _previousTransDate = LeanProductionFlowCosting::lastEndedToDate(_productionFlow.RecId, _transDate)
+    )
+    {
+        LeanWIPBalanceUpdate       balanceUpd = LeanWIPBalanceUpdate::construct();
+
+        balanceUpd.parmProductionFlow(_productionFlow);
+        balanceUpd.parmTransDate(_transDate);
+        balanceUpd.parmPreviousTransDate(_previousTransDate);
+
+        return balanceUpd;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveBalancesForProductionFlowCosting</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Saves the <c>ProdCalcTrans</c> records for a backflush costing.
+    /// </summary>
+    /// <param name="_leanProductionFlowCosting">
+    /// The backflush costing for which the records should be saved.
+    /// </param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    static public void saveBalancesForProductionFlowCosting(LeanProductionFlowCosting   _leanProductionFlowCosting)
+    {
+        ProdCalcTrans   source, target;
+
+        ProdTransRefType    newTransRefType     = ProdTransRefType::BackflushCosting;
+        CostTransRefId      newTransRefId       = _leanProductionFlowCosting.getTransRefId();
+        RefRecId            newIdRefRecId       = _leanProductionFlowCosting.RecId;
+        TableId             newIdRefTableId     = _leanProductionFlowCosting.TableId;
+        CostTransRefId      newCollectRefProdId = _leanProductionFlowCosting.getTransRefId();
+
+        #LOCALMACRO.ProdCalcTransFields
+            BOM,
+            CalcGroupId,
+            CalcType,
+            CollectRefLevel,
+            ConsumpConstant,
+            ConsumpType,
+            ConsumpVariable,
+            CostAmount,
+            CostGroupId,
+            CostMarkup,
+            CostPriceModelUsed,
+            DerivedReference,
+            DerivedRefNum,
+            FinancialIndirectAmount_RU,
+            InventDimId,
+            InventDimStr,
+            LineNum,
+            OprId,
+            OprNum,
+            PmfCostAllocation,
+            PmfCostAllocationPct,
+            PmfOverheadAmt,
+            PmfOverheadPct,
+            PriceDiscQty,
+            Production,
+            Qty,
+            RealConsump,
+            RealCostAdjustment,
+            RealCostAmount,
+            RealQty,
+            Resource,
+            SalesAmount,
+            SalesMarkup,
+            SalesPriceModelUsed,
+            TransDate,
+            UnitId,
+            VendId
+        #ENDMACRO
+
+        target.skipDataMethods(true);
+        insert_recordset target
+        (
+            #ProdCalcTransFields,
+            TransRefType,
+            TransRefId,
+            IdRefRecId,
+            IdRefTableId,
+            CollectRefProdId
+        )
+        select
+            #ProdCalcTransFields,
+            newTransRefType,
+            newTransRefId,
+            newIdRefRecId,
+            newIdRefTableId,
+            newCollectRefProdId
+        from source
+            where source.TransRefType      == ProdTransRefType::ProductionFlow
+                && source.TransRefId        == _leanProductionFlowCosting.displayProductionFlowName()
+                && source.CollectRefProdId  == _leanProductionFlowCosting.displayProductionFlowName();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBalances</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void updateBalances(
+        LeanProductionFlowReference _productionFlow,
+        TransDate                   _transDate         = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
+        TransDate                   _previousTransDate = LeanProductionFlowCosting::lastEndedToDate(_productionFlow.RecId, _transDate)
+    )
+    {
+        Debug::assert(_productionFlow.RecId != 0);
+
+        LeanWIPBalanceUpdate balanceUpd = LeanWIPBalanceUpdate::newFromParameters(_productionFlow,
+                                                                                  _transDate,
+                                                                                  _previousTransDate
+                                                                                 );
+        balanceUpd.updateNow();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

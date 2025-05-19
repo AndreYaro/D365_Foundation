@@ -1,0 +1,774 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailAssortmentSchedulerTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This <c>RetailAssortmentSchedulerTask</c> class handles all the assortment scheduler tasks.
+/// </summary>
+class RetailAssortmentSchedulerTask extends RunBaseBatch implements BatchRetryable
+{
+    TmpRetailAssortmentExploded     tmpExploded;
+    DataAreaId                      dataArea;
+    OMOperatingUnitRefRecId         omOperatingUnitRefRecId;
+    TmpRetailAssortmentExclusions   exclusions;
+    Set                             assortmentSet;
+    container                       packedAssortment;
+    int64                           numItemsAssorted, numItemsSkipped, numItemsError;
+    Set                             previouslyPublishedAssortmentsWithOU;
+
+    #define.RetryNum(3)
+    #define.CurrentVersion(1)
+    #define.CurrentVersion(2)
+    #localmacro.CurrentList
+        omOperatingUnitRefRecId,
+        packedAssortment
+    #endmacro
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addCategoryToTempTable</Name>
+				<Source><![CDATA[
+        private void addCategoryToTempTable(RetailAssortmentTable _assortment, RefRecId _categoryRecId)
+    {
+        Query                   query;
+        QueryRun                productsQueryRun;
+        EcoResProduct           ecoResProduct;
+        InventTable             inventTable;
+
+        query = RetailGroupMemberLineQueryProvider::containedProductsQuery(_categoryRecId, true /*includeSubCategories*/, dataArea);
+        productsQueryRun = new QueryRun(query);
+
+        while (productsQueryRun.next())
+        {
+            ecoResProduct = productsQueryRun.get(tableNum(EcoResProduct));
+            inventTable = productsQueryRun.get(tableNum(InventTable));
+
+            if (!ecoResProduct || exclusions.isProductCategoryExcluded(ecoResProduct.RecId, _assortment.ValidFrom, _assortment.ValidTo))
+            {
+                //skip the insertion of the product even if it finds one excluded category
+                continue;
+            }
+            else
+            {
+                this.addProductToTempTable(_assortment, inventTable.ItemId, ecoResProduct.RecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addProductToTempTable</Name>
+				<Source><![CDATA[
+        private void addProductToTempTable(RetailAssortmentTable _assortment, ItemId _itemId, RefRecId _productRecId)
+    {
+        ListEnumerator dateRanges;
+        RetailAssortmentDateRange dateRange;
+
+        // Stores the variants to be added for a partially excluded product.
+        Set productVariantsList = new Set(Types::Int64);
+        SetEnumerator productVariantsListEnumator;
+
+        numItemsAssorted++;
+        dateRanges = exclusions.getAvailableDateRanges(RetailAssortmentExclusionScope::Product, _productRecId, _assortment.ValidFrom, _assortment.ValidTo);
+        while (dateRanges.moveNext())
+        {
+            dateRange = dateRanges.current();
+
+            tmpExploded.AssortmentRecId = _assortment.RecId;
+            tmpExploded.ChannelDataAreaId = dataArea;
+            tmpExploded.OMOperatingUnitId = omOperatingUnitRefRecId;
+            tmpExploded.ValidFrom = dateRange.parmStartDate();
+            tmpExploded.ValidTo = dateRange.parmEndDate();
+            tmpExploded.ItemId = _itemId;
+
+            // Check if this product has at least one variant excluded. If so,
+            // we need to insert all variants of this product except those that
+            // have been specifically excluded.
+            if (exclusions.isProductPartiallyExcluded(_productRecId, _assortment.ValidFrom, _assortment.ValidTo))
+            {
+                productVariantsList = this.getVariantsByItemId(_itemId, _assortment.ValidFrom, _assortment.ValidTo);
+                productVariantsListEnumator = productVariantsList.getEnumerator();
+
+                while (productVariantsListEnumator.moveNext())
+                {
+                    tmpExploded.InventDimId = productVariantsListEnumator.current();
+                    tmpExploded.insert();
+                }
+            }
+            else
+            {
+                // Reset the variant flag to ensure we include all variants of this product.
+                tmpExploded.InventDimId = "";
+                tmpExploded.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addVariantToTempTable</Name>
+				<Source><![CDATA[
+        private void addVariantToTempTable(RetailAssortmentTable _assortment, ItemId _itemId, InventDimId _inventDimId, EcoResProductRecId masterRecId, RefRecId _variantRecId)
+    {
+        RetailAssortmentDateRange       dateRange;
+        ListEnumerator                  dateRanges;
+
+        numItemsAssorted++;
+        dateRanges = exclusions.getAvailableDateRanges(RetailAssortmentExclusionScope::Variant, masterRecId, _assortment.ValidFrom, _assortment.ValidTo);
+        while (dateRanges.moveNext())
+        {
+            dateRange = dateRanges.current();
+
+            tmpExploded.AssortmentRecId = _assortment.RecId;
+            tmpExploded.ChannelDataAreaId = dataArea;
+            tmpExploded.OMOperatingUnitId = omOperatingUnitRefRecId;
+            tmpExploded.ValidFrom = dateRange.parmStartDate();
+            tmpExploded.ValidTo = dateRange.parmEndDate();
+            tmpExploded.ItemId = _itemId;
+            tmpExploded.InventDimId = _inventDimId;
+            tmpExploded.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deltaSync</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copies only changed records from <c>RetailAssortmentExplodedStaging</c> to the
+    /// <c>RetailAssortmentExploded</c> table. This ensures that only the changes are
+    /// captured by the PREACTION overrides.
+    /// </summary>
+    private void deltaSync()
+    {
+        RetailAssortmentExploded    exploded, explodedFiltered;
+        RetailTmpAssortmentRecordsToKeep recordIdsToKeep, recordIdsToInclude;
+        int64                         countRecordsVisited;
+        int64                         countRecordsUpdated;
+        str                         stepName = 'deltaSync';
+        RefTableId                  assortmentTableId = tableNum(RetailAssortmentExploded);
+        int64                       currentTransId;
+        #RetailConn
+        countRecordsVisited = 0;
+        countRecordsUpdated = 0;
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXAssortmentExplodeStepStart(0, 0, 0, stepName);
+
+        //how many records we will process
+        select count(RecId) from tmpExploded
+        where tmpExploded.OMOperatingUnitId == omOperatingUnitRefRecId;
+
+        countRecordsVisited = tmpExploded.RecId;
+
+        // how many new inserts
+        select count(RecId) from tmpExploded
+            where tmpExploded.OMOperatingUnitId == omOperatingUnitRefRecId
+            notexists join explodedFiltered
+              where
+                    explodedFiltered.AssortmentRecId == tmpExploded.AssortmentRecId &&
+                    explodedFiltered.OMOperatingUnitId == tmpExploded.OMOperatingUnitId &&
+                    explodedFiltered.ChannelDataAreaId == tmpExploded.ChannelDataAreaId &&
+                    explodedFiltered.ItemId == tmpExploded.ItemId &&
+                    explodedFiltered.InventDimId == tmpExploded.InventDimId &&
+                    explodedFiltered.ValidFrom == tmpExploded.ValidFrom &&
+                    explodedFiltered.ValidTo == tmpExploded.ValidTo;
+
+        countRecordsUpdated = tmpExploded.RecId;
+
+        insert_recordset exploded (AssortmentRecId, OMOperatingUnitId, ChannelDataAreaId, ItemId, InventDimId, ValidFrom, ValidTo)
+        select AssortmentRecId, OMOperatingUnitId, ChannelDataAreaId, ItemId, InventDimId, ValidFrom, ValidTo
+          from tmpExploded
+         where tmpExploded.OMOperatingUnitId == omOperatingUnitRefRecId
+          notexists join explodedFiltered
+              where
+                    explodedFiltered.AssortmentRecId == tmpExploded.AssortmentRecId &&
+                    explodedFiltered.OMOperatingUnitId == tmpExploded.OMOperatingUnitId &&
+                    explodedFiltered.ChannelDataAreaId == tmpExploded.ChannelDataAreaId &&
+                    explodedFiltered.ItemId == tmpExploded.ItemId &&
+                    explodedFiltered.InventDimId == tmpExploded.InventDimId &&
+                    explodedFiltered.ValidFrom == tmpExploded.ValidFrom &&
+                    explodedFiltered.ValidTo == tmpExploded.ValidTo;
+
+        insert_recordset recordIdsToKeep (AssortmentExplodedRecId)
+        select RecId
+          from exploded
+         where exploded.OMOperatingUnitId == omOperatingUnitRefRecId
+          join tmpExploded
+         where exploded.AssortmentRecId == tmpExploded.AssortmentRecId &&
+               exploded.OMOperatingUnitId == tmpExploded.OMOperatingUnitId &&
+               exploded.ChannelDataAreaId == tmpExploded.ChannelDataAreaId &&
+               exploded.ItemId == tmpExploded.ItemId &&
+               exploded.InventDimId == tmpExploded.InventDimId &&
+               exploded.ValidFrom == tmpExploded.ValidFrom &&
+               exploded.ValidTo == tmpExploded.ValidTo
+          notexists join recordIdsToInclude
+         where recordIdsToInclude.AssortmentExplodedRecId == exploded.RecId;
+        
+        delete_from recordIdsToKeep
+        notexists join exploded
+         where exploded.OMOperatingUnitId == omOperatingUnitRefRecId &&
+                recordIdsToKeep.AssortmentExplodedRecId == exploded.RecId
+        join tmpExploded
+         where exploded.AssortmentRecId == tmpExploded.AssortmentRecId &&
+               exploded.OMOperatingUnitId == tmpExploded.OMOperatingUnitId &&
+               exploded.ChannelDataAreaId == tmpExploded.ChannelDataAreaId &&
+               exploded.ItemId == tmpExploded.ItemId &&
+               exploded.InventDimId == tmpExploded.InventDimId &&
+               exploded.ValidFrom == tmpExploded.ValidFrom &&
+               exploded.ValidTo == tmpExploded.ValidTo;
+
+        currentTransId = appl.curTransactionId();
+
+        delete_from exploded
+        where exploded.OMOperatingUnitId == omOperatingUnitRefRecId
+        notexists join recordIdsToKeep
+            where recordIdsToKeep.AssortmentExplodedRecId == exploded.RecId;
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXAssortmentExplodeInfo(0, countRecordsVisited, countRecordsUpdated, stepName);
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXAssortmentExplodeStepEnd(0, 0, 0, stepName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>explode</Name>
+				<Source><![CDATA[
+        private void explode()
+    {
+        QueryRun                        queryRun;
+        RetailAssortmentTable           assortment;
+        RetailAssortmentProductLine     product;
+        RetailGroupMemberLine           groupMemberLine;
+        InventTable                     inventTable;
+        InventDimCombination            inventDimCombination;
+
+        RefRecId                        ecoResCategoryId;
+        SetEnumerator                   containedCategories;
+        str                             stepName = 'explode';
+
+        queryRun = new QueryRun(this.getAssortedProductsQuery());
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXAssortmentExplodeStepStart(0, 0, 0, stepName);
+
+        while (queryRun.next())
+        {
+            assortment = queryRun.get(tableNum(RetailAssortmentTable));
+            product = queryRun.get(tableNum(RetailAssortmentProductLine));
+            groupMemberLine = queryRun.get(tableNum(RetailGroupMemberLine));
+
+            if (product.LineType == RetailAssortmentExcludeIncludeType::Exclude)
+            {
+                // Here we need to check from the bottom up (variants, products and then categories).
+                if (groupMemberLine.Variant)
+                {
+                    // If not already excluded, add the variant to the exclusion list.
+                    if (!exclusions.isVariantExcluded(groupMemberLine.Variant, assortment.ValidFrom, assortment.ValidTo))
+                    {
+                        exclusions.addVariantExclusion(groupMemberLine.Variant, assortment.ValidFrom, assortment.ValidTo);
+
+                        // If not already included, add the product to the list of
+                        // partially excluded products. A partially excluded product
+                        // is a product which has one or more of its variants excluded.
+                        if (!exclusions.isProductPartiallyExcluded(groupMemberLine.Product, assortment.ValidFrom, assortment.ValidTo))
+                        {
+                            exclusions.addPartialProductExclusion(groupMemberLine.Product, assortment.ValidFrom, assortment.ValidTo);
+                        }
+                    }
+                }
+                else if (groupMemberLine.Product)
+                {
+                    // If not already excluded, add the product to the exclusion list.
+                    if (!exclusions.isProductExcluded(groupMemberLine.Product, assortment.ValidFrom, assortment.ValidTo))
+                    {
+                        exclusions.addProductExclusion(groupMemberLine.Product, assortment.ValidFrom, assortment.ValidTo);
+                    }
+                }
+                else if (groupMemberLine.Category)
+                {
+                    // If not already excluded, add the category and all of its contained
+                    // categories to the exclusion list.
+                    containedCategories = RetailCategoryContainmentLookup::findContainedCategories(groupMemberLine.Category);
+                    while (containedCategories.moveNext())
+                    {
+                        ecoResCategoryId = containedCategories.current();
+                        if (!exclusions.isCategoryExcluded(ecoResCategoryId, assortment.ValidFrom, assortment.ValidTo))
+                        {
+                            exclusions.addCategoryExclusion(ecoResCategoryId, assortment.ValidFrom, assortment.ValidTo);
+                        }
+                    }
+                }
+            }
+            else // A group member line is being included.
+            {
+                // Here we need to check from the bottom up (variants, products and then categories).
+                if (groupMemberLine.Variant)
+                {
+                    // the existance of variant and product is guaranteed by the relationships of this table
+
+                    // If the product and variant have not been excluded, check whether the
+                    // product belongs to an excluded category.
+                    if (!exclusions.isProductExcluded(groupMemberLine.Product, assortment.ValidFrom, assortment.ValidTo) &&
+                        !exclusions.isVariantExcluded(groupMemberLine.Variant, assortment.ValidFrom, assortment.ValidTo))
+                    {
+                        if (exclusions.isProductCategoryExcluded(groupMemberLine.Product, assortment.ValidFrom, assortment.ValidTo))
+                        {
+                            //skip the insertion of the product even if it finds one excluded category
+                            return ;
+                        }
+                        else
+                        {
+                                inventDimCombination = queryRun.get(tableNum(InventDimCombination));
+                                if (inventDimCombination)
+                                {
+                                    // assumption: the membergroupline is created with varint and product
+                                    // this is currently the case in RetailAssortmentProductLine.createFromTmpProductsToAdd
+                                    this.addVariantToTempTable(
+                                                assortment,
+                                                inventDimCombination.ItemId,
+                                                inventDimCombination.InventDimId,
+                                                groupMemberLine.Product,
+                                                groupMemberLine.Variant);
+                                }
+                        }
+                    }
+                }
+                else if (groupMemberLine.Product)
+                {
+                    // If this product has not been excluded, check whether the product
+                    // belongs to an excluded category.
+                    if (!exclusions.isProductExcluded(groupMemberLine.Product, assortment.ValidFrom, assortment.ValidTo))
+                    {
+                        if (exclusions.isProductCategoryExcluded(groupMemberLine.Product, assortment.ValidFrom, assortment.ValidTo))
+                        {
+                            //skip the insertion of the product even if it finds one excluded category
+                            return ;
+                        }
+                        else
+                        {
+                            inventTable = queryRun.get(tableNum(InventTable));
+                            if (inventTable)
+                            {
+                                this.addProductToTempTable(assortment, inventTable.ItemId, groupMemberLine.Product);
+                            }
+                        }
+                    }
+                }
+                else if (groupMemberLine.Category)
+                {
+                    // If the category has not been excluded, expand the node to find all products.
+                    if (groupMemberLine.Category && !exclusions.isCategoryExcluded(groupMemberLine.Category, assortment.ValidFrom, assortment.ValidTo))
+                    {
+                        this.addCategoryToTempTable(assortment, groupMemberLine.Category);
+                    }
+                }
+            }
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXAssortmentExplodeStepEnd(0, 0, 0, stepName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAssortedProductsQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds a query for the published line type assortment products.
+    /// </summary>
+    /// <returns>
+    /// The query object.
+    /// </returns>
+
+    public Query getAssortedProductsQuery()
+    {
+        Query                       query = new Query();
+        QueryBuildDataSource        queryBuildDataSource;
+        QueryBuildDataSource        qbdsRetailGroupMemberLine;
+        QueryBuildRange             queryBuildRange;
+        RetailAssortmentRefRecId    assortmentId;
+        SetEnumerator               assortments;
+
+        // select from RetailAssortmentTable
+        queryBuildDataSource = query.addDataSource(tableNum(RetailAssortmentTable));
+
+        // where RecId in set of assortment ids
+        assortments = assortmentSet.getEnumerator();
+        while (assortments.moveNext())
+        {
+            assortmentId = assortments.current();
+            queryBuildRange = queryBuildDataSource.addRange(fieldNum(RetailAssortmentTable, RecId));
+            queryBuildRange.value(queryValue(assortmentId));
+        }
+
+        // join RetailAssortmentProductLine, order by line type to process excludes first
+        queryBuildDataSource = queryBuildDataSource.addDataSource(tableNum(RetailAssortmentProductLine));
+        queryBuildDataSource.relations(false);
+        queryBuildDataSource.addLink(fieldNum(RetailAssortmentTable, RecId), fieldNum(RetailAssortmentProductLine, AssortmentRecId));
+        queryBuildDataSource.addOrderByField(fieldNum(RetailAssortmentProductLine, LineType));
+
+        // where RetailAssortmentProductLine has been published
+        queryBuildRange = queryBuildDataSource.addRange(fieldNum(RetailAssortmentProductLine, Status));
+        queryBuildRange.value(queryValue(RetailAssortmentStatusType::Published));
+
+        // join RetailGroupMemberLine
+        qbdsRetailGroupMemberLine = queryBuildDataSource.addDataSource(tableNum(RetailGroupMemberLine));
+        qbdsRetailGroupMemberLine.relations(false);
+        qbdsRetailGroupMemberLine.addLink(fieldNum(RetailAssortmentProductLine, RetailGroupMemberLineId), fieldNum(RetailGroupMemberLine, RecId));
+
+        // join InventTable
+        queryBuildDataSource = qbdsRetailGroupMemberLine.addDataSource(tableNum(InventTable));
+        queryBuildDataSource.relations(false);
+        queryBuildDataSource.joinMode(JoinMode::OuterJoin);
+        queryBuildDataSource.fetchMode(QueryFetchMode::One2One);
+        queryBuildDataSource.addLink(fieldNum(RetailGroupMemberLine, Product), fieldNum(InventTable, Product));
+
+        // join InventDimTable
+        queryBuildDataSource = qbdsRetailGroupMemberLine.addDataSource(tableNum(InventDimCombination));
+        queryBuildDataSource.relations(false);
+        queryBuildDataSource.joinMode(JoinMode::OuterJoin);
+        queryBuildDataSource.fetchMode(QueryFetchMode::One2One);
+        queryBuildDataSource.addLink(fieldNum(RetailGroupMemberLine, Variant), fieldNum(InventDimCombination, DistinctProductVariant));
+    //    queryBuildDataSource.addLink(fieldNum(InventTable, ItemId), fieldNum(InventDimCombination, ItemId));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEcoResCategoryIdByProduct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resolves the specified product to the category.
+    /// </summary>
+    /// <param name="_productId">
+    /// The product identifier.
+    /// </param>
+    /// <returns>
+    /// The category identifier.
+    /// </returns>
+    /// <remarks>
+    /// We assume that the product comes from the Retail category hierarchy.
+    /// </remarks>
+    private EcoResCategoryId getEcoResCategoryIdByProduct(EcoResProductRecId _productId)
+    {
+        EcoResCategoryHierarchyRole ecoResCategoryHierarchyRole;
+
+        ecoResCategoryHierarchyRole = EcoResCategoryHierarchyRole::getHierarchiesByRole(EcoResCategoryNamedHierarchyRole::Retail);
+        return EcoResProductCategory::findCategoryByProduct(_productId, ecoResCategoryHierarchyRole.CategoryHierarchy).RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOperatingUnitName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the name of the current operating unit.
+    /// </summary>
+    /// <returns>
+    /// The operating unit. If none could be found, we return the RecId.
+    /// </returns>
+    private str getOperatingUnitName()
+    {
+        OMOperatingUnit omOperatingUnit;
+
+        select firstOnly Name
+            from omOperatingUnit
+            where omOperatingUnit.RecId == omOperatingUnitRefRecId;
+
+        if (!omOperatingUnit)
+        {
+            return int642str(omOperatingUnitRefRecId);
+        }
+
+        return omOperatingUnit.Name;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getVariantsByItemId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves all variants for a specific item while respecting the
+    /// exclusion rules.
+    /// </summary>
+    /// <param name="_itemId">
+    /// The ItemId for the product.
+    /// </param>
+    /// <param name="_fromValidDate">
+    /// The effective date.
+    /// </param>
+    /// <param name="_toValidDate">
+    /// The expiration date.
+    /// </param>
+    /// <returns>
+    /// A set of InventDimCombination.InventDimId.
+    /// </returns>
+    private Set getVariantsByItemId(ItemId _itemId, ValidFromDate _fromValidDate, ValidToDate _toValidDate)
+    {
+        InventDimCombination    inventDimCombination;
+        Set records             = new Set(Types::String);
+
+        if (_itemId)
+        {
+            while select InventDimId, DistinctProductVariant
+                from inventDimCombination
+                where
+                    inventDimCombination.ItemId == _itemId &&
+                    inventDimCombination.dataAreaId == dataArea
+            {
+                if (!exclusions.isVariantExcluded(inventDimCombination.DistinctProductVariant, _fromValidDate, _toValidDate))
+                {
+                    records.add(inventDimCombination.InventDimId);
+                }
+            }
+        }
+
+        return records;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initPreviouslyPublishedAssortmentsWithOU</Name>
+				<Source><![CDATA[
+        private void initPreviouslyPublishedAssortmentsWithOU()
+    {
+        SetEnumerator               assortments;
+        RecId                       assortmentId;
+        RetailAssortmentExploded    existingExploded;
+
+        previouslyPublishedAssortmentsWithOU = new Set(Types::Int64);
+
+        assortments = assortmentSet.getEnumerator();
+        while (assortments.moveNext())
+        {
+            assortmentId = assortments.current();
+
+            select firstOnly RecId
+                from existingExploded
+                where
+                    existingExploded.AssortmentRecId == assortmentId &&
+                    existingExploded.OMOperatingUnitId == omOperatingUnitRefRecId;
+
+            if (existingExploded.RecId)
+            {
+                previouslyPublishedAssortmentsWithOU.add(assortmentId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+        public void new()
+    {
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+        public container pack()
+    {
+        if (assortmentSet)
+        {
+            packedAssortment = assortmentSet.pack();
+        }
+
+        return [#CurrentVersion,#CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAssortmentSet</Name>
+				<Source><![CDATA[
+        public Set parmAssortmentSet(Set _assortmentSet = assortmentSet)
+    {
+        assortmentSet = _assortmentSet;
+        return assortmentSet;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmOMOperatingUnitRefRecId</Name>
+				<Source><![CDATA[
+        public OMOperatingUnitRefRecId parmOMOperatingUnitRefRecId(OMOperatingUnitRefRecId _omOperatingUnitRefRecId = omOperatingUnitRefRecId)
+    {
+        omOperatingUnitRefRecId = _omOperatingUnitRefRecId;
+        return omOperatingUnitRefRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+        public void run()
+    {
+        dataArea = RetailAssortmentSchedulerTask::getDataAreaByOperatingUnit(omOperatingUnitRefRecId);
+
+        try
+        {
+            ttsBegin;
+
+            // Step 0: initialize internal data structures
+            this.initPreviouslyPublishedAssortmentsWithOU();
+
+            // Step 1: populate temp table
+            changeCompany (dataArea)
+            {
+                this.explode();
+            }
+
+            // Step 2: sync only changes to the exploded table
+            this.deltaSync();
+
+            info(strFmt("@RET260985", this.getOperatingUnitName(), dataArea, numItemsAssorted, numItemsSkipped, numItemsError));
+
+            ttsCommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+        public boolean unpack(container packedClass)
+    {
+        Version version = RunBase::getVersion(packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version,#CurrentList] = packedClass;
+                if (packedAssortment)
+                {
+                    assortmentSet = Set::create(packedAssortment);
+                }
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the desription of the class
+    /// </summary>
+    /// <returns>
+    /// The class description.
+    /// </returns>
+    public static ClassDescription description()
+    {
+        return "@RET260929";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDataAreaByOperatingUnit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the <c>DataAreaId</c> for the specified operating unit of type <c>OMOperatingUnitType::RetailChannel</c>.
+    /// </summary>
+    /// <param name="_omOperatingUnitId">
+    /// The recId of the operating unit.
+    /// </param>
+    /// <returns>
+    /// The dataAreaId associated with the specified operating unit.
+    /// </returns>
+    /// <remarks>
+    /// The specified operating unit MUST be of type RetailChannel.
+    /// </remarks>
+    private static DataAreaId getDataAreaByOperatingUnit(OMOperatingUnitRefRecId _omOperatingUnitId)
+    {
+        RetailChannelTable  retailChannelTable;
+
+        select firstOnly inventLocationDataAreaId
+        from retailChannelTable
+        where retailChannelTable.OMOperatingUnitId == _omOperatingUnitId;
+
+        return retailChannelTable.inventLocationDataAreaId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>RetailAssortmentSchedulerTask</c>
+    /// class can be run in a new session.
+    /// </summary>
+    /// <returns>true if the the class <c>RetailAssortmentSchedulerTask</c> can
+    /// be run in a new session; otherwise, false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,367 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProjFundingLimitSpentAmountValidationService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class ProjFundingLimitSpentAmountValidationService extends SysOperationServiceBase
+{
+    #OCCRetryCount
+    private const str LoggerDataUpdateMsg = 'ProjFundingLimit spent amount updated.  ProjFundingLimit: %1';
+    private const str LoggerAmountsNotCorrectMsg = 'ProjFundingLimit spent amount out of sync. ProjFundingLimit: %1';
+    private const str LoggerCouldNotValidateMsg = 'Could not validate ProjectFundingLimit: %1';
+    private const str LoggerBatchInfoMsg = 'Time to process: %1, number of contracts: %2';
+    private const str LoggerRetryExceptionMsg = '%1 retries exceeded max limit for %2 method.';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    public void process(ProjFundingLimitSpentAmountValidationContract _contract)
+    {
+        ProjOpsFinancialsLogger logger = ProjOpsFinancialsLogger::createLogger(classStr(ProjFundingLimitSpentAmountValidationService));
+        
+        using (SysInstrumentationActivityContext activityContext = logger.projOpsFinActivity().projFundingLimitSpentAmountValidation())
+        {
+            QueryRun queryRun = new QueryRun(_contract.getQuery());
+            boolean dataUpdate = _contract.parmDataUpdate();
+            int projFundingLimitsOutOfSync = 0;
+
+            setPrefix("@Proj:FundingLimitSpentAmount");
+
+            // Data Purging
+            this.purgeRecordsOnDate();
+
+            // Loop over every Contract
+            while (queryRun.next())
+            {
+                ProjInvoiceTable localContract = queryRun.get(tableNum(ProjInvoiceTable));
+                ProjFundingLimit localProjFundingLimit;
+
+                // Loop over every ProjFundingLimit
+                while select localProjFundingLimit
+                    where localProjFundingLimit.ContractId == localContract.ProjInvoiceProjId
+                {
+                    // Calc
+                    if (this.validateFundingLimitProject(localProjFundingLimit))
+                    {
+                        projFundingLimitsOutOfSync += this.calculateUpdateFundingLimit(localProjFundingLimit, dataUpdate, logger);
+                    }
+                    else
+                    {
+                        // Log that this funding limit was not able to be validated
+                        logger.logInformation(strFmt(LoggerCouldNotValidateMsg, localProjFundingLimit.RecId));
+
+                        warning(strFmt("@Proj:ContractNotUpdatedNotification", localProjFundingLimit.LineNumber, localProjFundingLimit.ContractId));
+                    }
+                }
+            }
+
+            // Notification about funding limits out of sync
+            if (!dataUpdate && projFundingLimitsOutOfSync != 0)
+            {
+                info(strFmt("@Proj:FundingLimitSpentServiceNotification", projFundingLimitsOutOfSync));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateUpdateFundingLimit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The funding spent amount will be calculated and if dataUpdate is enabled then the funding limit will be updated accordingly.
+    /// There is error handling for batch jobs such as Deadlocks and Update Conflicts.  
+    /// </summary>
+    /// <param name="_projFundingLimit">The funding limit to be validated</param>
+    /// <param name="_dataUpdate">If true then the funding limit will be updated</param>
+    /// <param name="_logger">The logger to be used for logging</param>
+    /// <returns>1 if the funding amount is updated, 0 if no update is done</returns>
+    /// <remarks>This logic is contained in a singular transaction so any issue will cause the entire process to roll back.</remarks>
+    private int calculateUpdateFundingLimit(ProjFundingLimit _projFundingLimit, boolean _dataUpdate, ProjOpsFinancialsLogger _logger)
+    {
+        boolean fundingLimitOutOfSync = false;
+
+        try
+        {
+            ttsbegin;
+                            
+            AmountCur computedAmount = this.calculateAmountFundingLimit(_projFundingLimit);
+
+            if (!this.fundingLimitAmountsCorrect(computedAmount, _projFundingLimit))
+            {
+                fundingLimitOutOfSync = true;
+
+                // Update amount
+                if (_dataUpdate)
+                {
+                    _projFundingLimit.selectForUpdate(true);
+                    _projFundingLimit.LimitSpent = computedAmount;
+                    _projFundingLimit.update();
+
+                    _logger.logInformation(strFmt(LoggerDataUpdateMsg, _projFundingLimit.RecId));
+                }
+                else
+                {
+                    _logger.logInformation(strFmt(LoggerAmountsNotCorrectMsg, _projFundingLimit.RecId));
+                }
+            }
+
+            // Remove old records
+            this.purgeRecordsOnCount(_projFundingLimit);
+
+            // Insert Record
+            this.insertRecordToValidationHistory(_projFundingLimit, fundingLimitOutOfSync && _dataUpdate, computedAmount, _projFundingLimit.LimitSpent);
+
+            ttscommit;
+
+            return fundingLimitOutOfSync ? 1 : 0;
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                _logger.logError(strFmt(LoggerRetryExceptionMsg, 'Deadlock', 'ProjFundingLimitSpentAmountValidationService.calculateUpdateFundingLimit()'));
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                sleep(ProjConstants::DeadLockRetryInterval * xSession::currentRetryCount());
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    _logger.logError(strFmt(LoggerRetryExceptionMsg, 'UpdateConflict', 'ProjFundingLimitSpentAmountValidationService.calculateUpdateFundingLimit()'));
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ProjTransientSQLConnectionRetryProvider::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                _logger.logError(strFmt(LoggerRetryExceptionMsg, 'TransientSqlConnectionError', 'ProjFundingLimitSpentAmountValidationService.calculateUpdateFundingLimit()'));
+                throw Exception::TransientSqlConnectionError;
+            }
+        }
+        catch (Exception::Error)
+        {
+            _logger.logError(strFmt(LoggerRetryExceptionMsg, 'ExceptionError', 'ProjFundingLimitSpentAmountValidationService.calculateUpdateFundingLimit()'));
+            throw error("@SYS18447");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecordToValidationHistory</Name>
+				<Source><![CDATA[
+    private void insertRecordToValidationHistory(ProjFundingLimit _projFundingLimit, boolean _dataUpdate, real _calculatedSpent, real _spent)
+    {
+        // Calculate field
+        NoYes updateRequired = NoYes::Yes;
+
+        if (abs(_calculatedSpent - _spent) < this.getDifferenceAllowed())
+        {
+            updateRequired = NoYes::No;
+        }
+
+        // Insert
+        ProjFundingLimitSpentAmountValidationHistory projFundingLimitSpentAmountValidationHistory;
+        projFundingLimitSpentAmountValidationHistory.DataUpdate = _dataUpdate ? NoYes::Yes : NoYes::No;
+        projFundingLimitSpentAmountValidationHistory.ProjFundingLimit = _projFundingLimit.RecId;
+        projFundingLimitSpentAmountValidationHistory.LimitSpentComputed = _calculatedSpent;
+        projFundingLimitSpentAmountValidationHistory.LimitSpent = _spent;
+        projFundingLimitSpentAmountValidationHistory.UpdateRequired = updateRequired;
+        projFundingLimitSpentAmountValidationHistory.ContractId = _projFundingLimit.ContractId;
+        projFundingLimitSpentAmountValidationHistory.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFundingLimitProject</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The detection script will only look at funding limits which contain open projects
+    /// </summary>
+    /// <param name = "_projFundingLimit">The funding limit to be validated</param>
+    /// <returns>true if the funding limit should be validated; otherwise, false.</returns>
+    /// <remarks>
+    /// There are two scenarios used to filter
+    ///     1. A project is specified on the funding limit and is not closed
+    ///     2. The limit is not constrained by project. It will be considered close if all
+    ///        of the associated projects for the contract are closed.
+    /// </remarks>
+    private boolean validateFundingLimitProject(ProjFundingLimit _projFundingLimit)
+    {
+        boolean isValid = true;
+
+        if (_projFundingLimit.AmountMst > 0)
+        {
+            ProjTable projTable;
+
+            if (_projFundingLimit.ProjId != '')
+            {
+                select firstonly RecId from projTable
+                    where projTable.ProjId == _projFundingLimit.ProjId
+                        && projTable.Status != ProjStatus::Created
+                        && projTable.Status != ProjStatus::Completed;
+            }
+            else
+            {
+                select firstonly RecId from projTable
+                    where projTable.ProjInvoiceProjId == _projFundingLimit.ContractId
+                        && projTable.Status != ProjStatus::Completed
+                        && projTable.Status != ProjStatus::Created;
+            }
+
+            isValid = projTable.RecId != 0;
+        }
+        else
+        {
+            isValid = false;
+        }
+        
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateAmountFundingLimit</Name>
+				<Source><![CDATA[
+    private AmountCur calculateAmountFundingLimit(ProjFundingLimit _projFundingLimit)
+    {
+        ProjComputeFundingLimitActualAmount projComputeFundingLimitActualAmount = ProjComputeFundingLimitActualAmount::construct(_projFundingLimit);
+        AmountCur actualsAmount = ProjComputeFundingLimitActualAmount.run();
+
+        return actualsAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fundingLimitAmountsCorrect</Name>
+				<Source><![CDATA[
+    private boolean fundingLimitAmountsCorrect(AmountCur _computedAmount, ProjFundingLimit _projFundingLimit)
+    {
+        boolean isCorrect = true;
+
+        if (_computedAmount > _projFundingLimit.AmountMst)
+        {
+            warning(strFmt("@Proj:SpentAmountHigherNotification", _projFundingLimit.LineNumber, _projFundingLimit.ContractId));
+
+            isCorrect = false;
+        }
+
+        isCorrect = isCorrect && abs(_computedAmount - _projFundingLimit.LimitSpent) < this.getDifferenceAllowed();
+
+        return isCorrect;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRecordsDaysMaximum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The maximum number of days the record can be stored in the ProjFundingLimitSpentAmountValidationHistory,
+    /// when the Funding Limit Spent Validation Batch Process is run, it will check and purge any record in the table
+    /// longer than the length of days set in this method.
+    /// </summary>
+    /// <returns>The maximum number of days of retention for the validation history process</returns>
+    protected int getRecordsDaysMaximum()
+    {
+        return 180;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRecordsPerFundingLimitMaximum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The maximum number of records that can be stored per FundingLimit in in the ProjFundingLimitSpentAmountValidationHistory,
+    /// when the Funding Limit Spent Validation Batch Process is run, it will check and purge any record in the table
+    /// that has more records for the specific funding limit than the value returned from this method.
+    /// </summary>
+    /// <returns>The maximum number of records per FundingLimit for the validation history process</returns>
+    protected int getRecordsPerFundingLimitMaximum()
+    {
+        return 180;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDifferenceAllowed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculating the epsilon allowed between spent amount and computed spent amount due to
+    /// potential precision issues
+    /// </summary>
+    /// <returns>The epsilon allowed between spent amount and computed spent amount</returns>
+    protected AmountCur getDifferenceAllowed()
+    {
+        return 0.02;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>purgeRecordsOnDate</Name>
+				<Source><![CDATA[
+    private void purgeRecordsOnDate()
+    {
+        ProjFundingLimitSpentAmountValidationHistory projFundingLimitSpentAmountValidationHistory;
+        delete_from projFundingLimitSpentAmountValidationHistory 
+            where projFundingLimitSpentAmountValidationHistory.CreatedDateTime < DateTimeUtil::addDays(DateTimeUtil::utcNow(), -this.getRecordsDaysMaximum());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>purgeRecordsOnCount</Name>
+				<Source><![CDATA[
+    private void purgeRecordsOnCount(ProjFundingLimit _projFundingLimit)
+    {
+        ProjFundingLimitSpentAmountValidationHistory projFundingLimitSpentAmountValidationHistoryCount;
+        select count(RecId) from projFundingLimitSpentAmountValidationHistoryCount
+            where projFundingLimitSpentAmountValidationHistoryCount.ProjFundingLimit == _projFundingLimit.RecId;
+
+        if (projFundingLimitSpentAmountValidationHistoryCount.RecId >= this.getRecordsPerFundingLimitMaximum())
+        {
+            ProjFundingLimitSpentAmountValidationHistory projFundingLimitSpentAmountValidationHistory;
+            select firstonly forupdate projFundingLimitSpentAmountValidationHistory
+                order by CreatedDateTime asc
+                where projFundingLimitSpentAmountValidationHistory.ProjFundingLimit == _projFundingLimit.RecId;
+
+            projFundingLimitSpentAmountValidationHistory.delete();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

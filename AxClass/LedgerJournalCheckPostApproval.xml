@@ -1,0 +1,948 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>LedgerJournalCheckPostApproval</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using TaxServiceAPI = Microsoft.Dynamics.TaxCalculation.ApiContracts;
+
+public class LedgerJournalCheckPostApproval extends LedgerJournalCheckPost implements BatchRetryable
+{
+    private Set sentBusinessEvents = new Set(Types::Int64);
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public boolean isRetryable()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelApprovalJournal</Name>
+				<Source><![CDATA[
+    protected boolean cancelApprovalJournal(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        boolean ok;
+    
+        ok = super(_ledgerJournalTrans);
+
+        if (ok)
+        {
+            // When canceling an approval journal, unrealized gain or loss needs to be reversed prior to VendTrans update
+            this.reverseAndPostUnrealizedGainLoss(_ledgerJournalTrans, ledgerVoucher);
+        }
+    
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates the current instance of a journal.
+    /// </summary>
+    /// <returns>
+    ///    true if the journal is valid; otherwise, false.
+    /// </returns>
+    protected boolean checkJournal()
+    {
+        boolean ret;
+
+        ttsbegin;
+
+        ret = super();
+
+        ttsabort;
+
+        // Submits to check budget after transaction aborts because budget check is performed only when transaction commits.
+        if (isBudgetControlSourceIntegrationSupported)
+        {
+            LedgerJournalCheckPostBudget::submitBudgetForCheckJournal(this.ledgerJournalTable, this.voucherNum);
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postJournal</Name>
+				<Source><![CDATA[
+    protected container postJournal()
+    {
+        VendInvoiceJour vendInvoiceJour;
+        VendTrans vendTrans;
+        LedgerJournalTrans ledgerJournalTrans;
+        TmpDataAreaRecIdFilter specFilter;
+        boolean isCancelling;
+
+        while select VendTransId, maxof(Cancel) from ledgerJournalTrans
+            group by VendTransId
+            where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+        {
+            if (ledgerJournalTrans.Cancel == NoYes::Yes)
+            {
+                isCancelling = true;
+            }
+
+            vendTrans = VendTrans::find(ledgerJournalTrans.VendTransId);
+
+            vendInvoiceJour = VendInvoiceJour::findFromVendTrans(vendTrans.Invoice,
+                                                                    vendTrans.TransDate,
+                                                                    vendTrans.AccountNum,
+                                                                    true
+                                                                    );
+            if (vendInvoiceJour.RecId != 0 && !isCancelling)
+            {
+                vendInvoiceJour.SumTax = 0;
+                vendInvoiceJour.doUpdate();
+            }
+
+            this.sendBusinessEvent(vendInvoiceJour, ledgerJournalTable.JournalType);
+        }
+
+        if (FeatureStateProvider::isFeatureEnabled(SplitPaymentMandatoryRuleFeature_PL::instance()))
+        {
+            while select ledgerJournalTrans
+                group by VendTransId
+                where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+            {
+                LedgerJournalTrans ledgerJournalTransLocal;
+                select firstonly ledgerJournalTransLocal
+                    where ledgerJournalTransLocal.JournalNum == ledgerJournalTable.JournalNum
+                        && ledgerJournalTransLocal.VendTransId == ledgerJournalTrans.VendTransId;
+
+                SplitPaymentMandatoryRuleEngine::analyseAndUpdateSplitPaymMode(ledgerJournalTransLocal, true);
+            }
+        }
+
+        if (isCancelling)
+        {
+            specFilter = this.collectOrphanedSpecTrans();
+        }
+
+        container ret = super();
+
+        boolean allOK = conPeek(ret, 1);
+        boolean allOKIntercompany = conPeek(ret, 2);
+
+        if (allOK && allOKIntercompany)
+        {
+            if (isCancelling)
+            {
+                this.deleteOrphanedSpecTrans(specFilter);
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendBusinessEvent</Name>
+				<Source><![CDATA[
+    private void sendBusinessEvent(VendInvoiceJour _vendInvoiceJour, LedgerJournalType _ledgerJournalType)
+    {
+        // handle a particular vendor invoice journal once      
+        if (!sentBusinessEvents.In(_vendInvoiceJour.RecId))
+        {
+            BusinessEventsBase businessEvent;
+
+            if (_ledgerJournalType == LedgerJournalType::Approval)
+            {
+                businessEvent = VendorInvoiceApprovalJournalPostedBusinessEvent::newFromVendInvoiceJour(_vendInvoiceJour);
+            }
+
+            if (businessEvent)
+            {
+                businessEvent.send();
+            }
+
+            sentBusinessEvents.add(_vendInvoiceJour.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteOrphanedSpecTrans</Name>
+				<Source><![CDATA[
+    private void deleteOrphanedSpecTrans(TmpDataAreaRecIdFilter _specFilter)
+    {
+        select firstonly _specFilter;
+
+        if (_specFilter)
+        {
+            SpecTrans specTrans;
+
+            delete_from specTrans
+                exists join _specFilter
+                    where _specFilter.RefRecId == specTrans.RefRecId
+                        && _specFilter.RefTableId == specTrans.RefTableId
+                        && _specFilter.RefDataAreaId == specTrans.RefCompany;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>collectOrphanedSpecTrans</Name>
+				<Source><![CDATA[
+    private TmpDataAreaRecIdFilter collectOrphanedSpecTrans()
+    {
+        // Collects all SpecTrans records which refer to the transaction which is being settled.
+        // Those SpecTrans records would become orphaned so they should be deleted.
+        // E.X. We can have single trans open referenced by multiple SpecTrans records when invoice register (trans open)
+        // is marked for settlement from unposted payment journal and from unposted cancellation of the invoice register.
+        // When the invoice register is canceled a second SpecTrans record is created for the invoice register. This
+        // SpecTrans is used to find the other SpecTrans records for the invoice register.
+        
+        TmpDataAreaRecIdFilter tmpTableFilterOrphanedSpecRef, tmpTableFilterSpecRef;
+        SpecTrans specTrans;
+        LedgerJournalTrans ledgerJournalTrans;
+
+        insert_recordset tmpTableFilterSpecRef(RefRecId, RefTableId, RefDataAreaId)
+            select RefRecId, RefTableId, RefCompany from specTrans
+                group by RefRecId, RefTableId, RefCompany
+            exists join ledgerJournalTrans
+                where ledgerJournalTrans.RecId == specTrans.SpecRecId
+                    && ledgerJournalTrans.DataAreaId == specTrans.SpecCompany
+                    && ledgerJournalTrans.TableId == specTrans.SpecTableId
+                    && ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum;
+
+        // This retreiveds 
+        insert_recordset tmpTableFilterOrphanedSpecRef(RefRecId, RefTableId, RefDataAreaId)
+            select RefRecId, RefTableId, RefDataAreaId from tmpTableFilterSpecRef
+            exists join specTrans
+                where specTrans.RefRecId == tmpTableFilterSpecRef.RefRecId
+                    && specTrans.RefTableId == tmpTableFilterSpecRef.RefTableId
+                    && specTrans.RefCompany == tmpTableFilterSpecRef.RefDataAreaId
+            notexists join ledgerJournalTrans
+                where ledgerJournalTrans.RecId == specTrans.SpecRecId
+                    && ledgerJournalTrans.DataAreaId == specTrans.SpecCompany
+                    && ledgerJournalTrans.TableId == specTrans.RefTableId
+                    && ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum;
+
+        return tmpTableFilterOrphanedSpecRef;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteFromPool</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Deletes records from the ledger transaction pool for the specified voucher and invoice.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher to delete.
+    /// </param>
+    /// <param name="_invoice">
+    ///    The invoice to delete; optional.
+    /// </param>
+    protected void deleteFromPool(Voucher _voucher, InvoiceId _invoice = '')
+    {
+        LedgerJournalTrans ledgerJournalTransPool;
+        LedgerJournalId ledgerJournalIdLocal;
+        Voucher fromVoucher;
+
+        fromVoucher = LedgerJournalVoucherChanged::find(ledgerJournalTable.JournalNum, _voucher).FromVoucher;
+
+        if (!fromVoucher)
+        {
+            fromVoucher = _voucher;
+        }
+
+        ledgerJournalIdLocal = LedgerJournalTable::findVendorInvoicePool().JournalNum;
+
+        delete_from ledgerJournalTransPool
+            where ledgerJournalTransPool.JournalNum == ledgerJournalIdLocal &&
+                  ledgerJournalTransPool.Voucher == _voucher &&
+                    (_invoice == '' || ledgerJournalTransPool.Invoice == _invoice);
+
+        if (fromVoucher != _voucher)
+        {
+            delete_from ledgerJournalTransPool
+                where ledgerJournalTransPool.JournalNum == ledgerJournalIdLocal &&
+                      ledgerJournalTransPool.Voucher == fromVoucher;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isApprovalJournal</Name>
+				<Source><![CDATA[
+    protected boolean isApprovalJournal()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>keepJournalValidationLog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether the journal validation log should be kept.
+    /// </summary>
+    /// <returns>
+    /// true if the journal validation log should be kept; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    /// This method always returns false.
+    /// </remarks>
+    protected boolean keepJournalValidationLog()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>movePostedTaxes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method creates a new set of tax transactions, where the account number specified as charge account and
+    /// operations account is modified to be the new account numbers defined in the approval journal.
+    /// If the cost is split into more than one transaction, the tax transacions are split according to them,
+    /// if new tax is specified in the approval journal, the originally posted tax is just reversed.
+    /// </summary>
+    /// <param name = "_ledgerJournalTrans">The buffer of <c>LedgerJournalTrans</c></param>
+    /// <param name = "_posting">Determines whether to post.</param>
+    protected void movePostedTaxes(LedgerJournalTrans _ledgerJournalTrans,
+                                   boolean _posting = true)
+    {
+        Voucher originalVoucher;
+        TransDate originalTransDate;
+        TaxReverseTax taxReverseTax = new TaxReverseTax(_ledgerJournalTrans.Voucher, _ledgerJournalTrans.TransDate, _ledgerJournalTrans.Txt);
+        LedgerJournalVoucherChanged ledgerJournalVoucherChanged;
+        LedgerJournalTrans ledgerJournalTrans;
+        LedgerPostingController ledgerPostingController;
+        RefRecId parentRecId;
+
+        // <GTE>
+        boolean                             isGTEEnable = TaxSolutionScopeIntegrationUtil::isCompanyEnabled();
+        // </GTE>
+
+        taxReverseTax.setJournalNum(_ledgerJournalTrans.JournalNum);
+        taxReverseTax.setExchRates(_ledgerJournalTrans.CurrencyCode,
+                                   _ledgerJournalTrans.ExchRate,
+                                   _ledgerJournalTrans.ExchRateSecond,
+                                   Currency::noYes2UnknownNoYes(_ledgerJournalTrans.Triangulation));
+
+        taxReverseTax.parmReportingCurrencyExchRate(_ledgerJournalTrans.ReportingCurrencyExchRate);
+
+        if (!_ledgerJournalTrans.Cancel)
+        {
+            ledgerPostingController = LedgerPostingController::newForLedgerPostingJournal(ledgerVoucher);
+
+            //Use the original VendTrans record to find the appropriate LedgerJournalVoucherChanged record if one exists
+            ledgerJournalVoucherChanged = LedgerJournalVoucherChanged::findFromVendTrans(VendTrans::find(_ledgerJournalTrans.VendTransId));
+
+            if (ledgerJournalVoucherChanged)
+            {
+                originalTransDate = ledgerJournalVoucherChanged.FromDate;
+                originalVoucher = ledgerJournalVoucherChanged.FromVoucher;
+            }
+            else
+            {
+                originalTransDate = _ledgerJournalTrans.TransDate;
+                originalVoucher = _ledgerJournalTrans.Voucher;
+            }
+
+            // <GEEU>
+            select firstonly RecId, /* <GEEU>*/ VatDueDate_W /*</GEEU>*/, /* <GEEPL>*/CustVendName_PL, vatNumJournal, Addressing_PL, TaxPeriodPaymentCode_PL, /* </GEEPL> */ TaxGroup, TaxItemGroup, TaxCode, JournalNum from ledgerJournalTrans
+            // </GEEU>
+            where ledgerJournalTrans.JournalNum == _ledgerJournalTrans.JournalNum
+                   && ledgerJournalTrans.Voucher == _ledgerJournalTrans.Voucher
+                   && ledgerJournalTrans.TransDate == _ledgerJournalTrans.TransDate
+                   && ledgerJournalTrans.PurchLedgerPosting == ArrivalPostingType::None
+                   && (
+                        // <GTE>
+                        !isGTEEnable
+                        // </GTE>
+                        && ((ledgerJournalTrans.TaxGroup && ledgerJournalTrans.TaxItemGroup) || ledgerJournalTrans.TaxCode));
+
+            if (!ledgerJournalTrans.RecId)
+            {
+                // <GEEU>
+                if (TaxParameters::isEasternEuropeOrVatDueDateFeatureEnabled())
+                {
+                    taxReverseTax.parmVatRegData_W(this.vatRegData_W(_ledgerJournalTrans));
+                }
+                // </GEEU>
+
+                // <GEEU>
+                select firstonly RecId, VatDueDate_W, TaxGroup, TaxItemGroup, TaxCode, JournalNum, Voucher,/* <GEEPL>*/CustVendName_PL, vatNumJournal, Addressing_PL, TaxPeriodPaymentCode_PL /* </GEEPL> */from ledgerJournalTrans
+                // </GEEU>
+                where ledgerJournalTrans.JournalNum == _ledgerJournalTrans.JournalNum
+                       && ledgerJournalTrans.Voucher == _ledgerJournalTrans.Voucher
+                       && ledgerJournalTrans.TransDate == _ledgerJournalTrans.TransDate
+                       && ledgerJournalTrans.PurchLedgerPosting == ArrivalPostingType::None;
+            }
+            // <GEEU>
+            else if (TaxParameters::isEasternEuropeOrVatDueDateFeatureEnabled())
+            {
+                taxReverseTax.parmVatRegData_W(this.vatRegData_W(_ledgerJournalTrans));
+            }
+            // </GEEU>
+
+            LedgerJournalTrans ledgerJournalTransReverse;
+            select firstonly RecId from ledgerJournalTransReverse
+               where ledgerJournalTransReverse.Voucher == _ledgerJournalTrans.Voucher
+                    && ledgerJournalTransReverse.JournalNum == _ledgerJournalTrans.JournalNum
+                    && ledgerJournalTransReverse.TransDate == _ledgerJournalTrans.TransDate
+                    && ledgerJournalTransReverse.PurchLedgerPosting == ArrivalPostingType::Offset;
+
+            taxReverseTax.setReverseTableId(_ledgerJournalTrans.TableId);
+            taxReverseTax.setReverseRecId(ledgerJournalTransReverse.RecId);
+
+            boolean hasGTETax;
+
+            if(isGTEEnable)
+            {
+                TaxEngineLedgerJournalTransHeader taxEngineLedgerJournalTransHeader = TaxEngineLedgerJournalTransHeader::findByJourNumVoucher(ledgerJournalTrans.JournalNum, ledgerJournalTrans.Voucher);
+                hasGTETax = this.hasGTETaxForTaxEngineLedgerJournalTransHeader(taxEngineLedgerJournalTransHeader);
+            }
+            // </GTE>
+
+            if ((
+                // <GTE>
+                !isGTEEnable
+                // </GTE>
+                && (ledgerJournalTrans.TaxGroup && ledgerJournalTrans.TaxItemGroup) || ledgerJournalTrans.TaxCode)
+                // <GTE>
+                || hasGTETax
+                // </GTE>
+            )
+            {
+                // Only reverse the taxes from the Invoice register
+                taxReverseTax.parmReverseTaxJournalId(LedgerJournalTrans::ledgerJournalTransRegister(_ledgerJournalTrans).JournalNum);
+
+                ledgerPostingController.findReference(_ledgerJournalTrans.Voucher, _ledgerJournalTrans.TransDate);
+
+                taxReverseTax.calcAndPost(ledgerPostingController, originalVoucher, originalTransDate);
+
+                this.postTaxToISV(ledgerJournalTransReverse.RecId, true);
+            }
+            else
+            {
+                parentRecId = ledgerJournalTrans.RecId;
+
+                taxReverseTax.adjustTaxes(ledgerPostingController,
+                                          originalVoucher,
+                                          originalTransDate,
+                                          _ledgerJournalTrans.JournalNum,
+                                          _ledgerJournalTrans.TableId,
+                                          parentRecId);
+
+                this.postTaxToISV(ledgerJournalTransReverse.RecId, false);
+            }
+        }
+
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoGB]))
+        {
+            // Find the master invoice approval entry based on a child invoice approval entry
+            select firstonly * from ledgerJournalTrans
+                where ledgerJournalTrans.Voucher == _ledgerJournalTrans.Voucher
+                    && ledgerJournalTrans.Invoice == _ledgerJournalTrans.Invoice
+                    && ledgerJournalTrans.JournalNum == _ledgerJournalTrans.JournalNum
+                    && ledgerJournalTrans.TransferredTo == '';
+
+            if (ledgerJournalTrans.RecId > 0)
+            {
+                VendInvoiceTransRef::updateLedgerJournalTransRecIdForApprovalJournal(ledgerJournalTrans);
+                this.createInvoiceRefForSplitLines(_ledgerJournalTrans, ledgerJournalTrans.RecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postTaxToISV</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post sales tax to ISV for the invoice register.
+    /// </summary>
+    /// <param name = "_ledgerJournalTransReverseRecId">The RecId of reversed approval journal line</param>
+    /// <param name = "_InvoiceApprovalWithTax">Determines if invoice approval have tax.</param>
+    private void postTaxToISV(RecId _ledgerJournalTransReverseRecId, boolean _InvoiceApprovalWithTax)
+    {
+        // When sales tax is posted at the invoice register, the invoice approval journal should be skipped to post tax to ISV.
+        if (VendParameters::find().VendTaxRegisterApproval == VendTaxRegisterApproval::Register)
+        {
+            return;
+        }
+
+        LedgerJournalTrans ledgerJournalTransReverse = LedgerJournalTrans::findRecId(_ledgerJournalTransReverseRecId, false);
+        TaxIntegrationBusinessProcess businessProcess =
+            TaxIntegrationUtils::getBusinessProcessBySourceHeadingTable(ledgerJournalTable.TableId, ledgerJournalTable.RecId);
+
+        if (TaxIntegrationUtils::isISVApiActivated(TaxServiceISVApiTypes::PostTax)
+            && TaxIntegrationUtils::getTaxSolutionProviderTypeByBusinessProcess(businessProcess) == TaxSolutionProviderType::ISV
+            && TaxIntegrationUtils::isTaxIntegrationEnabledForJournalType(ledgerJournalTable.JournalType))
+        {
+            LedgerJournalTrans ledgerJournalTransRegister = LedgerJournalTrans::ledgerJournalTransRegister(ledgerJournalTransReverse);
+            LedgerJournalTrans ledgerJournalTransMainForInvoiceRegister = TaxIntegrationISVTaxPostUtil::getMainLedgerJournalTrans(ledgerJournalTransRegister.JournalNum, ledgerJournalTransRegister.Voucher);
+
+            // For Invoice approval, the posted sales tax will be sent to ISV twice.
+            // 1. Send the reversed posted tax trans on the invoice register, and the tax document is copied from the invoice register.
+            TaxIntegrationCalculationInputPersisted::copyPackedTaxCalculationInputFromInvoiceRegisterForInvoicePosting(ledgerJournalTransMainForInvoiceRegister, ledgerJournalTransReverse, ledgerJournalTransReverse.RecId);
+            TaxIntegrationFacade::postTaxToISV(ledgerJournalTransReverse.TableId, ledgerJournalTransReverse.RecId, TaxModuleType::Voucher);
+
+            // 2. Send the new posted tax trans on invoice approval.
+            // if the tax is not recalculated on the invoice approval side, the tax is just converted from invoice register, here will send the posted sales tax and the tax document is copied from the invoice register.
+            // if the tax is recalculated on the invoice approval side, the tax document comes from the tax document generated by calling tax calculation service, it will be sent in TaxPostJournal.postTaxToISVForVoucher.
+            if (!_InvoiceApprovalWithTax)
+            {
+                LedgerJournalTrans  ledgerJournalTransFieldList;
+                RefRecId ledgerJournalTransFirstRecId;
+
+                // Retrieves the editable invoice approval line and append the tax document line to input data.
+                while select AmountCurDebit, AmountCurCredit, JournalNum, TableId, RecId from ledgerJournalTransFieldList
+                    where ledgerJournalTransFieldList.JournalNum == ledgerJournalTransReverse.JournalNum
+                       && ledgerJournalTransFieldList.Voucher    == ledgerJournalTransReverse.Voucher
+                       && ledgerJournalTransFieldList.TransDate  == ledgerJournalTransReverse.TransDate
+                       && ledgerJournalTransFieldList.NoEdit     == NoYes::No
+                {
+                    if (!ledgerJournalTransFirstRecId)
+                    {
+                        // If the line is the first editable invoice approval line. take it's RecId as a primary key to query TaxIntegrationCalculationInputPersisted.
+                        ledgerJournalTransFirstRecId = ledgerJournalTransFieldList.RecId;
+                    }
+
+                    TaxIntegrationCalculationInputPersisted::copyPackedTaxCalculationInputFromInvoiceRegisterForInvoicePosting(ledgerJournalTransMainForInvoiceRegister, ledgerJournalTransFieldList, ledgerJournalTransFirstRecId);
+                }
+
+                TaxIntegrationFacade::postTaxToISV(tableNum(LedgerJournalTrans), ledgerJournalTransFirstRecId, TaxModuleType::Voucher);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasGTETaxForTaxEngineLedgerJournalTransHeader</Name>
+				<Source><![CDATA[
+    private boolean hasGTETaxForTaxEngineLedgerJournalTransHeader(TaxEngineLedgerJournalTransHeader _taxEngineLedgerJournalTransHeader)
+    {
+        ITaxDocument taxDocumentObject = TaxBusinessService::getTaxDocumentBySource(_taxEngineLedgerJournalTransHeader.TableId, _taxEngineLedgerJournalTransHeader.RecId);
+
+        TaxAmount taxAmountGTE = taxDocumentObject.sumByTaxAccountingProvider(TaxAccountingProvider::Party, TaxAccountingPostingProfileDistributionSide::Credit).amountTransactionCurrency();
+        taxAmountGTE -= taxDocumentObject.sumByTaxAccountingProvider(TaxAccountingProvider::Party, TaxAccountingPostingProfileDistributionSide::Debit).amountTransactionCurrency();
+
+        if (!taxAmountGTE)
+        {
+            // Check tax with Tax provider. In case of reverse charge, tax will be posted to Tax but not Party.
+            taxAmountGTE = taxDocumentObject.sumByTaxAccountingProvider(TaxAccountingProvider::Tax, TaxAccountingPostingProfileDistributionSide::Credit).amountTransactionCurrency();
+            taxAmountGTE += taxDocumentObject.sumByTaxAccountingProvider(TaxAccountingProvider::Tax, TaxAccountingPostingProfileDistributionSide::Debit).amountTransactionCurrency();
+        }
+
+        return taxAmountGTE != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>moveTransferredBack</Name>
+				<Source><![CDATA[
+    protected void moveTransferredBack()
+    {
+        VendTrans vendTrans;
+        LedgerJournalTrans ledgerJournalTrans;
+        Voucher oldVoucher;
+        boolean first = true;
+        LedgerJournalVoucherChanged ledgerJournalVoucherChanged;
+
+        ttsbegin;
+
+        vendTrans.skipDataMethods(true);
+        update_recordset vendTrans
+            setting JournalNum = ''
+            where vendTrans.JournalNum == ledgerJournalTable.JournalNum;
+
+        if (errorLedgerJournalId)
+        {
+            while select Voucher from ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum == errorLedgerJournalId
+            {
+                if (oldVoucher != ledgerJournalTrans.Voucher || first)
+                {
+                    first = false;
+                    oldVoucher = ledgerJournalTrans.Voucher;
+
+                    select firstonly forupdate ledgerJournalVoucherChanged
+                        where ledgerJournalVoucherChanged.JournalNum == errorLedgerJournalId
+                           && ledgerJournalVoucherChanged.ToVoucher == ledgerJournalTrans.Voucher;
+
+                    ledgerJournalVoucherChanged.JournalNum = ledgerJournalTable.JournalNum;
+                    ledgerJournalVoucherChanged.doUpdate();
+
+                    vendTrans.skipDataMethods(true);
+                    update_recordset vendTrans
+                        setting JournalNum = ledgerJournalTable.JournalNum
+                        where vendTrans.JournalNum == errorLedgerJournalId &&
+                              vendTrans.Voucher == ledgerJournalVoucherChanged.FromVoucher;
+                }
+            }
+            errorJournalDeleted = true;
+        }
+        super();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static ClassDescription description()
+    {
+        return "@AccountsPayable:InvoiceApproval";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reverseAndPostUnrealizedGainLoss</Name>
+				<Source><![CDATA[
+    protected void reverseAndPostUnrealizedGainLoss(LedgerJournalTrans _ledgerJournalTrans, LedgerVoucher _ledgerVoucher)
+    {
+        LedgerJournalCheckPostApproval::postExchangeRateAdjustments(_ledgerJournalTrans, _ledgerVoucher, _ledgerJournalTrans.TransDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postExchangeRateAdjustments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts unrealized gain/loss for current transaction date.
+    /// </summary>
+    /// <param name="_ledgerJournalTrans">
+    /// The <c>LedgerJournalTrans</c> record.
+    /// </param>
+    /// <param name="_ledgerVoucher">
+    /// The <c>LedgerVoucher</c> to which the exchange rate gain/loss needs to be posted.
+    /// </param>
+    /// <param name="_transDate">
+    /// The <c>TransDate</c> on which the exchange rate gain/loss is posted.
+    /// </param>
+    /// <param name="_toVoucher">
+    /// The <c>Voucher</c> on which the approval journal is being posted; optional.
+    /// </param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void postExchangeRateAdjustments(LedgerJournalTrans _ledgerJournalTrans,
+        LedgerVoucher _ledgerVoucher,
+        TransDate _transDate,
+        Voucher _toVoucher = _ledgerJournalTrans.Voucher)
+    {
+        VendTrans vendTransLocal;
+
+        if (_ledgerJournalTrans)
+        {
+            vendTransLocal = VendTrans::find(_ledgerJournalTrans.VendTransId);
+        }
+
+        //Reverse and post exchange rate difference only if currency revaluation has been run for the invoice.
+        if (vendTransLocal && vendTransLocal.LastExchAdjVoucher != '')
+        {
+            TransDate newCurrencyRevaluationDate;
+            LedgerJournalVoucherChanged ledgerJournalVoucherChanged = LedgerJournalVoucherChanged::find(_ledgerJournalTrans.JournalNum, _toVoucher);
+
+            if (ledgerJournalVoucherChanged
+                && ledgerJournalVoucherChanged.ToVoucher == ledgerJournalVoucherChanged.FromVoucher
+                && ledgerJournalVoucherChanged.ToDate == ledgerJournalVoucherChanged.FromDate
+                && vendTransLocal.LastExchAdj != dateNull())
+            {
+                newCurrencyRevaluationDate = vendTransLocal.LastExchAdj;
+            }
+            else
+            {
+                newCurrencyRevaluationDate = _transDate;
+            }
+
+            ttsBegin;
+            TransDate lastTransDate;
+            Voucher lastVoucher;
+
+            if (InvoiceApprovalReverseFCRWithNewVoucherFlightV2::instance().isEnabled() 
+                && _ledgerJournalTrans.Cancel == NoYes::No)
+            {
+                NumberSeq reverseExchAdjNumberSequence = NumberSeq::newGetVoucher(VendParameters::numRefVendExchAdjVoucher());
+                Voucher reverseExchAdjVoucher = reverseExchAdjNumberSequence.voucher();
+
+                lastTransDate = _ledgerVoucher.lastTransDate();
+                lastVoucher = _ledgerVoucher.lastVoucher();
+
+                _ledgerVoucher.addVoucher(
+                    LedgerVoucherObject::newVoucher(
+                        reverseExchAdjVoucher,
+                        _transDate,
+                        SysModule::Vend,
+                        LedgerTransType::ExchAdjustment));
+            }
+
+            VendTransOpen vendTransOpen = VendTransOpen::findRefId(vendTransLocal.RecId, true);
+
+            VendExchAdjPostingEngine_InvoiceApproval vendExchAdjEngine = VendExchAdjPostingEngine_InvoiceApproval::constructForInvoiceApproval(_ledgerVoucher,
+                _transDate,
+                vendTransLocal,
+                vendTransOpen);
+
+            vendExchAdjEngine.parmSkipUseLedgerVoucherChanged(true);
+
+            //Reverse any unrealized gains/losses
+            vendExchAdjEngine.addExchangeAdjustment(-vendTransLocal.ExchAdjustment,
+                -vendTransLocal.ExchAdjustmentReporting,
+                _transDate,
+                _transDate,
+                true,
+                true);
+
+            Voucher newCurrencyRevaluationVoucher;
+
+            if ((_transDate != newCurrencyRevaluationDate) && (_ledgerJournalTrans.Cancel == NoYes::No))
+            {
+                _transDate = newCurrencyRevaluationDate;
+
+                NumberSeq newCurrencyRevaluationNumberSequence = NumberSeq::newGetVoucher(VendParameters::numRefVendExchAdjVoucher());
+                newCurrencyRevaluationVoucher = newCurrencyRevaluationNumberSequence.voucher();
+
+                if (!InvoiceApprovalReverseFCRWithNewVoucherFlightV2::instance().isEnabled())
+                {
+                    lastTransDate = _ledgerVoucher.lastTransDate();
+                    lastVoucher = _ledgerVoucher.lastVoucher();
+                }
+
+                _ledgerVoucher.addVoucher(
+                LedgerVoucherObject::newVoucher(
+                    newCurrencyRevaluationVoucher,
+                    _transDate,
+                    SysModule::Vend,
+                    LedgerTransType::ExchAdjustment));
+
+                vendExchAdjEngine = VendExchAdjPostingEngine_InvoiceApproval::constructForInvoiceApproval(_ledgerVoucher,
+                    _transDate,
+                    vendTransLocal,
+                    vendTransOpen);
+            }
+
+            // Create a new exchange rate adjustment if the transaction is not cancelled.
+            if (_ledgerJournalTrans.Cancel == NoYes::No)
+            {
+                //Calculate the adjustment amounts for posting the new unrealized gains/losses
+                CurrencyExchangeHelper currencyExchangeHelper = CurrencyExchangeHelper::newExchangeDate(
+                         Ledger::primaryLedger(CompanyInfo::findDataArea(vendTransLocal.dataAreaId).RecId), _transDate);
+
+                // Calculate accounting currency adjustment
+                AmountMST newAccountingCurrencyAmount = currencyExchangeHelper.calculateTransactionToAccounting(
+                    vendTransLocal.CurrencyCode,
+                    vendTransOpen.AmountCur,
+                    true);
+
+                AmountMST accountingCurrencyAdjustmentAmount = newAccountingCurrencyAmount - vendTransOpen.AmountMST;
+
+                // Calculate reporting currency adjustment
+                AmountMST newReportingCurrencyAmount = currencyExchangeHelper.calculateTransactionCurrencyToReportingCurrency(
+                    vendTransLocal.CurrencyCode,
+                    vendTransOpen.AmountCur);
+
+                AmountMST reportingCurrencyAdjustmentAmount = newReportingCurrencyAmount - vendTransOpen.ReportingCurrencyAmount;
+
+                vendExchAdjEngine.parmSkipUseLedgerVoucherChanged(false);
+
+                //Post unrealized gain/loss
+                vendExchAdjEngine.addExchangeAdjustment(
+                    accountingCurrencyAdjustmentAmount,
+                    reportingCurrencyAdjustmentAmount,
+                    _transDate,
+                    _transDate,
+                    false,
+                    true);
+            }
+
+            if (lastVoucher != '')
+            {
+                _ledgerVoucher.lastTransDate(lastTransDate);
+                _ledgerVoucher.lastVoucher(lastVoucher);
+
+                RecId voucherGroupId = LedgerTransVoucherLink::findOrCreateParentVoucherLink(lastVoucher, lastTransDate, curExt()).RecId;
+                RecId currentVoucherGroupId = LedgerTransVoucherLink::getCurrentVoucherGroupId(voucherGroupId, newCurrencyRevaluationVoucher, _transDate);
+
+                if (currentVoucherGroupId)
+                {
+                    LedgerTransVoucherLink::updateVoucherLinkParentGroup(currentVoucherGroupId, voucherGroupId);
+                }
+            }
+
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateJournalForPosted</Name>
+				<Source><![CDATA[
+    protected void updateJournalForPosted()
+    {
+        LedgerVoucher ledgerVoucherLocal;
+        LedgerVoucherObject postingReference;
+        LedgerJournalTrans ledgerJournalTrans;
+        SysModule sysModule = ledgerJournalTable.ledgerJournalName().getSysModuleForJournal();
+        Voucher oldVoucher;
+        TransDate oldTransDate;
+
+        ttsBegin;
+
+        super();
+
+        NumberSequenceCode numSeqCode;
+
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoBE]))
+        {
+            numSeqCode = FinNumberSequenceExtension::getNumberSequence(ledgerJournalTable.NumberSequenceTable);
+        }
+
+        ledgerVoucherLocal = LedgerVoucher::newLedgerPost(detailSummaryPosting,
+                                                         sysModule,
+                                                         numSeqCode,
+                                                         TransactionLogType::LedgerJournal,
+                                                         ledgerJournalTable.JournalNum + ' ' + ledgerJournalTable.Name,
+                                                         this.isApprovalJournal());
+        ledgerVoucherLocal.parmLedgerJournalId(ledgerJournalTable.JournalNum);
+        ledgerVoucherLocal.parmTmpVoucherMap(tmpVoucherMap);
+        ledgerVoucherLocal.parmLedgerPostingMessageLog(ledgerPostingMessageCollection);
+
+        while select ledgerJournalTrans
+            order by Voucher, TransDate, AccountType desc, RecId
+            where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+                && ledgerJournalTrans.Cancel == NoYes::No
+        {
+            if (ledgerJournalTrans.Voucher != oldVoucher || ledgerJournalTrans.TransDate != oldTransDate)
+            {
+                oldVoucher = ledgerJournalTrans.Voucher;
+                oldTransDate = ledgerJournalTrans.TransDate;
+
+                postingReference = ledgerVoucherLocal.findLedgerVoucherObject(ledgerJournalTrans.Voucher, ledgerJournalTrans.TransDate);
+
+                if (!postingReference)
+                {
+                    postingReference = LedgerVoucherObject::newVoucher(
+                            ledgerJournalTrans.Voucher,
+                            ledgerJournalTrans.TransDate,
+                            sysModule,
+                            ledgerJournalTrans.TransactionType,
+                            ledgerJournalTrans.correct(),
+                            ledgerJournalTable.CurrentOperationsTax,
+                            ledgerJournalTrans.DocumentNum,
+                            ledgerJournalTrans.DocumentDate,
+                            ledgerJournalTrans.AcknowledgementDate);
+
+                    postingReference.parmSourceRecIdDefault(ledgerJournalTrans.RecId);
+                    postingReference.parmSourceTableIdDefault(tableNum(LedgerJournalTrans));
+
+                    ledgerVoucherLocal.addVoucher(postingReference);
+                }
+
+                this.reverseAndPostUnrealizedGainLoss(ledgerJournalTrans, ledgerVoucherLocal);
+            }
+        }
+
+        ledgerVoucherLocal.end();
+
+        ttsCommit;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInvoiceRefForSplitLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates invoice reference records in <c>VendInvoiceTransRef</c>.
+    /// </summary>
+    /// <param name="_ledgerJournalTrans">
+    /// The <c>LedgerJournalTrans</c> record.
+    /// </param>
+    /// <param name="_recId">
+    /// The <c>LedgerJournalTrans</c> recid.
+    /// </param>
+    private void createInvoiceRefForSplitLines(LedgerJournalTrans _ledgerJournalTrans, RefRecId _recId)
+    {
+        VendInvoiceTransRef vendInvoiceTransRef;
+        
+        select firstonly VendInvoiceTransRecId from vendInvoiceTransRef 
+            where vendInvoiceTransRef.LedgerJournalTransRecId == _recId;
+
+        RefRecId vendInvoiceTransRecId = vendInvoiceTransRef.VendInvoiceTransRecId;
+
+        if (vendInvoiceTransRecId)
+        {
+            LedgerJournalTrans localLedgerJournalTrans;
+            insert_recordset vendInvoiceTransRef(LedgerJournalTransRecId, VendInvoiceTransRecId)
+                select RecId, vendInvoiceTransRecId from localLedgerJournalTrans
+                    where localLedgerJournalTrans.Voucher == _ledgerJournalTrans.Voucher
+                        && localLedgerJournalTrans.Invoice == _ledgerJournalTrans.Invoice
+                        && localLedgerJournalTrans.JournalNum == _ledgerJournalTrans.JournalNum
+                        && !localLedgerJournalTrans.TransferredTo
+                        && localLedgerJournalTrans.RecId != _recId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>vatRegData_W</Name>
+				<Source><![CDATA[
+    private container vatRegData_W(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        VatDueDate_W           vatDueDate = _ledgerJournalTrans.VatDueDate_W;
+        DocumentDate           documentDate;
+        PlCustVendName         custVendName;
+        VATNumJournal          vatNumJournal;
+        Addressing             addressing;
+        PlTaxPeriodPaymentCode taxPeriodPaymentCode;
+        CzPostponeVAT          postponeVAT = NoYes::No;
+        IntraComVATDueDate_W   intraComVatDueDate;
+        #EECountryRegionCodes
+
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion(#easternEuropeAll))
+        {
+            documentDate = _ledgerJournalTrans.DocumentDate;
+            custVendName = _ledgerJournalTrans.CustVendName_PL;
+            vatNumJournal = _ledgerJournalTrans.vatNumJournal;
+            addressing = _ledgerJournalTrans.Addressing_PL;
+            taxPeriodPaymentCode = _ledgerJournalTrans.TaxPeriodPaymentCode_PL;
+            intraComVatDueDate = _ledgerJournalTrans.IntraComVATDueDate_W;
+        }
+
+        return [vatDueDate,
+                documentDate,
+                custVendName,
+                vatNumJournal,
+                addressing,
+                taxPeriodPaymentCode,
+                postponeVAT,
+                intraComVatDueDate];
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

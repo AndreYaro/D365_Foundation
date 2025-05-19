@@ -1,0 +1,566 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailPeriodicDiscountPublishService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Application.Instrumentation;
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// Publish discounts via 3 kinds of input:
+/// 1. offer id: publish a single discount.
+/// 2. product master id: publish all discounts linked to a product. (When the product variant is changed)
+/// 3. No input: publish all pending/draft discounts.
+/// </summary>
+public final class RetailPeriodicDiscountPublishService extends SysOperationServiceBase
+{
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+    private static readonly InventDimId InventDimAllBlank = InventDim::inventDimIdBlank();
+
+    private static readonly str lockNameFormat = 'RetailDiscountPublish\%1\%2';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processing publishing of the retail perioodic discounts.
+    /// </summary>
+    /// <param name = "_dataContract">The data contract for the operation service.</param>
+    public void processOperations(RetailPeriodicDiscountPublishContract _dataContract)
+    {
+        RetailPeriodicDiscount retailPeriodicDiscount;
+        if (_dataContract.parmOfferIds() != conNull())
+        {
+            int len = conLen(_dataContract.parmOfferIds());
+            for (int i = 1; i <= len; i++)
+            {
+                RetailOfferIdEx3 offerId = conPeek(_dataContract.parmOfferIds(), i);
+                retailPeriodicDiscount = RetailPeriodicDiscount::findByOfferId(offerId);
+                eventSource.EventWritePricingPublishStarted(retailPeriodicDiscount.RecId, 'Discount.Enablement');
+                if (!retailPeriodicDiscount)
+                {
+                    eventSource.EventWritePricingPublishOfferNotFound();
+                    continue;
+                }
+
+                this.publishDiscount(retailPeriodicDiscount);
+            }
+        }
+        else if (_dataContract.parmProductMasterRecId())
+        {
+            RetailPeriodicDiscountLine retailPeriodicDiscountLine;
+            RetailGroupMemberLine retailGroupMemberLine;
+            while select retailPeriodicDiscount
+                    where retailPeriodicDiscount.Status == RetailDisabledEnabled::Enabled
+                exists join retailPeriodicDiscountLine 
+                    where retailPeriodicDiscountLine.OfferId == retailPeriodicDiscount.OfferId
+                exists join retailGroupMemberLine 
+                    where retailGroupMemberLine.RecId == retailPeriodicDiscountLine.RetailGroupMemberLine && retailGroupMemberLine.Product == _dataContract.parmProductMasterRecId()
+            {
+                eventSource.EventWritePricingPublishStarted(retailPeriodicDiscount.RecId, 'Product.Release');
+                if (RetailPricingUseLegacyRetailPeriodicDiscountPublisherFlight::instance().isEnabled())
+                {
+                    this.publishDiscount(retailPeriodicDiscount);
+                }
+                else
+                {
+                    this.publishDiscountForProduct(retailPeriodicDiscount);
+                }
+            }
+        }
+        else if (_dataContract.parmProductMasterRecIds() != conNull())
+        {
+            RetailPeriodicDiscountLine retailPeriodicDiscountLine;
+            RetailGroupMemberLine retailGroupMemberLine;
+
+            Set retailPeriodicDiscountIds = new Set(Types::Int64);
+
+            int len = conLen(_dataContract.parmProductMasterRecIds());
+            for (int i = 1; i <= len; i++)
+            {
+                EcoResProductRecId productRecId = conPeek(_dataContract.parmProductMasterRecIds(), i);
+                while select retailPeriodicDiscount
+                        where retailPeriodicDiscount.Status == RetailDisabledEnabled::Enabled
+                    exists join retailPeriodicDiscountLine
+                        where retailPeriodicDiscountLine.OfferId == retailPeriodicDiscount.OfferId
+                    exists join retailGroupMemberLine
+                        where retailGroupMemberLine.RecId == retailPeriodicDiscountLine.RetailGroupMemberLine && retailGroupMemberLine.Product == productRecId
+                {
+                    if (retailPeriodicDiscountIds.add(retailPeriodicDiscount.RecId))
+                    {
+                        eventSource.EventWritePricingPublishStarted(retailPeriodicDiscount.RecId, 'Product.Release');
+                        if (RetailPricingUseLegacyRetailPeriodicDiscountPublisherFlight::instance().isEnabled())
+                        {
+                            this.publishDiscount(retailPeriodicDiscount);
+                        }
+                        else
+                        {
+                            this.publishDiscountForProduct(retailPeriodicDiscount);
+                        }
+                    }
+                }
+            }
+        }
+        else if (_dataContract.parmIsFullPublish())
+        {
+            if (RetailConfigurationParameters::getNumberOfParallelDiscountPublishTasks() == 1 && RetailRunDiscountPublishTasksForAllDiscountsFlight::instance().isEnabled())
+            {
+                while select crosscompany retailPeriodicDiscount
+                {
+                    changecompany(retailPeriodicDiscount.DataAreaId)
+                    {
+                        // Re-select the table buffer in the destination company.
+                        RetailPeriodicDiscount discount = RetailPeriodicDiscount::findByOfferId(retailPeriodicDiscount.OfferId);
+                        eventSource.EventWritePricingPublishStarted(discount.RecId, 'Batch.FullPublishAll');
+                        this.publishDiscount(discount);
+                    }
+                }
+            }
+            else
+            {
+                while (true)
+                {
+                    // We no longer use while select here since there may be more than 1 task running this.
+                    // while select sends a SQL(SELECT XXX) and do the loop on its results so when multiple tasks do this, a discount will be processed more than 1 time.
+                    select firstonly crosscompany OfferId, DataAreaId from retailPeriodicDiscount
+                        where retailPeriodicDiscount.Status == RetailDisabledEnabled::Enabled && retailPeriodicDiscount.ProcessingStatus == RetailPricingDiscountProcessingStatus::Draft;
+
+                    if (!retailPeriodicDiscount)
+                    {
+                        break;
+                    }
+
+                    str lockName = strFmt(lockNameFormat, retailPeriodicDiscount.DataAreaId, retailPeriodicDiscount.OfferId);
+
+                    // The reason we have to ask for a lock is that,
+                    // When running by multiple threads, say A and B.
+                    // We have a pessimisticlock below for the discount record. A and B both find discount X and A is the first to hold pessimisticlock.
+                    // So B has to wait for A completing the publish and start its publish. So discount X is published twice.'
+                    // With lock we can skip B's wait when it realizes A is already publishing it.
+                    using (ReqReaderWriterLock lock = ReqReaderWriterLock::construct())
+                    {
+                        if (!lock.tryEnterWriterLock(lockName))
+                        {
+                            // Some other process acquired the lock to initiate publish session.
+                            continue;
+                        }
+
+                        changecompany(retailPeriodicDiscount.DataAreaId)
+                        {
+                            // Re-select the table buffer in the destination company.
+                            RetailPeriodicDiscount discount = RetailPeriodicDiscount::findByOfferId(retailPeriodicDiscount.OfferId);
+                            eventSource.EventWritePricingPublishStarted(discount.RecId, 'Batch.FullPublishAll');
+                            this.publishDiscount(discount);
+                        }
+                    }
+                }
+            }
+
+            ttsbegin;
+            RetailPricingSharedParameters parameters = RetailPricingSharedParameters::find(true);
+            parameters.ProcessingLookupTables = false;
+            parameters.update();
+            ttscommit;
+        }
+        else
+        {
+            while select crosscompany OfferId, DataAreaId from retailPeriodicDiscount
+                where retailPeriodicDiscount.Status == RetailDisabledEnabled::Enabled && retailPeriodicDiscount.ProcessingStatus == RetailPricingDiscountProcessingStatus::Draft
+            {
+                changecompany(retailPeriodicDiscount.DataAreaId)
+                {
+                    // Re-select the table buffer in the destination company.
+                    RetailPeriodicDiscount discount = RetailPeriodicDiscount::findByOfferId(retailPeriodicDiscount.OfferId);
+                    eventSource.EventWritePricingPublishStarted(discount.RecId, 'Batch.PublishAll');
+                    this.publishDiscount(discount);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>publishDiscount</Name>
+				<Source><![CDATA[
+    [Replaceable(false)]
+    public void publishDiscount(RetailPeriodicDiscount _discount)
+    {
+        RetailPeriodicDiscountProductLookup retailPeriodicDiscountProductLookup;
+        RetailPeriodicDiscountCategoryLookup retailPeriodicDiscountCategoryLookup;
+        RetailPeriodicDiscount retailPeriodicDiscount;
+
+        System.Diagnostics.Stopwatch totalJobStopWatch = new System.Diagnostics.Stopwatch();
+        System.Diagnostics.Stopwatch subJobStopWatch = new System.Diagnostics.Stopwatch();
+        
+        int64 durationInMs;
+        this.startNewTiming(totalJobStopWatch);
+
+        // Explicit tts to shorten the transaction scope.
+        ttsbegin;
+        select pessimisticlock retailPeriodicDiscount where retailPeriodicDiscount.OfferId == _discount.OfferId;
+
+        ttsbegin;
+        retailPeriodicDiscount.ProcessingStatus = RetailPricingDiscountProcessingStatus::Processing;
+        retailPeriodicDiscount.update();
+        ttscommit;
+
+        try
+        {
+            ttsbegin;
+            delete_from retailPeriodicDiscountCategoryLookup where retailPeriodicDiscountCategoryLookup.OfferId == retailPeriodicDiscount.OfferId;
+            delete_from retailPeriodicDiscountProductLookup where retailPeriodicDiscountProductLookup.OfferId == retailPeriodicDiscount.OfferId;
+
+            if (retailPeriodicDiscount.Status != RetailDisabledEnabled::Enabled)
+            {
+                retailPeriodicDiscount.ProcessingStatus = RetailPricingDiscountProcessingStatus::Draft;
+            }
+            else
+            {
+                this.startNewTiming(subJobStopWatch);
+
+                this.publishProduct(retailPeriodicDiscount.OfferId);
+
+                durationInMs = this.stopTimingAndGetDurationInMs(subJobStopWatch);
+                eventSource.EventWritePricingPublishStep(retailPeriodicDiscount.RecId, 'PublishProduct', durationInMs);
+                
+                this.startNewTiming(subJobStopWatch);
+
+                this.publishVariant(retailPeriodicDiscount.OfferId);
+
+                durationInMs = this.stopTimingAndGetDurationInMs(subJobStopWatch);
+                eventSource.EventWritePricingPublishStep(retailPeriodicDiscount.RecId, 'PublishVariant', durationInMs);
+
+                this.startNewTiming(subJobStopWatch);
+
+                if (RetailPricingUseLegacyRetailPeriodicDiscountPublisherFlight::instance().isEnabled())
+                {
+                    this.publishDimensionLegacy(retailPeriodicDiscount.OfferId);
+                }
+                else
+                {
+                    this.publishDimension(retailPeriodicDiscount.OfferId);
+                }
+
+                durationInMs = this.stopTimingAndGetDurationInMs(subJobStopWatch);
+                eventSource.EventWritePricingPublishStep(retailPeriodicDiscount.RecId, 'PublishDimensions', durationInMs);
+
+                this.startNewTiming(subJobStopWatch);
+
+                this.publishCategory(retailPeriodicDiscount.OfferId);
+
+                durationInMs = this.stopTimingAndGetDurationInMs(subJobStopWatch);
+                eventSource.EventWritePricingPublishStep(retailPeriodicDiscount.RecId, 'PublishCategory', durationInMs);
+
+                retailPeriodicDiscount.ProcessingStatus = RetailPricingDiscountProcessingStatus::Processed;
+            }
+            
+            retailPeriodicDiscount.update();
+            ttscommit;
+
+            durationInMs = this.stopTimingAndGetDurationInMs(totalJobStopWatch);
+            eventSource.EventWritePricingPublishEnded(retailPeriodicDiscount.RecId, durationInMs);
+        }
+        catch (Exception::Error)
+        {
+            durationInMs = this.stopTimingAndGetDurationInMs(totalJobStopWatch);
+            eventSource.EventWritePricingPublishFailed(retailPeriodicDiscount.RecId, durationInMs);
+
+            ttsbegin;
+            // If for some reason, the deletion below failed, the status should still be failed.
+            retailPeriodicDiscount.ProcessingStatus = RetailPricingDiscountProcessingStatus::Failed;
+            retailPeriodicDiscount.update();
+            ttscommit;
+
+            ttsbegin;
+            // Delete to prevent an inconsistent view.
+            delete_from retailPeriodicDiscountCategoryLookup where retailPeriodicDiscountCategoryLookup.OfferId == retailPeriodicDiscount.OfferId;
+            delete_from retailPeriodicDiscountProductLookup where retailPeriodicDiscountProductLookup.OfferId == retailPeriodicDiscount.OfferId;
+            ttscommit;
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>publishDiscountForProduct</Name>
+				<Source><![CDATA[
+    [Replaceable(false)]
+    public void publishDiscountForProduct(RetailPeriodicDiscount _discount)
+    {
+        RetailPeriodicDiscountProductLookup retailPeriodicDiscountProductLookup;
+        RetailPeriodicDiscountCategoryLookup retailPeriodicDiscountCategoryLookup;
+        RetailPeriodicDiscount retailPeriodicDiscount;
+
+        System.Diagnostics.Stopwatch totalJobStopWatch = new System.Diagnostics.Stopwatch();
+        System.Diagnostics.Stopwatch subJobStopWatch = new System.Diagnostics.Stopwatch();
+
+        int64 durationInMs;
+        this.startNewTiming(totalJobStopWatch);
+
+        // Explicit tts to shorten the transaction scope.
+        ttsbegin;
+        select pessimisticlock retailPeriodicDiscount where retailPeriodicDiscount.OfferId == _discount.OfferId;
+
+        ttsbegin;
+        retailPeriodicDiscount.ProcessingStatus = RetailPricingDiscountProcessingStatus::Processing;
+        retailPeriodicDiscount.update();
+        ttscommit;
+
+        try
+        {
+            ttsbegin;
+
+            if (retailPeriodicDiscount.Status != RetailDisabledEnabled::Enabled)
+            {
+                retailPeriodicDiscount.ProcessingStatus = RetailPricingDiscountProcessingStatus::Draft;
+            }
+            else
+            {
+                this.startNewTiming(subJobStopWatch);
+
+                this.publishDimension(retailPeriodicDiscount.OfferId);
+
+                durationInMs = this.stopTimingAndGetDurationInMs(subJobStopWatch);
+                eventSource.EventWritePricingPublishStep(retailPeriodicDiscount.RecId, 'PublishDimensions', durationInMs);
+
+                retailPeriodicDiscount.ProcessingStatus = RetailPricingDiscountProcessingStatus::Processed;
+            }
+            
+            retailPeriodicDiscount.update();
+            ttscommit;
+
+            durationInMs = this.stopTimingAndGetDurationInMs(totalJobStopWatch);
+            eventSource.EventWritePricingPublishEnded(retailPeriodicDiscount.RecId, durationInMs);
+        }
+        catch (Exception::Error)
+        {
+            durationInMs = this.stopTimingAndGetDurationInMs(totalJobStopWatch);
+            eventSource.EventWritePricingPublishFailed(retailPeriodicDiscount.RecId, durationInMs);
+
+            ttsbegin;
+            // If for some reason, the deletion below failed, the status should still be failed.
+            retailPeriodicDiscount.ProcessingStatus = RetailPricingDiscountProcessingStatus::Failed;
+            retailPeriodicDiscount.update();
+            ttscommit;
+
+            ttsbegin;
+            // Delete to prevent an inconsistent view.
+            delete_from retailPeriodicDiscountCategoryLookup where retailPeriodicDiscountCategoryLookup.OfferId == retailPeriodicDiscount.OfferId;
+            delete_from retailPeriodicDiscountProductLookup where retailPeriodicDiscountProductLookup.OfferId == retailPeriodicDiscount.OfferId;
+            ttscommit;
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>publishProduct</Name>
+				<Source><![CDATA[
+    private void publishProduct(RetailDiscountOfferId _offerId)
+    {
+        RetailPeriodicDiscountFlattenedLineView retailPeriodicDiscountFlattenedLineView;
+        RetailPeriodicDiscountProductLookup retailPeriodicDiscountProductLookup;
+
+        insert_recordset retailPeriodicDiscountProductLookup
+        (
+            CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, Product, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit
+        )
+        select CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, Product, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit
+        from retailPeriodicDiscountFlattenedLineView
+            where retailPeriodicDiscountFlattenedLineView.OfferId == _offerId
+                  && retailPeriodicDiscountFlattenedLineView.Product > 0
+                  && retailPeriodicDiscountFlattenedLineView.Variant == 0
+                  && (retailPeriodicDiscountFlattenedLineView.InventDimId == '' || retailPeriodicDiscountFlattenedLineView.InventDimId == InventDimAllBlank);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>publishVariant</Name>
+				<Source><![CDATA[
+    private void publishVariant(RetailDiscountOfferId _offerId)
+    {
+        RetailPeriodicDiscountFlattenedLineView retailPeriodicDiscountFlattenedLineView;
+        RetailPeriodicDiscountProductLookup retailPeriodicDiscountProductLookup;
+
+        insert_recordset retailPeriodicDiscountProductLookup
+        (
+            CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, Product, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit
+        )
+        select CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, Variant, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit
+        from retailPeriodicDiscountFlattenedLineView
+            where retailPeriodicDiscountFlattenedLineView.OfferId == _offerId
+                  && retailPeriodicDiscountFlattenedLineView.Product > 0 && retailPeriodicDiscountFlattenedLineView.Variant > 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>publishDimensionLegacy</Name>
+				<Source><![CDATA[
+    private void publishDimensionLegacy(RetailDiscountOfferId _offerId)
+    {
+        RetailPeriodicDiscountFlattenedLineView retailPeriodicDiscountFlattenedLineView;
+        RetailPeriodicDiscountProductLookup retailPeriodicDiscountProductLookup;
+        InventDim variantInventDim;
+        InventDim discountInventDim;
+        InventTable inventTable;
+        InventDimCombination inventDimCombination;
+
+        insert_recordset retailPeriodicDiscountProductLookup
+        (
+            CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit,
+            Product
+        )
+        select CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit
+        from retailPeriodicDiscountFlattenedLineView
+            where retailPeriodicDiscountFlattenedLineView.OfferId == _offerId
+            && retailPeriodicDiscountFlattenedLineView.Product != 0
+            && retailPeriodicDiscountFlattenedLineView.Variant == 0
+            && retailPeriodicDiscountFlattenedLineView.InventDimId != InventDimAllBlank
+        join discountInventDim
+            where discountInventDim.inventDimId == retailPeriodicDiscountFlattenedLineView.InventDimId
+        join inventTable
+            where inventTable.Product == retailPeriodicDiscountFlattenedLineView.Product
+        join DistinctProductVariant from inventDimCombination
+            where inventDimCombination.ItemId == inventTable.ItemId
+        join variantInventDim
+            where variantInventDim.inventDimId == inventDimCombination.InventDimId
+            && (discountInventDim.InventColorId == '' || discountInventDim.InventColorId == variantInventDim.InventColorId)
+            && (discountInventDim.InventStyleId == '' || discountInventDim.InventStyleId == variantInventDim.InventStyleId)
+            && (discountInventDim.InventSizeId == '' || discountInventDim.InventSizeId == variantInventDim.InventSizeId)
+            && (discountInventDim.configId == '' || discountInventDim.configId == variantInventDim.configId)
+            && (discountInventDim.InventVersionId == '' || discountInventDim.InventVersionId == variantInventDim.InventVersionId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>publishDimension</Name>
+				<Source><![CDATA[
+    private void publishDimension(RetailDiscountOfferId _offerId)
+    {
+        RetailPeriodicDiscountFlattenedLineView retailPeriodicDiscountFlattenedLineView;
+        RetailPeriodicDiscountProductLookup retailPeriodicDiscountProductLookup;
+        InventDim variantInventDim;
+        InventDim discountInventDim;
+        InventTable inventTable;
+        InventDimCombination inventDimCombination;
+
+        insert_recordset retailPeriodicDiscountProductLookup
+        (
+            CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit,
+            Product
+        )
+        select forceSelectOrder CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit
+        from retailPeriodicDiscountFlattenedLineView
+            where retailPeriodicDiscountFlattenedLineView.OfferId == _offerId
+            && retailPeriodicDiscountFlattenedLineView.Product > 0
+            && retailPeriodicDiscountFlattenedLineView.Variant == 0
+            && retailPeriodicDiscountFlattenedLineView.InventDimId != InventDimAllBlank
+        join discountInventDim
+            where discountInventDim.inventDimId == retailPeriodicDiscountFlattenedLineView.InventDimId
+        join inventTable
+            where inventTable.Product == retailPeriodicDiscountFlattenedLineView.Product
+        join DistinctProductVariant from inventDimCombination
+            where inventDimCombination.ItemId == inventTable.ItemId
+        join variantInventDim
+            where variantInventDim.inventDimId == inventDimCombination.InventDimId
+            && (discountInventDim.InventColorId == '' || discountInventDim.InventColorId == variantInventDim.InventColorId)
+            && (discountInventDim.InventStyleId == '' || discountInventDim.InventStyleId == variantInventDim.InventStyleId)
+            && (discountInventDim.InventSizeId == '' || discountInventDim.InventSizeId == variantInventDim.InventSizeId)
+            && (discountInventDim.configId == '' || discountInventDim.configId == variantInventDim.configId)
+            && (discountInventDim.InventVersionId == '' || discountInventDim.InventVersionId == variantInventDim.InventVersionId)
+        notExists join retailPeriodicDiscountProductLookup
+            where retailPeriodicDiscountFlattenedLineView.OfferId == retailPeriodicDiscountProductLookup.OfferId
+            && retailPeriodicDiscountFlattenedLineView.LineNum == retailPeriodicDiscountProductLookup.LineNum
+            && inventDimCombination.DistinctProductVariant == retailPeriodicDiscountProductLookup.Product;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>publishCategory</Name>
+				<Source><![CDATA[
+    private void publishCategory(RetailDiscountOfferId _offerId)
+    {
+        RetailPeriodicDiscountFlattenedLineView retailPeriodicDiscountFlattenedLineView;
+        RetailPeriodicDiscountCategoryLookup retailPeriodicDiscountCategoryLookup;
+
+        insert_recordset retailPeriodicDiscountCategoryLookup
+        (
+            CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, Category, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit
+        )
+        select CurrencyCode, ValidFrom, ValidTo, PeriodicDiscountType, OfferId, LineNum, DiscountPercentOrValue, LineType, IsDiscountApplyingLine, UnitOfMeasure, Category, RetailPeriodicDiscountLineRecordId,
+            MixAndMatchLineGroup, MixAndMatchDiscountType, MixAndMatchNumberOfItemsNeeded,
+            SimpleDiscountMethod, SimpleDiscountAmount, SimpleDiscountPct, SimpleDiscountOfferPrice,
+            ThresholdLineDiscountMethod, ThresholdTier, ThresholdQuantityLimit
+        from RetailPeriodicDiscountFlattenedLineView
+            where retailPeriodicDiscountFlattenedLineView.OfferId == _offerId
+                  && retailPeriodicDiscountFlattenedLineView.Category > 0 && retailPeriodicDiscountFlattenedLineView.Product == 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startNewTiming</Name>
+				<Source><![CDATA[
+    private void startNewTiming(System.Diagnostics.Stopwatch stopWatch)
+    {
+        stopWatch.Reset();
+        stopWatch.Start();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stopTimingAndGetDurationInMs</Name>
+				<Source><![CDATA[
+    private int64 stopTimingAndGetDurationInMs(System.Diagnostics.Stopwatch stopWatch)
+    {
+        stopWatch.Stop();
+        System.TimeSpan timeSpan = stopWatch.Elapsed;
+        int64 durationInMs = timeSpan.TotalMilliseconds;
+        return durationInMs;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

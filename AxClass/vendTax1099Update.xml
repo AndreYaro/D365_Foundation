@@ -1,0 +1,1367 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>VendTax1099Update</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class VendTax1099Update extends RunBase
+{
+    Tax1099FieldsRecId boxFor1099RecId;
+    Tax1099State stateFor1099;
+    AccountNum vendorNum;
+    boolean setAll1099;
+    boolean recalcAmounts;
+    TransDate fromDate;
+    TransDate toDate;
+    SettleTax1099Amount vtSettleTax1099Amount;
+    SettleTax1099StateAmount vtSettleTax1099StateAmount;
+
+    ExchRate paymToInvoiceRate;
+
+    DialogField dialogTax1099Box;
+    DialogField dialogTax1099State;
+    DialogField dialogVendor;
+    DialogField dialogFromDate;
+    DialogField dialogToDate;
+    DialogField dialogUpdateAll;
+    DialogField dialogRecalcAmounts;
+    Set invoiceList; //Stores the VendTrans.RecId for each invoice to be processed.
+
+    #DEFINE.CurrentVersion(3)
+    #LOCALMACRO.CurrentList
+        setAll1099,
+        fromDate,
+        toDate,
+        stateFor1099,
+        recalcAmounts,
+        boxFor1099RecId,
+        vendorNum
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new()
+    {
+        super();
+        GlobalizationInstrumentationHelper::featureRun(GlobalizationConstants::FeatureReferenceUS00003, funcName());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcMiscChargeAmount</Name>
+				<Source><![CDATA[
+    private MarkupAmount calcMiscChargeAmount(VendInvoiceTrans _vendInvoiceTrans)
+    {
+        MarkupTable markupTable;
+        MarkupTrans markupTrans;
+
+        // if 'Apply US Taxation Rules' is true, then markupTrans.CalculatedAmount will include the tax.
+
+        select sum(CalculatedAmount) from markupTrans
+            where markupTrans.TransTableId == _vendInvoiceTrans.TableId
+                && markupTrans.TransRecId == _vendInvoiceTrans.RecId
+                && markupTrans.IsDeleted == NoYes::No
+            exists join markupTable
+                where (markupTable.CustType == MarkupType::CustVend || markupTable.VendType == MarkupType::CustVend)
+                    && markupTable.ModuleType == markupTrans.ModuleType
+                    && markupTable.MarkupCode == markupTrans.MarkupCode;
+
+        return markupTrans.CalculatedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcMiscChargeAmountTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Calculates the sales tax amount for miscellaneous charges.
+    /// </summary>
+    /// <param name = "_vendInvoiceJour">
+    ///     A <c>VendInvoiceJour</c> table buffer.
+    /// </param>
+    /// <param name = "_vendInvoiceTrans">
+    ///     A <c>VendInvoiceTrans</c> table buffer.
+    /// </param>
+    /// <returns>
+    ///     Sales tax amountfor miscellaneous charges.
+    /// </returns>
+    protected MarkupAmount calcMiscChargeAmountTax(VendInvoiceJour _vendInvoiceJour, VendInvoiceTrans _vendInvoiceTrans)
+    {
+        MarkupTrans markupTrans;
+        TaxTrans taxTrans;
+
+        if (!TaxParameters::find().PurchTaxOnOperations)
+        {
+            select sum(SourceTaxAmountCur) from taxTrans
+                where taxTrans.Voucher == _vendInvoiceJour.LedgerVoucher
+                    && taxTrans.TransDate == _vendInvoiceTrans.InvoiceDate
+                    && taxTrans.InventTransId == _vendInvoiceTrans.InventTransId
+                    && taxTrans.TaxDirection != TaxDirection::UseTax
+                    && taxTrans.TaxOrigin != TaxOrigin::TaxReversed
+                    && taxTrans.TaxOrigin != TaxOrigin::Transfer
+            exists join markupTrans
+                where markupTrans.TransTableId == _vendInvoiceTrans.TableId
+                    && markupTrans.TransRecId == _vendInvoiceTrans.RecId
+                    && markupTrans.IsDeleted == NoYes::No
+                    && ((markupTrans.OrigTableId == taxTrans.SourceTableId
+                    && markupTrans.OrigRecId == taxTrans.SourceRecId) // MarkupTrans posted in AX 6.2, due to bug 336959
+                    || (markupTrans.TableId == taxTrans.SourceTableId
+                    && markupTrans.RecId == taxTrans.SourceRecId)); // MarkupTrans posted in AX 6.0, or after fix for bug 336959
+        }
+
+        return taxTrans.SourceTaxAmountCur;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearAll_1099info</Name>
+				<Source><![CDATA[
+    private void clearAll_1099info(VendAccount vendAccount)
+    {
+        VendInvoiceTrans vendInvoiceTrans;
+        PurchLine purchLine;
+        LedgerJournalTrans ledgerJournalTrans;
+        VendTrans vendTransPayment;
+        VendInvoiceJour vendInvoiceJour;
+        VendTrans localVendTrans;
+        SetEnumerator invoiceEnumerator;
+        RecId invoiceId;
+        VendSettlement vendSettlement;
+        VendSettlement vendSettlementOffset;
+        VendTrans vendTrans;
+        VendTransOpen vendTransOpen;
+
+        ttsbegin;
+
+        invoiceEnumerator = invoiceList.getEnumerator();
+
+        // Process all invoices opened or with settlement activity in the specified time period.
+        while (invoiceEnumerator.moveNext())
+        {
+            invoiceId = invoiceEnumerator.current();
+
+            // Find the invoice
+            while select forupdate crosscompany vendTrans
+                where vendTrans.RecId == invoiceId
+            {
+                // Find the settlement records
+                while select forupdate crosscompany vendSettlement
+                    where vendSettlement.AccountNum == vendTrans.AccountNum
+                       && vendSettlement.TransRecId == vendTrans.RecId
+                {
+                    // if the SettlementGroup is not specified, the transaction originated from Ax 4, and
+                    // by design the value is always zero.
+                    if (vendSettlement.SettlementGroup == 0)
+                    {
+                        while select forupdate crosscompany vendSettlementOffset
+                            where vendSettlementOffset.TransRecId == vendSettlement.OffsetRecid
+                                && vendSettlementOffset.OffsetRecid == vendSettlement.TransRecId
+                                && vendSettlementOffset.OffsetCompany == vendSettlement.company()
+                        {
+                            this.remove1099FromVendSettlement(vendSettlementOffset, vendTrans.Invoice);
+                        }
+                    }
+                    else
+                    {
+                        while select forupdate crosscompany vendSettlementOffset
+                            where vendSettlementOffset.TransRecId == vendSettlement.OffsetRecid
+                               && vendSettlementOffset.SettlementGroup == vendSettlement.SettlementGroup
+                               && vendSettlementOffset.OffsetCompany == vendSettlement.company()
+                        {
+                            this.remove1099FromVendSettlement(vendSettlementOffset, vendTrans.Invoice);
+                        }
+                    }
+
+                    vendSettlement.SettleTax1099Amount = 0;
+                    vendSettlement.SettleTax1099StateAmount = 0;
+                    changecompany(vendSettlement.company())
+                    {
+                        vendSettlement.update();
+                    }
+                }
+
+                // Find the transaction open records
+                while select forupdate crosscompany vendTransOpen
+                    where vendTransOpen.AccountNum == vendTrans.AccountNum
+                       && vendTransOpen.DataAreaId == vendTrans.company()
+                       && vendTransOpen.RefRecId == vendTrans.RecId
+                {
+                    vendTransOpen.Tax1099Amount = 0;
+                    vendTransOpen.Tax1099StateAmount = 0;
+                    changecompany(vendTransOpen.company())
+                    {
+                        vendTransOpen.update();
+                    }
+                }
+
+                // Find vendTransInvoice records for purchase orders
+                if (vendTrans.TransType == LedgerTransType::Purch)
+                {
+                    while select forupdate crosscompany vendInvoiceTrans
+                         where vendInvoiceTrans.InvoiceId == vendTrans.Invoice
+                            && vendInvoiceTrans.DataAreaId == vendTrans.company()
+                    {
+                        changecompany(vendInvoiceTrans.company())
+                        {
+                            vendInvoiceJour = vendInvoiceTrans.vendInvoiceJour();
+                            localVendTrans = vendInvoiceJour.vendTrans();
+
+                            if (localVendTrans.RecId == vendTrans.RecId)
+                            {
+                                vendInvoiceTrans.Tax1099Fields = 0;
+                                vendInvoiceTrans.Tax1099Amount = recalcAmounts ? 0 : vendInvoiceTrans.Tax1099Amount;
+                                vendInvoiceTrans.Tax1099State = '';
+                                vendInvoiceTrans.Tax1099StateAmount = recalcAmounts ? 0 : vendInvoiceTrans.Tax1099StateAmount;
+                                vendInvoiceTrans.update();
+
+                                purchLine = PurchLine::findInventTransId(vendInvoiceTrans.InventTransId, true);
+                                if (purchLine)
+                                {
+                                    purchLine.Tax1099Fields = 0;
+                                    purchLine.Tax1099State = '';
+                                    purchLine.Tax1099Amount = 0;
+                                    purchLine.Tax1099StateAmount = 0;
+
+                                    // Use doUpdate to avoid making a new modified version of the PO
+                                    purchLine.doUpdate();
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    while select forupdate crosscompany ledgerJournalTrans
+                        where ledgerJournalTrans.VendTransId == vendTrans.RecId
+                           && ledgerJournalTrans.DataAreaId == vendTrans.company()
+                    {
+                        ledgerJournalTrans.Tax1099Fields = 0;
+                        ledgerJournalTrans.Tax1099State = '';
+                        ledgerJournalTrans.Tax1099Amount = recalcAmounts ? 0 : ledgerJournalTrans.Tax1099Amount;
+                        ledgerJournalTrans.Tax1099StateAmount = recalcAmounts ? 0 : ledgerJournalTrans.Tax1099StateAmount;
+                        changecompany(ledgerJournalTrans.company())
+                        {
+                            ledgerJournalTrans.update();
+                        }
+                    }
+                }
+
+                // Find VendTrans payments for this invoice
+                while select forupdate crosscompany vendTransPayment
+                    where vendTransPayment.OffsetRecid == vendTrans.RecId
+                       && vendTransPayment.TransType == LedgerTransType::Payment
+                {
+                    changecompany(vendTransPayment.company())
+                    {
+                        // Ledger journal trans in payment company
+                        while select forupdate ledgerJournalTrans
+                            where ledgerJournalTrans.VendTransId == vendTransPayment.RecId
+                        {
+                            ledgerJournalTrans.Tax1099Fields = 0;
+                            ledgerJournalTrans.Tax1099State = '';
+                            ledgerJournalTrans.Tax1099Amount = 0;
+                            ledgerJournalTrans.Tax1099StateAmount = 0;
+                            changeCompany(ledgerJournalTrans.company())
+                            {
+                                ledgerJournalTrans.update();
+                            }
+                        }
+
+                        // Payment trans in payment company
+                        vendTransPayment = VendTrans::find(vendTransPayment.RecId, true);
+                        vendTransPayment.Tax1099Fields = 0;
+                        vendTransPayment.Tax1099Amount = 0;
+                        vendTransPayment.Tax1099State = '';
+                        vendTransPayment.Tax1099StateAmount = 0;
+                        vendTransPayment.SettleTax1099Amount = 0;
+                        vendTransPayment.SettleTax1099StateAmount = 0;
+                        vendTransPayment.update();
+                    }
+                }
+
+                vendTrans.Tax1099Fields = 0;
+                vendTrans.Tax1099Amount = 0;
+                vendTrans.Tax1099State = '';
+                vendTrans.Tax1099StateAmount = 0;
+                vendTrans.SettleTax1099Amount = 0;
+                vendTrans.SettleTax1099StateAmount = 0;
+                changecompany(vendTrans.company())
+                {
+                    vendTrans.update();
+                }
+            }
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInvoiceList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates a list of invoices to be processed that includes all invoices opened in the specified time
+    ///    period and invoices that have had settlement activity in the specified time period.
+    /// </summary>
+    /// <param name="vendAccount">
+    ///    The vendor to process. If blank, all vendors will be processed.
+    /// </param>
+    private void createInvoiceList(VendAccount vendAccount)
+    {
+        VendTable localVendor;
+        VendTable vendorGroup;
+        VendTrans vendTrans;
+        TransactionReversalTrans transactionReversalTrans;
+        VendSettlement vendSettlement;
+
+        invoiceList = new Set (Types::Int64);
+
+        while select Party from localVendor
+            where (localVendor.AccountNum == vendAccount || vendAccount == '')
+        {
+            //Process all vendor accross companies which share the same directory ID
+            while select crosscompany vendorGroup
+                where localVendor.Party == vendorGroup.Party
+            {
+                // Find all invoice with settlements in the specified time period
+                while select crosscompany RecId from vendTrans
+                    where vendTrans.AccountNum == vendorGroup.AccountNum
+                       && vendTrans.DataAreaId == vendorGroup.company()
+                       && ((vendTrans.Invoice != '' && vendTrans.TransType != LedgerTransType::CrossCompanySettlement)
+                           || (vendTrans.Invoice == '' && vendTrans.TransType == LedgerTransType::GeneralJournal))
+                exists join vendSettlement
+                    where vendSettlement.AccountNum == vendTrans.AccountNum
+                       && vendSettlement.TransRecId == vendTrans.RecId
+                       && vendSettlement.TransDate >= fromDate
+                       && vendSettlement.TransDate <= toDate
+                notexists join transactionReversalTrans
+                    where transactionReversalTrans.RefTableId == vendTrans.TableId
+                       && transactionReversalTrans.RefRecId == vendTrans.RecId
+                {
+                    invoiceList.add(vendTrans.RecId);
+                }
+
+                // Find all invoice opened in the specified time period (duplicates
+                // from above loop will not be added since this is standard set
+                // functionality
+                while select crosscompany RecId from vendTrans
+                    where vendTrans.AccountNum == vendorGroup.AccountNum
+                       && vendTrans.DataAreaId == vendorGroup.company()
+                       && ((vendTrans.Invoice != '' && vendTrans.TransType != LedgerTransType::CrossCompanySettlement)
+                           || (vendTrans.Invoice == '' && vendTrans.TransType == LedgerTransType::GeneralJournal))
+                       && vendTrans.TransDate >= fromDate
+                       && vendTrans.TransDate <= toDate
+                notexists join transactionReversalTrans
+                    where transactionReversalTrans.RefTableId == vendTrans.TableId
+                       && transactionReversalTrans.RefRecId == vendTrans.RecId
+                {
+                    invoiceList.add(vendTrans.RecId);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVendSettlementTax1099</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the line amount by using a formula.
+    /// </summary>
+    /// <param name="_vendSettlement">
+    /// The settlement record that is based on the invoice transaction.
+    /// </param>
+    /// <param name="_vendSettlementOffset">
+    /// The settlement record that is based on the payment transaction.
+    /// </param>
+    /// <param name="_vendTrans">
+    /// The vendor transaction that is created when invoicing.
+    /// </param>
+    /// <param name="_vendTransOffset">
+    /// The vendor transaction that is created when generating a payment.
+    /// </param>
+    /// <remarks>
+    ///  The formula is as follows:
+    ///  <list type="bullet">
+    ///   <item>
+    ///   <description>Federal: Invoice 1099 line amount / (Total amount for the invoice / payment
+    ///   amount).</description>
+    ///   </item>
+    ///   <item>
+    ///   <description>State: Invoice 1099 state line amount / (Total amount for the invoice / payment
+    ///   amount). </description>
+    ///   </item>
+    ///   <item>
+    ///   <description>Invoice 1099 line amount = a negative amount.</description>
+    ///   </item>
+    ///  </list>
+    ///   The total invoice amount is typically negative. The payment amount will be positive unless the
+    ///  transaction is being reversed.
+    /// </remarks>
+    private void createVendSettlementTax1099(VendSettlement _vendSettlement, VendSettlement _vendSettlementOffset, VendTrans _vendTrans, VendTrans _vendTransOffset)
+    {
+        VendSettlementTax1099 vendSettlementTax1099;
+        VendInvoiceTrans vendInvoiceTrans;
+        boolean pullFromVendTrans = true;
+        Tax1099Fields tax1099Fields;
+        VendInvoiceJour vendInvoiceJour;
+        VendTrans localVendTrans;
+
+        ttsbegin;
+
+        if (_vendTrans.TransType == LedgerTransType::Purch)
+        {
+            while select forupdate crosscompany vendInvoiceTrans
+                where vendInvoiceTrans.InvoiceId == _vendTrans.Invoice
+                   && vendInvoiceTrans.DataAreaId == _vendTrans.company()
+            {
+                changecompany(vendInvoiceTrans.company())
+                {
+                    vendInvoiceJour = vendInvoiceTrans.vendInvoiceJour();
+                    localVendTrans = vendInvoiceJour.vendTrans();
+                }
+
+                if (localVendTrans.RecId == _vendTrans.RecId)
+                {
+                    pullFromVendTrans = false;
+
+                    if (!_vendTransOffset.Invoice)
+                    {
+                        changecompany(_vendSettlementOffset.company())
+                        {
+                            // In case of centralized payment, a VendSettlementTax1099 record should have a tax1099Fields
+                            // of a company where payments or settlement were made. Tax1099Fields of VendSettlementTax1099 is
+                            // assigned from _vendTransOffset which has Tax1099Fields of a vendor that is used for offset.
+
+                            vendSettlementTax1099.clear();
+                            vendSettlementTax1099.VendAccount = _vendSettlementOffset.AccountNum;
+                            vendSettlementTax1099.TransDate = _vendTransOffset.TransDate;
+                            vendSettlementTax1099.Voucher = _vendTransOffset.Voucher;
+                            vendSettlementTax1099.VendInvoiceId = _vendTrans.Invoice;
+                            vendSettlementTax1099.PurchInternalInvoiceId = _vendTrans.Voucher;
+                            vendSettlementTax1099.InventTransId = vendInvoiceTrans.InventTransId;
+                            vendSettlementTax1099.ExternalRecId = _vendTransOffset.RecId;
+                            vendSettlementTax1099.Tax1099Fields = _vendTransOffset.Tax1099Fields;
+                            vendSettlementTax1099.Tax1099State = _vendTransOffset.Tax1099State;
+
+                            if (_vendTrans.AmountCur != 0 && _vendSettlement.SettleAmountCur != 0 && vendSettlementTax1099.Tax1099Fields != 0)
+                            {
+                                vendSettlementTax1099.SettleTax1099Amount = CurrencyExchange::round(
+                                        (vendInvoiceTrans.Tax1099Amount /
+                                        (_vendTrans.AmountCur / (_vendSettlement.SettleAmountCur - _vendSettlement.UtilizedCashDisc))) * paymToInvoiceRate,
+                                        _vendTrans.CurrencyCode);
+                            }
+
+                            if (_vendTrans.AmountCur != 0 && _vendSettlement.SettleAmountCur != 0 && vendSettlementTax1099.Tax1099State != '')
+                            {
+                                vendSettlementTax1099.SettleTax1099StateAmount = CurrencyExchange::round(
+                                    (vendInvoiceTrans.Tax1099StateAmount /
+                                    (_vendTrans.AmountCur / (_vendSettlement.SettleAmountCur - _vendSettlement.UtilizedCashDisc))) * paymToInvoiceRate,
+                                    _vendTrans.CurrencyCode);
+                            }
+
+                            if (_vendTrans.AmountCur != 0 && _vendSettlement.SettleAmountCur != 0 && vendSettlementTax1099.Tax1099Fields)
+                            {
+                                tax1099Fields = Tax1099Fields::find(vendSettlementTax1099.Tax1099Fields);
+                                vendSettlementTax1099.irsReportable = vendSettlementTax1099.SettleTax1099Amount >= tax1099Fields.Tax1099Amount ? true : false;
+                                vtSettleTax1099Amount += CurrencyExchange::round(
+                                    vendInvoiceTrans.Tax1099Amount /(_vendTrans.AmountCur / _vendSettlement.SettleAmountCur),
+                                    _vendTrans.CurrencyCode);
+                            }
+
+                            if (_vendTrans.AmountCur != 0 && _vendSettlement.SettleAmountCur != 0 && vendInvoiceTrans.Tax1099State)
+                            {
+                                vtSettleTax1099StateAmount += CurrencyExchange::round(
+                                    vendInvoiceTrans.Tax1099StateAmount /(_vendTrans.AmountCur / _vendSettlement.SettleAmountCur),
+                                    _vendTrans.CurrencyCode);
+                            }
+
+                            if (vendSettlementTax1099.SettleTax1099Amount || vendSettlementTax1099.SettleTax1099StateAmount)
+                            {
+                                if (!this.isTaxDistributionByMainAccount(vendSettlementTax1099, vendInvoiceTrans))
+                                {
+                                    vendSettlementTax1099.insert();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (pullFromVendTrans)
+        {
+            if (!_vendTransOffset.Invoice)
+            {
+                changecompany(_vendSettlementOffset.company())
+                {
+                    // In case of centralized payment, a VendSettlementTax1099 record should have a tax1099Fields
+                    // of a company where payments or settlement were made. Tax1099Fields of VendSettlementTax1099 is
+                    // assigned from _vendTransOffset which has Tax1099Fields of a vendor that is used for offset.
+
+                    vendSettlementTax1099.clear();
+                    vendSettlementTax1099.VendAccount = _vendSettlementOffset.AccountNum;
+                    vendSettlementTax1099.TransDate = _vendTransOffset.TransDate;
+                    vendSettlementTax1099.Voucher = _vendTransOffset.Voucher;
+                    vendSettlementTax1099.VendInvoiceId = _vendTrans.Invoice;
+                    vendSettlementTax1099.ExternalRecId = _vendTransOffset.RecId;
+                    vendSettlementTax1099.Tax1099Fields = _vendTransOffset.Tax1099Fields;
+                    vendSettlementTax1099.Tax1099State = _vendTransOffset.Tax1099State;
+
+                    if (_vendTrans.AmountCur != 0 && _vendSettlement.SettleAmountCur != 0 && vendSettlementTax1099.Tax1099Fields != 0)
+                    {
+                        vendSettlementTax1099.SettleTax1099Amount = CurrencyExchange::round(
+                            (_vendTrans.Tax1099Amount /
+                            (_vendTrans.AmountCur / - (_vendSettlement.SettleAmountCur - _vendSettlement.UtilizedCashDisc))) * paymToInvoiceRate,
+                            _vendTrans.CurrencyCode);
+                    }
+
+                    if (_vendTrans.AmountCur != 0 && _vendSettlement.SettleAmountCur != 0 && vendSettlementTax1099.Tax1099State != '')
+                    {
+                        vendSettlementTax1099.SettleTax1099StateAmount = CurrencyExchange::round(
+                            (_vendTrans.Tax1099StateAmount /
+                            (_vendTrans.AmountCur / - (_vendSettlement.SettleAmountCur - _vendSettlement.UtilizedCashDisc))) * paymToInvoiceRate,
+                            _vendTrans.CurrencyCode);
+                    }
+
+                    if (_vendTrans.AmountCur != 0 && _vendSettlement.SettleAmountCur != 0 && vendSettlementTax1099.Tax1099Fields)
+                    {
+                        tax1099Fields = Tax1099Fields::find(vendSettlementTax1099.Tax1099Fields);
+                        vendSettlementTax1099.irsReportable = vendSettlementTax1099.SettleTax1099Amount >= tax1099Fields.Tax1099Amount ? true : false;
+                        vtSettleTax1099Amount += CurrencyExchange::round(
+                            _vendTrans.Tax1099Amount /(_vendTrans.AmountCur / - _vendSettlement.SettleAmountCur),
+                            _vendTrans.CurrencyCode);
+                    }
+
+                    if (_vendTrans.AmountCur != 0 && _vendSettlement.SettleAmountCur != 0 && _vendTrans.Tax1099State)
+                    {
+                        vtSettleTax1099StateAmount += CurrencyExchange::round(
+                            _vendTrans.Tax1099StateAmount /(_vendTrans.AmountCur / - _vendSettlement.SettleAmountCur),
+                            _vendTrans.CurrencyCode);
+                    }
+
+                    if (vendSettlementTax1099.SettleTax1099Amount || vendSettlementTax1099.SettleTax1099StateAmount)
+                    {
+                        vendSettlementTax1099.insert();
+                    }
+                }
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns a class that contains the methods that are described by the <c>RunBaseDialogable</c>
+    /// interface.
+    /// </summary>
+    /// <returns>
+    /// A class that contains the methods that are described by the <c>RunBaseDialogable</c> interface.
+    /// </returns>
+    /// <remarks>
+    /// A dialog box can be either built by using the <c>Dialog</c> class or by using a class that is
+    /// created in the Application Object Tree (AOT).
+    /// </remarks>
+    public Object dialog()
+    {
+        DialogRunbase dialog = super();
+
+        dialogVendor = dialog.addFieldValue(extendedTypeStr(VendAccount), vendorNum);
+        dialogVendor.allowEdit(vendorNum == '');
+
+        PreferredLocale locale = new Session().preferredLocale();
+        fromDate = DateTimeUtil::getStartOfYearDate(locale, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+        toDate = DateTimeUtil::getEndOfYearDate(locale, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+
+        dialogFromDate = dialog.addFieldValue(extendedTypeStr(TransDate), fromDate, "@SYS24050","");
+        dialogToDate = dialog.addFieldValue(extendedTypeStr(TransDate), toDate, "@SYS14656","");
+        dialogTax1099Box = dialog.addFieldValue(extendedTypeStr(Tax1099FieldsRecId), boxFor1099RecId);
+        dialogTax1099Box.allowEdit(false);
+        dialogTax1099State = dialog.addFieldValue(extendedTypeStr(Tax1099State), stateFor1099);
+        dialogUpdateAll = dialog.addField(enumStr(boolean), "@SYS25976", "@SYS96624");
+        dialogRecalcAmounts = dialog.addField(enumStr(boolean), "@SYS117576", "@SYS117575");
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets the values entered by the user in the dialog box.
+    /// </summary>
+    /// <returns>
+    ///    true if the state is not specified for MISC-04, DIV-4, and INT-4; otherwise, false.The
+    ///    <c>Tax1099Fields</c> records are defined for the selected <c>boxFor1099RecId</c> value.Tax
+    ///    information is defined for the vendor in the selected state and state is selected by user.The
+    ///    Option Update All is selected by user for S-2.The G-2 is selected by the user in option 1099
+    ///    box.The G-4 is selected as 1099 box that has Update All option selected.The user does not continue
+    ///    when G-4 is selected as 1099 box; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    This method updates the local variables with the options selected by the user. It also verifies
+    ///    data entered against the rules for each 1099.
+    /// </remarks>
+    public boolean getFromDialog()
+    {
+        boolean ret;
+        Tax1099Fields tax1099Fields;
+
+        fromDate = dialogFromDate.value();
+        toDate = dialogToDate.value();
+        stateFor1099 = strUpr(dialogTax1099State.value());
+        setAll1099 = dialogUpdateAll.value();
+        recalcAmounts = dialogRecalcAmounts.value();
+
+        ret = super();
+
+        tax1099Fields = Tax1099Fields::find(boxFor1099RecId);
+        if (stateFor1099 != '')
+        {
+            if (tax1099Fields.Tax1099Box == Tax1099MISC::federalIncomeTaxWithheld().tax1099Box || tax1099Fields.Tax1099Box == Tax1099DIV::federalIncomeTaxWithheld().tax1099Box || tax1099Fields.Tax1099Box == Tax1099INT::federalIncomeTaxWithheld().tax1099Box)
+            {
+                ret = checkFailed("@SYS96619");
+            }
+        }
+
+        if (ret && !tax1099Fields)
+        {
+            ret = checkFailed("@SYS96630");
+        }
+
+        if (ret && stateFor1099 != '' && !VendStateTaxID::findByVendState(vendorNum, stateFor1099))
+        {
+            ret = checkFailed(strFmt("@SYS96627", stateFor1099, vendorNum));
+        }
+
+        if (isConfigurationkeyEnabled(configurationKeyNum(Tax1099S)) || isConfigurationkeyEnabled(configurationKeyNum(Tax1099G)))
+        {
+            if (ret && setAll1099 && (tax1099Fields.Tax1099Box == Tax1099S::grossProceeds().tax1099Box))
+            {
+                ret = Box::yesNo(strFmt("@SPS15", "@SYS23907"), DialogButton::No,"@SYS93691","") == DialogButton::Yes;
+            }
+
+            if (ret && tax1099Fields.Tax1099Box == Tax1099G::incomeTaxRefundsCreditsOffsets().tax1099Box && setAll1099)
+            {
+                ret = (Box::okCancel(strFmt("@SPS16", "@SPS1064", "@SPS1065"), DialogButton::Cancel)== DialogButton::Ok);
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion,#CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmFromDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets the <c>fromDate</c> field to the passed in value. If no value is passed in then the
+    ///    <c>fromDate</c> value is not changed.
+    /// </summary>
+    /// <param name="_fromDate">
+    ///    The value that the <c>setAll1099</c> field should be set to.
+    /// </param>
+    /// <returns>
+    ///    The <c>fromDate</c> value.
+    /// </returns>
+    public TransDate parmFromDate(TransDate _fromDate = fromDate)
+    {
+        fromDate = _fromDate;
+
+        return fromDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSetAll1099</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets <c>setAll1099</c> to the passed in value. If no value is passed in then the setAll1099 value is not changed.
+    /// </summary>
+    /// <param name="_setAll1099">
+    /// The value that setAll1099 should be set to.
+    /// </param>
+    /// <returns>
+    /// The <c>setAll1099</c> value.
+    /// </returns>
+    public boolean parmSetAll1099(boolean _setAll1099 = setAll1099)
+    {
+        setAll1099 = _setAll1099;
+
+        return setAll1099;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmToDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets <c>toDate</c> field to the new value passed in and returns it. If a <c>toDate</c> value is not
+    ///    passed in then the current <c>toDate</c> field is returned.
+    /// </summary>
+    /// <param name="_toDate">
+    ///    The date that <c>toDate</c> should be set to.
+    /// </param>
+    /// <returns>
+    ///    The new <c>toDate</c> value.
+    /// </returns>
+    public TransDate parmToDate(TransDate _toDate = toDate)
+    {
+        toDate = _toDate;
+
+        return toDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmVendorNum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets <c>vendorNum</c> to the new value passed in if one is given or returns the current vendorNum
+    /// </summary>
+    /// <param name="_vendorNum">
+    /// The value _vendorNum should be set to.
+    /// </param>
+    /// <returns>
+    /// The <c>vendorNum</c> that has been modified.
+    /// </returns>
+    public AccountNum parmVendorNum(AccountNum _vendorNum = vendorNum)
+    {
+        vendorNum = _vendorNum;
+
+        return vendorNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecalcAmounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets <c>recalcAmounts</c> to the new value passed in if one is given or returns the current <c>recalcAmounts</c>
+    /// </summary>
+    /// <param name="_recalcAmounts">
+    /// The value _recalcAmounts should be set to.
+    /// </param>
+    /// <returns>
+    /// The <c>recalcAmounts</c> that has been modified.
+    /// </returns>
+    public boolean parmRecalcAmounts(boolean _recalcAmounts = recalcAmounts)
+    {
+        recalcAmounts = _recalcAmounts;
+
+        return recalcAmounts;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>remove1099FromVendSettlement</Name>
+				<Source><![CDATA[
+    private void remove1099FromVendSettlement(VendSettlement _vendSettlementOffset, VendInvoiceId _invoice)
+    {
+        VendSettlementTax1099 vendSettlementTax1099;
+
+        if (_vendSettlementOffset)
+        {
+            // VendSettlementTax1099 records are always in the settlement company
+            while select forupdate crosscompany vendSettlementTax1099
+                where vendSettlementTax1099.VendAccount == _vendSettlementOffset.AccountNum
+                    && vendSettlementTax1099.VendInvoiceId == _invoice
+                    && vendSettlementTax1099.ExternalRecId == _vendSettlementOffset.TransRecId
+            {
+                changecompany(vendSettlementTax1099.company())
+                {
+                    // Using doDelete() instead of delete(): as delete() will call table level delete() method which causes an issue (update conflict),
+                    // due to an update method called below in the same block of code after the while loop.
+                    vendSettlementTax1099.doDelete();
+                }
+            }
+
+            // If the transaction does not have Settlement Group, it originated from Ax 4 environment.
+            // In order to remove a proper 1099 record, the ExternalRecId needs to be assigned to the RecId of the invoice transaction.
+            if (_vendSettlementOffset.SettlementGroup == 0)
+            {
+                // VendSettlementTax1099 records are always in the settlement company
+                while select forupdate crosscompany vendSettlementTax1099
+                    where vendSettlementTax1099.VendAccount == _vendSettlementOffset.AccountNum
+                        && vendSettlementTax1099.VendInvoiceId == _invoice
+                        && vendSettlementTax1099.ExternalRecId == _vendSettlementOffset.OffsetRecid
+                {
+                    changecompany(vendSettlementTax1099.company())
+                    {
+                        vendSettlementTax1099.doDelete();
+                    }
+                }
+            }
+
+            _vendSettlementOffset.SettleTax1099Amount = 0;
+            _vendSettlementOffset.SettleTax1099StateAmount = 0;
+            changecompany(_vendSettlementOffset.company())
+            {
+                _vendSettlementOffset.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Contains the code that does the actual job of the class.
+    /// </summary>
+    public void run()
+    {
+        VendInvoiceTrans vendInvoiceTrans;
+        PurchLine purchLine;
+        LedgerJournalTrans ledgerJournalTrans;
+        Tax1099Amount vtTax1099Amount = 0;
+        Tax1099StateAmount vtTax1099StateAmount = 0;
+        TaxTrans taxTrans;
+        TaxAmount taxAmount;
+        VendInvoiceJour vendInvoiceJour;
+        VendTrans localVendTrans;
+        SetEnumerator invoiceEnumerator;
+        RecId invoiceId;
+        VendSettlement vendSettlement;
+        VendSettlement vendSettlementOffset;
+        VendTrans vendTrans;
+        VendTrans vendTransOffset;
+        VendTransOpen vendTransOpen;
+        VendTable vendTable;
+        #OCCRetryCount
+
+        vtSettleTax1099Amount = 0;
+        vtSettleTax1099StateAmount = 0;
+
+        this.createInvoiceList(vendorNum);
+
+        try
+        {
+            ttsbegin;
+            if (setAll1099)
+            {
+                this.clearAll_1099info(vendorNum);
+            }
+
+            invoiceEnumerator = invoiceList.getEnumerator();
+
+            while (invoiceEnumerator.moveNext())
+            {
+                invoiceId = invoiceEnumerator.current();
+
+                while select forupdate crosscompany vendTrans
+                    where vendTrans.RecId == invoiceId
+                {
+                    // set the invoices to have the box specified for the user
+                    // unless the user says to set all the boxes then we will only set the boxes where no 1099s have
+                    // not been set for that invoice
+                    if (setAll1099 || vendTrans.Tax1099Fields == 0)
+                    {
+                        vtTax1099Amount = 0;
+                        vtTax1099StateAmount = 0;
+                        if (vendTrans.TransType == LedgerTransType::Purch)
+                        {
+                            while select forupdate crosscompany vendInvoiceTrans
+                                where vendInvoiceTrans.InvoiceId == vendTrans.Invoice
+                                   && vendInvoiceTrans.DataAreaId == vendTrans.company()
+                            {
+                                changecompany(vendInvoiceTrans.company())
+                                {
+                                    vendInvoiceJour = vendInvoiceTrans.vendInvoiceJour();
+                                    localVendTrans = vendInvoiceJour.vendTrans();
+                                    vendTable = vendTable::find(localVendTrans.AccountNum);
+
+                                    if (localVendTrans.RecId == vendTrans.RecId)
+                                    {
+                                        vendInvoiceTrans.Tax1099Fields = vendTable.Tax1099Fields;
+                                        vendInvoiceTrans.Tax1099State = stateFor1099;
+
+                                        if (recalcAmounts || vendInvoiceTrans.Tax1099Amount == 0)
+                                        {
+                                            select
+                                                sum(TaxAmountCur)
+                                            from taxTrans
+                                            where taxTrans.Voucher == vendInvoiceJour.LedgerVoucher &&
+                                                    TaxTrans.SourceTableId == vendInvoiceTrans.TableId &&
+                                                    TaxTrans.SourceRecId == vendInvoiceTrans.RecId &&
+                                                    taxTrans.TransDate == vendInvoiceTrans.InvoiceDate &&
+                                                    taxTrans.InventTransId == vendInvoiceTrans.InventTransId &&
+                                                    taxTrans.TaxDirection != TaxDirection::UseTax &&
+                                                    taxTrans.TaxOrigin != TaxOrigin::TaxReversed &&
+                                                    taxTrans.TaxOrigin != TaxOrigin::Transfer;
+
+                                            vendInvoiceTrans.TaxAmount = taxTrans.TaxAmountCur;
+                                            vendInvoiceTrans.Tax1099Amount = vendInvoiceTrans.LineAmount
+                                                + vendInvoiceTrans.TaxAmount
+                                                + this.calcMiscChargeAmount(vendInvoiceTrans)
+                                                + this.calcMiscChargeAmountTax(vendInvoiceJour, vendInvoiceTrans)
+                                                - vendInvoiceTrans.PSARetainageAmount
+                                                + vendInvoiceTrans.PSAReleaseAmount;
+                                        }
+
+                                        if (stateFor1099 != '')
+                                        {
+                                            vendInvoiceTrans.Tax1099StateAmount = recalcAmounts || vendInvoiceTrans.Tax1099StateAmount == 0 ? vendInvoiceTrans.Tax1099Amount : vendInvoiceTrans.Tax1099StateAmount;
+                                        }
+                                        else
+                                        {
+                                            vendInvoiceTrans.Tax1099StateAmount = 0;
+                                        }
+
+                                        purchLine = PurchLine::findInventTransId(vendInvoiceTrans.InventTransId, true);
+                                        if (purchLine)
+                                        {
+                                            purchLine.Tax1099Fields = vendTable.Tax1099Fields;
+                                            purchLine.Tax1099State = stateFor1099;
+                                            purchLine.Tax1099Amount = 0;
+                                            purchLine.Tax1099StateAmount = 0;
+
+                                            // Use doUpdate to avoid making a new modified version of the PO
+                                            purchLine.doUpdate();
+                                        }
+
+                                        vtTax1099Amount += -vendInvoiceTrans.Tax1099Amount;
+                                        vtTax1099StateAmount += -vendInvoiceTrans.Tax1099StateAmount;
+                                        vendInvoiceTrans.update();
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            while select forupdate crosscompany ledgerJournalTrans
+                                where ledgerJournalTrans.VendTransId == vendTrans.RecId
+                                    && ledgerJournalTrans.DataAreaId == vendTrans.company()
+                                    && (ledgerJournalTrans.AccountType == LedgerJournalACType::Vend ||
+                                        ledgerJournalTrans.OffsetAccountType == LedgerJournalACType::Vend)
+                            {
+                                taxAmount = 0;
+
+                                if (!ledgerJournalTrans.ledgerJournalTable().LedgerJournalInclTax)
+                                {
+                                    select crosscompany sum(SourceTaxAmountCur) from taxTrans
+                                        where taxTrans.Voucher == ledgerJournalTrans.Voucher
+                                        && taxTrans.TransDate == ledgerJournalTrans.TransDate
+                                        && taxTrans.DataAreaId == ledgerJournalTrans.company()
+                                        && taxTrans.TaxDirection != TaxDirection::UseTax;
+
+                                    taxAmount = taxTrans.SourceTaxAmountCur;
+                                }
+
+                                changecompany(ledgerJournalTrans.company())
+                                {
+                                    vendTable = vendTable::find(vendTrans.AccountNum);
+                                    ledgerJournalTrans.Tax1099Fields = vendTable.Tax1099Fields;
+                                    ledgerJournalTrans.Tax1099State = stateFor1099;
+
+                                    if (recalcAmounts || ledgerJournalTrans.Tax1099Amount == 0)
+                                    {
+                                        if (ledgerJournalTrans.AmountCurCredit)
+                                        {
+                                            ledgerJournalTrans.Tax1099Amount = - (ledgerJournalTrans.AmountCurCredit + taxAmount);
+                                        }
+                                        else
+                                        {
+                                            ledgerJournalTrans.Tax1099Amount = ledgerJournalTrans.AmountCurDebit - taxAmount;
+                                        }
+                                    }
+
+                                    if (ledgerJournalTrans.OffsetAccountType == LedgerJournalACType::Vend)
+                                    {
+                                        ledgerJournalTrans.Tax1099Amount = - ledgerJournalTrans.Tax1099Amount;
+                                    }
+
+                                    if (stateFor1099 != '')
+                                    {   
+                                        ledgerJournalTrans.Tax1099StateAmount = recalcAmounts || ledgerJournalTrans.Tax1099StateAmount == 0 ? ledgerJournalTrans.Tax1099Amount : ledgerJournalTrans.Tax1099StateAmount;
+                                    }
+                                    else
+                                    {
+                                        ledgerJournalTrans.Tax1099StateAmount = 0;
+                                    }
+
+                                    vtTax1099Amount += ledgerJournalTrans.Tax1099Amount;
+                                    vtTax1099StateAmount += ledgerJournalTrans.Tax1099StateAmount;
+
+                                    ledgerJournalTrans.update();
+                                }
+                            }
+                        }
+
+                        vendTable = VendTable::findByDataAreaId(vendTrans.AccountNum, vendTrans.dataAreaId);
+                        vendTrans.Tax1099Amount = vtTax1099Amount;
+                        vendTrans.Tax1099StateAmount = vtTax1099StateAmount;
+                        vendTrans.Tax1099Fields = vendTable.Tax1099Fields;
+                        vendTrans.Tax1099State = stateFor1099;
+
+                        // Update VendTransOpen
+                        select forupdate crosscompany vendTransOpen
+                            where vendTransOpen.RefRecId == vendTrans.RecId
+                               && vendTransOpen.DataAreaId == vendTrans.company();
+
+                        if (vendTransOpen)
+                        {
+                            vendTransOpen.Tax1099Amount += vtTax1099Amount;
+                            vendTransOpen.Tax1099StateAmount += vtTax1099StateAmount;
+                        }
+
+                        // update payments
+                        // There are two records for each payment one where the vendSettlement.OffsetTransVoucher == vendTrans.Voucher
+                        // and the one below
+                        while select forupdate crosscompany vendSettlement
+                            where vendSettlement.AccountNum == vendTrans.AccountNum
+                               && vendSettlement.TransRecId == vendTrans.RecId
+                               && vendSettlement.TransCompany == vendTrans.company()
+                        {
+                            vtSettleTax1099Amount = 0;
+                            vtSettleTax1099StateAmount = 0;
+                            paymToInvoiceRate = 1;
+
+                            // if the SettlementGroup is not specified, the transaction originated from Ax 4, and
+                            // by design the value is always zero.
+                            if (vendSettlement.SettlementGroup == 0)
+                            {
+                                select firstonly forupdate crosscompany vendSettlementOffset
+                                    where vendSettlementOffset.TransRecId == vendSettlement.OffsetRecid
+                                        && vendSettlementOffset.OffsetRecid == vendSettlement.TransRecId
+                                        && vendSettlementOffset.OffsetCompany == vendSettlement.company();
+                            }
+                            else
+                            {
+                                select firstonly forupdate crosscompany vendSettlementOffset
+                                    where vendSettlementOffset.TransRecId == vendSettlement.OffsetRecid
+                                        && vendSettlementOffset.SettlementGroup == vendSettlement.SettlementGroup
+                                        && vendSettlementOffset.OffsetCompany == vendSettlement.company();
+                            }
+
+                            if (vendSettlementOffset.OffsetRecid != 0)
+                            {
+                                vendTransOffset = VendTrans::findByCompany(vendSettlementOffset.TransCompany, vendSettlementOffset.TransRecId);
+                                VendTable vendTableOffset = VendTable::findByDataAreaId(vendTransOffset.AccountNum, vendTransOffset.dataAreaId);
+                                vendTransOffset.Tax1099Fields = vendTableOffset.Tax1099Fields;
+                                if ((vendSettlement.SettleAmountCur - vendSettlement.UtilizedCashDisc) != 0)
+                                {
+                                    paymToInvoiceRate = abs(vendSettlementOffset.SettleAmountCur / (vendSettlement.SettleAmountCur - vendSettlement.UtilizedCashDisc));
+                                }
+                                this.createVendSettlementTax1099(vendSettlement, vendSettlementOffset, vendTrans, vendTransOffset);
+
+                                // Update totals and offset records
+                                vendSettlement.SettleTax1099Amount -= vtSettleTax1099Amount;
+                                vendSettlement.SettleTax1099StateAmount -= vtSettleTax1099StateAmount;
+                                changecompany(vendSettlement.company())
+                                {
+                                    vendSettlement.update();
+                                }
+
+                                vendSettlementOffset.SettleTax1099Amount = vtSettleTax1099Amount * paymToInvoiceRate;
+                                vendSettlementOffset.SettleTax1099StateAmount = vtSettleTax1099StateAmount * paymToInvoiceRate;
+                                changecompany(vendSettlementOffset.company())
+                                {
+                                    vendSettlementOffset.update();
+                                }
+                            }
+
+                            vendTrans.SettleTax1099Amount -= vtSettleTax1099Amount;
+                            vendTrans.SettleTax1099StateAmount -= vtSettleTax1099StateAmount;
+
+                            if (vendTransOpen)
+                            {
+                                vendTransOpen.Tax1099Amount += vtSettleTax1099Amount;
+                                vendTransOpen.Tax1099StateAmount += vtSettleTax1099StateAmount;
+                            }
+                        }
+
+                        changecompany(vendTrans.company())
+                        {
+                            if (vendTransOpen)
+                            {
+                                vendTransOpen.update();
+                            }
+                            vendTrans.update();
+                        }
+                    }
+                }
+            }
+            ttscommit;
+        }
+        catch(Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch(Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDialogArgValues</Name>
+				<Source><![CDATA[
+    private void setDialogArgValues(VendTable tempVendTable)
+    {
+        boxFor1099RecId = tempVendTable.Tax1099Fields;
+        vendorNum = tempVendTable.AccountNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setSettlementTotals</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copies <c>SettleTax1099Amount</c> amount field to the <c>vtSettleTax1099Amount</c> field and the
+    /// <c>SettleTax1099StateAmount</c> field to <c>vtSettleTax1099StateAmount</c> field.
+    /// </summary>
+    /// <param name="_settleTax1099Amount">
+    /// The <c>SettlTax1099Amount</c> value to be copied to the <c>vtSettleTax1099Amount</c> value.
+    /// </param>
+    /// <param name="_settleTax1099StateAmount">
+    /// The <c>SettleTax1099StateAmount</c> value to be copied to the <c>vtSettleTax1099StateAmount</c>
+    /// value.
+    /// </param>
+    private void setSettlementTotals(SettleTax1099Amount _settleTax1099Amount, SettleTax1099StateAmount _settleTax1099StateAmount)
+    {
+        vtSettleTax1099Amount = _settleTax1099Amount;
+        vtSettleTax1099StateAmount = _settleTax1099StateAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        #LOCALMACRO.Version2List
+            setAll1099,
+            fromDate,
+            toDate,
+            stateFor1099
+        #ENDMACRO
+
+        #LOCALMACRO.Version1List
+            setAll1099
+        #ENDMACRO
+
+        int version = RunBase::getVersion(packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                return true;
+            case 2:
+                [version, #Version2List] = packedClass;
+                return true;
+            case 1:
+                [version, #Version1List]=packedClass;
+                return true;
+            default :
+                return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static public ClassDescription description()
+    {
+        return "@SYS96623";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAmountIncludingTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    This method is use to retrieve the total amount for the invoice line including the tax for 1099s.
+    /// </summary>
+    /// <param name="_vendInvoiceTrans">
+    ///    The invoice transaction record that the amount and tax will be calculated on.
+    /// </param>
+    /// <returns>
+    ///    The total of the line amount and the tax.
+    /// </returns>
+    public static AmountCur getAmountIncludingTax(VendInvoiceTrans _vendInvoiceTrans)
+    {
+        AmountCur totalTax1099;
+
+        // If Tax 1099 Box and its values are provided, Tax1099Amount has been either already calculated
+        // or entered by the user while invoicing the purchase order.
+        // Otherwise, select item line amount and its sales tax.
+        if (_vendInvoiceTrans.Tax1099Fields && _vendInvoiceTrans.Tax1099Amount)
+        {
+            // Verify if Tax1099Amount has proper sales tax included in its amount.
+            if (_vendInvoiceTrans.Tax1099Amount == _vendInvoiceTrans.LineAmount)
+            {
+                totalTax1099 = _vendInvoiceTrans.LineAmount;
+            }
+            else
+            {
+                totalTax1099 = _vendInvoiceTrans.Tax1099Amount;
+            }
+        }
+        else
+        {
+            totalTax1099 = _vendInvoiceTrans.LineAmount;
+        }
+
+        return totalTax1099;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args args)
+    {
+        vendTax1099Update vendTax1099Update = new vendTax1099Update();
+        Common common;
+        VendTable tempVendTable;
+
+        boolean vendorMeetsConditions = true;
+
+        if (args && args.record().RecId)
+        {
+            common = args.record();
+        }
+
+        if (common.RecId && (common.TableId) == tableNum(VendTable))
+        {
+            // Need to do a select again on the VendTable as if execution is coming from the list page
+            //  not all table buffer fields will be present (OnlyFetchActive=Yes on VendTable datasource).
+            select Tax1099Fields, Tax1099Reports from tempVendTable
+                where tempVendTable.RecId == common.RecId;
+
+            if (tempVendTable.Tax1099Fields == 0)
+            {
+                vendorMeetsConditions = checkFailed("@SYS96621");
+            }
+
+            if (tempVendTable.Tax1099Reports == false)
+            {
+                vendorMeetsConditions = checkFailed(strFmt("@SYS4000754", fieldPName(VendTable, Tax1099Reports)));
+            }
+        }
+
+        if (vendorMeetsConditions)
+        {
+            vendTax1099Update.setDialogArgValues(tempVendTable);
+            vendTax1099Update.saveLast();
+
+            if (vendTax1099Update.prompt())
+            {
+                vendTax1099Update.runOperation();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    internal static VendTax1099Update construct()
+    {
+        VendTax1099Update vendTax1099Update = new VendTax1099Update();
+
+        return vendTax1099Update;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTaxDistributionByMainAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the tax amount is distributed based on main account setup for tax 1099 boxes.
+    /// </summary>
+    /// <param name="_settlementTax1099">
+    /// The <c>VendSettlementTax1099</c> record created by the core process.
+    /// </param>
+    /// <param name="_invoiceTrans">
+    /// The <c>VendInvoiceJour</c> record.
+    /// </param>
+    /// <returns>true if the tax amount is distributed by main account; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    /// This method will be the chain command to do the tax distribution based onmain accounts for Public sector clients.
+    /// </remarks>
+    protected boolean isTaxDistributionByMainAccount(VendSettlementTax1099 _settlementTax1099, vendInvoiceTrans _invoiceTrans)
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

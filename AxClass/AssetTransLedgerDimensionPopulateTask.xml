@@ -1,0 +1,411 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>AssetTransLedgerDimensionPopulateTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+internal class AssetTransLedgerDimensionPopulateTask implements IDataMaintenanceTask
+{
+    #OCCRetryCount
+    private DataMaintenanceTaskResult taskResult;
+    private const int MaxRecordsToFix = 500;
+        
+    AssetTransLedgerDimensionFixTmp assetTransLedgerDimensionFixTmp;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public DataMaintenanceCaption caption()
+    {
+        return literalStr("@FixedAssets:FA_PopulateEmptyAssetTransLedgerDimension");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public DataMaintenanceTaskResult run()
+    {
+        taskResult = DataMaintenanceTaskResult::construct();
+        
+        using (SysInstrumentationActivityContext activityContext = this.getActivityContextForRun())
+        {
+            ttsbegin;
+
+            this.populateFixTable();
+            this.updateAssetTransLedgerDimensionInFixTable(activityContext);
+            this.populateAssetTransLedgerDimensionFromFixTable();
+            this.logMissingRecords(activityContext);
+
+            ttscommit;
+        }
+       
+        return taskResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getActivityContextForRun</Name>
+				<Source><![CDATA[
+    private SysInstrumentationActivityContext getActivityContextForRun()
+    {
+        var logger = SysInstrumentationLoggerFactory::CreateLogger(classStr(AssetTransLedgerDimensionPopulateTask));
+        var activity = SysInstrumentationActivity::construct(AssetInstrumentationConstants::AssetTransLedgerDimensionPopulateTaskRun, AssetInstrumentationConstants::InstrumentationNameSpace);
+        return logger.activityContextWithCustomProperties(activity);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateFixTable</Name>
+				<Source><![CDATA[
+    internal int64 populateFixTable()
+    {
+        str sqlStatement = strfmt(@"
+            INSERT INTO %1
+                (ASSETTRANS, AMOUNTMST, TRANSDATE, VOUCHER, DEFAULTDIMENSION, ASSETTRANSDATAAREAID, PARTITION)
+            SELECT TOP %2
+                AT.RECID, AT.AMOUNTMST, AT.TRANSDATE, AT.VOUCHER, AT.DEFAULTDIMENSION, AT.DATAAREAID, %3
+                FROM ASSETTRANS AT
+                JOIN ASSETBOOK AB
+                    ON AT.ASSETID = AB.ASSETID
+                    AND AT.BOOKID = AB.BOOKID
+                    AND AT.DATAAREAID = AB.DATAAREAID
+                    AND AT.PARTITION = AB.PARTITION
+                    AND AB.STATUS IN (%4, %5, %6, %7)
+                JOIN ASSETBOOKTABLE ABT
+                    ON AT.BOOKID = ABT.BOOKID
+                    AND AT.DATAAREAID = ABT.DATAAREAID
+                    AND AT.PARTITION = ABT.PARTITION
+                    AND ABT.CURRENTOPERATIONSTAX != %8
+                WHERE AT.LEDGERDIMENSION = 0
+                    AND AT.PARTITION = %9
+                    AND NOT EXISTS (
+                        SELECT ASSETTRANS FROM ASSETTRANSLEDGERDIMENSIONFIXLOG ATFL
+                            WHERE ATFL.ASSETTRANS = AT.RECID)
+                    AND NOT EXISTS (
+                        SELECT RECID FROM TRANSACTIONREVERSALTRANS AS TRT
+                            WHERE TRT.REFRECID = AT.RECID
+                                AND REFTABLEID = %10)",
+            assetTransLedgerDimensionFixTmp.getPhysicalTableName(),
+            MaxRecordsToFix,
+            getCurrentPartitionRecId(),
+            enum2int(AssetStatus::Open),
+            enum2int(AssetStatus::Suspended),
+            enum2int(AssetStatus::Acquired_CZ),
+            enum2int(AssetStatus::TransferredToLowValuePool),
+            enum2int(CurrentOperationsTax::None),
+            getCurrentPartitionRecId(),
+            tableNum(AssetTrans));
+
+        return this.executeSQL(sqlStatement);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAssetTransLedgerDimensionInFixTable</Name>
+				<Source><![CDATA[
+    private void updateAssetTransLedgerDimensionInFixTable(SysInstrumentationActivityContext _activityContext = null)
+    {
+        Set assetTransSet = new Set(Types::Int64);
+        // Need to use a list for storing duplicates because it stores elements in the sequence in which they are added.
+        // So they could be processed in chunks by company in updateLedgerDimensionForDuplicates() method.
+        List assetTransDuplicates = new List(Types::Container); 
+
+        this.updateLedgerDimensionForAllTrans(assetTransSet, assetTransDuplicates);
+        this.updateLedgerDimensionForDuplicates(assetTransDuplicates);
+    
+        taskResult.parmCount(assetTransSet.elements());
+
+        if (_activityContext)
+        {
+            _activityContext.addCustomProperty(
+                AssetInstrumentationConstants::CountOfLedgerDimensionRecIdDuplicates,
+                int2Str(assetTransDuplicates.elements()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLedgerDimensionForAllTrans</Name>
+				<Source><![CDATA[
+    private void updateLedgerDimensionForAllTrans(Set _assetTransSet, List _assetTransDuplicates)
+    {
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+        GeneralJournalEntry generalJournalEntry;
+
+        while select crosscompany AssetTrans, DefaultDimension, AssetTransDataAreaId
+        from assetTransLedgerDimensionFixTmp
+            order by assetTransLedgerDimensionFixTmp.AssetTransDataAreaId // Need to order by company to be able to process duplicates in a chunks by company in updateLedgerDimensionForDuplicates() method.
+        join MainAccount, LedgerDimension
+            from generalJournalAccountEntry
+            where generalJournalAccountEntry.AccountingCurrencyAmount == assetTransLedgerDimensionFixTmp.AmountMST
+                && (generalJournalAccountEntry.PostingType == LedgerPostingType::FixedAssetsDebit
+                || generalJournalAccountEntry.PostingType == LedgerPostingType::FixedAssetsCredit
+                || generalJournalAccountEntry.PostingType == LedgerPostingType::PurchConsump
+                || generalJournalAccountEntry.PostingType == LedgerPostingType::PurchExpense)
+        exists join generalJournalEntry
+            where generalJournalEntry.RecId == generalJournalAccountEntry.GeneralJournalEntry
+                && generalJournalEntry.SubledgerVoucher == assetTransLedgerDimensionFixTmp.Voucher
+                && generalJournalEntry.AccountingDate == assetTransLedgerDimensionFixTmp.TransDate
+                && generalJournalEntry.SubledgerVoucherDataAreaId == assetTransLedgerDimensionFixTmp.AssetTransDataAreaId
+        {
+            if (_assetTransSet.in(assetTransLedgerDimensionFixTmp.AssetTrans))
+            {
+                container duplicateRecord = [
+                    assetTransLedgerDimensionFixTmp.AssetTrans,
+                    assetTransLedgerDimensionFixTmp.DefaultDimension,
+                    assetTransLedgerDimensionFixTmp.AssetTransDataAreaId,
+                    generalJournalAccountEntry.MainAccount,
+                    generalJournalAccountEntry.LedgerDimension];
+
+                _assetTransDuplicates.addEnd(duplicateRecord);
+            }
+            else
+            {
+                this.updateNewLedgerDimensionFieldInFixTable(
+                    assetTransLedgerDimensionFixTmp.AssetTrans,
+                    generalJournalAccountEntry.LedgerDimension);
+
+                _assetTransSet.add(assetTransLedgerDimensionFixTmp.AssetTrans);
+            }            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLedgerDimensionForDuplicates</Name>
+				<Source><![CDATA[
+    private void updateLedgerDimensionForDuplicates(List _assetTransDuplicates)
+    {
+        Set assetTransDuplicatesByCompany = new Set(Types::Container);
+        DataAreaId previousDataAreaId;
+        ListEnumerator duplicatesSetEnumerator = _assetTransDuplicates.getEnumerator();
+
+        while(duplicatesSetEnumerator.moveNext())
+        {
+            container duplicateRecord = duplicatesSetEnumerator.current();
+            DataAreaId dataAreaId = conPeek(duplicateRecord, 3);
+
+            if (dataAreaId != previousDataAreaId)
+            {
+                this.processDuplicatesByCompany(assetTransDuplicatesByCompany, previousDataAreaId);
+
+                assetTransDuplicatesByCompany = new Set(Types::Container);
+                previousDataAreaId = dataAreaId;
+            }
+
+            assetTransDuplicatesByCompany.add(duplicateRecord);
+        }
+
+        this.processDuplicatesByCompany(assetTransDuplicatesByCompany, previousDataAreaId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDuplicatesByCompany</Name>
+				<Source><![CDATA[
+    private void processDuplicatesByCompany(
+        Set _assetTransDuplicates, 
+        DataAreaId _dataAreaId)
+    {
+        if (!_assetTransDuplicates.empty() && _dataAreaId)
+        {
+            changecompany(_dataAreaId)
+            {
+                SetEnumerator duplicatesSetEnumerator = _assetTransDuplicates.getEnumerator();
+
+                while(duplicatesSetEnumerator.moveNext())
+                {
+                    container duplicateRecord = duplicatesSetEnumerator.current();
+
+                    RecId assetTrans = conPeek(duplicateRecord, 1);
+                    DimensionDefault defaultDimension = conPeek(duplicateRecord, 2);
+                    MainAccountRecId mainAccount = conPeek(duplicateRecord, 4);
+                    LedgerDimensionAccount ledgerDimensionGL = conPeek(duplicateRecord, 5);
+
+                    LedgerDimensionAccount ledgerDimension =  this.getLedgerDimensionForAssetTransRecord(
+                        mainAccount,
+                        defaultDimension,
+                        ledgerDimensionGL);
+
+                    if (ledgerDimension != 0)
+                    {
+                        this.updateNewLedgerDimensionFieldInFixTable(
+                            assetTrans,
+                            ledgerDimension);
+                    }
+                }
+            }
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateAssetTransLedgerDimensionFromFixTable</Name>
+				<Source><![CDATA[
+    private void populateAssetTransLedgerDimensionFromFixTable()
+    {
+        AssetTrans assetTrans;
+
+        this.callInsertUpdateRelatedSkipMethods(assetTrans);
+
+        update_recordset crosscompany assetTrans  
+            setting LedgerDimension = assetTransLedgerDimensionFixTmp.NewLedgerDimension
+            join assetTransLedgerDimensionFixTmp
+                where assetTransLedgerDimensionFixTmp.AssetTrans == assetTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logMissingRecords</Name>
+				<Source><![CDATA[
+    internal void logMissingRecords(SysInstrumentationActivityContext _activityContext = null)
+    {
+        AssetTransLedgerDimensionFixLog::insertRecords(assetTransLedgerDimensionFixTmp);
+
+        if (_activityContext)
+        {
+        _activityContext.addCustomProperty(
+            AssetInstrumentationConstants::MissingLedgerDimensionRecords,
+            int2Str(this.countOfMissingecords()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>countOfMissingecords</Name>
+				<Source><![CDATA[
+    private int countOfMissingecords()
+    {
+        select count(RecId) from assetTransLedgerDimensionFixTmp
+            where assetTransLedgerDimensionFixTmp.NewLedgerDimension == 0;
+
+        return assetTransLedgerDimensionFixTmp.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>callInsertUpdateRelatedSkipMethods</Name>
+				<Source><![CDATA[
+    private void callInsertUpdateRelatedSkipMethods(Common _buffer)
+    {
+        //BP deviation documented
+        _buffer.skipAosValidation(true);
+        _buffer.skipDatabaseLog(true);
+        _buffer.skipDataMethods(true);
+        //needed in case of crossCompany
+        _buffer.skipEvents(true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLedgerDimensionForAssetTransRecord</Name>
+				<Source><![CDATA[
+    private LedgerDimensionAccount getLedgerDimensionForAssetTransRecord(
+        MainAccountRecId _mainAccount,
+        DimensionDefault _defaultDimension,
+        LedgerDimensionAccount _ledgerDimensionGJAE)
+    {
+        LedgerDimensionAccount ledgerDimension = 0;
+
+        LedgerDimensionDefaultAccount defaultAccount = LedgerDefaultAccountHelper::getDefaultAccountFromMainAccountRecId(_mainAccount);
+
+        LedgerDimensionAccount ledgerDimensionCalculated = LedgerDimensionFacade::serviceApplyFixedDimensions(
+                LedgerDimensionFacade::serviceCreateLedgerDimension(defaultAccount, _defaultDimension));
+
+        if (LedgerDimensionFacade::AreEqual(_ledgerDimensionGJAE, ledgerDimensionCalculated))
+        {
+            ledgerDimension = _ledgerDimensionGJAE;
+        }
+
+        return ledgerDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateNewLedgerDimensionFieldInFixTable</Name>
+				<Source><![CDATA[
+    private void updateNewLedgerDimensionFieldInFixTable(
+        RecId _assetTransRecId,
+        LedgerDimensionAccount _ledgerDimension)
+    {
+        AssetTransLedgerDimensionFixTmp assetTransLedgerDimensionFixTmpLocal;
+        assetTransLedgerDimensionFixTmpLocal.linkPhysicalTableInstance(assetTransLedgerDimensionFixTmp);
+
+        update_recordset assetTransLedgerDimensionFixTmpLocal
+            setting NewLedgerDimension = _ledgerDimension
+            where assetTransLedgerDimensionFixTmpLocal.AssetTrans == _assetTransRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>executeSQL</Name>
+				<Source><![CDATA[
+    private int64 executeSQL(str _sqlStatement)
+    {
+        Connection sessionConn = new Connection();
+        int64 impactedRows;
+
+        try
+        {
+            Statement statement = sessionConn.createStatement();
+            new SqlStatementExecutePermission(_sqlStatement).assert();
+
+            impactedRows = statement.executeUpdateWithParameters(_sqlStatement, SqlParams::create());
+
+            statement.close();
+            CodeAccessPermission::revertAssert();
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        finally
+        {
+            sessionConn.finalize();
+        }
+        
+        return impactedRows;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAssetTransLedgerDimensionFixTmp</Name>
+				<Source><![CDATA[
+    internal AssetTransLedgerDimensionFixTmp getAssetTransLedgerDimensionFixTmp()
+    {
+        select assetTransLedgerDimensionFixTmp;
+        return assetTransLedgerDimensionFixTmp;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,1433 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventQualityManagementCreate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>InventQualityManagementCreate</c> class provides the facilities for quality management order generation.
+/// </summary>
+abstract class InventQualityManagementCreate implements InventQualityManagementActionable
+{
+    InventTestExecution         execution;
+    InventTestDocumentStatus    documentStatus;
+    InventQualityReferenceType  referenceType;
+    InventQty                   updatedQuantity;
+    PdsCWInventQty              updatedCWQuantity;
+    Map                         updatedQuantitiesPerDimMap;
+
+    InventItemSampling          inventItemSampling;
+
+    InventDimId                 adjustedReferenceInventDimId;
+
+    private   Set                    usedTestGroups;
+    protected InventQty              workCreateQty;
+    protected InventDim              workInventDim;
+    protected InventQualityOrderId   lastCreatedQualityOrder;
+    protected InventQty              maxAllowedQty;
+    private   boolean                skipCreateQualityOrder;
+    private   boolean                isBlockingInventTransFound;
+
+    private InventInstrumentationLogger instrumentationLogger;
+    private boolean mustBeQuarantineControlled = false;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>actOnAssociations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks quality associations that match criteria that is passed for creation policy and creates
+    ///    quality orders accordingly.
+    /// </summary>
+    /// <param name="_itemCode">
+    ///    An <c>ItemCode</c> value.
+    /// </param>
+    /// <param name="_itemRelation">
+    ///    An <c>ItemRelation</c> value.
+    /// </param>
+    /// <param name="_accountCode">
+    ///    An <c>InventTestAccountCode</c> value.
+    /// </param>
+    /// <param name="_accountRelation">
+    ///    An <c>InventTestAccountRelation</c> value.
+    /// </param>
+    /// <param name="_wrkCtrCode">
+    ///    An <c>InventTestWrkCtrCode</c> value.
+    /// </param>
+    /// <param name="_wrkCtrRelation">
+    ///    An <c>WrkCtrIdBase</c> value.
+    /// </param>
+    /// <remarks>
+    ///    This method is intended to provide a call back for third-party methods that are called in the
+    ///    <c>run</c> method.
+    /// </remarks>
+    public void actOnAssociations(
+        ItemCode                    _itemCode,
+        ItemRelation                _itemRelation,
+        InventTestAccountCode       _accountCode,
+        InventTestAccountRelation   _accountRelation,
+        InventTestWrkCtrCode        _wrkCtrCode,
+        WrkCtrIdBase                _wrkCtrRelation)
+    {
+        using (var activityContext = this.instrumentationLogger().qualityManagementActivities().createQualityOrdersFromTestAssociations())
+        {
+            InventTestAssociationTable  associationTable = this.queryAssociationTable(_itemCode, _itemRelation, _accountCode, _accountRelation, _wrkCtrCode, _wrkCtrRelation);
+            int associationCount            = 0;
+            int applicableAssociationCount  = 0;
+            while (associationTable)
+            {
+                associationCount++;
+                this.instrumentationLogger().logRecordInformation(associationTable);
+
+                if (this.checkNeedToGenerateQualityOrders(associationTable))
+                {
+                    this.generateQualityOrders(associationTable);
+
+                    applicableAssociationCount++;
+                }
+
+                next associationTable;
+            }
+
+            this.instrumentationLogger().qualityManagementActivities().createdQualityOrdersFromTestAssociations(activityContext, associationCount, applicableAssociationCount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryAssociationTable</Name>
+				<Source><![CDATA[
+    protected InventTestAssociationTable queryAssociationTable(
+        ItemCode                    _itemCode,
+        ItemRelation                _itemRelation,
+        InventTestAccountCode       _accountCode,
+        InventTestAccountRelation   _accountRelation,
+        InventTestWrkCtrCode        _wrkCtrCode,
+        WrkCtrIdBase                _wrkCtrRelation)
+    {
+        InventTestAssociationTable  associationTable;
+        InventSiteId                inventSiteIdThis    = referenceType.inventSiteId();
+        utcdatetime                 currentTime         = DateTimeUtil::getSystemDateTime();
+
+        select associationTable
+            order by associationTable.ApplicableWarehouseType desc
+            where   associationTable.OrderType          == referenceType.referenceType()
+                    && associationTable.ItemCode           == _itemCode
+                    && associationTable.ItemRelation       == _itemRelation
+                    && associationTable.AccountCode        == _accountCode
+                    && associationTable.AccountRelation    == _accountRelation
+                    && associationTable.WrkCtrCode         == _wrkCtrCode
+                    && associationTable.WrkCtrRelation     == _wrkCtrRelation
+                    && associationTable.DocumentType       == documentStatus
+                    && associationTable.ValidFromDateTime  <= currentTime
+                    && associationTable.ValidToDateTime    >  currentTime
+                    && associationTable.TestExecution      == execution
+                    && (associationTable.InventSiteId      == inventSiteIdThis
+                    || !associationTable.InventSiteId);
+
+        return associationTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustedReferenceInventDimId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the ID of the <c>InventDim</c> table record that corresponds to the referenced document
+    /// inventory dimensions with the adjustment according to actual dimension values.
+    /// </summary>
+    /// <returns>
+    /// The ID of the <c>InventDim</c> table record that corresponds to the referenced document
+    /// inventory dimensions with the adjustment according to actual dimension values.
+    /// </returns>
+    protected InventDimId adjustedReferenceInventDimId()
+    {
+        if (!adjustedReferenceInventDimId)
+        {
+            this.calcAdjustedReferenceInventDimId();
+        }
+
+        return adjustedReferenceInventDimId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>alreadyBlockedCWQty</Name>
+				<Source><![CDATA[
+    private PdsCWInventQty alreadyBlockedCWQty()
+    {
+        InventQualityOrderTable     inventQualityOrderTable;
+        InventBlockingQualityOrder  inventBlockingQualityOrder;
+        InventBlocking              inventBlocking;
+
+        select TableId from inventQualityOrderTable
+            where inventQualityOrderTable.InventRefId       == referenceType.inventRefId()
+              &&  inventQualityOrderTable.InventRefTransId  == referenceType.inventTransId()
+             join TableId from inventBlockingQualityOrder
+                where inventBlockingQualityOrder.InventQualityOrderId   == inventQualityOrderTable.QualityOrderId
+             join sum(PdsCWQty) from inventBlocking
+                where inventBlocking.RecId  == inventBlockingQualityOrder.InventBlocking;
+
+        return inventBlocking.PdsCWQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>alreadyBlockedQty</Name>
+				<Source><![CDATA[
+    private InventQty alreadyBlockedQty()
+    {
+        InventQualityOrderTable     inventQualityOrderTable;
+        InventBlockingQualityOrder  inventBlockingQualityOrder;
+        InventBlocking              inventBlocking;
+
+        select TableId from inventQualityOrderTable
+            where inventQualityOrderTable.InventRefId       == referenceType.inventRefId()
+              &&  inventQualityOrderTable.InventRefTransId  == referenceType.inventTransId()
+             join TableId from inventBlockingQualityOrder
+                where inventBlockingQualityOrder.InventQualityOrderId   == inventQualityOrderTable.QualityOrderId
+             join sum(Qty) from inventBlocking
+                where inventBlocking.RecId  == inventBlockingQualityOrder.InventBlocking;
+
+        return inventBlocking.Qty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcAdjustedReferenceInventDimId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the inventory dimensions for the referenced document.
+    /// </summary>
+    abstract protected void calcAdjustedReferenceInventDimId()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkNeedToGenerateQualityOrders</Name>
+				<Source><![CDATA[
+    protected boolean checkNeedToGenerateQualityOrders(InventTestAssociationTable _inventTestAssociationTable)
+    {
+        using (var activityContext = this.instrumentationLogger().qualityManagementActivities().verifyApplicableTestAssociation())
+        {
+            boolean ret = true;
+            // Find and cache item sampling
+            this.findInventItemSampling(_inventTestAssociationTable.ItemSamplingId);
+
+            ret = inventItemSampling.isValidForQualityOrderCreationProcess();
+
+            // Skip quality order generation if lot is not eligible for testing with current test group
+            if (ret && InventTestGroup::find(_inventTestAssociationTable.TestGroupId).TestDestructive
+                && !referenceType.isEligibleForDestructiveTest())
+            {
+                ret = false;
+            }
+
+            // - Check if test group has already been satisfied for the current transaction, then add the 
+            // test group to the set so we know which has already been accounted for.
+            // - All checks that would prevent quality orders from every being generated for this scenario, 
+            // e.g. the check for around destructive test, should be before this.
+            // - All checks that would only sometimes prevent creation, e.g. nth LP checks and checks for 
+            // existing quality orders, come after this.
+            if (ret && referenceType.isItemAndWarehouseQualityManagementProcessEnabled())
+            {
+                if (usedTestGroups.in(_inventTestAssociationTable.TestGroupId))
+                {
+                    ret = false;
+                }
+                else
+                {
+                    usedTestGroups.add(_inventTestAssociationTable.TestGroupId);
+                }
+            }
+            // If applicable warehouse type is applied for the warehouse management only and for the item or warehouse is not enabled quality management process -
+            // quality orders should not be created.
+            else if (_inventTestAssociationTable.ApplicableWarehouseType == WHSApplicableWarehouseType::QualityManagementOnlyEnabled)
+            {
+                ret = false;
+            }
+        
+            // - In Quality Management we allow quality orders to be created that partially satisfy the quality association.
+            //   We also allow for item sampling to accrue without creating a base quality order.
+            //   We can't just check to see if there is an existing QO. The decision for if we do item sampling or not is done much later.
+            // - Skip quality order generation if quality orders have already been created for an item sampling with
+            //   create per updated quantity not checked
+            if (ret
+                && (!referenceType.isItemAndWarehouseQualityManagementProcessEnabled())
+                && (!inventItemSampling.CreatePerUpdatedQuantity || _inventTestAssociationTable.isSetupToBlockPartialPurchaseReceipt()))
+            {
+                if (this.existsQualityOrderForAssociation(_inventTestAssociationTable))
+                {
+                    ret = false;
+                }
+            }
+        
+            // Skip quality order generation if a related quarantine order has already been created.
+            if (ret && this.isReferenceMarkedWithQuarantineOrder())
+            {
+                // The quality orders cannot be created. The creation of quality orders is prevented by the existence of quarantine orders.
+                // Ensure that quality associations exist for the quarantine orders or create the quality orders manually.
+                info("@SYS344025");
+                ret = false;
+            }
+
+            // Skip quality order generation if no quantity is updated, e.g., if this is only a source document status update.
+            if (ret && inventItemSampling.CreatePerUpdatedQuantity
+                && !updatedQuantity)
+            {
+                ret = false;
+            }
+
+            this.instrumentationLogger().qualityManagementActivities().verifiedApplicableTestAssociation(activityContext, ret);
+
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>existsQualityOrderForAssociation</Name>
+				<Source><![CDATA[
+    protected boolean existsQualityOrderForAssociation(InventTestAssociationTable _inventTestAssociationTable)
+    {
+        if (referenceType is InventQualityReferenceTypePurchase
+            && referenceType.getBufferInventDimId()
+            && !inventItemSampling.CreatePerUpdatedQuantity
+            && inventItemSampling.DiscriminatingInventoryDimensions != 0
+            && InventQualityOrderCreatedByDimensionFlight::instance().isEnabled())
+        {
+            InventDim inventDimParmLine = InventDim::find(referenceType.getBufferInventDimId());
+            InventDimParm inventDimParm;
+            inventDimParm.initFromInventDimFixed(inventItemSampling.DiscriminatingInventoryDimensions);
+
+            return InventQualityOrderTable::findQualityOrderForAssociationByItemSampling(
+                        _inventTestAssociationTable,
+                        inventDimParm,
+                        inventDimParmLine,
+                        referenceType.inventRefId(),
+                        referenceType.inventTransId(),
+                        referenceType.itemId(),
+                        referenceType.referenceType(),
+                        referenceType.routeOprId(),
+                        referenceType.oprNum()).RecId;
+        }
+        else
+        {
+            return InventQualityOrderTable::findOpenQualityOrderForAssociation(
+                            _inventTestAssociationTable,
+                            referenceType.inventRefId(),
+                            referenceType.inventTransId(),
+                            referenceType.itemId(),
+                            referenceType.referenceType(),
+                            referenceType.routeOprId(),
+                            referenceType.oprNum())
+                    ||  InventQualityOrderTable::findLastClosedQualityOrderForAssociation(
+                            _inventTestAssociationTable,
+                            referenceType.inventRefId(),
+                            referenceType.inventTransId(),
+                            referenceType.itemId(),
+                            referenceType.referenceType(),
+                            referenceType.routeOprId(),
+                            referenceType.oprNum());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the quantity of the <c>InventQualityOrderTable</c>.
+    /// </summary>
+    /// <param name = "_inventQualityOrderTable">The <c>InventQualityOrderTable</c> record.</param>
+    /// <returns>true, if the quality order quantity is valid; otherwise, false.</returns>
+    protected boolean checkQuantity(InventQualityOrderTable _inventQualityOrderTable)
+    {
+        return (_inventQualityOrderTable.Qty > 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeQualityOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a quality order based on the specified quality association.
+    /// </summary>
+    /// <param name="_inventTestAssociationTable">
+    /// A <c>InventTestAssociationTable</c> record.
+    /// </param>
+    /// <param name="_quantityToSample">
+    /// An inventory quantity to sample.
+    /// </param>
+    /// <param name="_inventDimId">
+    /// An inventory dimensions ID.
+    /// </param>
+    /// <param name="_cwQuantityToSample">
+    /// A catch weight quantity to sample.
+    /// </param>
+    protected InventQualityOrderTable initializeQualityOrder(
+        InventTestAssociationTable  _inventTestAssociationTable,
+        InventQty                   _quantityToSample,
+        InventDimId                 _inventDimId,
+        PdsCWInventQty              _cwQuantityToSample
+        )
+    {
+        InventQualityOrderTable inventQualityOrderTable;
+        NumberSeq               numberSeq;
+
+        numberSeq = NumberSeq::newGetNumFromId(InventParameters::numRefQualityOrderId().NumberSequenceId);
+        if (numberSeq)
+        {
+            inventQualityOrderTable.QualityOrderId = numberSeq.num();
+        }
+
+        inventQualityOrderTable.initFromReference(referenceType);
+
+        inventQualityOrderTable.InventDimId = _inventDimId;
+
+        inventQualityOrderTable.inventDim().modifiedInventSiteFromParent(inventQualityOrderTable);
+
+        inventQualityOrderTable.initFromInventTestAssociationTable(_inventTestAssociationTable);
+        inventQualityOrderTable.initFromInventTestGroup();
+
+        inventQualityOrderTable.initCompleteBlockingFromItemSampling();
+
+        // Full blocking is not supported for Quality order for warehouse processes.
+        if (inventQualityOrderTable.CompleteBlocking
+            && referenceType.isItemAndWarehouseQualityManagementProcessEnabled())
+        {
+            warning("@WAX:FullBlockingUnsupportedForQualityManagementProcess");
+            throw error("@SYS113922");
+        }
+
+        inventQualityOrderTable.initQtyFromAssociation(_inventTestAssociationTable, _quantityToSample, _cwQuantityToSample);
+
+        boolean isCWItem = PdsGlobal::pdsIsCWItem(referenceType.itemId());
+
+        // In quality order process for warehouse processes, system should not create quality order for more than the updateQty.
+        // This can happen when NOT coming from generateQualityOrdersWithDiscrimination or cross docking has occurred.
+        if (referenceType.isItemAndWarehouseQualityManagementProcessEnabled())
+        {
+            inventQualityOrderTable.Qty = min(maxAllowedQty, inventQualityOrderTable.Qty);
+    
+            // If it was determined that we don't actually need any more item sampling for the association then return.
+            if (inventQualityOrderTable.Qty == 0)
+            {
+                return inventQualityOrderTable;
+            }
+
+            // Track the amount being item sampled
+            WHSItemSamplingTracking::trackItemSampledQty(referenceType, _inventTestAssociationTable.RecId, inventQualityOrderTable.InventDimId, inventQualityOrderTable.Qty);
+    
+            // Set amount and dim to create work for
+            workCreateQty = isCWItem ? inventQualityOrderTable.PdsCWQty : inventQualityOrderTable.Qty;
+            workInventDim = inventQualityOrderTable.InventDim();
+    
+            // Set quality order id to associated the work to
+            lastCreatedQualityOrder = inventQualityOrderTable.QualityOrderId;
+        }
+        
+        if (isCWItem)
+        {
+            inventQualityOrderTable.Qty = this.pdsCalculateQuantityForCWItem(
+                inventQualityOrderTable.PdsCWQty,
+                inventQualityOrderTable.inventDim());
+            if (inventQualityOrderTable.Qty == 0)
+            {
+                // No blocking transaction is found and open quality order exists, so skip creating new quality order
+                skipCreateQualityOrder = true;
+                inventQualityOrderTable.PdsCWQty = 0;
+                return inventQualityOrderTable;
+            }
+        }
+
+        boolean reserveMinimumQty = !isBlockingInventTransFound && InventTable::isItemCatchWeightAndWarehouseProcessEnabled(referenceType.itemId());         
+
+        // Initialize BlockingQty
+        // In quality order process for warehouse processes, system should not create inventory blocking if the destructive testing is enabled.
+        if (referenceType.supportsInventoryBlocking()
+            && (!referenceType.isItemAndWarehouseQualityManagementProcessEnabled()
+                || !inventQualityOrderTable.TestDestructive))
+        {
+            if (inventQualityOrderTable.CompleteBlocking)
+            {
+                if (   _inventDimId == this.adjustedReferenceInventDimId()
+                    && !inventItemSampling.CreatePerUpdatedQuantity)
+                {
+                    // standard movement dimensions, so block full remaining quantity when "Per updated quantity" option is no
+                    inventQualityOrderTable.BlockingQty = referenceType.inventRefQty() - this.alreadyBlockedQty();
+                    inventQualityOrderTable.PdsCWBlockingQty = referenceType.pdsCWInventRefQty() - this.alreadyBlockedCWQty();
+                }
+                else
+                {
+                    // Not the standard movement blocking for leftover quantity, so only block the sample
+                    inventQualityOrderTable.BlockingQty = _quantityToSample;
+                    inventQualityOrderTable.PdsCWBlockingQty = _cwQuantityToSample;
+                }
+            }
+            else
+            {
+                inventQualityOrderTable.BlockingQty = inventQualityOrderTable.Qty;
+                inventQualityOrderTable.PdsCWBlockingQty = inventQualityOrderTable.PdsCWQty;                
+            }
+
+            if (reserveMinimumQty)
+            {
+                inventQualityOrderTable.BlockingQty = PdsCatchWeight::minInventQty(referenceType.itemId(), inventQualityOrderTable.PdsCWBlockingQty);
+            }
+        }
+        else
+        {
+            inventQualityOrderTable.BlockingQty = 0;
+        }
+
+        // Reduce destructive qty for destructive tests
+        InventChangeBlockingQtyOnDestructiveTestContext context = InventChangeBlockingQtyOnDestructiveTestContext::current();
+        if (context && inventQualityOrderTable.TestDestructive)
+        {
+            context.parmSkipDeductDestructiveQty(true);
+
+            inventQualityOrderTable.BlockingQty      -= inventQualityOrderTable.Qty;
+            inventQualityOrderTable.PdsCWBlockingQty -= inventQualityOrderTable.PdsCWQty;
+
+            inventQualityOrderTable.BlockingQty      = max(0, inventQualityOrderTable.BlockingQty);
+            inventQualityOrderTable.PdsCWBlockingQty = max(0, inventQualityOrderTable.PdsCWBlockingQty);
+        }
+
+        if (!this.checkQuantity(inventQualityOrderTable))
+        {
+            warning(strFmt("@SYS113923", inventQualityOrderTable.ItemId));
+            throw error("@SYS113922");
+        }
+        return inventQualityOrderTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createQualityOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a quality order based on the specified quality association.
+    /// </summary>
+    /// <param name="_inventTestAssociationTable">
+    /// A <c>InventTestAssociationTable</c> record.
+    /// </param>
+    /// <param name="_quantityToSample">
+    /// The inventory quantity to sample.
+    /// </param>
+    /// <param name="_inventDimId">
+    /// The inventory dimensions ID.
+    /// </param>
+    /// <param name="_cwQuantityToSample">
+    /// The catch weight quantity to sample.
+    /// </param>
+    protected void createQualityOrder(
+        InventTestAssociationTable  _inventTestAssociationTable,
+        InventQty                   _quantityToSample,
+        InventDimId                 _inventDimId,
+        PdsCWInventQty              _cwQuantityToSample = 0
+        )
+    {
+        using (var activityContext = this.instrumentationLogger().qualityManagementActivities().createQualityOrder())
+        {
+            skipCreateQualityOrder = false;
+            InventQualityOrderTable inventQualityOrderTable = this.initializeQualityOrder(_inventTestAssociationTable,
+                                                                                        _quantityToSample,
+                                                                                        _inventDimId,
+                                                                                        _cwQuantityToSample);
+
+            WHSQualityProcessingPolicy processingPolicy = WHSQualityProcessingPolicy::CreateQualityOrder;
+            boolean                    createQualityOrderForAnyQuantity = true;
+
+            // If it was determined that we don't actually need any more item sampling for the association or policy set to create work only then return.
+            if (referenceType.isItemAndWarehouseQualityManagementProcessEnabled())
+            {
+                processingPolicy = _inventTestAssociationTable.QualityProcessingPolicy;
+
+                if (inventQualityOrderTable.Qty == 0)
+                {
+                    createQualityOrderForAnyQuantity = false;
+                }
+            }
+
+            createQualityOrderForAnyQuantity = createQualityOrderForAnyQuantity && this.canCreateQualityOrderForAnyQuantity(inventQualityOrderTable);
+            
+            boolean createQualityOrder = (processingPolicy == WHSQualityProcessingPolicy::CreateQualityOrder && createQualityOrderForAnyQuantity
+                                            && !skipCreateQualityOrder);
+
+            if (createQualityOrder)
+            {
+                inventQualityOrderTable.insert();
+
+                // Reserve inventory blocking and quality order transactions at status level
+                if (referenceType.isItemAndWarehouseQualityManagementProcessEnabled())
+                {
+                    InventBlockingQualityOrder::findInventBlockingByQualityOrderId(inventQualityOrderTable.QualityOrderId).reserveBlockingAtStatusLevel();
+
+                    if (inventQualityOrderTable.TestDestructive)
+                    {
+                        inventQualityOrderTable.reserveQualityOrderAtStatusLevel();
+                    }
+                }
+
+                if (_inventTestAssociationTable.ShowInfoOnCreate)
+                {
+                    info(
+                        strFmt("@SYS113920", inventQualityOrderTable.QualityOrderId),
+                        '',
+                        SysInfoAction_TableField::newBuffer(inventQualityOrderTable));
+                }
+            }
+
+            this.instrumentationLogger().qualityManagementActivities().createdQualityOrder(activityContext, createQualityOrder, processingPolicy, createQualityOrderForAnyQuantity);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCreateQualityOrderForAnyQuantity</Name>
+				<Source><![CDATA[
+    protected boolean canCreateQualityOrderForAnyQuantity(inventQualityOrderTable  _inventQualityOrderTable)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustCreateQualityOrderForInventDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the quality order for the given inventory dimension must be created.
+    /// </summary>
+    /// <param name="_inventTestAssociationTable">
+    /// A <c>InventTestAssociationTable</c> record.
+    /// </param>
+    /// <param name="_quantityToSample">
+    /// The inventory quantity to sample.
+    /// </param>
+    /// <param name="_inventDimId">
+    /// The inventory dimensions ID.
+    /// </param>
+    /// <param name="_cwQuantityToSample">
+    /// The catch weight quantity to sample.
+    /// </param>
+    /// <returns>
+    /// true, if the quality order must be created; otherwise, false.
+    /// </returns>
+    protected boolean mustCreateQualityOrderForInventDim(InventTestAssociationTable  _inventTestAssociationTable,
+                                                         InventQty                   _quantityToSample,
+                                                         InventDimId                 _inventDimId,
+                                                         PdsCWInventQty              _cwQuantityToSample)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInventItemSampling</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Finds and caches a record in the <c>InventItemSampling</c> table.
+    /// </summary>
+    /// <param name="_itemSamplingId">
+    ///    The item sampling ID to find.
+    /// </param>
+    /// <returns>
+    ///    A record in the <c>InventItemSampling</c> table; otherwise, an empty record.
+    /// </returns>
+    protected InventItemSampling findInventItemSampling(InventItemSamplingId _itemSamplingId)
+    {
+        if (  !inventItemSampling
+            || inventItemSampling.InventItemSamplingId != _itemSamplingId)
+        {
+            inventItemSampling  = InventItemSampling::find(_itemSamplingId);
+        }
+
+        return inventItemSampling;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateQuantitiesToSample</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the quantities to sample.
+    /// </summary>
+    /// <returns>The sample quantities to create quality orders with.</returns>
+    protected PmfQtyDataCarrier calculateQuantitiesToSample()
+    {
+        PmfQtyDataCarrier quantitiesToSample = new PmfQtyDataCarrier();
+        
+        // Use the updateQuantity when dealing with every nth LP
+        if (inventItemSampling.CreatePerUpdatedQuantity
+            || inventItemSampling.PerNthLicensePlate > 0)
+        {
+            // Sample only the quantity that has been updated
+            quantitiesToSample.parmInventQty(updatedQuantity);
+            quantitiesToSample.parmCwQty(updatedCWQuantity);
+        }
+        else
+        {
+            // Sample the whole lot quantity
+            quantitiesToSample.parmInventQty(referenceType.inventRefQty());
+            quantitiesToSample.parmCwQty(referenceType.pdsCWInventRefQty());
+        }
+        return quantitiesToSample;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateQualityOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates quality orders based on a quality association.
+    /// </summary>
+    /// <param name="_inventTestAssociationTable">
+    /// The quality association.
+    /// </param>
+    protected void generateQualityOrders(InventTestAssociationTable _inventTestAssociationTable)
+    {
+        PmfQtyDataCarrier quantitiesToSample = this.calculateQuantitiesToSample();
+
+        InventQualityOrderPhysicalVoucherContext context = InventQualityOrderPhysicalVoucherContext::current();
+        if (context && !inventItemSampling.CreatePerUpdatedQuantity && !(InventQualityOrderSkipCleanVoucherFlight::instance().isEnabled() && (referenceType is InventQualityReferenceTypePurchSales)))
+        {
+            context.parmPhysicalVoucherForBlocking('');
+        }
+
+        using (InventChangeBlockingQtyOnDestructiveTestContext destructiveContext = InventChangeBlockingQtyOnDestructiveTestContext::construct())
+        {
+            if (inventItemSampling.DiscriminatingInventoryDimensions == 0)
+            {
+                if (referenceType.isItemAndWarehouseQualityManagementProcessEnabled())
+                {
+                    this.setMaxAllowedQuantity(referenceType.inventDimId());
+
+                    if (maxAllowedQty > 0)
+                    {
+                        // A single quality order is created for a lot
+                        this.createQualityOrder(
+                            _inventTestAssociationTable,
+                            quantitiesToSample.parmInventQty(),
+                            this.adjustedReferenceInventDimId(),
+                            quantitiesToSample.parmCwQty());
+                    }
+
+                    this.createQualityItemSamplingWork(_inventTestAssociationTable);
+                }
+                else // Base
+                {
+                    this.createQualityOrder(
+                        _inventTestAssociationTable,
+                        quantitiesToSample.parmInventQty(),
+                        this.adjustedReferenceInventDimId(),
+                        quantitiesToSample.parmCwQty());
+                }
+            }
+            else
+            {
+                // Quality orders will be generated per different inventory dimensions
+                this.generateQualityOrdersWithDiscrimination(
+                    _inventTestAssociationTable,
+                    quantitiesToSample.parmInventQty(),
+                    quantitiesToSample.parmCwQty()
+                    );
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateQualityOrdersWithDiscrimination</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates separate quality orders that are based on the quality associations per unique combination
+    /// of the inventory dimension subset specified in the related item sampling.
+    /// </summary>
+    /// <param name="_inventTestAssociationTable">
+    /// The quality association.
+    /// </param>
+    /// <param name="_quantityToSample">
+    /// A total quantity to be sampled.
+    /// </param>
+    /// <param name="_cwQuantityToSample">
+    /// A total catch weight quantity to be sampled.
+    /// </param>
+    abstract protected void generateQualityOrdersWithDiscrimination(
+        InventTestAssociationTable  _inventTestAssociationTable,
+        InventQty                   _quantityToSample,
+        PdsCWInventQty              _cwQuantityToSample)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUpdatedQuantitiesPerDimMap</Name>
+				<Source><![CDATA[
+    public Map parmUpdatedQuantitiesPerDimMap(Map _updatedQuantitiesPerDimMap = updatedQuantitiesPerDimMap)
+    {
+        updatedQuantitiesPerDimMap = _updatedQuantitiesPerDimMap;
+
+        return updatedQuantitiesPerDimMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isReferenceMarkedWithQuarantineOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether a quality order references transactions in a source that are marked with an
+    /// active quarantine order.
+    /// </summary>
+    /// <returns>
+    /// true if marked with a quarantine order; otherwise, false.
+    /// </returns>
+    private boolean isReferenceMarkedWithQuarantineOrder()
+    {
+        InventTrans                         inventTransReference;
+        InventTransOrigin                   inventTransOriginReference;
+        InventTransOriginQuarantineOrder    inventTransOriginQuarantineOrder;
+        InventQuarantineOrder               inventQuarantineOrder;
+        InventTransId                       inventRefTransId;
+        InventDim                           inventDimCriteria;
+        InventDim                           inventQuarantineOrderDim;
+        InventDimParm                       inventDimParm;
+        InventQty                           currentQuantity;
+        PdsCWInventQty                      currentCWQuantity;
+        MapEnumerator                       updatedQuantitiesMapEnumerator;
+        Map                                 newQuantitiesMap = new Map(Types::String, Types::Container);
+
+        boolean hasReferenceMarked()
+        {
+            select firstonly RecId from inventTransOriginReference
+                where inventTransOriginReference.InventTransId                  == inventRefTransId
+                exists join inventTransReference
+                    where inventTransReference.InventTransOrigin                == inventTransOriginReference.RecId
+                        && inventTransReference.MarkingRefInventTransOrigin      != 0    // Must be marked
+                exists join inventTransOriginQuarantineOrder
+                    where inventTransOriginQuarantineOrder.InventTransOrigin    == inventTransReference.MarkingRefInventTransOrigin // Marked with quarantine order
+                exists join inventQuarantineOrder
+                    where inventQuarantineOrder.DataAreaId                      == inventTransOriginQuarantineOrder.QuarantineOrderDataAreaId
+                        && inventQuarantineOrder.QuarantineId                    == inventTransOriginQuarantineOrder.QuarantineOrderId
+                        && inventQuarantineOrder.Status                          != InventQuarantineStatus::Ended    // quarantine order not ended yet
+                #InventDimExistsJoinNoField(inventQuarantineOrder.inventDimId, inventQuarantineOrderDim, inventDimCriteria, inventDimParm);
+
+            return inventTransOriginReference.RecId != 0;
+        }
+
+        if (!referenceType)
+        {
+            return false;
+        }
+
+        if (referenceType.referenceType() == InventTestReferenceType::Quarantine)
+        {
+            return false; // this is intentionally and naturally related to a quarantine order, so not extraordinary marked
+        }
+
+        inventRefTransId = referenceType.inventTransId();
+
+        if (!inventRefTransId)
+        {
+            return false;
+        }
+
+        // Skip quarantine order reference check when per updated quantity is checked and quarantine order is not created in registration process
+        if (updatedQuantitiesPerDimMap && (!inventItemSampling.CreatePerUpdatedQuantity || this.parmMustBeQuarantineControlled()))
+        {            
+            updatedQuantitiesMapEnumerator = updatedQuantitiesPerDimMap.getEnumerator();
+
+            while (updatedQuantitiesMapEnumerator.moveNext())
+            {
+                inventDimCriteria = InventDim::find(updatedQuantitiesMapEnumerator.currentKey());
+                inventDimParm.initFromInventDimFixed(inventItemSampling.DiscriminatingInventoryDimensions);
+                inventDimCriteria.clearNotSelectedDim(inventDimParm);
+
+                if (hasReferenceMarked())
+                {
+                    [currentQuantity, currentCWQuantity] = updatedQuantitiesMapEnumerator.currentValue();
+                    updatedQuantity -= currentQuantity;
+                    updatedCWQuantity -= currentCWQuantity;
+                }
+                else
+                {
+                    newQuantitiesMap.insert(updatedQuantitiesMapEnumerator.currentKey(), updatedQuantitiesMapEnumerator.currentValue());
+                }
+            }
+
+            return newQuantitiesMap.elements() == 0;
+        }
+
+        // Skip quality order generation if a related quarantine order has already been created for an item sampling with
+        // create per updated quantity not checked.
+        return !inventItemSampling.CreatePerUpdatedQuantity && hasReferenceMarked();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected final void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDocumentStatus</Name>
+				<Source><![CDATA[
+    protected InventTestDocumentStatus parmDocumentStatus(InventTestDocumentStatus _documentStatus = documentStatus)
+    {
+        documentStatus = _documentStatus;
+        return documentStatus;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmExecution</Name>
+				<Source><![CDATA[
+    protected InventTestExecution parmExecution(InventTestExecution _execution = execution)
+    {
+        execution = _execution;
+        return execution;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReferenceType</Name>
+				<Source><![CDATA[
+    protected InventQualityReferenceType parmReferenceType(InventQualityReferenceType _referenceType = referenceType)
+    {
+        referenceType = _referenceType;
+        return referenceType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUpdatedCWQuantity</Name>
+				<Source><![CDATA[
+    protected PdsCWInventQty parmUpdatedCWQuantity(PdsCWInventQty _updatedCWQuantity = updatedCWQuantity)
+    {
+        updatedCWQuantity = _updatedCWQuantity;
+
+        return updatedCWQuantity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUpdatedQuantity</Name>
+				<Source><![CDATA[
+    protected InventQty parmUpdatedQuantity(InventQty _updatedQuantity = updatedQuantity)
+    {
+        updatedQuantity = _updatedQuantity;
+
+        return updatedQuantity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pdsCalculateQuantityForCWItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the quality order quantity in inventory unit for a catch weight item.
+    /// </summary>
+    /// <param name="_cwQty">
+    /// The quality order quantity in catch weight unit.
+    /// </param>
+    /// <param name="_inventDimCriteria">
+    /// An <c>InventDim</c> table buffer.
+    /// </param>
+    /// <returns>
+    /// The quality order quantity in inventory unit for a catch weight item.
+    /// </returns>
+    /// <remarks>
+    /// This method follows marking logic that is used by inventory blocking when it picks exact
+    /// transactions that will be blocked.
+    /// </remarks>
+    protected InventQty pdsCalculateQuantityForCWItem(
+        PdsCWInventQty  _cwQty,
+        InventDim       _inventDimCriteria)
+    {
+        PdsCWInventQty      cwDelta;
+        InventQty           inventQty = 0;
+        PdsCWInventQty      cwRemainingQty = _cwQty;
+        InventTransOriginId inventTransOriginId;
+        InventTrans         inventTrans;
+
+        InventDim           inventDim;
+        InventDimParm       inventDimParm;
+        InventDimParm       inventDimParmSampling;
+        StatusReceipt       statusReceipt = StatusReceipt::Arrived;
+
+        inventDimParm.initFromInventDim(_inventDimCriteria);
+
+        if (documentStatus == InventTestDocumentStatus::ReportFinished 
+            && execution == InventTestExecution::After
+            && inventItemSampling.DiscriminatingInventoryDimensions != 0 )
+        {
+            inventDimParmSampling.initFromInventDimFixed(inventItemSampling.DiscriminatingInventoryDimensions);
+            inventDimParm = InventDimParm::orParms(inventDimParm, inventDimParmSampling);
+            if (inventItemSampling.CreatePerUpdatedQuantity == NoYes::No)
+            {
+                statusReceipt = StatusReceipt::Ordered;
+            }
+        }         
+
+        inventTransOriginId = InventTransOrigin::findByInventTransId(referenceType.inventTransId()).RecId;
+        isBlockingInventTransFound = false;
+
+        while select Qty, PdsCWQty from inventTrans
+            order by StatusReceipt desc, StatusIssue desc
+            where inventTrans.ValueOpen             == InventTransOpen::Yes
+                && inventTrans.InventTransOrigin    == inventTransOriginId
+                && inventTrans.StatusReceipt        <= statusReceipt
+                && inventTrans.StatusIssue          <= StatusIssue::Picked
+                && !inventTrans.PackingSlipReturned
+                && !inventTrans.MarkingRefInventTransOrigin
+            #inventDimExistsJoin(inventTrans.inventDimId, inventDim, _inventDimCriteria, inventDimParm)
+
+        {
+            isBlockingInventTransFound = true;
+
+            cwDelta = min(cwRemainingQty, abs(inventTrans.PdsCWQty));
+
+            cwRemainingQty -= cwDelta;
+            inventQty += PdsCatchWeight::adjustSplitInventQty(
+                referenceType.itemId(),
+                inventTrans.PdsCWQty,
+                inventTrans.Qty,
+                cwDelta,
+                PdsCatchWeight::minInventQty(referenceType.itemId(), cwDelta));
+
+            if (cwRemainingQty == 0)
+            {
+                break;
+            }
+        }
+          
+        InventQualityOrderTable inventQualityOrderTable;
+        // Cannot find unmarked transaction, so check if already created quality order. If yes, do not create quality order with minimal quantity
+        if (inventQty == 0)
+        {
+            select firstonly inventQualityOrderTable
+                where inventQualityOrderTable.OrderStatus == InventTestOrderStatus::Open
+                    && inventQualityOrderTable.InventRefId == referenceType.inventRefId()
+                    && inventQualityOrderTable.InventTransId == referenceType.inventTransId();
+        }
+
+        if (cwRemainingQty != 0 && !inventQualityOrderTable)
+        {
+            inventQty += PdsCatchWeight::minInventQty(referenceType.itemId(), cwRemainingQty);
+        }
+
+        return inventQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Contains the code that does the actual job of the class.
+    /// </summary>
+    protected void run()
+    {
+        if (!referenceType.isEligibleForQualityManagement())
+        {
+            return;
+        }
+
+        usedTestGroups = new Set(Types::String);
+
+        ttsbegin;
+        referenceType.iterateQualityAssociations(this);
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createOnRegistration</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates quality orders that are conditioned on the existence of relevant quality associations and
+    /// the lack of open quality orders that match ones that exist.
+    /// </summary>
+    /// <param name="_inventTransOrigin">
+    /// An <c>InventTransOrigin</c> record.
+    /// </param>
+    /// <param name="_inventReceiptForTestRegistrator">
+    /// An instance of the <c>InventReceiptForTestRegistrator</c> class.
+    /// </param>
+    /// <remarks>
+    /// This method is used in the cases when the updated quantity is registered that uses an instance of
+    /// the <c>InventReceiptForTestRegistrator</c> class.
+    /// </remarks>
+    public static void createOnRegistration(
+        InventTransOrigin               _inventTransOrigin,
+        InventReceiptForTestRegistrator _inventReceiptForTestRegistrator)
+    {
+        InventQualityReferenceType inventQualityReferenceType = InventQualityReferenceType::newFromInventTransOrigin(_inventTransOrigin);
+
+        if (InventTestAssociationTable::recordCountForOrderType(inventQualityReferenceType.referenceType()) <= 0)
+        {
+            // No associations for the given reference type, so no need to check any further
+            return;
+        }
+
+        InventQualityManagementCreateInvent inventQualityManagementCreateInvent = InventQualityManagementCreateInvent::newFromInventReceiptForTestRegistrator(inventQualityReferenceType,
+            _inventReceiptForTestRegistrator);
+        inventQualityManagementCreateInvent.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPerQualityAssociations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates quality orders that are conditioned on the existence of relevant quality associations and
+    /// the lack of open quality orders that match ones that exist.
+    /// </summary>
+    /// <param name="_buffer">
+    /// A <c>Common</c> record that contains the reference document.
+    /// </param>
+    /// <param name="_documentStatus">
+    /// A <c>InventTestDocumentStatus</c> value.
+    /// </param>
+    /// <param name="_execution">
+    /// A <c>InventTestExecution</c> value.
+    /// </param>
+    /// <param name="_updatedQuantity">
+    /// An inventory quantity that is updated.
+    /// </param>
+    /// <param name="_cwUpdatedQuantity">
+    /// A catch weight quantity that is updated.
+    /// </param>
+    /// <param name="_inventSiteId">
+    /// The ID of the site set on the quality reference.
+    /// </param>
+    public static void createPerQualityAssociations(
+        Common                      _buffer,
+        InventTestDocumentStatus    _documentStatus,
+        InventTestExecution         _execution,
+        InventQty                   _updatedQuantity,
+        PdsCWInventQty              _cwUpdatedQuantity  = 0,
+        InventSiteId                _inventSiteId       = ''
+        )
+    {
+        InventQualityReferenceType inventQualityReferenceType = InventQualityManagementCreate::createInventQualityReferenceType(_buffer);
+        InventQualityManagementCreate::createPerQualityAssociationsForReferenceType(_buffer, _documentStatus, _execution, _updatedQuantity, _cwUpdatedQuantity, _inventSiteId, inventQualityReferenceType);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPerQualityAssociationsForReferenceType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates quality orders that are conditioned on the existence of relevant quality associations and
+    /// the lack of open quality orders that match ones that exist.
+    /// </summary>
+    /// <param name="_buffer">
+    /// A <c>Common</c> record that contains the reference document.
+    /// </param>
+    /// <param name="_documentStatus">
+    /// A <c>InventTestDocumentStatus</c> value.
+    /// </param>
+    /// <param name="_execution">
+    /// A <c>InventTestExecution</c> value.
+    /// </param>
+    /// <param name="_updatedQuantity">
+    /// An inventory quantity that is updated.
+    /// </param>
+    /// <param name="_cwUpdatedQuantity">
+    /// A catch weight quantity that is updated.
+    /// </param>
+    /// <param name="_inventSiteId">
+    /// The ID of the site set on the quality reference.
+    /// </param>
+    /// <param name="_inventQualityReferenceType">
+    /// Property of a reference document.
+    /// </param>
+    protected static void createPerQualityAssociationsForReferenceType(
+        Common                      _buffer,
+        InventTestDocumentStatus    _documentStatus,
+        InventTestExecution         _execution,
+        InventQty                   _updatedQuantity,
+        PdsCWInventQty              _cwUpdatedQuantity,
+        InventSiteId                _inventSiteId,
+        InventQualityReferenceType  _inventQualityReferenceType
+        )
+    {
+        if (InventTestAssociationTable::recordCountForOrderType(_inventQualityReferenceType.referenceType()) <= 0)
+        {
+            // No associations for the given reference type, so no need to check any further
+            return;
+        }
+        if (_inventSiteId)
+        {
+            _inventQualityReferenceType.parmPdsInventSiteId(_inventSiteId);
+        }
+
+        InventQualityManagementCreate inventQualityManagementCreate = InventQualityManagementCreate::newInventQualityManagementCreate(
+            _inventQualityReferenceType,
+            _documentStatus,
+            _execution,
+            _updatedQuantity,
+            _cwUpdatedQuantity);
+
+        inventQualityManagementCreate.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInventQualityReferenceType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of the <c>InventQualityReferenceType</c> class.
+    /// </summary>
+    /// <param name="_buffer">A <c>Common</c> record that contains the reference document.</param>
+    /// <returns>A new instance of the <c>InventQualityReferenceType</c> class.</returns>
+    protected static InventQualityReferenceType createInventQualityReferenceType(Common _buffer)
+    {
+        return InventQualityReferenceType::newFromBuffer(_buffer);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newInventQualityManagementCreate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a new <c>InventQualityManagementCreate</c> object.
+    /// </summary>
+    /// <param name = "_inventQualityReferenceType">
+    /// An instance of the <c>InventQualityReferenceType</c> class that contains the reference document.
+    /// </param>
+    /// <param name="_documentStatus">
+    /// An <c>InventTestDocumentStatus</c> value.
+    /// </param>
+    /// <param name="_execution">
+    /// An <c>InventTestExecution</c> value.
+    /// </param>
+    /// <param name="_updatedQuantity">
+    /// An inventory quantity that is updated.
+    /// </param>
+    /// <param name="_cwUpdatedQuantity">
+    ///  A catch weight quantity that is updated.
+    /// </param>
+    /// <returns>
+    /// A new <c>InventQualityManagementCreate</c> object.
+    /// </returns>
+    protected static InventQualityManagementCreate newInventQualityManagementCreate(
+        InventQualityReferenceType  _inventQualityReferenceType,
+        InventTestDocumentStatus    _documentStatus,
+        InventTestExecution         _execution,
+        InventQty                   _updatedQuantity,
+        PdsCWInventQty              _cwUpdatedQuantity)
+    {
+        InventQualityManagementCreate inventQualityManagementCreate = InventQualityMgmtCreateNonInvent::construct();
+        inventQualityManagementCreate.parmDocumentStatus(_documentStatus);
+        inventQualityManagementCreate.parmExecution(_execution);
+        inventQualityManagementCreate.parmReferenceType(_inventQualityReferenceType);
+        inventQualityManagementCreate.parmUpdatedQuantity(_updatedQuantity);
+        inventQualityManagementCreate.parmUpdatedCWQuantity(_cwUpdatedQuantity);
+        return inventQualityManagementCreate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setMaxAllowedQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the maximum allowed quantity for the quality order creation.
+    /// </summary>
+    /// <param name = "_inventDimId">An inventory dimensions ID.</param>
+    [Wrappable(true)]
+    final public void setMaxAllowedQuantity(InventDimId _inventDimId)
+    {
+        WHSCrossDockOpportunity	crossDockOpportunity;
+        InventDim               inventDim;
+        InventDimParm           inventDimParm;
+
+        InventDim inventDimCriteria = inventDim::find(_inventDimId);
+        inventDimParm.initFromInventDim(inventDimCriteria);
+
+        select sum(CrossDockQuantity) from crossDockOpportunity
+            #InventDimExistsJoin(crossDockOpportunity.SupplyInventDimId, inventDim, inventDimCriteria, inventDimParm);
+
+        maxAllowedQty = updatedQuantity - crossDockOpportunity.CrossDockQuantity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldInboundQualityOrderWorkBeCreated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if quality in item sampling work should be created or not.
+    /// </summary>
+    /// <returns>
+    /// true if the process should create work; otherwise, false.
+    /// </returns>
+    [Hookable(false)]
+    internal boolean shouldInboundQualityOrderWorkBeCreated(InventTestAssociationTable _inventTestAssociationTable)
+    {
+        boolean shouldCreateWork;
+
+        // Check to make sure that we are in a scenario that uses Quality Management features and has a demand for work.
+        if (workCreateQty
+            && _inventTestAssociationTable.ApplicableWarehouseType == WHSApplicableWarehouseType::QualityManagementOnlyEnabled
+            && referenceType.isItemAndWarehouseQualityManagementProcessEnabled()
+            && WHSWorkTemplateTable::validTemplateExistsForWorkTransType(WHSWorkTransType::QualityItemSampling))
+        {
+            // Check to make sure we are no in an invalid scenario above location dims are being generated.
+            InventTable inventTable = InventTable::find(referenceType.itemId());
+
+            if (inventTable.SerialNumGroupId
+                &&  WhsReservationHierarchyInventDimUtil::isSerialAboveLocation(inventTable))
+            {
+                if (InventQualityManagementCreateSerialNumControlSerialAboveHierarchyItemFlight::instance().isEnabled()
+                    && inventTable.isItemSerialNumberControlled())
+                {
+                    shouldCreateWork = true;
+                }
+                else
+                {
+                    warning("@WAX:QualitySerialGroupValidation");
+                }
+            }
+            else
+            {
+                shouldCreateWork = true;
+            }
+        }
+
+        return shouldCreateWork;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackLP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the license plates exists and based on which system determines whether to generate the quality order for the LP or not.
+    /// </summary>
+    /// <param name = "_inventTestAssociationTable">A <c>InventTestAssociationTable</c> buffer.</param>
+    /// <param name = "_inventDim">A <c>InventDim</c> buffer.</param>
+    /// <returns>true, if we need to create the quality order; otherwise, false</returns>
+    [Hookable(false)]
+    internal boolean trackLP(InventTestAssociationTable _inventTestAssociationTable, InventDim _inventDim)
+    {
+        int     numLPsTracked;
+        boolean ret = true;
+    
+        if (inventItemSampling.PerNthLicensePlate > 0)
+        {
+            // If we don't have LP on our dim return false
+            if (!_inventDim.LicensePlateId)
+            {
+                ret = false;
+            }
+            else
+            {
+                // Create a place holder tracking record to account for the current transaction being processed.
+                WHSItemSamplingTracking::createTrackingPlaceHolder(referenceType, _inventTestAssociationTable.RecId, _inventDim.inventDimId);
+    
+                // Based on the scope we get different totals for the amount already sampled and the number of LPs already tracked
+                numLPsTracked = WHSItemSamplingTracking::calculateNumberOfTrackedLicensePlates(referenceType, _inventTestAssociationTable.RecId);
+    
+                // numLPsTracked should always be at least one since we just incremented the value.
+                if (numLPsTracked >= 1)
+                {
+                    // For nthLP sampling we sample the first LP of every set of LPs.
+                    // A set is based on the number specified on the item sampling setup.
+                    // E.g, if sampleNthLP is 5 then a set is 5 LPs and we will sample the 1st, 6th, 11th, ect...
+                    ret = (inventItemSampling.PerNthLicensePlate == 1) || ((numLPsTracked mod inventItemSampling.PerNthLicensePlate) == 1);
+                }
+            }
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createQualityItemSamplingWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create quality item sampling work to move inventory to the quality location
+    /// </summary>
+    /// <param name = "_inventTestAssociationTable">A <c>InventTestAssociationTable</c> record.</param>
+    [Hookable(false)]
+    internal protected void createQualityItemSamplingWork(InventTestAssociationTable _inventTestAssociationTable)
+    {
+        throw error(error::missingOverride(funcName()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    final internal InventInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = InventInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmMustBeQuarantineControlled</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal final NoYes parmMustBeQuarantineControlled(NoYes _mustBeQuarantineControlled = mustBeQuarantineControlled)
+    {
+        mustBeQuarantineControlled = _mustBeQuarantineControlled;
+        return mustBeQuarantineControlled;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

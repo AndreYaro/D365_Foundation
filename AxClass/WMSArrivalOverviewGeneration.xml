@@ -1,0 +1,2428 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WmsArrivalOverviewGeneration</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class WmsArrivalOverviewGeneration
+{
+    WMSArrivalOverviewOptions               wmsArrivalOverviewOptions;
+    WMSArrivalOverviewTmp                   wmsArrivalOverviewTmp;
+    WMSArrivalDetailTmp                     wmsArrivalDetailTmp;
+    Common                                  inventTransRefBuffer;
+    Set                                     referencesWithPendingQuantities;
+    Set                                     wmsJournalTransWithCreateQuarantineOrder;
+    Map                                     wmsJournalTransDataCache;
+    Map                                     itemModelGroupQuarantine;
+    private Map                             measureTime;
+    private Map                             measureCountMethodCalls;
+    private Map                             measureCountLines;
+    private Map                             measureCountInventoryTransactions;
+    private CostManagementInstrumentation   instrumentation;
+    private int64                           inventoryTransactionCount;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>anyJournalLinesUnderQuarantineControl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if any journal lines for the <c>InventTransId</c> ID was using quarantine control.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// An <c>InventTransId</c> ID.
+    /// </param>
+    /// <returns>
+    /// true if any journal lines for the <c>InventTransId</c> ID was using quarantine control; Otherwise, false.
+    /// </returns>
+    private boolean anyJournalLinesUnderQuarantineControl(InventTransId _inventTransId)
+    {
+        return wmsJournalTransWithCreateQuarantineOrder.in(_inventTransId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildDefault</Name>
+				<Source><![CDATA[
+    protected void buildDefault(
+        InventTransType         _referenceCategory,
+        InventTransRefId        _referenceId)
+    {
+        InventTransOrigin               inventTransOrigin;
+        TradeInstrumentationStopwatch   instrumentationStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+        int64                           inventTransOriginCount;
+
+        inventoryTransactionCount = 0;
+
+        while select InventTransId from inventTransOrigin
+            group by InventTransId
+            where inventTransOrigin.ReferenceCategory == _referenceCategory
+               && inventTransOrigin.ReferenceId       == _referenceId
+        {
+            inventTransOriginCount++;
+
+            this.buildInventTransId(inventTransOrigin.InventTransId);
+        }
+
+        this.addMeasure(funcName(), instrumentationStopWatch.elapsedMilliseconds(), inventTransOriginCount, inventoryTransactionCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildDetails</Name>
+				<Source><![CDATA[
+    private void buildDetails()
+    {
+        WMSArrivalOverviewTmp   wmsArrivalOverviewTmpLocal;
+        Map                     transTypesMap = new Map(Types::Enum, Types::Class);
+        Set                     transRefIdSet;
+        InventTransType         inventTransType;
+
+        wmsArrivalOverviewTmpLocal.setTmpData(wmsArrivalOverviewTmp);
+
+        while select wmsArrivalOverviewTmpLocal
+        {
+            inventTransType = wmsArrivalOverviewTmpLocal.InventTransType;
+            if (inventTransType == InventTransType::BOMLine) // both BOMLine and BOMMain can be in same journal so only handle once
+            {
+                inventTransType = InventTransType::BOMMain;
+            }
+
+            if (!transTypesMap.exists(inventTransType))
+            {
+                transRefIdSet = new Set(Types::String);
+                transTypesMap.insert(inventTransType, transRefIdSet);
+            }
+            else
+            {
+                transRefIdSet = transTypesMap.lookup(inventTransType);
+            }
+
+            if (!transRefIdSet.in(wmsArrivalOverviewTmpLocal.InventTransRefId))
+            {
+                this.buildReference(wmsArrivalOverviewTmpLocal.InventTransType, wmsArrivalOverviewTmpLocal.InventTransRefId);
+                this.buildPendingRegistrationDetailsReference(wmsArrivalOverviewTmpLocal.InventTransType, wmsArrivalOverviewTmpLocal.InventTransRefId);
+                transRefIdSet.add(wmsArrivalOverviewTmpLocal.InventTransRefId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventJournal</Name>
+				<Source><![CDATA[
+    protected void buildInventJournal(InventJournalId   _inventJournalId)
+    {
+        InventJournalTrans              inventJournalTrans;
+        TradeInstrumentationStopwatch   instrumentationStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+        int64                           journalLineCount;
+
+        inventoryTransactionCount = 0;
+
+        while select InventTransId, ToInventTransId from inventJournalTrans
+            where inventJournalTrans.JournalId == _inventJournalId
+        {
+            journalLineCount++;
+
+            // if ToInventTransId is present it is a transfer journal and we should use the receipt inventTransId
+            this.buildInventTransId(inventJournalTrans.ToInventTransId ? inventJournalTrans.ToInventTransId : inventJournalTrans.InventTransId);
+        }
+
+        this.addMeasure(funcName(), instrumentationStopWatch.elapsedMilliseconds(), journalLineCount, inventoryTransactionCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventTransId</Name>
+				<Source><![CDATA[
+    protected void buildInventTransId(InventTransId _inventTransId)
+    {
+        WMSArrivalDetailTmp     wmsArrivalDetailTmpLocal;
+        InventTransOrigin       inventTransOrigin;
+        InventTrans             inventTrans;
+        InventDim               inventDim;
+        InventQty               inProgress;
+        InventQuarantineControl quarantineControl               = NoYes::No;
+        boolean                 hasInitializedForTransId        = false;
+        PdsCWInventQty          cwInProgress;
+
+        wmsArrivalDetailTmpLocal.setTmpData(wmsArrivalDetailTmp);
+
+        while select inventTransOrigin
+            group by inventTrans.DateStatus,
+                     inventTransOrigin.InventTransId,
+                     inventTransOrigin.ReferenceCategory,
+                     inventTransOrigin.ReferenceId,
+                     inventTransOrigin.ItemId,
+                     inventDim.InventSiteId,
+                     inventDim.InventLocationId
+            where inventTransOrigin.InventTransId == _inventTransId
+            join sum(Qty)
+            , sum(PdsCWQty)
+                from inventTrans
+                where inventTrans.InventTransOrigin == inventTransOrigin.RecId &&
+                      inventTrans.StatusIssue       == StatusIssue::None       &&
+                      inventTrans.StatusReceipt     == StatusReceipt::Ordered
+                join InventLocationId from inventDim
+                    where inventDim.InventDimId == inventTrans.InventDimId
+        {
+            if (!(this.mustInsertArrivalDetailForInventTransId(inventTransOrigin, inventDim)))
+            {
+                continue;
+            }
+
+			inventoryTransactionCount++;
+
+			//in case there are more transactions per inventtransid, e.g from different dates, then only set the data once
+			if (!hasInitializedForTransId)
+			{
+				[inProgress,cwInProgress,quarantineControl]  = this.findValuesFromWMSJournalTrans(_inventTransId);
+				hasInitializedForTransId = true;
+			}
+
+			wmsArrivalDetailTmpLocal.clear();
+			wmsArrivalDetailTmpLocal.InventTransId      = _inventTransId;
+			wmsArrivalDetailTmpLocal.InventTransType    = inventTransOrigin.ReferenceCategory;
+			wmsArrivalDetailTmpLocal.InventTransRefId   = inventTransOrigin.ReferenceId;
+			wmsArrivalDetailTmpLocal.DateStatus         = inventTrans.DateStatus;
+			wmsArrivalDetailTmpLocal.InventSiteId       = inventDim.InventSiteId;
+			wmsArrivalDetailTmpLocal.InventLocationId   = inventDim.InventLocationId;
+			wmsArrivalDetailTmpLocal.InventQty          = max(0, inventTrans.Qty - inProgress);
+			wmsArrivalDetailTmpLocal.InProgressQty      = inProgress;
+
+			wmsArrivalDetailTmpLocal.PdsCWQty           = max(0, inventTrans.PdsCWQty - cwInProgress);
+
+			this.initDetailValues(wmsArrivalDetailTmpLocal, inventTransOrigin.ItemId,true);
+			wmsArrivalDetailTmpLocal.OutOfRange         = !this.isDetailRecordInRange(wmsArrivalDetailTmpLocal);
+
+			if (wmsArrivalDetailTmpLocal.InProgressQty)
+			{
+				wmsArrivalDetailTmpLocal.InProgress             = NoYes::Yes;
+				wmsArrivalDetailTmpLocal.QuarantineControlled   = quarantineControl;
+				wmsArrivalDetailTmpLocal.PdsCWInProgressQty     = cwInProgress;
+			}
+			wmsArrivalDetailTmpLocal.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustInsertArrivalDetailForInventTransId</Name>
+				<Source><![CDATA[
+	/// <summary>
+    ///		Indicates whether <c>WMSArrivalDetailTmp</c> records must be inserted.
+    /// </summary>
+    /// <param name = "_inventTransOrigin">
+    ///		A <c>InventTransOrigin</c> record.
+	/// </param>
+    /// <param name = "_inventDim">
+    ///		A <c>InventDim</c> record.
+	/// </param>
+    /// <returns>
+    ///		A boolean value true, as <c>WMSArrivalDetailTmp</c> records must be inserted.
+	/// </returns>
+    protected boolean mustInsertArrivalDetailForInventTransId(InventTransOrigin _inventTransOrigin, InventDim _inventDim)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>filterOnPurchHeaderDlvMode</Name>
+				<Source><![CDATA[
+    protected boolean filterOnPurchHeaderDlvMode()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildOverviewQuery</Name>
+				<Source><![CDATA[
+    protected Query buildOverviewQuery()
+    {
+        Query                   query                       = new Query();
+        QueryBuildDataSource    qbd_InventTransOrigin       = query.addDataSource(tableNum(InventTransOrigin));
+        QueryBuildDataSource    qbd_InventTrans             = qbd_InventTransOrigin.addDataSource(tableNum(InventTrans));
+        QueryBuildDataSource    qbd_InventDim               = qbd_InventTrans.addDataSource(tableNum(InventDim));
+        str                     referenceCategoryRangeStr   = '';
+
+        query.recordLevelSecurity(true);
+        if (wmsArrivalOverviewOptions.parmParty())
+        {
+            qbd_InventTransOrigin.addRange(fieldNum(InventTransOrigin, Party)).value(queryValue(wmsArrivalOverviewOptions.parmParty()));
+        }
+
+        if (wmsArrivalOverviewOptions.parmItemId())
+        {
+            qbd_InventTransOrigin.addRange(fieldNum(InventTransOrigin, ItemId)).value(queryValue(wmsArrivalOverviewOptions.parmItemId()));
+        }
+
+        referenceCategoryRangeStr = this.getReferenceCategoryRangeStr();
+
+        qbd_InventTransOrigin.addRange(fieldNum(InventTransOrigin, ReferenceCategory)).value(referenceCategoryRangeStr);
+        qbd_InventTransOrigin.addRange(fieldNum(InventTransOrigin, ReferenceId)).value(wmsArrivalOverviewOptions.parmReferenceIdRange());
+
+        qbd_InventTrans.joinMode(JoinMode::InnerJoin);
+        qbd_InventTrans.addLink(fieldNum(InventTransOrigin, RecId), fieldNum(InventTrans, InventTransOrigin));
+
+        qbd_InventDim.joinMode(JoinMode::InnerJoin);
+        qbd_InventDim.relations(true);
+
+        qbd_InventTrans.addRange(fieldNum(InventTrans, DateStatus)).value(SysQuery::range(wmsArrivalOverviewOptions.startDate(), wmsArrivalOverviewOptions.endDate()));
+        qbd_InventTrans.addRange(fieldNum(InventTrans, StatusIssue)).value(queryValue(StatusIssue::None));
+        qbd_InventTrans.addRange(fieldNum(InventTrans, StatusReceipt)).value(queryValue(StatusReceipt::Ordered));
+
+        qbd_InventDim.addRange(fieldNum(InventDim, InventSiteId)).value(wmsArrivalOverviewOptions.parmInventSiteIdDock());
+        qbd_InventDim.addRange(fieldNum(InventDim, InventLocationId)).value(wmsArrivalOverviewOptions.parmWarehouseRange());
+
+        qbd_InventTrans.addGroupByField(fieldNum(InventTrans, DateStatus));
+        qbd_InventTransOrigin.addGroupByField(fieldNum(InventTransOrigin, ReferenceCategory));
+        qbd_InventTransOrigin.addGroupByField(fieldNum(InventTransOrigin, ReferenceId));
+
+        qbd_InventDim.addGroupByField(fieldNum(InventDim, InventSiteId));
+        qbd_InventDim.addGroupByField(fieldNum(InventDim, InventLocationId));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildOverviewQueryPendingRegistration</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a <c>Query</c> object that can be used to select the <c>InventPendingRegistrationDetail</c>
+    /// records that are used to populate the arrival overview header data.
+    /// </summary>
+    /// <returns>
+    /// A <c>Query</c> object that can be used to select <c>InventPendingRegistrationDetail</c> records.
+    /// </returns>
+    protected Query buildOverviewQueryPendingRegistration()
+    {
+        #timeConstants
+        utcdatetime             dateTimeStart;
+        utcdatetime             dateTimeEnd;
+        str                     referenceCategoryRangeStr = '';
+
+        Query                   query = new Query();
+        QueryBuildDataSource    qbds_InventPendingRegistrationDetail = query.addDataSource(tableNum(InventPendingRegistrationDetail));
+
+        query.recordLevelSecurity(true);
+
+        //always filter within current company
+        qbds_InventPendingRegistrationDetail.addRange(fieldNum(InventPendingRegistrationDetail,SourceLineLegalEntityId)).value(queryValue(CompanyInfo::current()));
+
+        if (wmsArrivalOverviewOptions.parmParty())
+        {
+            qbds_InventPendingRegistrationDetail.addRange(fieldNum(InventPendingRegistrationDetail, Party)).value(queryValue(wmsArrivalOverviewOptions.parmParty()));
+        }
+
+        if (wmsArrivalOverviewOptions.parmItemId())
+        {
+            qbds_InventPendingRegistrationDetail.addRange(fieldNum(InventPendingRegistrationDetail, ItemId)).value(queryValue(wmsArrivalOverviewOptions.parmItemId()));
+        }
+
+        //add range on reference categories. For sales returns this is always type sales
+        if (wmsArrivalOverviewOptions.parmInclReturn())
+        {
+            referenceCategoryRangeStr = SysQuery::value(InventTransType::Sales);
+        }
+        else
+        {
+            referenceCategoryRangeStr = this.getReferenceCategoryRangeStr();
+        }
+        qbds_InventPendingRegistrationDetail.addRange(fieldNum(InventPendingRegistrationDetail, ReferenceCategory)).value(referenceCategoryRangeStr);
+        qbds_InventPendingRegistrationDetail.addRange(fieldNum(InventPendingRegistrationDetail, ReferenceID)).value(wmsArrivalOverviewOptions.parmReferenceIdRange());
+
+        //add range on dates
+        dateTimeStart   = DateTimeUtil::newDateTime(wmsArrivalOverviewOptions.startDate(), 0);              //start at the beginning of the start day
+        dateTimeEnd     = DateTimeUtil::newDateTime(wmsArrivalOverviewOptions.endDate(), #secondsPerDay-1); //end at the last second of the end day
+        qbds_InventPendingRegistrationDetail.addRange(fieldNum(InventPendingRegistrationDetail, ExpectedDeliveryDateTime)).value(SysQuery::range(dateTimeStart,dateTimeEnd));
+
+        //add range on site and warehouse
+        qbds_InventPendingRegistrationDetail.addRange(fieldNum(InventPendingRegistrationDetail, InventSiteIdSearchable)).value(wmsArrivalOverviewOptions.parmInventSiteIdDock());
+        qbds_InventPendingRegistrationDetail.addRange(fieldNum(InventPendingRegistrationDetail, InventLocationIdSearchable)).value(wmsArrivalOverviewOptions.parmWarehouseRange());
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildOverviewQueryReturnOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Builds the query that finds return order lines in the <c>SalesLine</c> table.
+    /// </summary>
+    /// <returns>
+    ///    A query object.
+    /// </returns>
+    protected Query buildOverviewQueryReturnOrder()
+    {
+        Query                   query = new Query();
+        QueryBuildDataSource    dsSalesLine    = query.addDataSource(tableNum(SalesLine));
+        QueryBuildDataSource    dataSourceDim   = dsSalesLine.addDataSource(tableNum(InventDim));
+        SalesId                 salesId;
+
+        query.recordLevelSecurity(true);
+
+        if (wmsArrivalOverviewOptions.parmCustVendAC())
+        {
+            dsSalesLine.addRange(fieldNum(SalesLine, CustAccount)).value(queryValue(wmsArrivalOverviewOptions.parmCustVendAC()));
+        }
+
+        if (wmsArrivalOverviewOptions.parmItemId())
+        {
+            dsSalesLine.addRange(fieldNum(SalesLine, ItemId)).value(queryValue(wmsArrivalOverviewOptions.parmItemId()));
+        }
+
+        if (wmsArrivalOverviewOptions.parmReturnItemNum())
+        {
+            salesId = SalesTable::findReturnItemNum(wmsArrivalOverviewOptions.parmReturnItemNum()).SalesId;
+            dsSalesLine.addRange(fieldNum(SalesLine, SalesId)).value(queryValue(salesId));
+        }
+
+        if (wmsArrivalOverviewOptions.parmDlvModeId())
+        {
+            dsSalesLine.addRange(fieldNum(SalesLine, DlvMode)).value(queryValue(wmsArrivalOverviewOptions.parmDlvModeId()));
+        }
+
+        if (wmsArrivalOverviewOptions.parmInventSiteIdDock())
+        {
+            dataSourceDim.addRange(fieldNum(InventDim, InventSiteId)).value(queryValue(wmsArrivalOverviewOptions.parmInventSiteIdDock()));
+        }
+
+        if (wmsArrivalOverviewOptions.parmWarehouseRange())
+        {
+            dataSourceDim.addRange(fieldNum(InventDim, InventLocationId)).value(wmsArrivalOverviewOptions.parmWarehouseRange());
+        }
+
+        dsSalesLine.addRange(fieldNum(SalesLine, SalesId)).value(wmsArrivalOverviewOptions.parmReferenceIdRange());
+
+        dataSourceDim.joinMode(JoinMode::InnerJoin);
+        dataSourceDim.relations(true);
+
+        dsSalesLine.addRange(fieldNum(SalesLine, SalesType)).value(SysQuery::value(SalesType::ReturnItem));
+
+        dsSalesLine.addRange(fieldNum(SalesLine, ReturnStatus)).value(SysQuery::value(ReturnStatusLine::Awaiting));
+        dsSalesLine.addRange(fieldNum(SalesLine, ReturnDeadline)).value(SysQuery::range(wmsArrivalOverviewOptions.startDate(), wmsArrivalOverviewOptions.endDate()));
+        dsSalesLine.addRange(fieldNum(SalesLine, Scrap)).value(enum2Value(NoYes::No));
+        dsSalesLine.addRange(fieldNum(SalesLine, DeliveryType)).value(SysQuery::valueNot(TradeLineDlvType::DropShip));
+
+        dsSalesLine.addSortField(fieldNum(SalesLine, ReturnDeadline));
+        dsSalesLine.addSortField(fieldNum(SalesLine, SalesId));
+        dsSalesLine.orderMode(OrderMode::GroupBy);
+
+        dataSourceDim.addSortField(fieldNum(InventDim, InventSiteId));
+        dataSourceDim.addSortField(fieldNum(InventDim, InventLocationId));
+        dataSourceDim.orderMode(OrderMode::GroupBy);
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPendingRegistationOverview</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reads <c>InventPendingRegistrationDetail</c> records to populate data for the arrival overview from.
+    /// </summary>
+    protected void buildPendingRegistationOverview()
+    {
+        InventPendingRegistrationDetail     inventPendingRegistrationDetail;
+        QueryRun                            queryRun;
+        Query                               query;
+
+        query = this.buildOverviewQueryPendingRegistration();
+        queryRun = new QueryRun(query);
+
+        while (queryRun.next())
+        {
+            inventPendingRegistrationDetail = queryRun.get(tableNum(InventPendingRegistrationDetail)) as InventPendingRegistrationDetail;
+
+            if (this.includeReference(inventPendingRegistrationDetail.ReferenceCategory, inventPendingRegistrationDetail.ReferenceID))
+            {
+                //handle overview records
+                this.buildPendingRegistrationOverview(inventPendingRegistrationDetail);
+            }
+
+            this.trackReferenceWithPendingQuantity(inventPendingRegistrationDetail.ReferenceCategory, inventPendingRegistrationDetail.ReferenceID);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPendingRegistrationDetail</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create records in <c>WMSArrivalDetailTmp</c> from <c>InventPendingRegistrationDetail</c> records and <c>InventPendingQuantity</c> records.
+    /// </summary>
+    /// <param name="_inventPendingRegistrationDetail">
+    /// A <c>InventPendingRegistrationDetail</c> record.
+    /// </param>
+    /// <param name="_inventPendingQuantity">
+    /// An <c>InventPendingQuantity</c> record.
+    /// </param>
+    private void buildPendingRegistrationDetail(
+        InventPendingRegistrationDetail _inventPendingRegistrationDetail,
+        InventPendingQuantity           _inventPendingQuantity)
+    {
+        WMSArrivalDetailTmp             wmsArrivalDetailTmpLocal;
+
+        wmsArrivalDetailTmpLocal.setTmpData(wmsArrivalDetailTmp);
+
+        wmsArrivalDetailTmpLocal.clear();
+
+        wmsArrivalDetailTmpLocal.InventTransId          = _inventPendingRegistrationDetail.ReferenceLineID;
+        wmsArrivalDetailTmpLocal.InventTransType        = _inventPendingRegistrationDetail.ReferenceCategory;
+        wmsArrivalDetailTmpLocal.InventTransRefId       = _inventPendingRegistrationDetail.ReferenceID;
+        wmsArrivalDetailTmpLocal.InventSiteId           = _inventPendingRegistrationDetail.InventSiteIdSearchable;
+        wmsArrivalDetailTmpLocal.InventLocationId       = _inventPendingRegistrationDetail.InventLocationIdSearchable;
+        wmsArrivalDetailTmpLocal.ItemId                 = _inventPendingRegistrationDetail.ItemId;
+        wmsArrivalDetailTmpLocal.Description            = _inventPendingRegistrationDetail.Description;
+        wmsArrivalDetailTmpLocal.SourceLineCategory     = _inventPendingRegistrationDetail.SourceLineCategory;
+        wmsArrivalDetailTmpLocal.DateStatus             = DateTimeUtil::date(_inventPendingRegistrationDetail.ExpectedDeliveryDateTime);
+
+        wmsArrivalDetailTmpLocal.InventQty              = _inventPendingQuantity.Quantity;
+        wmsArrivalDetailTmpLocal.InventPendingQuantity  = _inventPendingQuantity.RecId;
+
+        //these values will have fixed values for pending quantities
+        wmsArrivalDetailTmpLocal.InProgress             = NoYes::No;
+        wmsArrivalDetailTmpLocal.InProgressQty          = 0;
+        wmsArrivalDetailTmpLocal.DirectRegistration     = NoYes::Yes;
+
+        wmsArrivalDetailTmpLocal.PdsCWInProgressQty     = 0;
+
+        if (wmsArrivalDetailTmpLocal.ItemId)
+        {
+            this.initDetailValues(wmsArrivalDetailTmpLocal,wmsArrivalDetailTmpLocal.ItemId,false);
+        }
+        else
+        {
+            wmsArrivalDetailTmpLocal.ArrivalTimeMissing = NoYes::Yes;
+        }
+
+        this.initDetailWeightAndVolumeFields(wmsArrivalDetailTmpLocal,_inventPendingRegistrationDetail.GrossVolume,_inventPendingRegistrationDetail.GrossWeight);
+
+        wmsArrivalDetailTmpLocal.OutOfRange             = !this.isDetailRecordInRange(wmsArrivalDetailTmpLocal);
+
+        //if it is a sales order then try to set the return item number
+        if (wmsArrivalDetailTmpLocal.InventTransType == InventTransType::Sales)
+        {
+            wmsArrivalDetailTmpLocal.ReturnItemNum      = SalesTable::find(wmsArrivalDetailTmpLocal.InventTransRefId).ReturnItemNum;
+        }
+
+        wmsArrivalDetailTmpLocal.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPendingRegistrationDetailsReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create records in <c>WMSArrivalOverviewTmp</c> based on selected
+    /// <c>InventPendingRegistrationDetails</c> records that can be identified by the parameters.
+    /// </summary>
+    /// <param name="_referenceCategory">
+    /// A <c>InventTransType</c> reference category used to identify the
+    /// <c>InventPendingRegistrationDetails</c> records.
+    /// </param>
+    /// <param name="_referenceId">
+    /// A <c>InventTransRefId</c> reference ID used to identify the <c>InventPendingRegistrationDetails</c>
+    /// records.
+    /// </param>
+    private void buildPendingRegistrationDetailsReference(
+        InventTransType         _referenceCategory,
+        InventTransRefId        _referenceId)
+    {
+        InventPendingRegistrationDetail inventPendingRegistrationDetail;
+        InventPendingQuantity           inventPendingQuantity;
+        if (this.mustUsePendingQuantity(_referenceCategory,_referenceId))
+        {
+            SysDaQueryObject qoPendingRegistrationDetail = new SysDaQueryObject(inventPendingRegistrationDetail);
+            SysDaQueryExpression qeWhereClause = this.buildWhereClauseForPendingRegistrationDetailsReference(inventPendingRegistrationDetail, _referenceCategory, _referenceId);
+            qoPendingRegistrationDetail.whereClause(qeWhereClause);
+            qoPendingRegistrationDetail.joinClause(SysDaJoinKind::innerJoin, this.buildJoinClauseForPendingRegistrationDetailsReference(inventPendingRegistrationDetail, inventPendingQuantity));
+            SysDaSearchObject searchObject = new SysDaSearchObject(qoPendingRegistrationDetail);
+            SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+            while (searchStatement.next(searchObject))
+            {
+                this.buildPendingRegistrationDetail(inventPendingRegistrationDetail,inventPendingQuantity);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWhereClauseForPendingRegistrationDetailsReference</Name>
+				<Source><![CDATA[
+    protected SysDaQueryExpression buildWhereClauseForPendingRegistrationDetailsReference(
+        InventPendingRegistrationDetail _inventPendingRegistrationDetail,
+        InventTransType                 _referenceCategory,
+        InventTransRefId                _referenceId)
+    {
+        SysDaQueryExpression pendingRegistrationDetailsReferenceWhereClause =
+                 new SysDaEqualsExpression(new SysDaFieldExpression(_inventPendingRegistrationDetail, fieldStr(InventPendingRegistrationDetail, ReferenceCategory)), new SysDaValueExpression(_referenceCategory))
+            .and(new SysDaEqualsExpression(new SysDaFieldExpression(_inventPendingRegistrationDetail, fieldStr(InventPendingRegistrationDetail, ReferenceID)), new SysDaValueExpression(_referenceId)))
+            .and(new SysDaEqualsExpression(new SysDaFieldExpression(_inventPendingRegistrationDetail, fieldStr(InventPendingRegistrationDetail, SourceLineLegalEntityId)), new SysDaValueExpression(CompanyInfo::current())));
+        return pendingRegistrationDetailsReferenceWhereClause;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildJoinClauseForPendingRegistrationDetailsReference</Name>
+				<Source><![CDATA[
+    protected SysDaQueryObject buildJoinClauseForPendingRegistrationDetailsReference(
+        InventPendingRegistrationDetail _inventPendingRegistrationDetail,
+        InventPendingQuantity           _inventPendingQuantity)
+    {
+        SysDaQueryObject qeInventPendingQuantity = new SysDaQueryObject(_inventPendingQuantity);
+        qeInventPendingQuantity.whereClause(new SysDaEqualsExpression(new SysDaFieldExpression(_inventPendingRegistrationDetail, fieldStr(InventPendingRegistrationDetail, InventPendingQuantity)), new SysDaFieldExpression(_inventPendingQuantity, fieldStr(InventPendingQuantity, RecId))));
+        return qeInventPendingQuantity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPendingRegistrationOverview</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates records in the <c>WMSArrivalOverviewTmp</c> table from an
+    /// <c>InventPendingRegistrationDetail</c> record.
+    /// </summary>
+    /// <param name="_inventPendingRegistrationDetail">
+    /// A <c>InventPendingRegistrationDetail</c> record.
+    /// </param>
+    protected void buildPendingRegistrationOverview(InventPendingRegistrationDetail _inventPendingRegistrationDetail)
+    {
+        date expectedDeliveryDate = DateTimeUtil::date(_inventPendingRegistrationDetail.ExpectedDeliveryDateTime);
+
+        //since we can have a mix between order lines with inventtrans and order lines with pending registration we must check if a header has allreday been created
+        if (!WMSArrivalOverviewTmp::find(wmsArrivalOverviewTmp,
+                                         expectedDeliveryDate,
+                                         _inventPendingRegistrationDetail.ReferenceCategory,
+                                         _inventPendingRegistrationDetail.ReferenceID,
+                                         _inventPendingRegistrationDetail.InventSiteIdSearchable,
+                                         _inventPendingRegistrationDetail.InventLocationIdSearchable).RecId)
+        {
+            wmsArrivalOverviewTmp.clear();
+            this.initOverviewValues(wmsArrivalOverviewTmp,
+                                    expectedDeliveryDate,
+                                    _inventPendingRegistrationDetail.ReferenceCategory,
+                                    _inventPendingRegistrationDetail.ReferenceID,
+                                    _inventPendingRegistrationDetail.InventSiteIdSearchable,
+                                    _inventPendingRegistrationDetail.InventLocationIdSearchable);
+
+            wmsArrivalOverviewTmp.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPurch</Name>
+				<Source><![CDATA[
+    protected void buildPurch(PurchId   _purchId)
+    {
+        PurchLine                       purchLine;
+        WMSJournalTransUnPosted         wmsJournalTransUnPosted;
+        TradeInstrumentationStopwatch   instrumentationStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+        int64                           purchaseOrderLineCount;
+
+        inventoryTransactionCount = 0;
+
+        SysDaQueryObject qePurchLine = this.buildPurchaseOrderQuery(_purchId, purchLine, wmsJournalTransUnPosted);
+				        	
+        SysDaSearchObject searchObject = new SysDaSearchObject(qePurchLine);
+        SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+
+        while (searchStatement.nextRecord(searchObject))
+        {
+            purchaseOrderLineCount++;
+
+            if (purchLine.StockedProduct == NoYes::Yes)
+            {
+                this.insertToWMSJournalTransDataCaches(purchLine.InventTransId,wmsJournalTransUnPosted.Qty,wmsJournalTransUnPosted.PdsCWQty,wmsJournalTransUnPosted.CreateQuarantineOrder);
+                this.buildInventTransId(purchLine.InventTransId);
+            }
+            else //we then need to examine the pending quantities for this order
+            {
+                this.trackReferenceWithPendingQuantity(InventTransType::Purch, purchLine.PurchId);
+            }
+        }
+
+        this.addMeasure(funcName(), instrumentationStopWatch.elapsedMilliseconds(), purchaseOrderLineCount, inventoryTransactionCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPurchaseOrderQuery</Name>
+				<Source><![CDATA[
+	/// <summary>
+    ///		Builds query object for <c>PurchLine</c> record.
+    /// </summary>
+    /// <param name = "_purchId">
+    ///		A purchase order Id.
+	/// </param>
+    /// <param name = "_purchLine">
+    ///		A purchase order line.
+	/// </param>
+    /// <param name = "_wmsJournalTransUnPosted">
+    ///		An unposted location journal line.
+	/// </param>
+    /// <returns>
+    ///		A purchase order query object.
+	/// </returns>
+    protected SysDaQueryObject buildPurchaseOrderQuery(PurchId _purchId, PurchLine _purchLine, WMSJournalTransUnPosted _wmsJournalTransUnPosted)
+    {
+        SysDaQueryObject qePurchLine = new SysDaQueryObject(_purchLine);
+        qePurchLine.projection()
+                .add(fieldStr(PurchLine, InventTransId))
+                .add(fieldStr(PurchLine, StockedProduct))
+                .add(fieldStr(PurchLine, PurchId));
+
+        qePurchLine = this.buildGroupByClauseForPurchaseOrderQuery(qePurchLine);
+
+        SysDaQueryExpression whereClause = this.buildWhereClauseForPurchaseOrderQuery(_purchLine, _purchId);
+        qePurchLine.whereClause(whereClause);
+
+        qePurchLine.joinClause(SysDaJoinKind::OuterJoin, this.buildJoinClauseForPurchaseOrderQuery(_purchLine, _wmsJournalTransUnPosted));
+
+        return qePurchLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGroupByClauseForPurchaseOrderQuery</Name>
+				<Source><![CDATA[
+	/// <summary>
+    ///		Builds group by clause for purchase order query.
+    /// </summary>
+    /// <param name = "_qePurchLine">
+    ///		A purchase order query object.
+	/// </param>
+    /// <returns>
+    ///		A purchase order query object.
+    /// </returns>
+    protected SysDaQueryObject buildGroupByClauseForPurchaseOrderQuery(SysDaQueryObject _qePurchLine)
+    {
+        _qePurchLine.groupByClause()
+			.add(fieldStr(PurchLine, InventTransId))
+			.add(fieldStr(PurchLine, StockedProduct))
+			.add(fieldStr(PurchLine, PurchId));
+
+        return _qePurchLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWhereClauseForPurchaseOrderQuery</Name>
+				<Source><![CDATA[
+	/// <summary>
+    ///		Builds where clause for <c>PurchLine</c> record.
+    /// </summary>
+    /// <param name = "_purchLine">
+    ///		A purchase order line.
+	/// </param>
+    /// <param name = "_purchId">
+    ///		A purchase order Id.
+	/// </param>
+    /// <returns>
+    ///		A purchase order query expression.
+	/// </returns>
+    protected SysDaQueryExpression buildWhereClauseForPurchaseOrderQuery(PurchLine _purchLine, PurchId _purchId)
+    {
+        SysDaQueryExpression purchLineWhereClause =
+                         new SysDaEqualsExpression(new SysDaFieldExpression(_purchLine, fieldStr(PurchLine, PurchId)), new SysDaValueExpression(_purchId))
+					.and(new SysDaEqualsExpression(new SysDaFieldExpression(_purchLine, fieldStr(PurchLine, IsDeleted)), new SysDaValueExpression(NoYes::No)))
+                    .and(new SysDaNotEqualsExpression(new SysDaFieldExpression(_purchLine, fieldStr(PurchLine, DeliveryType)), new SysDaValueExpression(TradeLineDlvType::DropShip))); //exclude direct deliveries since they will not arrive at our warehouse
+
+        return purchLineWhereClause;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildJoinClauseForPurchaseOrderQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///		Builds join clause for purchase order query.
+    /// </summary>
+    /// <param name = "_purchLine">
+    ///		A purchase order line.
+    /// </param>
+    /// <param name = "_wmsJournalTransUnPosted">
+    ///		An unposted location journal line.
+    /// </param>
+    /// <returns>
+    ///		A purchase order query object.
+    /// </returns>
+    protected SysDaQueryObject buildJoinClauseForPurchaseOrderQuery(PurchLine _purchLine, WMSJournalTransUnPosted _wmsJournalTransUnPosted)
+    {
+        SysDaQueryObject qeWMSJournalTransUnPosted = new SysDaQueryObject(_wmsJournalTransUnPosted);
+
+        qeWMSJournalTransUnPosted.projection()
+                .addSum(fieldStr(WMSJournalTransUnPosted, Qty))
+                .addSum(fieldStr(WMSJournalTransUnPosted, PdsCWQty))
+                .addMax(fieldStr(WMSJournalTransUnPosted, CreateQuarantineOrder));
+        qeWMSJournalTransUnPosted.whereClause(new SysDaEqualsExpression(new SysDaFieldExpression(_wmsJournalTransUnPosted, fieldStr(WMSJournalTransUnPosted, InventTransId)), new SysDaFieldExpression(_purchLine, fieldStr(PurchLine, InventTransId))));
+
+        qeWMSJournalTransUnPosted.joinClauseKind(SysDaJoinKind::OuterJoin);
+
+        return qeWMSJournalTransUnPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildReference</Name>
+				<Source><![CDATA[
+    protected void buildReference(
+        InventTransType         _inventTransType,
+        InventTransRefId        _inventTransRefId)
+    {
+        switch (_inventTransType)
+        {
+            case InventTransType::Sales:
+                this.buildSales(_inventTransRefId);
+                break;
+            case InventTransType::Production:
+                this.buildProductionOrder(ProdTable::find(_inventTransRefId).InventTransId);
+                break;
+            case InventTransType::PmfProdCoBy:
+                this.buildProductionCoByProduct(_inventTransRefId);
+                break;
+            case InventTransType::Purch:
+                this.buildPurch(_inventTransRefId);
+                break;
+            case InventTransType::InventTransaction:
+            case InventTransType::InventLossProfit:
+            case InventTransType::InventTransfer:
+            case InventTransType::BOMLine:
+            case InventTransType::BOMMain:
+            case InventTransType::InventCounting:
+            case InventTransType::Asset:
+                this.buildInventJournal(_inventTransRefId);
+                break;
+            case InventTransType::QuarantineOrder:
+                this.buildQuarantineOrder(InventQuarantineOrder::find(_inventTransRefId).InventTransId);
+                break;
+            case InventTransType::TransferOrderReceive:
+                this.buildTransferOrder(_inventTransRefId);
+                break;
+            default:
+                this.buildDefault(_inventTransType, _inventTransRefId);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildReturnOrderFromSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Inserts the return order details into the temp <c>WMSArrivalDetailTmp</c> table displayed in the
+    ///    detail section of the Arrival overview form.
+    /// </summary>
+    /// <param name="_salesLine">
+    /// A <c>SalesLine</c> record to initialize the <c>WMSArrivalDetailTmp</c> record from.
+    /// </param>
+    /// <param name="_inventDim">
+    /// An <c>InventDim</c>record to initialize the <c>WMSArrivalDetailTmp</c> record from.
+    /// </param>
+    protected void buildReturnOrderFromSalesLine(
+        SalesLine   _salesLine,
+        InventDim   _inventDim)
+    {
+        WMSArrivalDetailTmp  wmsArrivalDetailTmpLocal = this.initReturnOrderFromSalesLine(_salesLine, _inventDim);
+
+        if (wmsArrivalDetailTmpLocal.QuarantineControlled == NoYes::Yes)
+        {
+            wmsJournalTransWithCreateQuarantineOrder.add(_salesLine.InventTransId);
+        }
+
+        if (FeatureStateProvider::IsFeatureEnabled(KittingFeature::instance()))
+        {
+            this.kittingInitWMSArrivalDetailTmp_delegate(wmsArrivalDetailTmpLocal, _salesLine);
+        }
+
+        wmsArrivalDetailTmpLocal.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initReturnOrderFromSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a <c>WMSArrivalDetailTmp</c> table with return order details.
+    /// </summary>
+    /// <param name="_salesLine">
+    /// A <c>SalesLine</c> record to initialize the <c>WMSArrivalDetailTmp</c> record from.
+    /// </param>
+    /// <param name="_inventDim">
+    /// An <c>InventDim</c>record to initialize the <c>WMSArrivalDetailTmp</c> record from.
+    /// </param>
+    /// <returns>The initialized table.</returns>
+    protected WMSArrivalDetailTmp initReturnOrderFromSalesLine(
+        SalesLine   _salesLine,
+        InventDim   _inventDim)
+    {
+        WMSArrivalDetailTmp     wmsArrivalDetailTmpLocal;
+        InventQuarantineControl quarantineControlOnJournalLines;
+        PdsCWInProgressQty      cwInProgress;
+        InventQty               inProgress;
+
+        wmsArrivalDetailTmpLocal.setTmpData(wmsArrivalDetailTmp);
+        [inProgress, cwInProgress, quarantineControlOnJournalLines] = this.findValuesFromWMSJournalTrans(_salesLine.InventTransId);
+
+        wmsArrivalDetailTmpLocal.clear();
+        wmsArrivalDetailTmpLocal.InventTransId      = _salesLine.InventTransId;
+        wmsArrivalDetailTmpLocal.InventTransType    = InventTransType::Sales;
+        wmsArrivalDetailTmpLocal.InventTransRefId   = _salesLine.SalesId;
+        wmsArrivalDetailTmpLocal.DateStatus         = _salesLine.ReturnDeadline;
+        wmsArrivalDetailTmpLocal.InventSiteId       = _inventDim.InventSiteId;
+        wmsArrivalDetailTmpLocal.InventLocationId   = _inventDim.InventLocationId;
+        wmsArrivalDetailTmpLocal.InventQty          = max(0, _salesLine.calcQtyOrdered(_salesLine.ExpectedRetQty *-1)  - inProgress);
+        wmsArrivalDetailTmpLocal.InProgressQty      = inProgress;
+
+        wmsArrivalDetailTmpLocal.PdsCWQty           = max(0,(_salesLine.PdsCWExpectedRetQty * -1) - cwInProgress);
+        wmsArrivalDetailTmpLocal.ReturnItemNum      = SalesTable::find(_salesLine.SalesId).ReturnItemNum;
+        this.initDetailValues(wmsArrivalDetailTmpLocal,_salesLine.ItemId,true);
+        wmsArrivalDetailTmpLocal.OutOfRange         = !this.isDetailRecordInRange(wmsArrivalDetailTmpLocal);
+
+        if (wmsArrivalDetailTmpLocal.InProgressQty)
+        {
+            wmsArrivalDetailTmpLocal.InProgress     = NoYes::Yes;
+            wmsArrivalDetailTmpLocal.PdsCWInProgressQty = cwInProgress;
+
+            if (wmsArrivalDetailTmpLocal.QuarantineControlled == NoYes::No)
+            {
+                wmsArrivalDetailTmpLocal.QuarantineControlled = quarantineControlOnJournalLines;
+            }
+        }
+        return wmsArrivalDetailTmpLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSales</Name>
+				<Source><![CDATA[
+    protected void buildSales(SalesId   _salesId)
+    {
+        SalesLine                       salesLine;
+        InventDim                       inventDim;
+        TradeInstrumentationStopwatch   instrumentationStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+        int64                           salesOrderLineCount;
+
+        inventoryTransactionCount = 0;
+
+        SysDaQueryObject salesLineQueryObject = this.buildSalesOrderQuery(_salesId, salesLine, inventDim);
+
+        SysDaSearchObject searchObject = new SysDaSearchObject(salesLineQueryObject);
+        SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+
+        while (searchStatement.nextRecord(searchObject))
+        {
+            salesOrderLineCount++;
+
+            if (salesLine.StockedProduct)
+            {
+                switch (salesLine.ReturnStatus)
+                {
+                    case ReturnStatusLine::Awaiting:
+                        this.buildReturnOrderFromSalesLine(salesLine, inventDim);
+                        break;
+
+                    case ReturnStatusLine::None:
+                        this.buildInventTransId(salesLine.InventTransId);
+                        break;
+
+                    default : //added to protect code from wrong changes
+                        throw error(error::wrongUseOfFunction(funcName()));
+                }
+            }
+            else //we then need to examine the pending quantities for this order
+            {
+                this.trackReferenceWithPendingQuantity(InventTransType::Sales, salesLine.SalesId);
+            }
+        }
+
+        this.addMeasure(funcName(), instrumentationStopWatch.elapsedMilliseconds(), salesOrderLineCount, inventoryTransactionCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSalesOrderQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///		Builds query object for <c>SalesLine</c> record.
+    /// </summary>
+    /// <param name = "_salesId">
+    ///		A sales order Id.
+    /// </param>
+    /// <param name = "_salesLine">
+    ///		A sales order line.
+    /// </param>
+    /// <param name = "_inventDim">
+    ///		An inventory dimension record.
+    /// </param>
+    /// <returns>
+    ///		A sales order query object.
+    /// </returns>
+    protected SysDaQueryObject buildSalesOrderQuery(SalesId _salesId, SalesLine _salesLine, InventDim _inventDim)
+    {
+        SysDaQueryObject salesLineQueryObject = new SysDaQueryObject(_salesLine);
+
+        SysDaQueryExpression whereClause = this.buildWhereClauseForSalesOrderQuery(_salesLine, _salesId);
+        salesLineQueryObject.whereClause(whereClause);
+
+        salesLineQueryObject.joinClause(SysDaJoinKind::InnerJoin, this.buildJoinClauseForSalesOrderQuery(_salesLine, _inventDim));
+
+        return salesLineQueryObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWhereClauseForSalesOrderQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///		Builds where clause for <c>SalesLine</c> record.
+    /// </summary>
+    /// <param name = "_salesLine">
+    ///		A sales order line.
+    /// </param>
+    /// <param name = "_salesId">
+    ///		A sales order Id.
+    /// </param>
+    /// <returns>
+    ///		A sales order query expression.
+    /// </returns>
+    protected SysDaQueryExpression buildWhereClauseForSalesOrderQuery(SalesLine _salesLine, SalesId _salesId)
+    {
+        SysDaQueryExpression salesLineWhereClause =
+                         new SysDaEqualsExpression(new SysDaFieldExpression(_salesLine, fieldStr(SalesLine, SalesId)), new SysDaValueExpression(_salesId))
+                    .and(new SysDaNotEqualsExpression(new SysDaFieldExpression(_salesLine, fieldStr(SalesLine, DeliveryType)), new SysDaValueExpression(TradeLineDlvType::DropShip))) //exclude direct deliveries since they will not arrive at our warehouse
+                    .and(new SysDaOrExpression(
+                        new SysDaEqualsExpression(new SysDaFieldExpression(_salesLine, fieldStr(SalesLine, ReturnStatus)), new SysDaValueExpression(ReturnStatusLine::None)),
+                        new SysDaEqualsExpression(new SysDaFieldExpression(_salesLine, fieldStr(SalesLine, ReturnStatus)), new SysDaValueExpression(ReturnStatusLine::Awaiting))
+                        ));
+
+        return salesLineWhereClause;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildJoinClauseForSalesOrderQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///		Builds join clause for sales order query.
+    /// </summary>
+    /// <param name = "_salesLine">
+    ///		A sales order line.
+    /// </param>
+    /// <param name = "_inventDim">
+    ///		An inventory dimension record.
+    /// </param>
+    /// <returns>
+    ///		A sales order query object.
+    /// </returns>
+    protected SysDaQueryObject buildJoinClauseForSalesOrderQuery(SalesLine _salesLine, InventDim _inventDim)
+    {
+        SysDaQueryObject qeInventDim = new SysDaQueryObject(_inventDim);
+
+        qeInventDim.projection()
+                .add(fieldStr(InventDim, InventSiteId))
+                .add(fieldStr(InventDim, InventLocationId));
+        qeInventDim.whereClause(new SysDaEqualsExpression(new SysDaFieldExpression(_inventDim, fieldStr(InventDim, InventDimId)), new SysDaFieldExpression(_salesLine, fieldStr(SalesLine, InventDimId))));
+
+        return qeInventDim;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildTransferOrder</Name>
+				<Source><![CDATA[
+    protected void buildTransferOrder(InventTransferId  _inventTransferId)
+    {
+        InventTransferLine              inventTransferLine;
+        WMSJournalTransUnPosted         wmsJournalTransUnPosted;
+        TradeInstrumentationStopwatch   instrumentationStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+        int64                           transferOrderCount;
+
+        inventoryTransactionCount = 0;
+
+        SysDaQueryObject qeInventTransferLine = this.buildTransferOrderQuery(_inventTransferId, inventTransferLine, wmsJournalTransUnPosted);
+		        
+        SysDaSearchObject searchObject = new SysDaSearchObject(qeInventTransferLine);
+        SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+
+        while (searchStatement.nextRecord(searchObject))
+        {
+            transferOrderCount++;
+
+            this.insertToWMSJournalTransDataCaches(inventTransferLine.InventTransIdReceive,wmsJournalTransUnPosted.Qty,wmsJournalTransUnPosted.PdsCWQty,wmsJournalTransUnPosted.CreateQuarantineOrder);
+            this.buildInventTransId(inventTransferLine.InventTransIdReceive);
+        }
+
+        this.addMeasure(funcName(), instrumentationStopWatch.elapsedMilliseconds(), transferOrderCount, inventoryTransactionCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildTransferOrderQuery</Name>
+				<Source><![CDATA[
+	/// <summary>
+    ///		Builds query object for <c>InventTransferLine</c> record.
+    /// </summary>
+    /// <param name = "_inventTransferId">
+    ///		A transfer order Id.
+	/// </param>
+    /// <param name = "_inventTransferLine">
+	///		A transfer order line.
+	/// </param>
+    /// <param name = "_wmsJournalTransUnPosted">
+	///		An unposted location journal line.
+	/// </param>
+    /// <returns>
+    ///		A transfer order query object.
+	/// </returns>
+    protected SysDaQueryObject buildTransferOrderQuery(InventTransferId _inventTransferId, InventTransferLine _inventTransferLine, WMSJournalTransUnPosted _wmsJournalTransUnPosted)
+    {
+        SysDaQueryObject qeInventTransferLine = new SysDaQueryObject(_inventTransferLine);
+        qeInventTransferLine.projection()
+            .add(fieldStr(InventTransferLine, InventTransIdReceive));
+
+        qeInventTransferLine = this.buildGroupByClauseForTransferOrderQuery(qeInventTransferLine);
+
+        SysDaQueryExpression whereClause = this.buildWhereClauseForTransferOrderQuery(_inventTransferLine, _inventTransferId);
+        qeInventTransferLine.whereClause(whereClause);
+        
+        qeInventTransferLine.joinClause(SysDaJoinKind::OuterJoin, this.buildJoinClauseForTransferOrderQuery(_inventTransferLine, _wmsJournalTransUnPosted));
+
+        return qeInventTransferLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGroupByClauseForTransferOrderQuery</Name>
+				<Source><![CDATA[
+	/// <summary>
+    ///		Builds group by clause for transfer order query.
+    /// </summary>
+    /// <param name = "_qeInventTransferLine">
+	///		A transfer order line query object.
+	/// </param>
+    /// <returns>
+    ///		A transfer order line query object.
+    /// </returns>
+    protected SysDaQueryObject buildGroupByClauseForTransferOrderQuery(SysDaQueryObject _qeInventTransferLine)
+    {
+        _qeInventTransferLine.groupByClause().add(fieldStr(InventTransferLine, InventTransIdReceive));
+
+        return _qeInventTransferLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWhereClauseForTransferOrderQuery</Name>
+				<Source><![CDATA[
+	/// <summary>
+    ///		Builds where clause for <c>InventTransferLine</c> record.
+    /// </summary>
+    /// <param name = "_inventTransferLine">
+	///		A transfer order line.
+	/// </param>
+    /// <param name = "_inventTransferId">
+    ///		A transfer order Id.
+	/// </param>
+    /// <returns>
+    ///		A transfer order query expression.
+	/// </returns>
+    protected SysDaQueryExpression buildWhereClauseForTransferOrderQuery(InventTransferLine _inventTransferLine, InventTransferId _inventTransferId)
+    {
+        SysDaQueryExpression inventTransferLineWhereClause =
+			new SysDaEqualsExpression(
+                new SysDaFieldExpression(_inventTransferLine, fieldStr(InventTransferLine, TransferId)), new SysDaValueExpression(_inventTransferId));
+
+        return inventTransferLineWhereClause;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildJoinClauseForTransferOrderQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///		Builds join clause for transfer order query.
+    /// </summary>
+    /// <param name = "_inventTransferLine">
+    ///		A transfer order line.
+    /// </param>
+    /// <param name = "_wmsJournalTransUnPosted">
+    ///		An unposted location journal line.
+    /// </param>
+    /// <returns>
+    ///		A transfer order query object.
+    /// </returns>
+    protected SysDaQueryObject buildJoinClauseForTransferOrderQuery(InventTransferLine _inventTransferLine, WMSJournalTransUnPosted _wmsJournalTransUnPosted)
+    {
+        SysDaQueryObject qeWMSJournalTransUnPosted = new SysDaQueryObject(_wmsJournalTransUnPosted);
+        
+        qeWMSJournalTransUnPosted.projection()
+            .addSum(fieldStr(WMSJournalTransUnPosted, Qty))
+            .addSum(fieldStr(WMSJournalTransUnPosted, PdsCWQty))
+            .addMax(fieldStr(WMSJournalTransUnPosted, CreateQuarantineOrder));
+        qeWMSJournalTransUnPosted.whereClause(new SysDaEqualsExpression(new SysDaFieldExpression(_wmsJournalTransUnPosted, fieldStr(WMSJournalTransUnPosted, InventTransId)), new SysDaFieldExpression(_inventTransferLine, fieldStr(InventTransferLine, InventTransIdReceive))));
+
+        qeWMSJournalTransUnPosted.joinClauseKind(SysDaJoinKind::OuterJoin);
+
+        return qeWMSJournalTransUnPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildProductionOrder</Name>
+				<Source><![CDATA[
+    protected void buildProductionOrder(InventTransId  _inventTransId)
+    {
+        TradeInstrumentationStopwatch   instrumentationStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+
+        inventoryTransactionCount = 0;
+
+        this.buildInventTransId(_inventTransId);
+
+        this.addMeasure(funcName(), instrumentationStopWatch.elapsedMilliseconds(), 1, inventoryTransactionCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildProductionCoByProduct</Name>
+				<Source><![CDATA[
+    protected void buildProductionCoByProduct(InventTransRefId _inventTransRefId)
+    {
+        PmfProdCoBy                     pmfProdCoBy;
+        TradeInstrumentationStopwatch   instrumentationStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+        int64                           productionCoByProductCount;
+
+        inventoryTransactionCount = 0;
+
+        while select InventTransId from pmfProdCoBy
+                    where pmfProdCoBy.ProdId == _inventTransRefId
+        {
+            productionCoByProductCount++;
+
+            this.buildInventTransId(pmfProdCoBy.InventTransId);
+        }
+
+        this.addMeasure(funcName(), instrumentationStopWatch.elapsedMilliseconds(), productionCoByProductCount, inventoryTransactionCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildQuarantineOrder</Name>
+				<Source><![CDATA[
+    protected void buildQuarantineOrder(InventTransId  _inventTransId)
+    {
+        TradeInstrumentationStopwatch   instrumentationStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+
+        inventoryTransactionCount = 0;
+
+        this.buildInventTransId(_inventTransId);
+
+        this.addMeasure(funcName(), instrumentationStopWatch.elapsedMilliseconds(), 1, inventoryTransactionCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteArrivalDetailTmp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes records in the <c>WMSArrivalDetailTmp</c> table.
+    /// </summary>
+    private void deleteArrivalDetailTmp()
+    {
+        WMSArrivalDetailTmp wmsArrivalDetailTmpLocal;
+
+        wmsArrivalDetailTmpLocal.setTmpData(wmsArrivalDetailTmp);
+
+        delete_from wmsArrivalDetailTmpLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doesItemHaveQuarantineOnModelGroup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if an item have quarantine control enabled on its model group.
+    /// </summary>
+    /// <param name="_inventTable">
+    /// The item for which the model group should be examined.
+    /// </param>
+    /// <returns>
+    /// true if quarantine control is enabled; Otherwise, false.
+    /// </returns>
+    private boolean doesItemHaveQuarantineOnModelGroup(InventTable _inventTable)
+    {
+        boolean value = false;
+
+        if (itemModelGroupQuarantine.exists(_inventTable.ItemId))
+        {
+            return itemModelGroupQuarantine.lookup(_inventTable.ItemId);
+        }
+
+        if (_inventTable.modelGroup().QuarantineControl == NoYes::Yes)
+        {
+            value = true;
+        }
+
+        itemModelGroupQuarantine.insert(_inventTable.ItemId,value);
+
+        return value;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doesReferenceHaveAnyPendingQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if any pending quantities associated with the reference parameters existed.
+    /// </summary>
+    /// <param name="_inventTransType">
+    /// The <c>InventTransType</c> type of the order.
+    /// </param>
+    /// <param name="_inventTransRefId">
+    /// The <c>InventTransRefId</c> ID of the order.
+    /// </param>
+    /// <returns>
+    /// true if any pending quantities existed; Otherwise, false.
+    /// </returns>
+    private boolean doesReferenceHaveAnyPendingQuantity(
+        InventTransType         _inventTransType,
+        InventTransRefId        _inventTransRefId)
+    {
+        if (referencesWithPendingQuantities.in([_inventTransType,_inventTransRefId]))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fillTables</Name>
+				<Source><![CDATA[
+    protected container fillTables()
+    {
+        Query                       query;
+        Query                       queryReturnOrder;
+        QueryRun                    queryRun;
+        QueryRun                    queryRunReturnOrder;
+        InventTransOrigin           inventTransOrigin;
+        InventTrans                 inventTrans;
+        SalesLine                   salesLine;
+        InventDim                   inventDim;
+        container                   inProgressTotals;
+
+        ttsbegin;
+        delete_from wmsArrivalOverviewTmp;
+        //delete any existing details
+        this.deleteArrivalDetailTmp();
+
+        if (wmsArrivalOverviewOptions.parmInclReturn())
+        {
+            queryReturnOrder = this.buildOverviewQueryReturnOrder();
+            queryRunReturnOrder = new QueryRun(queryReturnOrder);
+            while (queryRunReturnOrder.next())
+            {
+                salesLine = queryRunReturnOrder.get(tableNum(SalesLine));
+                if (this.includeReference(InventTransType::Sales, salesLine.SalesId))
+                {
+                    inventDim   = queryRunReturnOrder.get(tableNum(InventDim));
+
+                    wmsArrivalOverviewTmp.clear();
+                    this.initOverviewValues(wmsArrivalOverviewTmp,
+                                            salesLine.ReturnDeadline,
+                                            InventTransType::Sales,
+                                            salesLine.SalesId,
+                                            inventDim.InventSiteId,
+                                            inventDim.InventLocationId);
+                    wmsArrivalOverviewTmp.insert();
+                }
+            }
+        }
+        else
+        {
+            query = this.buildOverviewQuery();
+            queryRun = new QueryRun(query);
+            while (queryRun.next())
+            {
+                inventTransOrigin = queryRun.get(tableNum(InventTransOrigin));
+                inventTrans       = queryRun.get(tableNum(InventTrans));
+                if (this.includeReference(inventTransOrigin.ReferenceCategory, inventTransOrigin.ReferenceId))
+                {
+                    inventDim   = queryRun.get(tableNum(InventDim));
+                    wmsArrivalOverviewTmp.clear();
+                    this.initOverviewValues(wmsArrivalOverviewTmp,
+                                            inventTrans.DateStatus,
+                                            inventTransOrigin.ReferenceCategory,
+                                            inventTransOrigin.ReferenceId,
+                                            inventDim.InventSiteId,
+                                            inventDim.InventLocationId);
+
+                    if (!wmsArrivalOverviewTmp.ReturnItemNum)
+                    {
+                        wmsArrivalOverviewTmp.insert();
+                    }
+                }
+            }
+        }
+
+        //build data from pending registrations - this is done both for sales order return scenario and normal receipt scenario
+        this.buildPendingRegistationOverview();
+
+        this.buildDetails();
+
+        this.updateOverviewInformation();
+
+        ttscommit;
+
+        this.logMeasures();
+
+        inProgressTotals = WMSArrivalOverviewGeneration::getInProgressTotals(wmsArrivalDetailTmp);
+        return inProgressTotals;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findValuesFromWMSJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves a container with aggregated values from the unposted <c>WMSJournalTrans</c> journal lines.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// The <c>InventTransId</c> ID that the journal lines should be selected by.
+    /// </param>
+    /// <returns>
+    /// A container with aggregated values from the unposted <c>WMSJournalTrans</c> journal lines.
+    /// </returns>
+    private container findValuesFromWMSJournalTrans(InventTransId _inventTransId)
+    {
+        WMSJournalTransUnPosted wmsJournalTransUnPosted;
+
+        if (!wmsJournalTransDataCache.exists(_inventTransId))
+        {
+            select sum(Qty), sum(PdsCWQty), maxof(CreateQuarantineOrder) from wmsJournalTransUnPosted
+                where wmsJournalTransUnPosted.InventTransId == _inventTransId;
+
+            this.insertToWMSJournalTransDataCaches(_inventTransId,wmsJournalTransUnPosted.Qty,wmsJournalTransUnPosted.PdsCWQty,wmsJournalTransUnPosted.CreateQuarantineOrder);
+        }
+
+        return wmsJournalTransDataCache.lookup(_inventTransId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addInventTransTypeToRange</Name>
+				<Source><![CDATA[
+    protected str addInventTransTypeToRange(str _range, InventTransType _inventTransType, boolean _negated = false)
+    {
+        if (_range)
+        {
+            _range += ', ';
+        }
+
+        if (_negated)
+        {
+            _range += SysQuery::valueNot(_inventTransType);
+        }
+        else
+        {
+            _range += SysQuery::value(_inventTransType);
+        }
+
+        return _range;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReferenceCategoryRangeStr</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves a string that is a range of the reference categories to include or exclude.
+    /// </summary>
+    /// <returns>
+    /// A string that is a range of the reference categories to include or exclude.
+    /// </returns>
+    private str getReferenceCategoryRangeStr()
+    {
+        str typeRangeStr = '';
+
+        str alwaysExcludedTypeRange()
+        {
+            str excludedTypes = '';
+            
+            DictEnum dictEnum = DictEnum::newFromName(enumStr(InventTransType));
+            Enumerator enum = dictEnum.getEnumerator();
+
+            while (enum.moveNext())
+            {
+                InventTransType inventTransType = enum.current();
+
+                if (!WMSJournalTable::canTransTypeBeHandled(inventTransType))
+                {
+                    excludedTypes = this.addInventTransTypeToRange(excludedTypes, inventTransType, true);
+                }
+            }
+            return excludedTypes;
+        }
+
+        if (wmsArrivalOverviewOptions.parmInclOther())
+        {
+            typeRangeStr  = alwaysExcludedTypeRange();
+
+            if (!this.allOptionsIncludeOtherEnabled())
+            {
+                if (!wmsArrivalOverviewOptions.parmInclPurch())
+                {
+                    typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::Purch, true);
+                }
+                if (!wmsArrivalOverviewOptions.parmInclProd())
+                {
+                    typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::Production, true);
+                    typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::PmfProdCoBy, true);
+                }
+                if (!wmsArrivalOverviewOptions.parmInclTransfer())
+                {
+                    typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::TransferOrderReceive, true);
+                }
+                if (!wmsArrivalOverviewOptions.parmInclQuarantine())
+                {
+                    typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::QuarantineOrder, true);
+                }
+                if (!wmsArrivalOverviewOptions.parmIncludeConsignmentReplenishmentOrder())
+                {
+                    typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::ConsignmentReplenishmentOrder, true);
+                }
+
+                typeRangeStr = this.addAdditionalTypeRange(typeRangeStr, true);
+            }
+        }
+        else
+        {
+            if (wmsArrivalOverviewOptions.parmInclPurch())
+            {
+                typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::Purch);
+            }
+            if (wmsArrivalOverviewOptions.parmInclProd())
+            {
+                typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::Production);
+                typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::PmfProdCoBy);
+            }
+            if (wmsArrivalOverviewOptions.parmInclTransfer())
+            {
+                typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::TransferOrderReceive);
+            }
+            if (wmsArrivalOverviewOptions.parmInclQuarantine())
+            {
+                typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::QuarantineOrder);
+            }
+            if (wmsArrivalOverviewOptions.parmIncludeConsignmentReplenishmentOrder())
+            {
+                typeRangeStr = this.addInventTransTypeToRange(typeRangeStr, InventTransType::ConsignmentReplenishmentOrder);
+            }
+
+            typeRangeStr = this.addAdditionalTypeRange(typeRangeStr);
+        }
+
+        return typeRangeStr;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allOptionsIncludeOtherEnabled</Name>
+				<Source><![CDATA[
+    protected boolean allOptionsIncludeOtherEnabled()
+    {
+        return wmsArrivalOverviewOptions.parmInclPurch()        &&
+               wmsArrivalOverviewOptions.parmInclProd()         &&
+               wmsArrivalOverviewOptions.parmInclTransfer()     &&
+               wmsArrivalOverviewOptions.parmInclQuarantine()   &&
+               wmsArrivalOverviewOptions.parmIncludeConsignmentReplenishmentOrder();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAdditionalTypeRange</Name>
+				<Source><![CDATA[
+    protected str addAdditionalTypeRange(str _typerRnageStr, boolean _negated = false)
+    {
+        return _typerRnageStr;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>includeReference</Name>
+				<Source><![CDATA[
+    protected NoYes includeReference(
+        InventTransType             _inventTransType,
+        InventTransRefId            _inventTransRefId)
+    {
+        PurchTable              purchTable;
+        SalesTable              salesTable;
+        InventTransferTable     inventTransferTable;
+
+        inventTransRefBuffer = null;
+
+        switch (_inventTransType)
+        {
+            case InventTransType::Purch:
+                if (wmsArrivalOverviewOptions.parmDlvModeId() && this.filterOnPurchHeaderDlvMode())
+                {
+                    purchTable = this.parmInventTransRefBuffer(PurchTable::find(_inventTransRefId));
+                    if (wmsArrivalOverviewOptions.parmDlvModeId() != purchTable.DlvMode)
+                    {
+                        return NoYes::No;
+                    }
+                }
+                if (wmsArrivalOverviewOptions.parmVendRef())
+                {
+                    if (!purchTable)
+                    {
+                        purchTable = this.parmInventTransRefBuffer(PurchTable::find(_inventTransRefId));
+                    }
+                    if (wmsArrivalOverviewOptions.parmVendRef() != purchTable.VendorRef)
+                    {
+                        return NoYes::No;
+                    }
+                }
+                if (wmsArrivalOverviewOptions.parmReturnItemNum())
+                {
+                    return NoYes::No;
+                }
+                break;
+            case InventTransType::Sales:
+                salesTable = this.parmInventTransRefBuffer(SalesTable::find(_inventTransRefId));
+
+                if (salesTable.SalesType == SalesType::ReturnItem
+                &&  salesTable.InterCompanyDirectDelivery
+                && !salesTable.interCompanyNonICExist())
+                {
+                    return NoYes::No;
+                }
+
+                if (wmsArrivalOverviewOptions.parmReturnItemNum()
+                &&  salesTable.ReturnItemNum != wmsArrivalOverviewOptions.parmReturnItemNum())
+                {
+                    return NoYes::No;
+                }
+
+                if (wmsArrivalOverviewOptions.parmDlvModeId()
+                &&  wmsArrivalOverviewOptions.parmDlvModeId() != salesTable.DlvMode)
+                {
+                    return NoYes::No;
+                }
+
+                if (wmsArrivalOverviewOptions.parmVendRef())
+                {
+                    return NoYes::No;
+                }
+                break;
+            case InventTransType::TransferOrderReceive:
+                if (wmsArrivalOverviewOptions.parmReturnItemNum())
+                {
+                    return NoYes::No;
+                }
+
+                if (wmsArrivalOverviewOptions.parmVendRef())
+                {
+                    return NoYes::No;
+                }
+
+                if (wmsArrivalOverviewOptions.parmDlvModeId())
+                {
+                    inventTransferTable = this.parmInventTransRefBuffer(InventTransferTable::find(_inventTransRefId));
+                    if (wmsArrivalOverviewOptions.parmDlvModeId() != inventTransferTable.DlvModeId)
+                    {
+                        return NoYes::No;
+                    }
+                }
+                break;
+            default:
+                if (wmsArrivalOverviewOptions.parmDlvModeId())
+                {
+                    return NoYes::No;
+                }
+                if (wmsArrivalOverviewOptions.parmVendRef())
+                {
+                    return NoYes::No;
+                }
+                if (wmsArrivalOverviewOptions.parmReturnItemNum())
+                {
+                    return NoYes::No;
+                }
+                break;
+        }
+        return NoYes::Yes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initCaches</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes caches that are used internally by this class.
+    /// </summary>
+    private void initCaches()
+    {
+        referencesWithPendingQuantities             = new Set(Types::Container);    //key [inventtransType,inventtransRefId]
+        wmsJournalTransWithCreateQuarantineOrder    = new Set(Types::String);       //key: inventtransId
+        itemModelGroupQuarantine                    = new Map(Types::String,Types::Integer);    //key: itemId, value boolean
+        wmsJournalTransDataCache                    = new Map(Types::String,Types::Container);  //key: inventtransId, value [....]
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDetailValues</Name>
+				<Source><![CDATA[
+    protected void initDetailValues(
+        WMSArrivalDetailTmp _wmsArrivalDetailTmp,
+        ItemId              _itemId,
+        boolean             _initWeightAndVolume)
+    {
+        InventTable         inventTable = InventTable::find(_itemId);
+
+        InventDim           inventDimOrderSetup;
+        InventDimId         inventDimIdOrderSetup;
+        QtyStandard         standardOrderQty;
+
+        PdsCWInventQty      standardOrderCWQty;
+        _wmsArrivalDetailTmp.ItemId = _itemId;
+
+        if (this.doesItemHaveQuarantineOnModelGroup(inventTable)
+        && InventTrans::canTransTypeDoQuarantineMgmt(_wmsArrivalDetailTmp.InventTransType))
+        {
+            _wmsArrivalDetailTmp.QuarantineControlled = NoYes::Yes;
+        }
+
+        if (inventTable.wmsArrivalHandlingTime)
+        {
+            inventDimOrderSetup.clear();
+
+            if (_wmsArrivalDetailTmp.InventLocationId)
+            {
+                inventDimOrderSetup.InventSiteId    = InventLocation::find(_wmsArrivalDetailTmp.InventLocationId).InventSiteId;
+            }
+
+            if (inventDimOrderSetup.InventSiteId)
+            {
+                inventDimIdOrderSetup   = InventDim::findOrCreate(inventDimOrderSetup).InventDimId;
+            }
+            else
+            {
+                inventDimIdOrderSetup   = InventDim::inventDimIdBlank();
+            }
+
+            standardOrderQty    = inventTable.inventStandardQty(inventDimIdOrderSetup);
+
+            if (PdsGlobal::pdsIsCWItem(_itemId))
+            {
+                standardOrderCWQty = PdsCatchWeight::cwQty(inventTable.ItemId, standardOrderQty);
+                _wmsArrivalDetailTmp.ArrivalHandlingTime            = real2int(_wmsArrivalDetailTmp.PdsCWQty * inventTable.wmsArrivalHandlingTime / (standardOrderCWQty ? standardOrderCWQty : 1));
+                _wmsArrivalDetailTmp.InProgressArrivalHandlingTime  = real2int(_wmsArrivalDetailTmp.PdsCWInProgressQty * inventTable.wmsArrivalHandlingTime / (standardOrderCWQty ? standardOrderCWQty : 1));
+            }
+            else
+            {
+                _wmsArrivalDetailTmp.ArrivalHandlingTime            = real2int(_wmsArrivalDetailTmp.InventQty * inventTable.wmsArrivalHandlingTime / (standardOrderQty ? standardOrderQty : 1));
+                _wmsArrivalDetailTmp.InProgressArrivalHandlingTime  = real2int(_wmsArrivalDetailTmp.InProgressQty * inventTable.wmsArrivalHandlingTime / (standardOrderQty ? standardOrderQty : 1));
+            }
+        }
+        else
+        {
+            _wmsArrivalDetailTmp.ArrivalTimeMissing = NoYes::Yes;
+        }
+
+        if (_initWeightAndVolume)
+        {
+            this.initDetailWeightAndVolumeFields(_wmsArrivalDetailTmp,inventTable.grossVolume(),inventTable.grossWeight());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDetailWeightAndVolumeFields</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes fields that are related to weight and volume.
+    /// </summary>
+    /// <param name="_wmsArrivalDetailTmp">
+    /// The <c>WMSArrivalDetailTmp</c> buffer we the fields should be initialized.
+    /// </param>
+    /// <param name="_volume">
+    /// The volume for one unit of the quantity.
+    /// </param>
+    /// <param name="_weight">
+    /// The weight for one unit of the quantity.
+    /// </param>
+    private void initDetailWeightAndVolumeFields(
+        WMSArrivalDetailTmp _wmsArrivalDetailTmp,
+        Volume              _volume,
+        Weight              _weight)
+    {
+        if (PdsGlobal::pdsIsCWItem(_wmsArrivalDetailTmp.ItemId))
+        {
+            _wmsArrivalDetailTmp.Volume             = _wmsArrivalDetailTmp.PdsCWQty * _volume;
+            _wmsArrivalDetailTmp.InProgressVolume   = _wmsArrivalDetailTmp.PdsCWInProgressQty * _volume;
+        }
+        else
+        {
+            _wmsArrivalDetailTmp.Volume             = _wmsArrivalDetailTmp.InventQty * _volume;
+            _wmsArrivalDetailTmp.InProgressVolume   = _wmsArrivalDetailTmp.InProgressQty * _volume;
+        }
+        if (!_volume)
+        {
+            _wmsArrivalDetailTmp.VolumeMissing  = NoYes::Yes;
+        }
+
+        _wmsArrivalDetailTmp.Weight             = _wmsArrivalDetailTmp.InventQty * _weight;
+        _wmsArrivalDetailTmp.InProgressWeight   = _wmsArrivalDetailTmp.InProgressQty * _weight;
+
+        if (!_weight)
+        {
+            _wmsArrivalDetailTmp.WeightMissing = NoYes::Yes;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initOverviewValues</Name>
+				<Source><![CDATA[
+    protected void initOverviewValues(
+        WMSArrivalOverviewTmp   _wmsArrivalOverviewTmp,
+        DateStatus              _dateStatus,
+        InventTransType         _inventTransType,
+        InventTransRefId        _inventTransRefId,
+        InventSiteId            _inventSiteId,
+        InventLocationId        _inventLocationId)
+    {
+        VendTable               vendTable;
+        PurchTable              purchTable;
+        CustTable               custTable;
+        SalesTable              salesTable;
+        InventQuarantineOrder   inventQuarantineOrder;
+        InventTransferTable     inventTransferTable;
+
+        _wmsArrivalOverviewTmp.DateStatus           = _dateStatus;
+        _wmsArrivalOverviewTmp.InventTransType      = _inventTransType;
+        _wmsArrivalOverviewTmp.InventTransRefId     = _inventTransRefId;
+        _wmsArrivalOverviewTmp.InventSiteId         = _inventSiteId;
+        _wmsArrivalOverviewTmp.InventLocationId     = _inventLocationId;
+
+        switch (_inventTransType)
+        {
+            case InventTransType::Purch:
+                purchTable = this.parmInventTransRefBuffer();
+                if (!purchTable)
+                {
+                    purchTable = this.parmInventTransRefBuffer(PurchTable::find(_inventTransRefId));
+                }
+
+                vendTable      = purchTable.vendTable_OrderAccount();
+
+                _wmsArrivalOverviewTmp.CustVendAC   = purchTable.OrderAccount;
+                _wmsArrivalOverviewTmp.Name         = vendTable.vendorName();
+                _wmsArrivalOverviewTmp.DlvModeId    = purchTable.DlvMode;
+                _wmsArrivalOverviewTmp.VendRef      = purchTable.VendorRef;
+
+                break;
+            case InventTransType::QuarantineOrder:
+                inventQuarantineOrder = InventQuarantineOrder::find(_inventTransRefId);
+                if (InventLocation::find(_inventLocationId).InventLocationType == InventLocationType::Quarantine)
+                {
+                    _wmsArrivalOverviewTmp.Name = InventDim::find(inventQuarantineOrder.InventDimId).InventLocationId;
+                }
+                else
+                {
+                    _wmsArrivalOverviewTmp.Name = InventDim::find(inventQuarantineOrder.InventDimIdQuarantine).InventLocationId;
+                }
+                _wmsArrivalOverviewTmp.NoOfLines = 1;
+                break;
+            case InventTransType::Sales:
+                salesTable = this.parmInventTransRefBuffer();
+                if (!salesTable)
+                {
+                    salesTable = this.parmInventTransRefBuffer(SalesTable::find(_inventTransRefId));
+                }
+                custTable      = salesTable.custTable_CustAccount();
+
+                _wmsArrivalOverviewTmp.CustVendAC   = salesTable.CustAccount;
+                _wmsArrivalOverviewTmp.Name         = custTable.name();
+                _wmsArrivalOverviewTmp.DlvModeId    = salesTable.DlvMode;
+                _wmsArrivalOverviewTmp.ReturnItemNum    = salesTable.ReturnItemNum;
+                break;
+            case InventTransType::TransferOrderReceive:
+                inventTransferTable = this.parmInventTransRefBuffer();
+                if (!inventTransferTable)
+                {
+                    inventTransferTable = this.parmInventTransRefBuffer(InventTransferTable::find(_inventTransRefId));
+                }
+                _wmsArrivalOverviewTmp.Name = inventTransferTable.InventLocationIdFrom;
+                _wmsArrivalOverviewTmp.DlvModeId = inventTransferTable.DlvModeId;
+                break;
+            default:
+                _wmsArrivalOverviewTmp.NoOfLines = 1;
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertToWMSJournalTransDataCaches</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts values into the caches used by this class.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// An <c>InventTransId</c> ID used as key.
+    /// </param>
+    /// <param name="_journalTransSummedQty">
+    /// A summed <c>InventQty</c> quantity from the journal lines.
+    /// </param>
+    /// <param name="_journalTransSummedCWQty">
+    /// A summed <c>PDSCwInventQty</c> quantity from the journal lines.
+    /// </param>
+    /// <param name="_createQuarantineOrder">
+    /// The value from the journal lines indicating if a line within the lot used quarantine control for the arrival.
+    /// </param>
+    private void insertToWMSJournalTransDataCaches(
+        InventTransId   _inventTransId,
+        InventQty       _journalTransSummedQty,
+        PdsCWInventQty  _journalTransSummedCWQty,
+        NoYes           _createQuarantineOrder)
+
+    {
+        wmsJournalTransDataCache.insert(_inventTransId,[_journalTransSummedQty,_journalTransSummedCWQty, _createQuarantineOrder]);
+
+        if (_createQuarantineOrder)
+        {
+            wmsJournalTransWithCreateQuarantineOrder.add(_inventTransId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isDetailRecordInRange</Name>
+				<Source><![CDATA[
+    protected NoYes isDetailRecordInRange(WMSArrivalDetailTmp _wmsArrivalDetailTmp)
+    {
+        if (wmsArrivalOverviewOptions.parmItemId() && _wmsArrivalDetailTmp.ItemId != wmsArrivalOverviewOptions.parmItemId())
+        {
+            return NoYes::No;
+        }
+
+        if (WMSArrivalOverviewTmp::find(wmsArrivalOverviewTmp,
+                                        _wmsArrivalDetailTmp.DateStatus,
+                                        _wmsArrivalDetailTmp.InventTransType,
+                                        _wmsArrivalDetailTmp.InventTransRefId,
+                                        _wmsArrivalDetailTmp.InventSiteId,
+                                        _wmsArrivalDetailTmp.InventLocationId).RecId)
+        {
+            return NoYes::Yes;
+        }
+
+        return NoYes::No;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustUsePendingQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if pending quantities must used based on the reference arguments.
+    /// </summary>
+    /// <param name="_inventTransType">
+    /// An <c>InventTransType</c> type.
+    /// </param>
+    /// <param name="_inventTransRefId">
+    /// An <c>InventTransRefId</c> ID.
+    /// </param>
+    /// <returns>
+    /// true if pending quantities must be used; otherwise, false.
+    /// </returns>
+    private boolean mustUsePendingQuantity(
+        InventTransType         _inventTransType,
+        InventTransRefId        _inventTransRefId)
+    {
+        boolean mustUsePendingQuantity = false;
+
+        switch (_inventTransType)
+        {
+            case InventTransType::Sales: //fallthrough
+            case InventTransType::Purch:
+                mustUsePendingQuantity = this.doesReferenceHaveAnyPendingQuantity(_inventTransType,_inventTransRefId);
+                break;
+
+            default: //only sales and purch uses pending quantity for non stocked lines
+                mustUsePendingQuantity = false;
+                break;
+        }
+
+        return mustUsePendingQuantity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        this.initInstrumentation();
+        this.initCaches();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initInstrumentation</Name>
+				<Source><![CDATA[
+    private void initInstrumentation()
+    {
+        instrumentation = CostManagementInstrumentation::newInstrumentationWithUniqueContext(classStr(WMSArrivalOverviewGeneration));
+        
+        measureTime = new Map(Types::String, Types::Int64);
+        measureCountMethodCalls = new Map(Types::String, Types::Int64);
+        measureCountLines = new Map(Types::String, Types::Int64);
+        measureCountInventoryTransactions = new Map(Types::String, Types::Int64);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventTransRefBuffer</Name>
+				<Source><![CDATA[
+    protected Common parmInventTransRefBuffer(Common _inventTransRefBuffer = inventTransRefBuffer)
+    {
+        inventTransRefBuffer = _inventTransRefBuffer;
+        return inventTransRefBuffer;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWmsArrivalDetailTmp</Name>
+				<Source><![CDATA[
+    public WMSArrivalDetailTmp parmWmsArrivalDetailTmp(WMSArrivalDetailTmp _wmsArrivalDetailTmp = wmsArrivalDetailTmp)
+    {
+        if (!prmisDefault(_wmsArrivalDetailTmp))
+        {
+            wmsArrivalDetailTmp.setTmpData(_wmsArrivalDetailTmp);
+        }
+        return wmsArrivalDetailTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWmsArrivalOverviewOptions</Name>
+				<Source><![CDATA[
+    public WMSArrivalOverviewOptions parmWmsArrivalOverviewOptions(WMSArrivalOverviewOptions _wmsArrivalOverviewOptions = wmsArrivalOverviewOptions)
+    {
+        wmsArrivalOverviewOptions = _wmsArrivalOverviewOptions;
+        return wmsArrivalOverviewOptions;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWmsArrivalOverviewTmp</Name>
+				<Source><![CDATA[
+    public WMSArrivalOverviewTmp parmWmsArrivalOverviewTmp(WMSArrivalOverviewTmp _wmsArrivalOverviewTmp = wmsArrivalOverviewTmp)
+    {
+        if (!prmisDefault(_wmsArrivalOverviewTmp))
+        {
+            wmsArrivalOverviewTmp.setTmpData(_wmsArrivalOverviewTmp);
+        }
+        return wmsArrivalOverviewTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackReferenceWithPendingQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Tracks that a pending quantity record existed for the reference parameters.
+    /// </summary>
+    /// <param name="_inventTransType">
+    /// A <c>InventTransType</c> type.
+    /// </param>
+    /// <param name="_inventTransRefId">
+    /// A <c>InventTransRefId</c> ID.
+    /// </param>
+    private void trackReferenceWithPendingQuantity(
+        InventTransType         _inventTransType,
+        InventTransRefId        _inventTransRefId)
+    {
+        referencesWithPendingQuantities.add([_inventTransType,_inventTransRefId]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOverviewInformation</Name>
+				<Source><![CDATA[
+    protected void updateOverviewInformation()
+    {
+        WMSArrivalOverviewTmp   wmsArrivalOverviewTmpLocal;
+        WMSArrivalDetailTmp     wmsArrivalDetailTmpLocal;
+        WMSArrivalDetailTmp     wmsArrivalDetailTmpLocal2;
+        WMSArrivalDetailTmp     wmsArrivalDetailTmpLocal3;
+
+        int                     lineCount;
+
+        wmsArrivalOverviewTmpLocal.setTmpData(wmsArrivalOverviewTmp);
+        wmsArrivalDetailTmpLocal.setTmpData(wmsArrivalDetailTmp);
+        wmsArrivalDetailTmpLocal2.setTmpData(wmsArrivalDetailTmp);
+        wmsArrivalDetailTmpLocal3.setTmpData(wmsArrivalDetailTmp);
+
+        while select forupdate wmsArrivalOverviewTmpLocal
+        {
+            lineCount = 0;
+
+            while select wmsArrivalDetailTmpLocal3
+                where wmsArrivalDetailTmpLocal3.DateStatus          == wmsArrivalOverviewTmpLocal.DateStatus
+                &&    wmsArrivalDetailTmpLocal3.InventTransType     == wmsArrivalOverviewTmpLocal.InventTransType
+                &&    wmsArrivalDetailTmpLocal3.InventTransRefId    == wmsArrivalOverviewTmpLocal.InventTransRefId
+                &&    wmsArrivalDetailTmpLocal3.InventLocationId    == wmsArrivalOverviewTmpLocal.InventLocationId
+                &&    wmsArrivalDetailTmpLocal3.InventSiteId        == wmsArrivalOverviewTmpLocal.InventSiteId
+            {
+                lineCount++;
+
+                this.initializeQuantityValues(wmsArrivalDetailTmpLocal3, wmsArrivalOverviewTmpLocal);
+
+                if (!wmsArrivalOverviewTmpLocal.QuarantineControlled
+                &&  (InventTrans::canTransTypeDoQuarantineMgmt(wmsArrivalDetailTmpLocal3.InventTransType)
+                &&  (this.doesItemHaveQuarantineOnModelGroup(InventTable::find(wmsArrivalDetailTmpLocal3.ItemId)) ||
+                    this.anyJournalLinesUnderQuarantineControl(wmsArrivalDetailTmpLocal3.InventTransId))))
+                {
+                    wmsArrivalOverviewTmpLocal.QuarantineControlled = NoYes::Yes;
+                }
+            }
+
+            select firstonly wmsArrivalDetailTmpLocal
+                where wmsArrivalDetailTmpLocal.DateStatus       == wmsArrivalOverviewTmpLocal.DateStatus
+                &&    wmsArrivalDetailTmpLocal.InventTransType  == wmsArrivalOverviewTmpLocal.InventTransType
+                &&    wmsArrivalDetailTmpLocal.InventTransRefId == wmsArrivalOverviewTmpLocal.InventTransRefId
+                &&    wmsArrivalDetailTmpLocal.InventLocationId == wmsArrivalOverviewTmpLocal.InventLocationId
+                &&    wmsArrivalDetailTmpLocal.InventSiteId     == wmsArrivalOverviewTmpLocal.InventSiteId
+                &&    wmsArrivalDetailTmpLocal.InProgress       == NoYes::Yes;
+
+            if (wmsArrivalDetailTmpLocal.RecId)
+            {
+                select firstonly wmsArrivalDetailTmpLocal2
+                    where wmsArrivalDetailTmpLocal2.DateStatus          == wmsArrivalOverviewTmpLocal.DateStatus
+                    &&    wmsArrivalDetailTmpLocal2.InventTransType     == wmsArrivalOverviewTmpLocal.InventTransType
+                    &&    wmsArrivalDetailTmpLocal2.InventTransRefId    == wmsArrivalOverviewTmpLocal.InventTransRefId
+                    &&    wmsArrivalDetailTmpLocal2.InventLocationId    == wmsArrivalOverviewTmpLocal.InventLocationId
+                    &&    wmsArrivalDetailTmpLocal2.InventSiteId        == wmsArrivalOverviewTmpLocal.InventSiteId
+                    &&    wmsArrivalDetailTmpLocal2.InventQty           != 0;
+                if (wmsArrivalDetailTmpLocal2.RecId)
+                {
+                    wmsArrivalOverviewTmpLocal.ReceiptStatus = WMSReceiptStatus::Partly;
+                }
+                else
+                {
+                    wmsArrivalOverviewTmpLocal.ReceiptStatus = WMSReceiptStatus::Complete;
+                }
+            }
+
+            if (lineCount > 0)
+            {
+                wmsArrivalOverviewTmpLocal.NoOfLines = lineCount;
+                wmsArrivalOverviewTmpLocal.update();
+            }
+            else
+            {
+                wmsArrivalOverviewTmpLocal.delete();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeQuantityValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize values of InventQty, Volume, Weight and PDsCWQty fields from the source to the destination <c>WMSArrivalOverviewTmp</c> record.
+    /// </summary>
+    /// <param name = "_source">The source <c>WMSArrivalDetailTmp</c> record.</param>
+    /// <param name = "_destination">The destination <c>WMSArrivalOverviewTmp</c> record.</param>
+    protected void initializeQuantityValues(WMSArrivalDetailTmp _source, WMSArrivalOverviewTmp _destination)
+    {
+        _destination.InventQty    += _source.InventQty;
+        _destination.Volume       += _source.Volume;
+        _destination.Weight       += _source.Weight;
+        _destination.PdsCWQty     += _source.PdsCWQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addMeasure</Name>
+				<Source><![CDATA[
+    private void addMeasure(TradeInstrumentationMeasureName _measureName, int64 _elapsedMilliseconds, int64 _countDocumentLines, int64 _countInventoryTransactions)
+    {
+        int64 measureValueTime;
+        int64 measureValueCountLines;
+        int64 measureValueCountMethodCalls;
+        int64 measureValueInventoryTransactions;
+
+        if (measureTime.exists(_measureName))
+        {
+            measureValueTime = measureTime.lookup(_measureName);
+            measureValueCountLines = measureCountLines.lookup(_measureName);
+            measureValueInventoryTransactions = measureCountInventoryTransactions.lookup(_measureName);
+            measureValueCountMethodCalls = measureCountMethodCalls.lookup(_measureName);
+        }
+
+        measureValueTime += _elapsedMilliseconds;
+        measureValueCountLines += _countDocumentLines;
+        measureValueInventoryTransactions += _countInventoryTransactions;
+        measureValueCountMethodCalls++;
+
+        measureTime.insert(_measureName, measureValueTime);
+        measureCountLines.insert(_measureName, measureValueCountLines);
+        measureCountInventoryTransactions.insert(_measureName, measureValueInventoryTransactions);
+        measureCountMethodCalls.insert(_measureName, measureValueCountMethodCalls);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logMeasures</Name>
+				<Source><![CDATA[
+    private void logMeasures()
+    {
+        MapEnumerator measureTimeEnumerator = measureTime.getEnumerator();
+
+        while (measureTimeEnumerator.moveNext())
+        {
+            var measureKey = measureTimeEnumerator.currentKey();
+
+            instrumentation.addMeasureCount(measureKey+'_Lines', measureCountLines.lookup(measureKey));
+            instrumentation.addMeasureCount(measureKey+'_Transactions', measureCountInventoryTransactions.lookup(measureKey));
+            instrumentation.addMeasureCount(measureKey+'_MethodCalls', measureCountMethodCalls.lookup(measureKey));
+            instrumentation.addMeasureElapsedMilliseconds(measureKey, measureTimeEnumerator.currentValue());
+        }
+
+        instrumentation.logMeasures();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInstrumentation</Name>
+				<Source><![CDATA[
+    private CostManagementInstrumentation getInstrumentation()
+    {
+        return instrumentation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static WMSArrivalOverviewGeneration construct()
+    {
+        return new WMSArrivalOverviewGeneration();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateFromForm</Name>
+				<Source><![CDATA[
+    public static container generateFromForm(
+        WMSArrivalOverviewTmp   _wmsArrivalOverviewTmp,
+        WMSArrivalDetailTmp     _wmsArrivalDetailTmp,
+        container               _packedOptions)
+    {
+        TradeInstrumentationStopwatch   totalStopWatch = TradeInstrumentationStopwatch::newStopwatch();
+        WMSArrivalOverviewGeneration    wmsArrivalOverviewGeneration = WMSArrivalOverviewGeneration::construct();
+
+        wmsArrivalOverviewGeneration.getInstrumentation().addMeasureProcessStarted(funcName()).logMeasures();
+
+        wmsArrivalOverviewGeneration.parmWmsArrivalOverviewTmp(_wmsArrivalOverviewTmp);
+        wmsArrivalOverviewGeneration.parmWmsArrivalDetailTmp(_wmsArrivalDetailTmp);
+        wmsArrivalOverviewGeneration.parmWmsArrivalOverviewOptions(WMSArrivalOverviewOptions::newFromPacked(_packedOptions));
+        
+        container result = wmsArrivalOverviewGeneration.fillTables();
+
+        wmsArrivalOverviewGeneration.getInstrumentation()
+            .addMeasureElapsedMillisecondsFromStopwatch(funcName(), totalStopWatch)
+            .addMeasureProcessCompleted(funcName())
+            .logMeasures();
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInProgressTotals</Name>
+				<Source><![CDATA[
+    public static container getInProgressTotals(WMSArrivalDetailTmp     _wmsArrivalDetailTmp)
+    {
+        WMSArrivalDetailTmp     wmsArrivalDetailTmpLocal;
+        Weight                  weight      = 0;
+        Volume                  volume      = 0;
+        InventQty               qty         = 0;
+        TimeHour24              arrivalTime = 0;
+        NoYes                   volumeMissing, weightMissing, timeMissing;
+
+        PdsCWInProgressQty      cwQty       = 0;
+
+        wmsArrivalDetailTmpLocal.setTmpData(_wmsArrivalDetailTmp);
+        while select ItemId, sum(InProgressQty), sum(InProgressVolume), sum(InProgressWeight), sum(InProgressArrivalHandlingTime),
+                sum(PdsCWInProgressQty),
+                     VolumeMissing, WeightMissing, ArrivalTimeMissing from wmsArrivalDetailTmpLocal
+            group by ItemId, VolumeMissing, WeightMissing, ArrivalTimeMissing
+            where wmsArrivalDetailTmpLocal.InProgress == NoYes::Yes
+        {
+            qty         += wmsArrivalDetailTmpLocal.InProgressQty;
+
+            cwQty       += wmsArrivalDetailTmpLocal.PdsCWInProgressQty;
+
+            weight      += wmsArrivalDetailTmpLocal.InProgressWeight;
+            volume      += wmsArrivalDetailTmpLocal.InProgressVolume;
+            arrivalTime += wmsArrivalDetailTmpLocal.InProgressArrivalHandlingTime;
+
+            if (wmsArrivalDetailTmpLocal.VolumeMissing)
+            {
+                volumeMissing = NoYes::Yes;
+            }
+
+            if (wmsArrivalDetailTmpLocal.WeightMissing)
+            {
+                weightMissing = NoYes::Yes;
+            }
+
+            if (wmsArrivalDetailTmpLocal.ArrivalTimeMissing)
+            {
+                timeMissing = NoYes::Yes;
+            }
+        }
+        return [weight, volume, qty, arrivalTime, volumeMissing, weightMissing, timeMissing, cwQty];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectedTotals</Name>
+				<Source><![CDATA[
+    static public container selectedTotals(WMSArrivalDetailTmp     _wmsArrivalDetailTmp)
+    {
+        WMSArrivalDetailTmp     wmsArrivalDetailTmpLocal;
+        Weight                  weight      = 0;
+        Volume                  volume      = 0;
+        InventQty               qty         = 0;
+        TimeHour24              arrivalTime = 0;
+        NoYes                   volumeMissing, weightMissing, timeMissing;
+        PdsCWInventQty          cwQty       = 0;
+
+        wmsArrivalDetailTmpLocal.setTmpData(_wmsArrivalDetailTmp);
+        while select ItemId, sum(InventQty), sum(Volume), sum(Weight), sum(ArrivalHandlingTime),
+                sum(PdsCWQty),
+                VolumeMissing, WeightMissing, ArrivalTimeMissing from wmsArrivalDetailTmpLocal
+            group by ItemId, VolumeMissing, WeightMissing, ArrivalTimeMissing
+            where wmsArrivalDetailTmpLocal.Selected          == NoYes::Yes
+        {
+            qty         += wmsArrivalDetailTmpLocal.InventQty;
+
+            cwQty       += wmsArrivalDetailTmpLocal.PdsCWQty;
+
+            weight      += wmsArrivalDetailTmpLocal.Weight;
+            volume      += wmsArrivalDetailTmpLocal.Volume;
+            arrivalTime += wmsArrivalDetailTmpLocal.ArrivalHandlingTime;
+
+            if (wmsArrivalDetailTmpLocal.VolumeMissing)
+            {
+                volumeMissing = NoYes::Yes;
+            }
+
+            if (wmsArrivalDetailTmpLocal.WeightMissing)
+            {
+                weightMissing = NoYes::Yes;
+            }
+
+            if (wmsArrivalDetailTmpLocal.ArrivalTimeMissing)
+            {
+                timeMissing = NoYes::Yes;
+            }
+        }
+        return [weight, volume, qty, arrivalTime, volumeMissing, weightMissing, timeMissing, cwQty];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>kittingInitWMSArrivalDetailTmp_delegate</Name>
+				<Source><![CDATA[
+    delegate void kittingInitWMSArrivalDetailTmp_delegate(WMSArrivalDetailTmp _wmsArrivalDetailTmp, SalesLine _salesLine)
+    {
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

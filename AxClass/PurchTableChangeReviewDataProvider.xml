@@ -1,0 +1,1049 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PurchTableChangeReviewDataProvider</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>PurchTableChangeReviewDataProvider</c> class is responsible for finding the changed purchase orders and calculate the impact of those changes.
+/// </summary>
+internal final class PurchTableChangeReviewDataProvider
+{
+    private Map purchaseOrders;
+    private Map purchaseOrderLines;
+    private Set highImpactPurchIds;
+    private Set highImpactChangedPurchLineRecIds;
+    private Map impactingRelationshipsMap;
+    private Map impactedOrdersMap;
+    private LanguageId language;
+
+    private boolean displayTransferOrdersDownstreamImpactFlightEnabled = PurchTableChangeReviewTransferOrderImpactFlight::instance().isEnabled();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    public void init()
+    {
+        purchaseOrders = new Map(Types::String, Types::Class);
+        purchaseOrderLines = new Map(Types::Int64, Types::Class);
+        highImpactPurchIds = new Set(Types::String);
+        highImpactChangedPurchLineRecIds = new Set(Types::Int64);
+        impactingRelationshipsMap = new Map(Types::Container, Types::Class);
+        impactedOrdersMap = new Map(Types::Container, Types::Class);
+
+        language = currentUserLanguage();
+
+        this.initChangedPurchLines();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initChangedPurchLines</Name>
+				<Source><![CDATA[
+    private void initChangedPurchLines()
+    {
+        PurchTable purchTable;
+        VendPurchOrderJour vendPurchOrderJour;
+        PurchTableChangeReviewChangeHeader currentHeader;
+
+        boolean isPurchTableChangeReviewNewLineFlight = PurchTableChangeReviewNewLineFlight::instance().isEnabled();
+
+        while select PurchId, OrderAccount
+            from purchTable
+            group by PurchId, OrderAccount
+            join maxof(PurchTableVersion)
+                from vendPurchOrderJour
+                    where vendPurchOrderJour.PurchId == purchTable.PurchId
+                       && purchTable.DocumentState == VersioningDocumentState::Approved
+                       && purchTable.PurchStatus != PurchStatus::Canceled
+        {
+            currentHeader = new PurchTableChangeReviewChangeHeader(purchTable);
+            purchaseOrders.add(purchTable.PurchId, currentHeader);
+
+            PurchLineAllVersions journalLine;
+            PurchLine currentLine;
+            InventTransOrigin inventTransOrigin;
+
+            while select ItemId, QtyOrdered, ConfirmedDlv, DeliveryDate from journalLine
+                where journalLine.PurchTableVersionRecId == vendPurchOrderJour.PurchTableVersion
+                join RecId from inventTransOrigin
+                    where inventTransOrigin.InventTransId == journalLine.InventTransId
+                outer join RecId, ItemId, InventDimId, QtyOrdered, ConfirmedDlv, DeliveryDate from currentLine
+                    where currentLine.InventTransId == journalLine.InventTransId
+            {
+                if (isPurchTableChangeReviewNewLineFlight)
+                {
+                    PurchTableChangeReviewChangeLine currentChangeLine = PurchTableChangeReviewChangeLine::newFromPurchLineAllVersions(
+                        currentHeader,
+                        journalLine,
+                        currentLine,
+                        inventTransOrigin.RecId);
+                    this.calculateImpactOfChangeLine(currentChangeLine, currentHeader, currentLine);
+                }
+                else
+                {
+                    PurchTableChangeReviewChangeLine currentChangeLine = PurchTableChangeReviewChangeLine::newFromPurchLineAllVersions(
+                        currentHeader,
+                        journalLine,
+                        currentLine,
+                        inventTransOrigin.RecId);
+
+                    if (currentChangeLine.isChanged())
+                    {
+                        currentHeader.addLine(currentChangeLine);
+                        purchaseOrderLines.add(currentLine.RecId, currentChangeLine);
+
+                        if (currentChangeLine.isRisky())
+                        {
+                            this.calculateImpactInMasterPlanning(currentHeader, currentChangeLine);
+                            this.calculateImpactInMarking(currentHeader, currentChangeLine);
+                            this.calculateImpactInProjects(currentHeader, currentChangeLine);
+                        }
+                    }
+                }
+            }
+
+            if (isPurchTableChangeReviewNewLineFlight)
+            {
+                while select RecId, ItemId, InventDimId, QtyOrdered, ConfirmedDlv, DeliveryDate from currentLine
+                where currentLine.PurchId == purchTable.PurchId
+                    notexists join RecId from journalLine
+                        where journalLine.InventTransId == currentLine.InventTransId
+                {
+                    PurchTableChangeReviewChangeLine currentChangeLine = PurchTableChangeReviewChangeLine::newFromPurchLine(
+                        currentHeader,
+                        currentLine);
+                    this.calculateImpactOfChangeLine(currentChangeLine, currentHeader, currentLine);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateImpactOfChangeLine</Name>
+				<Source><![CDATA[
+    private void calculateImpactOfChangeLine(
+        PurchTableChangeReviewChangeLine _currentChangeLine,
+        PurchTableChangeReviewChangeHeader _currentHeader,
+        PurchLine _currentLine)
+    {
+        if (_currentChangeLine.isChanged())
+        {
+            _currentHeader.addLine(_currentChangeLine);
+            purchaseOrderLines.add(_currentLine.RecId, _currentChangeLine);
+
+            if (_currentChangeLine.isRisky())
+            {
+                this.calculateImpactInMasterPlanning(_currentHeader, _currentChangeLine);
+                this.calculateImpactInMarking(_currentHeader, _currentChangeLine);
+                this.calculateImpactInProjects(_currentHeader, _currentChangeLine);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateImpactInProjects</Name>
+				<Source><![CDATA[
+    private void calculateImpactInProjects(
+        PurchTableChangeReviewChangeHeader _currentHeader,
+        PurchTableChangeReviewChangeLine   _currentChangeLine)
+    {
+        PurchLine currentPurchLine = PurchLine::findRecId(_currentChangeLine.getCurrentPurchLineRecId());
+
+        if (currentPurchLine.ProjId)
+        {
+            // impacts to the projects are high-impact changes.
+            highImpactChangedPurchLineRecIds.add(_currentChangeLine.getCurrentPurchLineRecId());
+            highImpactPurchIds.add(_currentHeader.getPurchId());
+
+            PurchTableChangeReviewImpactedProject impactedOrder = PurchTableChangeReviewImpactedProject::newFromValues(
+                currentPurchLine.ProjId,
+                _currentChangeLine.getJournalQty(),
+                _currentChangeLine.getJournalDlvDate());
+
+            this.addImpactedOrder(_currentChangeLine, impactedOrder);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateImpactInMarking</Name>
+				<Source><![CDATA[
+    private void calculateImpactInMarking(
+        PurchTableChangeReviewChangeHeader _currentHeader,
+        PurchTableChangeReviewChangeLine   _currentChangeLine)
+    {
+        this.calculateImpactInMarkingRecursive(
+            _currentHeader,
+            _currentChangeLine,
+            _currentChangeLine.getJournalInventTransOriginRecId(),
+            null);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateImpactInMarkingRecursive</Name>
+				<Source><![CDATA[
+    private void calculateImpactInMarkingRecursive(
+        PurchTableChangeReviewChangeHeader  _currentHeader,
+        PurchTableChangeReviewChangeLine    _currentChangeLine,
+        RefRecId                            _impactedInventTransOriginRecId,
+        PurchTableChangeReviewImpactedOrder _parentImpactedOrder)
+    {
+        InventTrans purchOrderTrans;
+        InventTransOrigin markedTransOrigin;
+        InventTrans markedInventTrans;
+
+        while select sum(Qty) from markedInventTrans
+            group by markedTransOrigin.RecId, markedTransOrigin.ReferenceCategory, markedTransOrigin.ReferenceId, markedTransOrigin.InventTransId, markedTransOrigin.ItemId
+            join RecId, ReferenceCategory, ReferenceId, InventTransId, ItemId from markedTransOrigin
+                where  markedTransOrigin.RecId == markedInventTrans.InventTransOrigin
+                    && markedTransOrigin.ReferenceCategory != InventTransType::InventTransaction    // those will be covered as part of project relations.
+            exists join purchOrderTrans
+                where  purchOrderTrans.MarkingRefInventTransOrigin == markedInventTrans.InventTransOrigin
+                    && purchOrderTrans.MarkingRefInventTransOrigin != 0
+                    && purchOrderTrans.InventTransOrigin == _impactedInventTransOriginRecId
+        {
+            // impacts to the marked orders are high-impact changes.
+            highImpactChangedPurchLineRecIds.add(_currentChangeLine.getCurrentPurchLineRecId());
+            highImpactPurchIds.add(_currentHeader.getPurchId());
+
+            PurchTableChangeReviewImpactedMarking impactedOrder = PurchTableChangeReviewImpactedMarking::newFromValues(
+                markedTransOrigin,
+                markedInventTrans.Qty,
+                _currentChangeLine.getJournalDlvDate());
+
+            this.addImpactedOrder(_currentChangeLine, impactedOrder, _parentImpactedOrder);
+
+            // calculate recursively if marked to production line as in that case there may be further downstream impact.
+            if (markedTransOrigin.ReferenceCategory == InventTransType::ProdLine)
+            {
+                ProdTable prodTable = ProdTable::find(markedTransOrigin.ReferenceId);
+
+                this.calculateImpactInMarkingRecursive(
+                    _currentHeader,
+                    _currentChangeLine,
+                    InventTransOrigin::findByInventTransId(prodTable.InventTransId).RecId,
+                    impactedOrder);
+            }
+            // find transfer order receive for the transfer order ship and calculate if there are any impacted orders by it.
+            else if (displayTransferOrdersDownstreamImpactFlightEnabled
+                && markedTransOrigin.ReferenceCategory == InventTransType::TransferOrderShip)
+            {
+                InventTransferTable transferOrder = InventTransferTable::find(markedTransOrigin.ReferenceId);
+                InventTransferLine transferLine = InventTransferLine::findTransIdShip(markedTransOrigin.InventTransId);
+                InventTransOrigin transferOriginForTransferReceive = InventTransOrigin::findByInventTransId(transferLine.InventTransIdReceive);
+
+                this.calculateImpactInMarkingRecursive(
+                    _currentHeader,
+                    _currentChangeLine,
+                    transferOriginForTransferReceive.RecId,
+                    impactedOrder);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateImpactInMasterPlanning</Name>
+				<Source><![CDATA[
+    private void calculateImpactInMasterPlanning(
+        PurchTableChangeReviewChangeHeader  _currentHeader,
+        PurchTableChangeReviewChangeLine    _currentChangeLine)
+    {
+        ReqPlanVersionRefRecId planVersion = ReqPlanVersion::findActiveReqPlanIdDynamic().RecId;
+        ReqTrans receiptReqTrans;
+
+        while select RecId from receiptReqTrans
+            where  receiptReqTrans.InventTransOrigin == _currentChangeLine.getJournalInventTransOriginRecId()
+                && receiptReqTrans.PlanVersion == planVersion
+                && receiptReqTrans.RefType == ReqRefType::Purch
+                && receiptReqTrans.RefId == _currentHeader.getPurchId()
+        {
+            this.runReqTransExplosion(
+                _currentHeader,
+                _currentChangeLine,
+                receiptReqTrans,
+                planVersion);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runReqTransExplosion</Name>
+				<Source><![CDATA[
+    private void runReqTransExplosion(
+        PurchTableChangeReviewChangeHeader      _currentHeader,
+        PurchTableChangeReviewChangeLine        _currentChangeLine,
+        ReqTrans                                _receiptReqTrans,
+        ReqPlanVersionRefRecId                  _planVersion)
+    {
+        Types RecIdType = typeName2Type(extendedtypestr(recId));
+
+        container conSetTopRecId;
+        container conMapDerived;
+        container conMapReqTrans;
+        container conMapReqTransPO;
+        container conMapParent;
+        container conMapReqTransSettled;
+
+        // For killswitched customers we should not calculate the derived records in the explosion 
+        boolean skipDerivedRecordsCalculation = !PurchTableChangeReviewCalculateMultilevelImpactFlight::instance().isEnabled();
+        
+        // Calc explosion
+        [conSetTopRecId, conMapDerived, conMapReqTrans, conMapReqTransPO, conMapParent, conMapReqTransSettled] = ReqTransExplode::packRunReqTransSkipDerivedRecords(_receiptReqTrans, ReqExplodeType::Up, true, skipDerivedRecordsCalculation);
+
+        Set setTopRecId          = (conSetTopRecId)          ? Set::create(conSetTopRecId)           : new Set(Types::Integer);
+        Map mapDerived           = (conMapDerived)           ? Map::create(conMapDerived)            : new Map(RecIdType, Types::Container);
+        Map mapReqTrans          = (conMapReqTrans)          ? Map::create(conMapReqTrans)           : new Map(RecIdType, Types::Record);
+        Map mapReqTransPO        = (conMapReqTransPO)        ? Map::create(conMapReqTransPO)         : new Map(RecIdType, Types::Record);
+        Map mapParent            = (conMapParent)            ? Map::create(conMapParent)             : new Map(RecIdType, RecIdType);
+        Map mapReqTransSettled   = (conMapReqTransSettled)   ? Map::create(conMapReqTransSettled)    : new Map(RecIdType, Types::Class);
+
+        if (setTopRecId && setTopRecId.elements())
+        {
+            ReqTrans impactedIssueReqTransTmp;
+
+            SetEnumerator setTopRecIdEnumerator = setTopRecId.getEnumerator();
+            while (setTopRecIdEnumerator.moveNext())
+            {
+                RecId impactedIssueReqTransRecId = setTopRecIdEnumerator.current();
+
+                if (mapReqTrans.exists(impactedIssueReqTransRecId))
+                {
+                    impactedIssueReqTransTmp = mapReqTrans.lookup(impactedIssueReqTransRecId);
+                }
+                else
+                {
+                    impactedIssueReqTransTmp = null;
+                }
+
+                if (impactedIssueReqTransTmp.RecId
+                    && (   _currentChangeLine.getCurrentDlvDate() > impactedIssueReqTransTmp.ReqDateDlvOrig
+                        || _currentChangeLine.getCurrentQty() < _currentChangeLine.getJournalQty()))
+                {
+                    this.processIssueReqTransAsImpactedOrder(
+                        _currentHeader,
+                        _currentChangeLine,
+                        _receiptReqTrans,
+                        impactedIssueReqTransTmp,
+                        null,
+                        mapReqTrans,
+                        mapDerived);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processIssueReqTransAsImpactedOrder</Name>
+				<Source><![CDATA[
+    private void processIssueReqTransAsImpactedOrder(
+        PurchTableChangeReviewChangeHeader _currentHeader,
+        PurchTableChangeReviewChangeLine _currentChangeLine,
+        ReqTrans _receiptReqTrans,
+        ReqTrans _impactedIssueReqTrans,
+        PurchTableChangeReviewImpactedOrder _impactedOrder,
+        Map _mapReqTrans,
+        Map _mapDerived)
+    {
+        changecompany (_impactedIssueReqTrans.company())
+        {
+            ReqQtySettled coverageQty = this.calculateQuantityCoveredByReceipt(_impactedIssueReqTrans, _receiptReqTrans);
+            PurchTableChangeReviewImpactedReqTransOrder impactedOrder = PurchTableChangeReviewImpactedReqTransOrder::newFromValues(_impactedIssueReqTrans, coverageQty);
+
+            if (_impactedIssueReqTrans.RefType != ReqRefType::SafetyInvent)
+            {
+                highImpactChangedPurchLineRecIds.add(_currentChangeLine.getCurrentPurchLineRecId());
+                highImpactPurchIds.add(_currentHeader.getPurchId());
+            }
+
+            if (!impactedOrdersMap.exists(impactedOrder.orderKey()))
+            {
+                this.addImpactedOrder(_currentChangeLine, impactedOrder, _impactedOrder);
+                if (PurchTableChangeReviewCalculateMultilevelImpactFlight::instance().isEnabled())
+                {
+                    this.calculateNextLevelImpactInMasterPlanning(_currentHeader, _currentChangeLine, _impactedIssueReqTrans, _mapReqTrans, _mapDerived, impactedOrder);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateNextLevelImpactInMasterPlanning</Name>
+				<Source><![CDATA[
+    private void calculateNextLevelImpactInMasterPlanning(
+        PurchTableChangeReviewChangeHeader _currentHeader,
+        PurchTableChangeReviewChangeLine _currentChangeLine,
+        ReqTrans _impactedIssueReqTrans,
+        Map _mapReqTrans,
+        Map _mapDerived,
+        PurchTableChangeReviewImpactedOrder _impactedOrder = null)
+    {
+        if (_impactedIssueReqTrans.RecId && _mapDerived.exists(_impactedIssueReqTrans.RecId))
+        {
+            Set nextLevelImpactedIssueReqTransRecIdSet;
+
+            container nextLevelImpactedIssueReqTransRecIdPackedContainer = _mapDerived.lookup(_impactedIssueReqTrans.RecId);
+            if (nextLevelImpactedIssueReqTransRecIdPackedContainer)
+            {
+                nextLevelImpactedIssueReqTransRecIdSet = Set::create(nextLevelImpactedIssueReqTransRecIdPackedContainer);
+            }
+
+            if (nextLevelImpactedIssueReqTransRecIdPackedContainer && nextLevelImpactedIssueReqTransRecIdSet && nextLevelImpactedIssueReqTransRecIdSet.elements())
+            {
+                SetEnumerator nextLevelImpactedIssueReqTransRecIdSetEnumerator = nextLevelImpactedIssueReqTransRecIdSet.getEnumerator();
+                while (nextLevelImpactedIssueReqTransRecIdSetEnumerator.moveNext())
+                {
+                    RecId nextLevelImpactedIssueReqTransRecId = nextLevelImpactedIssueReqTransRecIdSetEnumerator.current();
+                    ReqTrans nextLevelImpactedIssueReqTransTmp;
+
+                    if (nextLevelImpactedIssueReqTransRecId && _mapReqTrans.exists(nextLevelImpactedIssueReqTransRecId))
+                    {
+                        nextLevelImpactedIssueReqTransTmp = _mapReqTrans.lookup(nextLevelImpactedIssueReqTransRecId);
+                    }
+
+                    if (nextLevelImpactedIssueReqTransTmp.RecId)
+                    {
+                        this.processIssueReqTransAsImpactedOrder(
+                            _currentHeader,
+                            _currentChangeLine,
+                            null,
+                            nextLevelImpactedIssueReqTransTmp,
+                            _impactedOrder,
+                            _mapReqTrans,
+                            _mapDerived);
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateQuantityCoveredByReceipt</Name>
+				<Source><![CDATA[
+    private ReqQtySettled calculateQuantityCoveredByReceipt(ReqTrans _issueReqTrans, ReqTrans _receiptReqTrans)
+    {
+        if (_receiptReqTrans)
+        {
+            ReqTransCov reqTransCov;
+
+            select sum(Qty) from reqTransCov
+                where  reqTransCov.ReceiptRecId == _receiptReqTrans.RecId
+                    && reqTransCov.IssueRecId == _issueReqTrans.RecId
+                    && reqTransCov.PlanVersion == _issueReqTrans.PlanVersion;
+
+            // coverage has negative qty.
+            return -reqTransCov.Qty;
+        }
+        else
+        {
+            // issue ReqTrans records have negative qty.
+            return -_issueReqTrans.CovQty;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLineChanges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs an in-memory table buffer <c>PurchTableChangeReviewLineChangeDetails</c> based on the selected purchase order lines.
+    /// </summary>
+    /// <param name = "_ds">A data source with the selected purchase order lines.</param>
+    /// <returns>A <c>PurchTableChangeReviewLineChangeDetails</c> table buffer.</returns>
+    public PurchTableChangeReviewLineChangeDetails getLineChanges(FormDataSource _ds)
+    {
+        MultiSelectionHelper selection = MultiSelectionHelper::construct();
+        selection.parmDatasource(_ds);
+        PurchTable purchTable = selection.getFirst();
+        PurchTableChangeReviewLineChangeDetails result;
+        
+        while (purchTable)
+        {
+            if (purchaseOrders.exists(purchTable.PurchId))
+            {
+                PurchTableChangeReviewChangeHeader header = purchaseOrders.lookup(purchTable.PurchId);
+                ListEnumerator recordEnum = header.getLines();
+
+                while (recordEnum.moveNext())
+                {
+                    PurchTableChangeReviewChangeLine currentLine = recordEnum.current();
+
+                    result.clear();
+                    result.PurchLineRecId = currentLine.getCurrentPurchLineRecId();
+                    result.ItemId = currentLine.getItemId();
+                    result.ItemName = currentLine.getItemName();
+                    result.ConfirmedQty = currentLine.getJournalQty();
+                    result.ConfirmedDlvDate = currentLine.getJournalDlvDate();
+                    result.CurrentQty = currentLine.getCurrentQty() == currentLine.getJournalQty() ? 0 : currentLine.getCurrentQty();
+                    result.CurrentDlvDate = currentLine.getCurrentDlvDate() == currentLine.getJournalDlvDate() ? dateNull() : currentLine.getCurrentDlvDate();
+                    result.doInsert();
+                }
+            }
+
+            purchTable = selection.getNext();
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetPurchChangeLineListEnumerator</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a list of <c>PurchTableChangeReviewChangeLine</c> for all the selected lines.
+    /// </summary>
+    /// <param name = "_ds">A data source with the selected <c>PurchTableChangeReviewLineChangeDetails</c>.</param>
+    /// <returns>An enumerator for the created list of <c>PurchTableChangeReviewChangeLine</c> records.</returns>
+    public ListEnumerator GetPurchChangeLineListEnumerator(FormDataSource _ds)
+    {
+        MultiSelectionHelper selection = MultiSelectionHelper::construct();
+        selection.parmDatasource(_ds);
+        PurchTableChangeReviewLineChangeDetails changeReviewRecord = selection.getFirst();
+        List purchChangeLineList = new List(Types::Class);
+            
+        while (changeReviewRecord)
+        {
+            PurchTableChangeReviewChangeLine purchChangeLine = this.getPurchChangeLine(changeReviewRecord.PurchLineRecId);
+                
+            if(purchChangeLine)
+            {
+                purchChangeLineList.addEnd(purchChangeLine);
+            }
+
+            changeReviewRecord = selection.getNext();
+        }
+
+        return purchChangeLineList.getEnumerator();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPurchChangeLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets an instance of the <c>PurchTableChangeReviewChangeLine</c> class based on the purchase line RecId.
+    /// </summary>
+    /// <param name = "_purchLineRecId">A RecId of the purchase line to search for.</param>
+    /// <returns></returns>
+    public PurchTableChangeReviewChangeLine getPurchChangeLine(RefRecId _purchLineRecId)
+    {
+        if (purchaseOrderLines.exists(_purchLineRecId))
+        {
+            return purchaseOrderLines.lookup(_purchLineRecId);
+        }
+
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getImpactingOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs an in-memory table buffer <c>PurchTableChangeReviewLineChangeDetails</c> which represents the changed purchase order line which has impacted the given order.
+    /// </summary>
+    /// <param name = "_impactedOrderTmp">An impacted order.</param>
+    /// <returns>A <c>PurchTableChangeReviewLineChangeDetails</c> table buffer.</returns>
+    public PurchTableChangeReviewLineChangeDetails getImpactingOrders(PurchTableChangeReviewImpactedOrderTmp _impactedOrderTmp)
+    {
+        PurchTableChangeReviewLineChangeDetails purchTableChangeLine;
+
+        container orderKey = [_impactedOrderTmp.ImpactedOrderType, _impactedOrderTmp.ReferenceRecId];
+
+        if (_impactedOrderTmp && impactingRelationshipsMap.exists(orderKey))
+        {
+            List impactingLines = impactingRelationshipsMap.lookup(orderKey);
+
+            ListEnumerator impactingLinesEnumerator = impactingLines.getEnumerator();
+            while (impactingLinesEnumerator.moveNext())
+            {
+                PurchTableChangeReviewChangeLine currentLine = impactingLinesEnumerator.current();
+
+                purchTableChangeLine.clear();
+
+                purchTableChangeLine.PurchId = currentLine.getPurchId();
+                purchTableChangeLine.OrderAccount = currentLine.getVendAccount();
+                purchTableChangeLine.ItemId = currentLine.getItemId();
+                purchTableChangeLine.ItemName = currentLine.getItemName();
+                purchTableChangeLine.ConfirmedQty = currentLine.getJournalQty();
+                purchTableChangeLine.ConfirmedDlvDate = currentLine.getJournalDlvDate();
+                purchTableChangeLine.CurrentQty = currentLine.getCurrentQty() == currentLine.getJournalQty() ? 0 : currentLine.getCurrentQty();
+                purchTableChangeLine.CurrentDlvDate = currentLine.getCurrentDlvDate() == currentLine.getJournalDlvDate() ? dateNull() : currentLine.getCurrentDlvDate();
+
+                purchTableChangeLine.doInsert();
+            }
+        }
+
+        return purchTableChangeLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getImpactedOrdersTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs an in-memory table buffer <c>PurchTableChangeReviewImpactedOrderTmp</c> of all the impacted orders.
+    /// </summary>
+    /// <returns>A <c>PurchTableChangeReviewImpactedOrderTmp</c> table buffer.</returns>
+    public PurchTableChangeReviewImpactedOrderTmp getImpactedOrdersTable()
+    {
+        PurchTableChangeReviewImpactedOrderTmp impactedOrderTmp;
+
+        MapEnumerator purchaseOrderLinesEnumerator = purchaseOrderLines.getEnumerator();
+        while (purchaseOrderLinesEnumerator.moveNext())
+        {
+            PurchTableChangeReviewChangeLine purchTableChangeLine = purchaseOrderLinesEnumerator.currentValue();
+
+            ListEnumerator impactedOrdersEnumerator = purchTableChangeLine.getImpactedOrders();
+            while (impactedOrdersEnumerator.moveNext())
+            {
+                PurchTableChangeReviewImpactedOrder impactedOrder = impactedOrdersEnumerator.current();
+
+                impactedOrderTmp.clear();
+
+                impactedOrderTmp.ReferenceType = impactedOrder.parmReferenceType();
+                impactedOrderTmp.ReferenceId = impactedOrder.parmReferenceId();
+                impactedOrderTmp.ImpactedOrderType = impactedOrder.parmImpactedOrderType();
+                impactedOrderTmp.ReferenceRecId = impactedOrder.parmReferenceRecId();
+                impactedOrderTmp.RequiredOnDate = impactedOrder.parmRequiredOnDate();
+                impactedOrderTmp.CustAccountId = impactedOrder.parmCustomerAccount();
+
+                impactedOrderTmp.doInsert();
+            }
+        }
+
+        return impactedOrderTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getImpactedOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds an instance of the <c>PurchTableChangeReviewImpactedOrder</c> based on the given <c>PurchTableChangeReviewImpactedOrderTmp</c> record.
+    /// </summary>
+    /// <param name = "_impactedOrderTable">A table representation of the impacted order.</param>
+    /// <returns>An instance of the <c>PurchTableChangeReviewImpactedOrder</c> which represents the impacted order.</returns>
+    public PurchTableChangeReviewImpactedOrder getImpactedOrder(PurchTableChangeReviewImpactedOrderTmp _impactedOrderTable)
+    {
+        if (impactedOrdersMap.exists(_impactedOrderTable.orderKey()))
+        {
+            return impactedOrdersMap.lookup(_impactedOrderTable.orderKey());
+        }
+
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRequirementsTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a string which describes the dependencies for the given purchase order.
+    /// </summary>
+    /// <param name = "_purchId">An ID of the purchase order.</param>
+    /// <returns>String desciption of the dependent orders.</returns>
+    public str getRequirementsTable(PurchId _purchId)
+    {
+        str result = '';
+
+        PurchTableChangeReviewChangeHeader header = purchaseOrders.lookup(_purchId);
+        ListEnumerator recordEnum = header.getLines();
+
+        while (recordEnum.moveNext())
+        {
+            PurchTableChangeReviewChangeLine currentLine = recordEnum.current();
+
+            if (PurchTableChangeReviewAllChangedPOLinesEmailFlight::instance().isEnabled())
+            {
+                if (currentLine.isRisky())
+                {
+                    result += strFmt('%1|%2|%3\n',
+                        currentLine.getItemId(),
+                        any2Str(currentLine.getJournalQty()),
+                        strFmt('%1', currentLine.getJournalDlvDate()));
+                }
+            }
+            else
+            {
+                InventQty requiredQty = 0;
+                PurchLineDlvDate requiredDate = dateMax();
+
+                ListEnumerator orderEnum = currentLine.getImpactedOrders();
+                while (orderEnum.moveNext())
+                {
+                    PurchTableChangeReviewImpactedOrder currentOrder = orderEnum.current();
+                    requiredQty += currentOrder.parmRequiredQty();
+                    requiredDate = min(requiredDate, currentOrder.parmRequiredOnDate());
+                }
+
+                if (requiredQty > currentLine.getCurrentQty() || requiredDate < currentLine.getCurrentDlvDate())
+                {
+                    result += strFmt('%1|%2|%3\n',
+                        currentLine.getItemId(),
+                        requiredQty > currentLine.getCurrentQty() ? any2Str(requiredQty) : '',
+                        requiredDate < currentLine.getCurrentDlvDate() ? strFmt('%1', requiredDate) : '');
+                }
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>highImpactQueryRange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a query range to filter only the high-impact changes.
+    /// </summary>
+    /// <returns>A query range.</returns>
+    public str highImpactQueryRange()
+    {
+        str rangeValue = '';
+
+        SetEnumerator orderEnum = highImpactPurchIds.getEnumerator();
+        
+        while (orderEnum.moveNext())
+        {
+            PurchId currentPurchId = orderEnum.current();
+            rangeValue = queryRangeConcat(rangeValue, currentPurchId);
+        }
+
+        if (!rangeValue)
+        {
+            // some non-existing id.
+            rangeValue = guid2Str(newGuid());
+        }
+
+        return rangeValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lowImpactQueryRange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a query range to filter only the low-impact changes.
+    /// </summary>
+    /// <returns>A query range.</returns>
+    public str lowImpactQueryRange()
+    {
+        str rangeValue = '';
+
+        MapEnumerator orderEnum = purchaseOrders.getEnumerator();
+        
+        while (orderEnum.moveNext())
+        {
+            PurchId currentPurchId = orderEnum.currentKey();
+            if (!highImpactPurchIds.in(currentPurchId))
+            {
+                rangeValue = queryRangeConcat(rangeValue, currentPurchId);
+            }
+        }
+
+        if (!rangeValue)
+        {
+            // some non-existing id.
+            rangeValue = guid2Str(newGuid());
+        }
+
+        return rangeValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildOrderTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a string which summarizes the changes of purchase orders in a tabular format.
+    /// </summary>
+    /// <param name = "_isHighImpact">Specifies if should construct for high-imapact orders.</param>
+    /// <returns>A string representation of the changed purchase orders.</returns>
+    public str buildOrderTable(boolean _isHighImpact)
+    {
+        str result = '';
+
+        MapEnumerator orderEnum = purchaseOrders.getEnumerator();
+        
+        Map countsMap = new Map(Types::String, Types::Integer);
+        Map itemsMap = new Map(Types::String, Types::Class);
+
+        void addLine(str _classification, PurchTableChangeReviewChangeLine _line)
+        {
+            if (countsMap.exists(_classification))
+            {
+                countsMap.insert(_classification, countsMap.lookup(_classification) + 1);
+            }
+            else
+            {
+                countsMap.insert(_classification, 1);
+            }
+
+            if (itemsMap.exists(_classification))
+            {
+                Set items = itemsMap.lookup(_classification);
+                items.add(_line.getItemId());
+            }
+            else
+            {
+                Set items = new Set(Types::String);
+                items.add(_line.getItemId());
+                itemsMap.insert(_classification, items);
+            }
+        }
+
+        while (orderEnum.moveNext())
+        {
+            PurchId currentPurchId = orderEnum.currentKey();
+
+            if (highImpactPurchIds.in(currentPurchId) == _isHighImpact)
+            {
+                PurchTableChangeReviewChangeHeader currentHeader = orderEnum.currentValue();
+                ListEnumerator linesEnum = currentHeader.getLines();
+                while (linesEnum.moveNext())
+                {
+                    PurchTableChangeReviewChangeLine currentLine = linesEnum.current();
+
+                    if (currentLine.getCurrentQty() > currentLine.getJournalQty() && !_isHighImpact)
+                    {
+                        addLine("@ProcurementAndSourcing:OAIPrompt_QuantityIncreased", currentLine);
+                    }
+                    if (currentLine.getCurrentQty() < currentLine.getJournalQty())
+                    {
+                        addLine("@ProcurementAndSourcing:OAIPrompt_QuantityDecreased", currentLine);
+                    }
+                    if (currentLine.getCurrentDlvDate() > currentLine.getJournalDlvDate())
+                    {
+                        addLine("@ProcurementAndSourcing:OAIPrompt_DeliveryDelayed", currentLine);
+                    }
+                    if (currentLine.getCurrentDlvDate() < currentLine.getJournalDlvDate() && !_isHighImpact)
+                    {
+                        addLine("@ProcurementAndSourcing:OAIPrompt_DeliveryRushed", currentLine);
+                    }
+                }
+            }
+        }
+
+        MapEnumerator countsEnum = countsMap.getEnumerator();
+        while (countsEnum.moveNext())
+        {
+            str classification = countsEnum.currentKey();
+            int lineCount = countsEnum.currentValue();
+            Set items = itemsMap.lookup(classification);
+            str itemString;
+            SetEnumerator itemsEnum = items.getEnumerator();
+
+            while (itemsEnum.moveNext())
+            {
+                if (itemString)
+                {
+                    itemString += ',';
+                }
+                itemString += itemsEnum.current();
+            }
+
+            result += strFmt('%1|%2|%3\n', classification, lineCount, itemString);
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildImpactTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a string with summary of the impacted orders.
+    /// </summary>
+    /// <returns>impacted orders in a string format.</returns>
+    public str buildImpactTable()
+    {
+        str result = '';
+
+        Map countsMap = new Map(Types::String, Types::Integer);
+        Set processedImpactedOrdersSet = new Set(Types::Container);
+
+        MapEnumerator purchaseOrderLinesEnumerator = purchaseOrderLines.getEnumerator();
+        while (purchaseOrderLinesEnumerator.moveNext())
+        {
+            PurchTableChangeReviewChangeLine purchTableChangeLine = purchaseOrderLinesEnumerator.currentValue();
+
+            ListEnumerator impactedOrdersEnumerator = purchTableChangeLine.getImpactedOrders();
+            while (impactedOrdersEnumerator.moveNext())
+            {
+                PurchTableChangeReviewImpactedOrder impactedOrder = impactedOrdersEnumerator.current();
+
+                if (!processedImpactedOrdersSet.in(impactedOrder.orderKey()))
+                {
+                    // first encounter of the order, need to count it.
+                    if (countsMap.exists(impactedOrder.parmReferenceType()))
+                    {
+                        countsMap.insert(impactedOrder.parmReferenceType(), countsMap.lookup(impactedOrder.parmReferenceType()) + 1);
+                    }
+                    else
+                    {
+                        countsMap.insert(impactedOrder.parmReferenceType(), 1);
+                    }
+
+                    processedImpactedOrdersSet.add(impactedOrder.orderKey());
+                }
+            }
+        }
+
+        MapEnumerator countsEnum = countsMap.getEnumerator();
+        while (countsEnum.moveNext())
+        {
+            result += strFmt('%1|%2\n', countsEnum.currentKey(), countsEnum.currentValue());
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLowImpactChangeCount</Name>
+				<Source><![CDATA[
+    public int getLowImpactChangeCount()
+    {
+        return purchaseOrderLines.elements() - highImpactChangedPurchLineRecIds.elements();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getHighImpactChangeCount</Name>
+				<Source><![CDATA[
+    public int getHighImpactChangeCount()
+    {
+        return highImpactChangedPurchLineRecIds.elements();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getImpactedOrdersCount</Name>
+				<Source><![CDATA[
+    public int getImpactedOrdersCount()
+    {
+        return impactedOrdersMap.elements();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLowImpactOrdersCount</Name>
+				<Source><![CDATA[
+    public int getLowImpactOrdersCount()
+    {
+        return purchaseOrders.elements() - highImpactPurchIds.elements();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getHighImpactOrdersCount</Name>
+				<Source><![CDATA[
+    public int getHighImpactOrdersCount()
+    {
+        return highImpactPurchIds.elements();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLanguage</Name>
+				<Source><![CDATA[
+    public LanguageId getLanguage()
+    {
+        return language;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBasicSummary</Name>
+				<Source><![CDATA[
+    public container getBasicSummary()
+    {
+        return [
+            strFmt("@ProcurementAndSourcing:PurchTableChangeReviewLowImpactSummaryBasic", purchaseOrders.elements() - highImpactPurchIds.elements()),
+            strFmt("@ProcurementAndSourcing:PurchTableChangeReviewHighImpactSummaryBasic", highImpactPurchIds.elements()),
+            strFmt("@ProcurementAndSourcing:PurchTableChangeReviewDownstreamImpactSummaryBasic", impactedOrdersMap.elements())
+        ];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addImpactedOrder</Name>
+				<Source><![CDATA[
+    private void addImpactedOrder(
+        PurchTableChangeReviewChangeLine _currentChangeLine,
+        PurchTableChangeReviewImpactedOrder _impactedOrder,
+        PurchTableChangeReviewImpactedOrder _parentImpactedOrder = null)
+    {
+        _currentChangeLine.addImpactedOrder(_impactedOrder);
+
+        if (!impactedOrdersMap.exists(_impactedOrder.orderKey()))
+        {
+            impactedOrdersMap.add(_impactedOrder.orderKey(), _impactedOrder);
+        }
+
+        List impactingLines;
+
+        if (impactingRelationshipsMap.exists(_impactedOrder.orderKey()))
+        {
+            impactingLines = impactingRelationshipsMap.lookup(_impactedOrder.orderKey());
+        }
+        else
+        {
+            impactingLines = new List(Types::Class);
+            impactingRelationshipsMap.add(_impactedOrder.orderKey(), impactingLines);
+        }
+
+        impactingLines.addEnd(_currentChangeLine);
+
+        if (_parentImpactedOrder)
+        {
+            _parentImpactedOrder.addChildImpactedOrder(_impactedOrder);
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

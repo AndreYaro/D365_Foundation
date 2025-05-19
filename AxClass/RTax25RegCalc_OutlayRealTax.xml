@@ -1,0 +1,370 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>rTax25RegCalc_OutlayRealTax</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+final class rTax25RegCalc_OutlayRealTax extends RTax25RegCalc implements BatchRetryable
+{
+    int             vatCleared      [ enumcnt(TaxType_W) ];
+    TaxAmount       vatAmounts      [ enumcnt(TaxType_W) ];
+    TaxBase         vatBaseAmounts  [ enumcnt(TaxType_W) ];
+    TransDate       vatAccrualDate;
+    boolean         vatCached;
+
+    TaxAmount       grandTotalTaxAmount;
+    TaxBase         grandTotalTaxBase;
+
+    #define.MaxAccrualDateDev(2)
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>calc</Name>
+				<Source><![CDATA[
+public void calc()
+    {
+        RTax25RegisterProfit registerProfit;
+        RTax25ProfitBalance  profitBalance;
+        RefRecId             profitTableRecId;
+
+        try
+        {
+            ttsbegin;
+
+            super();
+            // Calculate automated taxes
+            regQuery.addHeaderRecord();
+            this.calcAutoTax();
+
+            // Calculate other taxes posted directly to Gl
+
+            while select rTax25ProfitTable
+                from registerProfit
+                where registerProfit.RegisterId == registerId
+            {
+                profitTableRecId = registerProfit.rTax25ProfitTable;
+                profitBalance = new RTax25ProfitBalance(profitTableRecId);
+                profitBalance.setBalance(dateFrom, dateTo);
+
+                regQuery.addBodyRecord(profitTableRecId,
+                                       [RTax25ProfitTable::find(profitTableRecId).Description,
+                                        RTax25ProfitTable::find(profitTableRecId).ProfitId,
+                                        dateTo,
+                                        0.0,
+                                        0.0,
+                                        profitBalance.balanceMST()]);
+
+                grandTotalTaxAmount += profitBalance.balanceMST();
+            }
+            regQuery.addFooterRecord(0,
+                                     ["",
+                                      "",
+                                      dateNull(),
+                                      grandTotalTaxBase,
+                                      0.0,
+                                      grandTotalTaxAmount],
+                                     0);
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+    }
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcAutoTax</Name>
+				<Source><![CDATA[
+private void calcAutoTax()
+    {
+        RTax25TaxTable      groupTaxTable;
+        RTax25TaxTable      taxTable;
+
+        TaxReportPeriod     taxReportPeriod;
+        TaxTrans            salesTaxTrans;
+        TaxTable            salesTaxTable;
+
+        TransDate           taxAccrualDate = dateNull();
+        TaxAmount           totTaxAmount;
+        TaxAmount           taxAmount;
+        TaxBase             totTaxBaseAmount, taxBaseAmount;
+
+        RefTableId          refTableId;
+        RefRecId            refRecId;
+
+        boolean checkAccrualDate()
+        {
+            boolean ret = true;
+            if (abs(taxAccrualDate - dateTo) > #MaxAccrualDateDev)
+            {
+                ret = checkFailed(strfmt("@GLS104765", taxTable.TaxCode, taxAccrualDate));
+            }
+            return ret;
+        }
+
+        this.progressInit("@GLS105851",(select count(RecId) from rTax25TaxTable
+                                       group by TaxModule, rTax25ProfitTable).RecId);
+
+        vatCached = false;
+        // Scan profit codes
+        while select groupTaxTable
+            group by rTax25ProfitTable
+            where groupTaxTable.TaxModule == RTax25TaxModule::Tax
+        {
+            progress.setText(groupTaxTable.taxName());
+
+            totTaxAmount       = 0;
+            totTaxBaseAmount   = 0;
+            taxAccrualDate     = dateNull();
+                    while select taxTable
+                        where taxTable.rTax25ProfitTable == groupTaxTable.rTax25ProfitTable
+                           && taxTable.TaxModule         == RTax25TaxModule::Tax
+                    join salesTaxTable
+                        where salesTaxTable.TaxCode == taxTable.TaxCode
+                    {
+                        refTableId  = salesTaxTable.TableId;
+                        refRecId    = salesTaxTable.RecId;
+
+                        if (taxTable.SalesTaxType == TaxType_W::VATZero    ||
+                            taxTable.SalesTaxType == TaxType_W::VATReduced ||
+                            taxTable.SalesTaxType == TaxType_W::VAT)
+                        {
+                            // Calculate VAT using sales and purchase book tables
+                            [taxAmount, taxBaseAmount] = this.calcVATType(taxTable.SalesTaxType);
+                        }
+                        else
+                        {
+                            // Sales tax "on payment", excise
+                            taxAccrualDate = (select maxof(ToDate) from taxReportPeriod
+                                                where taxReportPeriod.TaxPeriod == salesTaxTable.TaxPeriod  &&
+                                                      taxReportPeriod.FromDate  >= dateFrom                 &&
+                                                      taxReportPeriod.ToDate    <= dateTo).ToDate;
+                            checkAccrualDate();
+                            select sum(TaxAmount), sum(TaxBaseAmount) from salesTaxTrans
+                                where salesTaxTrans.TransDate       >= dateFrom                     &&
+                                      salesTaxTrans.TransDate       <= dateTo                       &&
+                                      salesTaxTrans.TaxDirection    == TaxDirection::OutgoingTax    &&
+                                      salesTaxTrans.TaxCode         == taxTable.TaxCode;
+
+                            taxAmount     = -salesTaxTrans.TaxAmount;
+                            taxBaseAmount = -salesTaxTrans.TaxBaseAmount;
+                        }
+                        totTaxAmount     += taxAmount;
+                        totTaxBaseAmount += taxBaseAmount;
+                    }
+            regQuery.addBodyRecord(groupTaxTable.rTax25ProfitTable,
+                                   [RTax25ProfitTable::find(groupTaxTable.rTax25ProfitTable).Description,
+                                    RTax25ProfitTable::find(groupTaxTable.rTax25ProfitTable).ProfitId,
+                                    taxAccrualDate,
+                                    totTaxBaseAmount,
+                                    totTaxBaseAmount ? totTaxAmount / totTaxBaseAmount * 100 : 0.0,
+                                    totTaxAmount],
+                                   refTableId,
+                                   refRecId);
+
+            grandTotalTaxAmount += totTaxAmount;
+            grandTotalTaxBase   += totTaxBaseAmount;
+            refRecId   = 0;
+            refTableId = 0;
+            progress.incCount();
+        }
+    }
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcVATType</Name>
+				<Source><![CDATA[
+private container calcVATType(TaxType_W _taxType)
+    {
+        int                         idx = _taxType;
+
+        SalesBookTable_RU           salesBookTable, salesBookTableRep;
+        SalesBookTrans_RU           salesBookTrans;
+        PurchBookTable_RU           purchBookTable, purchBookTableRep;
+        PurchBookTrans_RU           purchBookTrans;
+
+        SalesPurchBookTable_RU      salesPurchBookTable, salesPurchBookTableReporting;
+        SalesPurchBookTrans_RU      salesPurchBookTrans;
+
+        void selectBook(int _sign = 1)
+        {
+            int tmpIdx;
+
+            rTax25PeriodIterator.first();
+
+            do
+            {
+                if (rTax25PeriodIterator.fromDateAccounting() == dateFrom &&
+                    rTax25PeriodIterator.toDateAccounting()   == dateTo   &&
+                    rTax25PeriodIterator.fromDateReporting()  == dateFrom &&
+                    rTax25PeriodIterator.toDateReporting()    == dateTo)
+                {
+            select sum(TaxAmountVAT20), sum(AmountLiableToVAT20),
+                   sum(TaxAmountVAT10), sum(AmountLiableToVAT10),
+                   sum(AmountLiableToVAT0) from salesPurchBookTrans
+                           where !salesPurchBookTrans.CorrectedSalesPurchBookTable
+            join maxof(RecId) from salesPurchBookTable
+                where salesPurchBookTable.RecId         == salesPurchBookTrans.SalesPurchBookTable_RU &&
+                      salesPurchBookTable.ClosingDate   >= dateFrom &&
+                      salesPurchBookTable.ClosingDate   <= dateTo;
+                }
+                else
+                {
+                    select sum(TaxAmountVAT20), sum(AmountLiableToVAT20),
+                           sum(TaxAmountVAT10), sum(AmountLiableToVAT10),
+                           sum(AmountLiableToVAT0) from salesPurchBookTrans
+                    join TableId from salesPurchBookTable
+                        where salesPurchBookTable.RecId         == salesPurchBookTrans.SalesPurchBookTable_RU &&
+                              salesPurchBookTable.ClosingDate   >= rTax25PeriodIterator.fromDateAccounting()  &&
+                              salesPurchBookTable.ClosingDate   <= rTax25PeriodIterator.toDateAccounting()
+                    join TableId from salesPurchBookTableReporting
+                        where salesPurchBookTableReporting.RecId       == salesPurchBookTrans.CorrectedSalesPurchBookTable &&
+                              salesPurchBookTableReporting.ClosingDate >= rTax25PeriodIterator.fromDateReporting()         &&
+                              salesPurchBookTableReporting.ClosingDate <= rTax25PeriodIterator.toDateReporting();
+                }
+
+            tmpIdx = TaxType_W::VAT;
+            vatAmounts[tmpIdx]     += salesPurchBookTrans.TaxAmountVAT20 * _sign;
+            vatBaseAmounts[tmpIdx] += salesPurchBookTrans.AmountLiableToVAT20 * _sign;
+
+            tmpIdx = TaxType_W::VATReduced;
+            vatAmounts[tmpIdx]     += salesPurchBookTrans.TaxAmountVAT10 * _sign;
+            vatBaseAmounts[tmpIdx] += salesPurchBookTrans.AmountLiableToVAT10 * _sign;
+
+            tmpIdx = TaxType_W::VATZero;
+            vatAmounts[tmpIdx]     += 0.0;
+            vatBaseAmounts[tmpIdx] += salesPurchBookTrans.AmountLiableToVAT0 * _sign;
+            }
+            while (rTax25PeriodIterator.next());
+
+            select maxof(ClosingDate) from salesPurchBookTable
+                where salesPurchBookTable.ClosingDate   >= dateFrom &&
+                      salesPurchBookTable.ClosingDate   <= dateTo;
+            vatAccrualDate = min(vatAccrualDate, salesPurchBookTable.ClosingDate);
+
+            if (abs(salesPurchBookTable.ClosingDate - dateTo) > #MaxAccrualDateDev)
+            {
+                warning("@GLS104767");
+            }
+        }
+
+        vaTcleared[idx]++;
+        if (vaTcleared[idx] > 1)
+            return [0.0, 0.0, dateNull()];
+
+        if (! vatCached)
+        {
+            vatAccrualDate = dateMax();
+
+            salesPurchBookTrans = salesBookTrans;
+            salesPurchBookTable = salesBookTable;
+            salesPurchBookTableReporting = salesBookTableRep;
+            selectBook(1);
+
+            salesPurchBookTrans = purchBookTrans;
+            salesPurchBookTable = purchBookTable;
+            salesPurchBookTableReporting = purchBookTableRep;
+
+            selectBook(-1);
+
+            vatCached = true;
+        }
+        return [vatAmounts[idx], vatBaseAmounts[idx]];
+    }
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkParameters</Name>
+				<Source><![CDATA[
+        protected boolean checkParameters()
+    {
+        boolean ret = true;
+
+        if (! (select firstonly RecId from rTax25TaxTable).RecId)
+        {
+            ret = checkFailed("@GLS104766");
+        }
+        return super() || ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>correctedPeriodDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the minimum date from the dates which correspond to the end of the quarter in which the reporting date of the corrective transaction is included.
+    /// </summary>
+    /// <param name="_fromDateCalc">
+    ///    Start date of the period in which the accounting date should be included.
+    /// </param>
+    /// <param name="_toDateCalc">
+    ///    End date of the period in which the accounting date should be included.
+    /// </param>
+    /// <param name="_toDateCorr">
+    ///    End date of the period in which the reporting date should be included.
+    /// </param>
+    /// <returns>
+    ///    Minimum date from the dates which correspond to the end of the quarter in which the corrective transaction is included.
+    /// </returns>
+    public ReportingDate_RU correctedPeriodDate(FromDate _fromDateCalc, ToDate _toDateCalc, ToDate _toDateCorr)
+    {
+        ReportingDate_RU        correctedPeriodDate;
+
+        SalesBookTable_RU       salesBookTable, salesBookTableRep;
+        SalesBookTrans_RU       salesBookTrans;
+        PurchBookTable_RU       purchBookTable, purchBookTableRep;
+        PurchBookTrans_RU       purchBookTrans;
+
+        SalesPurchBookTable_RU  salesPurchBookTable, salesPurchBookTableReporting;
+        SalesPurchBookTrans_RU  salesPurchBookTrans;
+
+        void selectBook(int _sign = 1)
+        {
+            select firstonly ClosingDate from salesPurchBookTableReporting
+                order by ClosingDate asc
+                where salesPurchBookTableReporting.ClosingDate <= _toDateCorr
+            exists join salesPurchBookTrans
+                where salesPurchBookTrans.CorrectedSalesPurchBookTable == salesPurchBookTableReporting.RecId
+            exists join salesPurchBookTable
+                where salesPurchBookTable.RecId         == salesPurchBookTrans.SalesPurchBookTable_RU &&
+                        salesPurchBookTable.ClosingDate >= _fromDateCalc &&
+                        salesPurchBookTable.ClosingDate <= _toDateCalc;
+
+            if (salesPurchBookTableReporting.ClosingDate &&
+               (!correctedPeriodDate || correctedPeriodDate > salesPurchBookTableReporting.ClosingDate))
+            {
+                correctedPeriodDate = dateEndQtr(salesPurchBookTableReporting.ClosingDate);
+            }
+        }
+
+        salesPurchBookTrans = salesBookTrans;
+        salesPurchBookTable = salesBookTable;
+        salesPurchBookTableReporting = salesBookTableRep;
+        selectBook(1);
+
+        salesPurchBookTrans = purchBookTrans;
+        salesPurchBookTable = purchBookTable;
+        salesPurchBookTableReporting = purchBookTableRep;
+        selectBook(-1);
+
+        return correctedPeriodDate;
+    }
+]]></Source>
+			</Method>
+		<Method><Name>isRetryable</Name><Source><![CDATA[
+    /// <summary>
+    /// Controls whether the batch task should be retried in case of transient errors.
+    /// </summary>
+    /// <returns>
+    /// Always returns true.
+    /// </returns>
+    [Hookable(false)]
+    public final boolean isRetryable() 
+    {
+        return true;
+    }
+]]></Source></Method></Methods>
+	</SourceCode>
+</AxClass>

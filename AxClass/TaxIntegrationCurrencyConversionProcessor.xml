@@ -1,0 +1,691 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TaxIntegrationCurrencyConversionProcessor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>TaxIntegrationCurrencyConversionProcessor</c> class is for currency conversion and rounding.
+/// </summary>
+public class TaxIntegrationCurrencyConversionProcessor
+{
+    private TaxIntegrationDocumentObject document;
+    private TaxCurrencyConversionHelper conversionHelper;
+    private TaxIntegrationRoundingHelper roundingHelper;
+    private Map summedAmountForLineMap;
+    private Set needAdjustBaseAmountTaxLineSet;
+    private CurrencyCode accountingCurrency, reportingCurrency;
+    private boolean isTaxOnTaxBaseAmountExcludedFlight;
+    private boolean isRoundingPerfFlightEnabled = TaxRoundingPerfFlight::instance().isEnabled();
+    private boolean isRoundingInLineWithTaxCode = false;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create and initialize the instance
+    /// </summary>
+    /// <param name = "_document">Tax integration document object</param>
+    public void new(TaxIntegrationDocumentObject _document)
+    {
+        TransDate transactionDate = _document.getTransactionDate();
+        CurrencyCode transactionCurrency = _document.getTransactionCurrencyCode();
+
+        this.conversionHelper = new TaxCurrencyConversionHelper(transactionCurrency, transactionDate);
+        if (_document.getAccountingCurrencyFixedExchangeRate())
+        {
+            conversionHelper.setAccountingCurrencyFixedExchangeRate(_document.getAccountingCurrencyFixedExchangeRate());
+        }
+        
+        if (_document.getReportingCurrencyFixedExchangeRate())
+        {
+            conversionHelper.setReportingCurrencyFixedExchangeRate(_document.getReportingCurrencyFixedExchangeRate());
+        }
+
+        TaxIntegrationSetting calculationServiceSetting = _document.getTaxIntegrationSetting() as TaxIntegrationSetting;
+        this.roundingHelper = new TaxIntegrationRoundingHelper(calculationServiceSetting.getRoundingConfiguration());
+        this.isRoundingInLineWithTaxCode = this.roundingHelper.isRoundingInLineWithTaxCode();
+        this.document = _document;
+        this.isTaxOnTaxBaseAmountExcludedFlight = TaxIntegrationTaxOnTaxExcludeBaseAmountForPennyDiffAdjustTaxSalesFlight::instance().isEnabled();
+        this.summedAmountForLineMap = this.isTaxOnTaxBaseAmountExcludedFlight ? new Map(Types::Container, Types::Container) : new Map(Types::Container, Types::Real);
+        this.needAdjustBaseAmountTaxLineSet = new Set(Types::Class);
+
+        Ledger ledger = this.document.getContext().getLedger();
+        this.accountingCurrency = ledger.AccountingCurrency;
+        this.reportingCurrency = ledger.ReportingCurrency ? ledger.ReportingCurrency : ledger.AccountingCurrency;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    public void execute()
+    {
+        SetEnumerator chargeEnumerator = this.document.getChargeSet().getEnumerator();
+        while (chargeEnumerator.moveNext())
+        {
+            TaxIntegrationLineObject charge = chargeEnumerator.current();
+            if (!this.populateLine(charge))
+            {
+                return;
+            }
+        }
+
+        SetEnumerator lineEnumerator = this.document.getLineSet().getEnumerator();
+        while (lineEnumerator.moveNext())
+        {
+            TaxIntegrationLineObject line = lineEnumerator.current();
+
+            //Currently only support intercompany journal
+            if (line.getAncestorDocument().isJournal()
+                && line.getCompany()
+                && line.getCompany() != curExt())
+            {
+                changecompany (line.getCompany())
+                {
+                    this.setLedgerCurrencyCode();
+                    if (!this.populateLine(line))
+                    {
+                        return;
+                    }
+                }
+                this.setLedgerCurrencyCode();
+            }
+            else
+            {
+                if (!this.populateLine(line))
+                {
+                    return;
+                }
+            }
+
+            chargeEnumerator = line.getChargeSet().getEnumerator();
+            while (chargeEnumerator.moveNext())
+            {
+                TaxIntegrationLineObject charge = chargeEnumerator.current();
+                if (!this.populateLine(charge))
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates a line.
+    /// </summary>
+    /// <param name = "_line">The line.</param>
+    /// <returns>true if the operation is successful; otherwise, false.</returns>
+    private boolean populateLine(TaxIntegrationLineObject _line)
+    {
+        this.processRoundingForLine(_line);
+
+        Set taxLineSet = _line.getTaxLineSet();
+        SetEnumerator taxLineSetEnumerator = taxLineSet.getEnumerator();
+
+        while (taxLineSetEnumerator.moveNext())
+        {
+            TaxIntegrationTaxLineObject taxLine = taxLineSetEnumerator.current();
+            if (!this.populateTaxLine(taxLine))
+            {
+                return false;
+            }
+        }
+        
+        // Process line sum amount penny difference adjustment which will adjust base amount in case base amount + tax amount + cash discount does not equal to line amount;
+        this.processLineSumAmountPennyDiffAdjustment(_line);
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateTaxLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates a tax line.
+    /// </summary>
+    /// <param name = "_taxLine">The tax line.</param>
+    /// <returns>True if the operation is successful; otherwise, false.</returns>
+    private boolean populateTaxLine(TaxIntegrationTaxLineObject _taxLine)
+    {
+        return this.processCurrencyConversion(_taxLine)
+            && this.processRounding(_taxLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCurrencyConversion</Name>
+				<Source><![CDATA[
+    private boolean processCurrencyConversion(TaxIntegrationTaxLineObject _taxLine)
+    {
+        this.fillTransactionCurrencyAmounts(_taxLine);
+        this.fillTaxCurrency(_taxLine);
+
+        CurrencyCode taxCurrency = _taxLine.getTaxCurrencyCode();
+        CurrencyCode transactionCurrency = _taxLine.getParentLine().getTransactionCurrencyCode();
+        conversionHelper.setTransactionCurrencyCode(transactionCurrency);
+        conversionHelper.setTaxCurrencyCode(taxCurrency);
+        this.prepareCurrencyConversion(_taxLine);
+
+        this.convertAmountObject(_taxLine.getTransactionCurrencyAmount(), _taxLine.getAccountingCurrencyAmount(), TaxCurrencyConvertDirection::TransactionToAccounting);
+        this.convertAmountObject(_taxLine.getTransactionCurrencyAmount(), _taxLine.getReportingCurrencyAmount(), TaxCurrencyConvertDirection::TransactionToReporting);
+
+        RefTableId headingTableId;
+        RefRecId headingRecId;
+        if (TaxSpecificExchangeRateHelper::isTaxSpecificExchangeRateEnabled())
+        {
+            TaxIntegrationAbstractRecordObject parentRecord = _taxLine.getParentLine().getParentRecord();
+            headingTableId = parentRecord.getLocalTableId();
+            headingRecId = parentRecord.getLocalRecId();
+        }
+
+        if (transactionCurrency == taxCurrency
+            // When tax specific exchange rate is enabled, all tax currency amounts should directly exchange from transaction currency.
+            || TaxSpecificExchangeRateHelper::isTaxSpecificExchRateEnabledByTable(headingTableId, headingRecId))
+        {
+            this.convertAmountObject(_taxLine.getTransactionCurrencyAmount(), _taxLine.getTaxCurrencyAmount(), TaxCurrencyConvertDirection::TransactionToTax);
+        }
+        else
+        {
+            TaxCurConvPath currentRoutine = TaxParameters::find().TaxCurConvPath;
+            switch (currentRoutine)
+            {
+                case TaxCurConvPath::ReportingCurrency:
+                    this.convertAmountObject(_taxLine.getReportingCurrencyAmount(), _taxLine.getTaxCurrencyAmount(), TaxCurrencyConvertDirection::ReportingToTax);
+                    break;
+                default:
+                    this.convertAmountObject(_taxLine.getAccountingCurrencyAmount(), _taxLine.getTaxCurrencyAmount(), TaxCurrencyConvertDirection::AccountingToTax);
+                    break;
+            }
+        }
+        this.convertAmountObject(_taxLine.getRawTransactionCurrencyAmount(), _taxLine.getRawAccountingCurrencyAmount(), TaxCurrencyConvertDirection::TransactionToAccounting);
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>prepareCurrencyConversion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Prepare the conversion helper and related context
+    /// </summary>
+    /// <param name = "_taxLine">TaxIntegrationTaxLineObject</param>
+    private void prepareCurrencyConversion(TaxIntegrationTaxLineObject _taxLine)
+    {
+        if (_taxLine.getParentLine().getAncestorDocument().isJournal())
+        {
+            TaxIntegrationJournalLineObject journalLine = _taxLine.getParentLine();
+            conversionHelper.setAccountingCurrencyFixedExchangeRate(journalLine.getAccountingCurrencyFixedExchangeRate());
+            conversionHelper.setReportingCurrencyFixedExchangeRate(journalLine.getReportingCurrencyFixedExchangeRate());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>convertAmountObject</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Converts the amount object which contains base amount, tax amount and cost in price
+    /// </summary>
+    /// <param name = "_fromAmountObject">Convert from object</param>
+    /// <param name = "_targetAmountObject">Target object</param>
+    /// <param name = "_path">Convert path</param>
+    private void convertAmountObject(TaxIntegrationAmountObject _fromAmountObject, TaxIntegrationAmountObject _targetAmountObject, TaxCurrencyConvertDirection _path)
+    {
+        switch (_path)
+        {
+            case TaxCurrencyConvertDirection::TransactionToAccounting:
+                _targetAmountObject.setBaseAmount(conversionHelper.convertTransactionToAccounting(_fromAmountObject.getBaseAmount()));
+                _targetAmountObject.setTaxAmount(conversionHelper.convertTransactionToAccounting(_fromAmountObject.getTaxAmount()));
+                _targetAmountObject.setNondeductibleTaxAmount(conversionHelper.convertTransactionToAccounting(_fromAmountObject.getNondeductibleTaxAmount()));
+                break;
+            case TaxCurrencyConvertDirection::AccountingToTax:
+                _targetAmountObject.setBaseAmount(conversionHelper.convertAccountingToTax(_fromAmountObject.getBaseAmount()));
+                _targetAmountObject.setTaxAmount(conversionHelper.convertAccountingToTax(_fromAmountObject.getTaxAmount()));
+                _targetAmountObject.setNondeductibleTaxAmount(conversionHelper.convertAccountingToTax(_fromAmountObject.getNondeductibleTaxAmount()));
+                break;
+            case TaxCurrencyConvertDirection::TransactionToReporting:
+                _targetAmountObject.setBaseAmount(conversionHelper.convertTransactionToReporting(_fromAmountObject.getBaseAmount()));
+                _targetAmountObject.setTaxAmount(conversionHelper.convertTransactionToReporting(_fromAmountObject.getTaxAmount()));
+                _targetAmountObject.setNondeductibleTaxAmount(conversionHelper.convertTransactionToReporting(_fromAmountObject.getNondeductibleTaxAmount()));
+                break;
+            case TaxCurrencyConvertDirection::TransactionToTax:
+                _targetAmountObject.setBaseAmount(conversionHelper.convertTransactionToTax(_fromAmountObject.getBaseAmount()));
+                _targetAmountObject.setTaxAmount(conversionHelper.convertTransactionToTax(_fromAmountObject.getTaxAmount()));
+                _targetAmountObject.setNondeductibleTaxAmount(conversionHelper.convertTransactionToTax(_fromAmountObject.getNondeductibleTaxAmount()));
+                break;
+            case TaxCurrencyConvertDirection::ReportingToTax:
+                _targetAmountObject.setBaseAmount(conversionHelper.convertReportingToTax(_fromAmountObject.getBaseAmount()));
+                _targetAmountObject.setTaxAmount(conversionHelper.convertReportingToTax(_fromAmountObject.getTaxAmount()));
+                _targetAmountObject.setNondeductibleTaxAmount(conversionHelper.convertReportingToTax(_fromAmountObject.getNondeductibleTaxAmount()));
+                break;
+            default:
+                _targetAmountObject.setBaseAmount(conversionHelper.convertTransactionToAccounting(_fromAmountObject.getBaseAmount()));
+                _targetAmountObject.setTaxAmount(conversionHelper.convertTransactionToAccounting(_fromAmountObject.getTaxAmount()));
+                _targetAmountObject.setNondeductibleTaxAmount(conversionHelper.convertTransactionToAccounting(_fromAmountObject.getNondeductibleTaxAmount()));
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fillTransactionCurrencyAmounts</Name>
+				<Source><![CDATA[
+    private void fillTransactionCurrencyAmounts(TaxIntegrationTaxLineObject _taxLine)
+    {
+        TaxBaseCur sourceBaseAmountCur = _taxLine.getSourceBaseAmountCur();
+        TaxAmountCur sourceTaxAmountCur = _taxLine.getSourceTaxAmountCur();
+        TaxAmountCur taxInCostPrice = _taxLine.getTaxInCostPrice();
+
+        _taxLine.setSourceBaseAmountCur(sourceBaseAmountCur);
+        _taxLine.setSourceTaxAmountCur(sourceTaxAmountCur);
+        switch (_taxLine.getTaxDirection())
+        {
+            case TaxDirection::IncomingTax:
+            case TaxDirection::UseTax:
+                if (TaxParameters::find().PurchTaxOnOperations)
+                {
+                    _taxLine.setTaxInCostPrice(sourceTaxAmountCur);
+                }
+                else
+                {
+                    _taxLine.setTaxInCostPrice(taxInCostPrice);
+                }
+                break;
+            default:
+                _taxLine.setTaxInCostPrice(taxInCostPrice);
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fillTaxCurrency</Name>
+				<Source><![CDATA[
+    private void fillTaxCurrency(TaxIntegrationTaxLineObject _taxLine)
+    {
+        TaxIntegrationDocumentObject ancestor = _taxLine.getParentLine().getAncestorDocument();
+        TransDate transactionDate = ancestor.getTransactionDate();
+
+        TaxTable taxTable = ancestor.getContext().getTaxTable(_taxLine.getTaxCode());
+
+        if (!taxTable)
+        {
+            ancestor.setException(new System.InvalidOperationException(strFmt("@TaxIntegrationException:RecordNotFound", 'TaxCode', _taxLine.getTaxCode(), 'TaxTable')));
+            return;
+        }
+
+        CurrencyCode taxCurrency;
+        if (ancestor.getLocalTableId() == tableNum(PlSADTable))
+        {
+            taxCurrency = CompanyInfoHelper::standardCurrency();
+        }
+        else
+        {
+            taxCurrency = taxTable.TaxCurrencyCode;
+        }
+
+        _taxLine.setTaxCurrencyCode(taxCurrency);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRoundingForLine</Name>
+				<Source><![CDATA[
+    private boolean processRoundingForLine(TaxIntegrationLineObject _line)
+    {
+        if (document.getSolutionProviderType() == TaxSolutionProviderType::Microsoft)
+        {
+            CurrencyCode transactionCurrency = _line.getTransactionCurrencyCode();
+
+            TaxIntegrationRoundingParameter parameter = new TaxIntegrationRoundingParameter(
+                ['',
+                _line.getLocalRecId(),
+                _line.getLocalTableId(),
+                _line.getTaxCodeSet().toString()]);
+
+            // Here we start transaction currency amounts rounding
+            parameter.setCurrency(TaxCurrency::TransactionCurrency);
+            parameter.setAmountType(TaxIntegrationAmountType::SourceBaseAmountCur);
+            AmountCur baseAmount = roundingHelper.roundAmount(_line.getBaseAmount(), transactionCurrency, parameter);
+            _line.setBaseAmount(baseAmount);
+            AmountCur cashDiscountAmount = roundingHelper.roundAmount(_line.getCashDiscountAmountForBase(), transactionCurrency, parameter);
+            _line.setCashDiscountAmountForBase(cashDiscountAmount);
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRounding</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes rounding for tax integration. This will use the same mechanism with tax service for rounding.
+    /// It is to do the rounding line by line, every line rounding diff will be added to next line before next line rounding.
+    /// </summary>
+    /// <param name = "_taxLine">line item of tax</param>
+    /// <returns>True if the operation is successful; otherwise, false.</returns>
+    private boolean processRounding(TaxIntegrationTaxLineObject _taxLine)
+    {
+        Ledger ledger = this.document.getContext().getLedger();
+        CurrencyCode transactionCurrency = _taxLine.getParentLine().getTransactionCurrencyCode();
+        CurrencyCode taxCurrency = _taxLine.getTaxCurrencyCode();
+
+        TaxIntegrationRoundingParameter parameter = new TaxIntegrationRoundingParameter(
+            [_taxLine.getTaxCode(),
+            _taxLine.getParentLine().getLocalRecId(),
+            _taxLine.getParentLine().getLocalTableId(),
+            _taxLine.getParentLine().getTaxCodeSet().toString()]);
+
+        if (document.getSolutionProviderType() == TaxSolutionProviderType::Microsoft)
+        {
+            // Here we start transaction currency amounts rounding
+            parameter.setCurrency(TaxCurrency::TransactionCurrency);
+            parameter.setAmountType(TaxIntegrationAmountType::SourceBaseAmountCur);
+            TaxBaseCur sourceBaseAmountCur = roundingHelper.roundAmount(_taxLine.getSourceBaseAmountCur(), transactionCurrency, parameter);
+            parameter.setAmountType(TaxIntegrationAmountType::SourceTaxAmountCur);
+            TaxAmountCur sourceTaxAmountCur = roundingHelper.roundAmount(_taxLine.getSourceTaxAmountCur(), transactionCurrency, parameter);
+            parameter.setAmountType(TaxIntegrationAmountType::TaxInCostPrice);
+            TaxAmountCur taxInCostPrice = roundingHelper.roundAmount(_taxLine.getTaxInCostPrice(), transactionCurrency, parameter);
+
+            // Then set the amounts back to line document
+            _taxLine.setSourceBaseAmountCur(sourceBaseAmountCur);
+            _taxLine.setSourceTaxAmountCur(sourceTaxAmountCur);
+            _taxLine.setTaxInCostPrice(taxInCostPrice);
+
+            this.calcSummedAmount(_taxLine, sourceBaseAmountCur, sourceTaxAmountCur);
+        }
+
+        // Here we start accounting currency amounts rounding
+        parameter.setCurrency(TaxCurrency::AccountingCurrency);
+        parameter.setAmountType(TaxIntegrationAmountType::TaxBaseAmount);
+        TaxBase taxBaseAmount = roundingHelper.roundAmount(_taxLine.getTaxBaseAmount(), accountingCurrency, parameter);
+        parameter.setAmountType(TaxIntegrationAmountType::TaxAmount);
+        TaxAmount taxAmount = roundingHelper.roundAmount(_taxLine.getTaxAmount(), accountingCurrency, parameter);
+        parameter.setAmountType(TaxIntegrationAmountType::TaxInCostPriceMST);
+        TaxAmount taxInCostPriceMST = roundingHelper.roundAmount(_taxLine.getTaxInCostPriceMST(), accountingCurrency, parameter);
+
+        // Then set the amounts back to line document
+        _taxLine.setTaxBaseAmount(taxBaseAmount);
+        _taxLine.setTaxAmount(taxAmount);
+        _taxLine.setTaxInCostPriceMST(taxInCostPriceMST);
+
+        // Here we start tax currency amounts rounding
+        parameter.setCurrency(TaxCurrency::TaxCurrency);
+        parameter.setAmountType(TaxIntegrationAmountType::TaxBaseAmountCur);
+        TaxBaseCur taxBaseAmountCur = roundingHelper.roundAmount(_taxLine.getTaxBaseAmountCur(), taxCurrency, parameter);
+        parameter.setAmountType(TaxIntegrationAmountType::TaxAmountCur);
+        TaxAmountCur taxAmountCur = roundingHelper.roundAmount(_taxLine.getTaxAmountCur(), taxCurrency, parameter);
+        parameter.setAmountType(TaxIntegrationAmountType::TaxInCostPriceCur);
+        TaxAmountCur taxInCostPriceCur = roundingHelper.roundAmount(_taxLine.getTaxInCostPriceCur(), taxCurrency, parameter);
+
+        // Then set the amounts back to line document
+        _taxLine.setTaxBaseAmountCur(taxBaseAmountCur);
+        _taxLine.setTaxAmountCur(taxAmountCur);
+        _taxLine.setTaxInCostPriceCur(taxInCostPriceCur);
+
+        // Here we start reporting currency amount rounding
+        TaxBaseCur taxBaseAmountRep;
+        TaxAmountCur taxAmountRep;
+        TaxAmountCur taxInCostPriceRep;
+
+        if (isRoundingPerfFlightEnabled 
+            && this.isRoundingInLineWithTaxCode
+            && reportingCurrency == accountingCurrency)
+        {
+            taxBaseAmountRep = taxBaseAmount;
+            taxAmountRep = taxAmount;
+            taxInCostPriceRep = taxInCostPriceMST;
+        }
+        else
+        {
+            parameter.setCurrency(TaxCurrency::ReportingCurrency);
+            parameter.setAmountType(TaxIntegrationAmountType::TaxBaseAmountRep);
+            taxBaseAmountRep = roundingHelper.roundAmount(_taxLine.getTaxBaseAmountRep(), reportingCurrency, parameter);
+            parameter.setAmountType(TaxIntegrationAmountType::TaxAmountRep);
+            taxAmountRep = roundingHelper.roundAmount(_taxLine.getTaxAmountRep(), reportingCurrency, parameter);
+            parameter.setAmountType(TaxIntegrationAmountType::TaxInCostPriceRep);
+            taxInCostPriceRep = roundingHelper.roundAmount(_taxLine.getTaxInCostPriceRep(), reportingCurrency, parameter);
+        }
+
+        // Then set the amounts back to line document
+        _taxLine.setTaxBaseAmountRep(taxBaseAmountRep);
+        _taxLine.setTaxAmountRep(taxAmountRep);
+        _taxLine.setTaxInCostPriceRep(taxInCostPriceRep);
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLedgerCurrencyCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the accounting currency code and reporting currency code by ledger.
+    /// </summary>
+    private void setLedgerCurrencyCode()
+    {
+        Ledger ledger = this.document.getContext().getLedger();
+        this.accountingCurrency = ledger.AccountingCurrency;
+        this.reportingCurrency = ledger.ReportingCurrency ? ledger.ReportingCurrency : ledger.AccountingCurrency;
+        conversionHelper.setLedgerCurrencyCode(ledger);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcSummedAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the tax amount per tax line, the tax amounts will be summed besides use tax.
+    /// And this summed amount will be prepared for line amount consistency adjustment excluding: tax on tax; TaxBaseType::PctPerGross and TaxBaseType::AmountByUnit
+    /// </summary>
+    /// <param name = "_taxLine">TaxIntegrationTaxLineObject</param>
+    /// <param name = "_sourceBaseAmountCur">Base Amount</param>
+    /// <param name = "_sourceTaxAmountCur">Tax Amount</param>
+    private void calcSummedAmount(TaxIntegrationTaxLineObject _taxLine, TaxBaseCur _sourceBaseAmountCur, TaxAmountCur _sourceTaxAmountCur)
+    {
+        if (this.document.getIncludingTax())
+        {
+            TaxTable taxTable = this.document.getContext().getTaxTable(_taxLine.getTaxCode());
+
+            // here should also add tax origin check != TaxOrigin::TaxReversed; 
+            // for case TaxOrigin::Transfer only journal with tax code using this origin, but at this point of time, this entry is not generated yet.
+            // Seems the TCS call will default origin as Tax. So only exclude use tax
+            if(!_taxLine.getTaxUseTax())
+            {
+                // tax amounts of the same line will be summed and ready to line amount consistent check
+                container key = [_taxLine.getParentLine().getLocalRecId(), _taxLine.getParentLine().getLocalTableId()];
+                AmountCur summedAmount;
+                boolean baseAmountSummed;
+                if (summedAmountForLineMap.exists(key))
+                {
+                    if (this.isTaxOnTaxBaseAmountExcludedFlight)
+                    {
+                        [summedAmount, baseAmountSummed] = summedAmountForLineMap.lookup(key);
+
+                        // for all rest entries, will not need base amount since it only needs once.
+                        if (!taxTable.TaxOnTax && !baseAmountSummed)
+                        {
+                            summedAmount += _sourceBaseAmountCur;
+                            baseAmountSummed = true;
+                        }
+
+                        summedAmount += _sourceTaxAmountCur;
+                    }
+                    else
+                    {
+                        summedAmount = _sourceTaxAmountCur + summedAmountForLineMap.lookup(key);
+                    }
+                }
+                else
+                {
+                    // for the first entry, will need go with base amount
+                    TaxIntegrationDocumentObject taxDocument = _taxLine.getParentLine().getAncestorDocument();
+                    if (taxDocument.getTaxJurisdictionParameters().isCashDiscDeductedBeforeTaxCalculation())
+                    {
+                        summedAmount = _sourceTaxAmountCur + _sourceBaseAmountCur + _taxLine.getParentLine().getCashDiscountAmountForBase();
+                        baseAmountSummed = true;
+                    }
+                    else
+                    {
+                        if (this.isTaxOnTaxBaseAmountExcludedFlight)
+                        {
+                            if (taxTable.TaxOnTax)
+                            {
+                                summedAmount = _sourceTaxAmountCur;
+                            }
+                            else
+                            {
+                                summedAmount = _sourceTaxAmountCur + _sourceBaseAmountCur;
+                                baseAmountSummed = true;
+                            }
+                        }
+                        else
+                        {
+                            summedAmount = _sourceTaxAmountCur + _sourceBaseAmountCur;
+                        }
+                    }
+                }
+
+                if (this.isTaxOnTaxBaseAmountExcludedFlight)
+                {
+                    summedAmountForLineMap.insert(key, [summedAmount, baseAmountSummed]);
+                }
+                else
+                {
+                    summedAmountForLineMap.insert(key, summedAmount);
+                }
+
+                if (!taxTable.TaxOnTax
+                    && (taxTable.TaxBase != TaxBaseType::PctPerGross 
+                        && taxTable.TaxBase != TaxBaseType::AmountByUnit))
+                {
+                    // adding this tax line for later base amount adjustment
+                    needAdjustBaseAmountTaxLineSet.add(_taxLine);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processLineSumAmountPennyDiffAdjustment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// After every line rounding, will need to adjust the base amount through the difference between summed tax amount + base amount and line amount.
+    /// </summary>
+    /// <param name = "_line">TaxIntegrationLineObject</param>
+    private void processLineSumAmountPennyDiffAdjustment(TaxIntegrationLineObject _line)
+    {
+        if (needAdjustBaseAmountTaxLineSet.empty())
+        {
+            return;
+        }
+
+        container key = [_line.getLocalRecId(), _line.getLocalTableId()];
+        if (!summedAmountForLineMap.exists(key))
+        {
+            return;
+        }
+
+        AmountCur amountDiff;
+        if (this.isTaxOnTaxBaseAmountExcludedFlight)
+        {
+            amountDiff = conPeek(summedAmountForLineMap.lookup(key), 1) - _line.getTransactionAmount();
+        }
+        else
+        {
+            amountDiff = summedAmountForLineMap.lookup(key) - _line.getTransactionAmount();
+        }
+
+        if (amountDiff)
+        {
+            Enumerator enumerator  = needAdjustBaseAmountTaxLineSet.getEnumerator();
+            while(enumerator.moveNext())
+            {
+                TaxIntegrationTaxLineObject taxLine = enumerator.current();
+                CurrencyCode taxCurrency = taxLine.getTaxCurrencyCode();
+                TaxBaseCur taxBaseAmountCur;
+
+                taxLine.setSourceBaseAmountCur(taxLine.getSourceBaseAmountCur() - amountDiff);
+
+                // Not going to check TaxInCostPrice since the logic in standard tax engine (Tax::adjustPennyDiff()) has nothing to do with rounding.
+                // Then convert to all other currencies
+                CurrencyCode transactionCurrency = taxLine.getParentLine().getTransactionCurrencyCode();
+                conversionHelper.setTransactionCurrencyCode(transactionCurrency);
+                conversionHelper.setTaxCurrencyCode(taxCurrency);
+                this.prepareCurrencyConversion(taxLine);
+
+                TaxBase taxBaseAmount = roundingHelper.roundWithCurrencyType(conversionHelper.convertTransactionToAccounting(taxLine.getSourceBaseAmountCur()), accountingCurrency, TaxCurrency::AccountingCurrency);
+                taxLine.setTaxBaseAmount(taxBaseAmount);
+
+                TaxBaseCur taxBaseAmountRep = roundingHelper.roundWithCurrencyType(conversionHelper.convertTransactionToReporting(taxLine.getSourceBaseAmountCur()), reportingCurrency, TaxCurrency::ReportingCurrency);
+                taxLine.setTaxBaseAmountRep(taxBaseAmountRep);
+
+
+                RefTableId headingTableId;
+                RefRecId headingRecId;
+                if (TaxSpecificExchangeRateHelper::isTaxSpecificExchangeRateEnabled())
+                {
+                    TaxIntegrationAbstractRecordObject parentRecord = taxLine.getParentLine().getParentRecord();
+                    headingTableId = parentRecord.getLocalTableId();
+                    headingRecId = parentRecord.getLocalRecId();
+                }
+
+                if (transactionCurrency == taxCurrency
+                    // When tax specific exchange rate is enabled, all tax currency amounts should directly exchange from transaction currency.
+                    || TaxSpecificExchangeRateHelper::isTaxSpecificExchRateEnabledByTable(headingTableId, headingRecId))
+                {
+                    taxBaseAmountCur = roundingHelper.roundWithCurrencyType(conversionHelper.convertTransactionToTax(taxLine.getSourceBaseAmountCur()), taxCurrency, TaxCurrency::TaxCurrency);
+                    taxLine.setTaxBaseAmountCur(taxBaseAmountCur);
+                }
+                else
+                {
+                    TaxCurConvPath currentRoutine = TaxParameters::find().TaxCurConvPath;
+                    switch (currentRoutine)
+                    {
+                        case TaxCurConvPath::ReportingCurrency:
+                            taxBaseAmountCur = roundingHelper.roundWithCurrencyType(conversionHelper.convertReportingToTax(taxLine.getTaxBaseAmountRep()), taxCurrency, TaxCurrency::TaxCurrency);
+                            taxLine.setTaxBaseAmountCur(taxBaseAmountCur);
+
+                            break;
+                        default:
+                            taxBaseAmountCur = roundingHelper.roundWithCurrencyType(conversionHelper.convertAccountingToTax(taxLine.getTaxBaseAmount()), taxCurrency, TaxCurrency::TaxCurrency);
+                            taxLine.setTaxBaseAmountCur(taxBaseAmountCur);
+                            break;
+                    }
+                }
+
+            }
+        }
+        this.summedAmountForLineMap = this.isTaxOnTaxBaseAmountExcludedFlight ? new Map(Types::Container, Types::Container) : new Map(Types::Container, Types::Real);
+        this.needAdjustBaseAmountTaxLineSet = new Set(Types::Class);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

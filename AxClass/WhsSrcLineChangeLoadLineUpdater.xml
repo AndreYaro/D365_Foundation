@@ -1,0 +1,1876 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsSrcLineChangeLoadLineUpdater</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WHSSrcLineChangeLoadLineUpdater</c> class is used to validate changes to the source line that may need to be
+/// synchronized to existing load lines.
+/// The <c>WHSSrcLineChangeLoadLineUpdater</c> also handles the actually updating of the affected load lines.
+/// </summary>
+[WHSSrcLineChangeLoadLineUpdAttribute(tableStr(SalesLine)), WHSSrcLineChangeLoadLineUpdAttribute(tableStr(InventTransferLine))]
+class WhsSrcLineChangeLoadLineUpdater
+{
+    InventTransId                   inventTransId;
+    InventDimId                     newInventDimId;
+    InventDimId                     oldInventDimId;
+    InventDimId                     updateDimId;
+    InventQty                       oldQty;
+    InventQty                       newQty;
+    InventQty                       diffQty;
+    InventQty                       loadLineDiffQty;
+    InventQty                       sumQtyOnLoad;
+    private InventQty               deductedQtyOnLoad;
+    private InventHandlingQty       diffHandlingQty;
+    private InventHandlingQty       loadLineDiffHandlingQty;
+    UnitOfMeasureSymbol             oldUnitId;
+    UnitOfMeasureSymbol             newUnitId;
+    UnitOfMeasureSymbol             inventUnitId;
+    RefRecId                        productRefRecId;
+    NoYesId                         mustAutoCreateLoadLine;
+    WHSLoadWeight                   diffLoadWeight;
+    WHSLoadNetWeight                diffLoadNetWeight;
+    InventTable                     inventTable;
+    boolean                         loadLineIncreased;
+    WHSLoadLineSyncIssueHandler     whsLoadLineSyncIssueHandler;
+    TMSAddressPhone                 newAddress;
+    TMSAddressPhone                 oldAddress;
+    private ItemId                  itemId;
+    private UnknownNoYes            isCWItem;
+    private boolean                 autoUpdateShipment;
+    private WHSLoadWeightParameters loadWeightParameters;
+    private WHSInstrumentationLogger    instrumentationLogger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>canChangeAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that address on the shipment can be changed.
+    /// </summary>
+    /// <returns>
+    /// true if address on the shipment can be changed; otherwise, false.
+    /// </returns>
+    protected boolean canChangeAddress()
+    {
+        return this.checkShipmentStatusForAddressChange() && this.checkLoadLines();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkShipmentStatusForAddressChange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check status of shipment.
+    /// </summary>
+    /// <returns>
+    /// true if shipment has not been shipped or received; otherwise, false.
+    /// </returns>
+    private boolean checkShipmentStatusForAddressChange()
+    {
+        boolean          ret = true;
+        WHSLoadLine      loadLine;
+        WHSShipmentTable shipmentTable;
+         
+        select firstOnly recId, ShipmentStatus from shipmentTable
+            exists join loadLine
+            where shipmentTable.LoadId          == loadLine.LoadId
+               && loadLine.InventTransId        == inventTransId
+               && (shipmentTable.ShipmentStatus == WHSShipmentStatus::Shipped
+               || shipmentTable.ShipmentStatus  == WHSShipmentStatus::Received);
+         
+        if (shipmentTable.RecId)
+        {
+            if (WHSSrcLineChangeLoadLineUpdaterDeliveryAddressUpdatingFlight::instance().isEnabled())
+            {
+                warning(strFmt("@WAX:NotChangedShipmentDeliveryAddress", shipmentTable.ShipmentStatus));
+            }
+            else
+            {
+                ret = checkFailed("@SCM:CannotChangeAddressForShipmentWithShippedOrReceivedStatus");
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check whether shipment with multiple lines
+    /// </summary>
+    /// <returns>
+    /// false if more then one line is part of the shipment; otherwise, true.
+    /// </returns>
+    private boolean checkLoadLines()
+    {
+        boolean     ret = true;
+        WHSLoadLine otherloadLine;
+        WHSLoadLine loadLine;
+
+        select firstOnly RecId from otherloadLine
+            where otherloadLine.InventTransId != inventTransId
+            exists join loadLine
+            where loadLine.LoadId           == otherloadLine.LoadId
+               && loadLine.InventTransId    == inventTransId
+               && loadLine.ShipmentId       == otherloadLine.ShipmentId;
+         
+        if (otherloadLine.RecId)
+        {
+            ret = checkFailed("@SCM:CannotChangeAddressForShipmentWithMultipleLines");
+        }
+         
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canChangeLeadToUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if there a change we need to update load lines.
+    /// </summary>
+    /// <returns>
+    /// true if we possibliy need to update loadLines based on changes; otherwise, false
+    /// </returns>
+    private boolean canChangeLeadToUpdate()
+    {
+        if (newInventDimId  == oldInventDimId
+            &&  oldQty == newQty
+            &&  oldUnitId   == newUnitId
+            &&  (!oldAddress
+            ||  !newAddress
+            ||  oldAddress.parmPostalAddressRecId() == newAddress.parmPostalAddressRecId()))
+        {
+            return false;
+        }
+
+        WHSLoadLine loadLine;
+        // LoadLines must exists for the order line
+        select firstonly RecId, LoadId, InventTransType, PickedQty from loadLine
+            where loadLine.InventTransId == inventTransId;
+
+        if (!loadLine.RecId)
+        {
+            return false;
+        }
+
+        if (!WHSCancelDeliverRemainderSkipPickedQtyCheckV2Flight::instance().isEnabled() &&
+            loadLine.InventTransType == InventTransType::Sales && newQty == 0)
+        {
+            WHSLoadTable whsLoadTable;
+            if (loadLine.PickedQty > 0)
+            {
+                select firstonly RecId from whsLoadTable
+                    where whsLoadTable.LoadId      == loadLine.LoadId
+                        && whsLoadTable.LoadStatus != WHSLoadStatus::Open;
+                if (whsLoadTable.RecId)
+                {
+                    return false;
+                }
+            }
+
+            InventTrans       inventTrans;
+            inventTransOrigin inventTransOrigin;
+            select firstonly RecId from inventTrans
+                where inventTrans.StatusReceipt        == StatusReceipt::None
+                    && inventTrans.StatusIssue         <=  StatusIssue::Picked
+            exists join inventTransOrigin
+                where inventTransOrigin.RecId          == inventTrans.InventTransOrigin
+                    && inventTransOrigin.InventTransId == inventTransId;
+            if (inventTrans.RecId)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canSyncDimensionChange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that we can change dimensions on load lines.
+    /// </summary>
+    /// <returns>
+    /// true if we can update load line dimensions; otherwise,
+    /// false
+    /// </returns>
+    protected boolean canSyncDimensionChange()
+    {
+        InventTrans         inventTrans;
+        InventTransOrigin   inventTransOrigin;
+        Counter             i;
+
+        // Validate that we are not changing WH dimension if loadLines exist
+        if (this.isWarehouseChanged())
+        {
+            this.validateShipmentExistOnWarehouseChange();
+            return checkFailed("@WAX4640");
+        }
+
+        // Validate that we are not changing dimensions of a laodLine with work created.
+        if (this.doesOpenWorkExistWithOtherDimensions())
+        {
+            return checkFailed("@WAX4654");
+        }
+
+        while select InventDimId from inventTrans
+            group by InventDimId
+            where (inventTrans.StatusIssue      == StatusIssue::ReservPhysical
+            ||    inventTrans.StatusIssue       == StatusIssue::ReservOrdered
+            ||    inventTrans.StatusIssue       == StatusIssue::OnOrder)
+            &&    inventTrans.StatusReceipt     == StatusReceipt::None
+            exists join inventTransOrigin
+                where inventTransOrigin.InventTransId   == this.parmInventTransId()
+                   && inventTransOrigin.RecId           == inventTrans.InventTransOrigin
+        {
+            i++;
+            if (i > 1)
+            {
+                return checkFailed("@WAX4655");
+            }
+
+            updateDimId = inventTrans.InventDimId;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canSyncQtyIncrease</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the load line qty can be increased.
+    /// </summary>
+    /// <returns>
+    /// true if qty on the load line can be increased; otherwise, false.
+    /// </returns>
+    protected boolean canSyncQtyIncrease()
+    {
+        WHSLoadLine     loadLine;
+        WHSLoadTable    loadTable;
+
+        if (mustAutoCreateLoadLine)
+        {
+            // Cannot increase load line if it's on a shipped load.
+            select count(RecId) from loadLine
+            exists join loadTable
+            where loadLine.LoadId           == loadTable.LoadId
+            &&    loadLine.InventTransId    == inventTransId
+            &&    loadTable.LoadStatus      <  WHSLoadStatus::Shipped;
+
+            if (loadLine.RecId == 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canSyncQtyReduction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that qty on the load line can be reduced
+    /// </summary>
+    /// <returns>
+    /// true if qty on the load line can be reduced; otherwise, false.
+    /// </returns>
+    protected boolean canSyncQtyReduction()
+    {
+        WHSLoadLine     loadLine;
+
+        // Look for any loadLine that aren't fully picked
+        select count(RecId) from loadLine
+            where loadLine.InventTransId    == inventTransId
+            &&    loadLine.InventQty        >  loadLine.PickedQty;
+
+        // We cannot update if multiple 'open' loadLines exist.
+        if (loadLine.RecId > 1)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doesOpenWorkExistWithOtherDimensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if open work exists for the order line.
+    /// </summary>
+    /// <returns>
+    /// true if there is unfished work or a partially picked load line; otherwise,
+    /// false
+    /// </returns>
+    /// <remarks>
+    /// This is used in determine if we are allowed to change dimensions on a loadline.
+    /// We are allowed to skip over loadLines that are fully picked.
+    /// </remarks>
+    protected boolean doesOpenWorkExistWithOtherDimensions()
+    {
+        WHSLoadLine loadLine;
+        // Validate that we are not changing dimensions of a loadLine with work created.
+        select firstonly RecId from loadLine
+            where loadLine.WorkCreatedQty   >  0
+            &&    (loadLine.WorkCreatedQty  != loadLine.PickedQty
+            ||    loadLine.InventQty        != loadLine.PickedQty)   // partially picked loadline
+            &&    loadLine.InventTransId    == inventTransId
+            &&    loadLine.InventDimId      != newInventDimId;
+
+        if (loadLine.RecId)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getloadLineDiffQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets loadLineDiffQty value.
+    /// </summary>
+    /// <returns>
+    /// loadLineDiffQty value.
+    /// </returns>
+    [SysObsolete('Method is obsoleted to support catch weight items. Method is replaced by the getloadLineDiffHandlingQty method. Please file an extensibility request if access is required.', false, 30\9\2019)]
+    public InventQty getloadLineDiffQty()
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), this.parmItemId());
+
+        return this.getloadLineDiffHandlingQuantity();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getloadLineDiffHandlingQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets loadLineDiffHandlingQty value.
+    /// </summary>
+    /// <returns>
+    /// loadLineDiffHandlingQty value.
+    /// </returns>
+    [Hookable(false)]
+    final public InventHandlingQty getloadLineDiffHandlingQty()
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightItemLogic(funcName(), this.parmItemId()))
+        {
+            return this.getloadLineDiffHandlingQuantity();
+        }
+
+        return this.getloadLineDiffQty();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getloadLineDiffHandlingQuantity</Name>
+				<Source><![CDATA[
+    private InventHandlingQty getloadLineDiffHandlingQuantity()
+    {
+        return loadLineDiffHandlingQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLoadLineIncreased</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets loadLineIncreased value.
+    /// </summary>
+    /// <returns>
+    /// loadLineIncreased value.
+    /// </returns>
+    public boolean getLoadLineIncreased()
+    {
+        return loadLineIncreased;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleValidationFailure</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Handles a validation failure by invoking the synchronization issue handler.
+    /// </summary>
+    /// <param name="_message">
+    ///    The message that may be used by the issue handler.
+    /// </param>
+    /// <param name="_canThrowError">
+    ///    A Boolean value that indicates if the issue handler may throw an error.
+    /// </param>
+    /// <param name="_forcePolicy">
+    ///    A Boolean value that indicates if a policy should be enforced; optional.
+    /// </param>
+    /// <param name="_forcedSynchronizationPolicy">
+    ///    A <c>WHSLoadSynchronizationPolicy</c> value that represents the enforced policy.
+    /// </param>
+    /// <returns>
+    ///    The return value given by the issue handler.
+    /// </returns>
+    protected boolean handleValidationFailure(
+        str           _message,
+        boolean       _canThrowError,
+        boolean       _forcePolicy = false,
+        WHSLoadSynchronizationPolicy _forcedSynchronizationPolicy = WHSLoadSynchronizationPolicy::Invalidate)
+    {
+        return this.whsLoadLineSyncIssueHandler().handleIssue(inventTransId, _message, _canThrowError, _forcePolicy, _forcedSynchronizationPolicy);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleValidationQtyChangedPosToNeg</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method handles validations when qty is changed from positive to negative.
+    /// </summary>
+    /// <returns>
+    /// The updated result of the validation.
+    /// </returns>
+    protected boolean handleValidationQtyChangedPosToNeg()
+    {
+        boolean result = true;
+
+        this.instrumentationLogger().logInformation('HandleValidationFailure: HandleValidationQtyChangedPosToNeg');
+        result = this.handleValidationFailure("@WAX4663", false);
+        result = this.handleValidationFailure("@SYS18447", true) && result;
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isWarehouseChanged</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if warehouse changed on the dimensions.
+    /// </summary>
+    /// <returns>
+    /// true if warehouse dimension changed; otherwise,
+    /// false
+    /// </returns>
+    /// <remarks>
+    /// Warehouse cannot be changed when load lines exist for the line.
+    /// </remarks>
+    protected boolean isWarehouseChanged()
+    {
+        return InventDim::find(newInventDimId).InventLocationId != InventDim::find(oldInventDimId).InventLocationId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustUpdateQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if we need to decrement qty on load line.
+    /// </summary>
+    /// <returns>
+    /// true if qty on load lines (which were not yet deducted or sold) is greater than the new qty (which is logically represent delivery remainder) on the order line;
+    /// otherwise, false
+    /// </returns>
+    protected boolean mustUpdateQty()
+    {
+        sumQtyOnLoad = (select sum(InventQty) from whsLoadLine
+            where whsLoadLine.InventTransId == inventTransId).InventQty;
+            
+        deductedQtyOnLoad = this.calculateDeductedQtyOnLoad();
+
+        if (newQty < sumQtyOnLoad - deductedQtyOnLoad)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventTransId</Name>
+				<Source><![CDATA[
+    public InventTransId parmInventTransId(InventTransId _inventTransId = inventTransId)
+    {
+        if (inventTransId != _inventTransId)
+        {
+            inventTransId   = _inventTransId;
+            this.setItemId('');
+        }
+
+        return inventTransId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmItemId</Name>
+				<Source><![CDATA[
+    private ItemId parmItemId()
+    {
+        if (!itemId)
+        {
+            this.setItemId(WHSSrcLineChangeLoadLineUpdater::retrieveInventTransItemId(this.parmInventTransId()));
+        }
+
+        return itemId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateDeductedQtyOnLoad</Name>
+				<Source><![CDATA[
+    private InventQty calculateDeductedQtyOnLoad()
+    {
+        InventTrans inventTrans;
+        InventTransOrigin inventTransOrigin;
+
+        select sum(Qty) from inventTrans
+            where (inventTrans.StatusIssue == StatusIssue::Deducted
+            ||     inventTrans.StatusIssue == StatusIssue::Sold)
+            && inventTrans.StatusReceipt == StatusReceipt::None
+            exists join inventTransOrigin
+                where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                    && inventTransOrigin.InventTransId == inventTransId;
+
+        return abs(inventTrans.Qty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsCWItem</Name>
+				<Source><![CDATA[
+    private boolean parmIsCWItem()
+    {
+        if (isCWItem == UnknownNoYes::Unknown && this.parmItemId())
+        {
+            isCWItem = PdsGlobal::pdsIsCWItem(this.parmItemId()) ? UnknownNoYes::Yes : UnknownNoYes::No;
+        }
+
+        return isCWItem == UnknownNoYes::Yes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmMustAutoCreateLoadLine</Name>
+				<Source><![CDATA[
+    public NoYesId parmMustAutoCreateLoadLine(NoYesId _mustAutoCreateLoadLine = mustAutoCreateLoadLine)
+    {
+        mustAutoCreateLoadLine = _mustAutoCreateLoadLine;
+
+        return mustAutoCreateLoadLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmNewInventDimId</Name>
+				<Source><![CDATA[
+    public InventDimId parmNewInventDimId(InventDimId _newInventDimId = newInventDimId)
+    {
+        newInventDimId = _newInventDimId;
+
+        return newInventDimId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmNewQty</Name>
+				<Source><![CDATA[
+    public InventQty parmNewQty(InventQty _newQty = newQty)
+    {
+        newQty = _newQty;
+
+        return newQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmNewUnitId</Name>
+				<Source><![CDATA[
+    public UnitOfMeasureSymbol parmNewUnitId(UnitOfMeasureSymbol _newUnitId = newUnitId)
+    {
+        newUnitId = _newUnitId;
+
+        return newUnitId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmOldInventDimId</Name>
+				<Source><![CDATA[
+    public InventDimId parmOldInventDimId(InventDimId _oldInventDimId = oldInventDimId)
+    {
+        oldInventDimId = _oldInventDimId;
+
+        return oldInventDimId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmOldQty</Name>
+				<Source><![CDATA[
+    public InventQty parmOldQty(InventQty _oldQty = oldQty)
+    {
+        oldQty = _oldQty;
+
+        return oldQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmOldUnitId</Name>
+				<Source><![CDATA[
+    public UnitOfMeasureSymbol parmOldUnitId(UnitOfMeasureSymbol _oldUnitId = oldUnitId)
+    {
+        oldUnitId = _oldUnitId;
+
+        return oldUnitId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmNewAddress</Name>
+				<Source><![CDATA[
+    public TMSAddressPhone parmNewAddress(TMSAddressPhone _newAddress = newAddress)
+    {
+        newAddress = _newAddress;
+         
+        return newAddress;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmOldAddress</Name>
+				<Source><![CDATA[
+    public TMSAddressPhone parmOldAddress(TMSAddressPhone _oldAddress = oldAddress)
+    {
+        oldAddress = _oldAddress;
+         
+        return oldAddress;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLoadDiffWeight</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the change in load weights based on change in qty.
+    /// </summary>
+    /// <remarks>
+    /// Used when updating load header weight.
+    /// </remarks>
+    protected void setLoadDiffWeight()
+    {
+        loadWeightParameters = WHSLoadTable::calculateWeightDiffOnInventoryChange(inventTable, loadLineDiffHandlingQty);
+        diffLoadWeight = loadWeightParameters.loadWeightDiff;
+        diffLoadNetWeight = loadWeightParameters.loadNetWeightDiff;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOptionalGlobalsByItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets some global parameters based on the item.
+    /// </summary>
+    /// <param name="_itemId">
+    /// The itemId we want to set parameters based on.
+    /// </param>
+    protected void setOptionalGlobalsByItem(ItemId _itemId)
+    {
+        inventTable = InventTable::find(_itemId);
+        inventUnitId = WHSCatchWeightHelper::inventHandlingUnitId(_itemId);
+        productRefRecId = InventTable::itemProduct(_itemId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLoadHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the load header information for status and wieghts.
+    /// </summary>
+    /// <param name="_loadId">
+    /// The loadId of the load that is to be updated.
+    /// </param>
+    protected void updateLoadHeader(WHSLoadId _loadId)
+    {
+        WHSLoadTable    loadTable;
+        WHSLoadLine     loadLine;
+
+        this.setLoadDiffWeight();
+        loadTable = WHSLoadTable::find(_loadId, true);
+
+        // Only possible status change is from a loaded status to a not loaded status for qty decrease
+        // Service items updates won't change shipment status.
+        if (newQty > oldQty && inventTable.ItemType != ItemType::Service)
+        {
+            if (loadTable.LoadStatus == WHSLoadStatus::Loaded)
+            {
+                loadTable.LoadStatus = WHSLoadStatus::InProcess;
+            }
+        }
+        else if (newQty < oldQty)
+        {
+            // If all loadLines are fully picked then the load is in a loaded status.
+            // Assuming we have at least one line.
+            select firstonly RecId from loadLine
+            where loadLine.LoadId       == _loadId
+            &&    loadLine.InventQty    >  loadLine.PickedQty;
+
+            if (!loadLine.RecId)
+            {
+                loadTable.LoadStatus = WHSLoadStatus::Loaded;
+            }
+        }
+        loadTable.LoadWeight += diffLoadWeight;
+        loadTable.LoadNetWeight += diffLoadNetWeight;
+        loadTable.updateLoadTareWeight();
+        loadTable.resetNegativeWeight(loadWeightParameters.LoadWeightMismatchHeaderAndLines);
+        
+        loadTable.doUpdate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLoadLineInventoryDimensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the dimension of all eligible load lines.
+    /// </summary>
+    /// <remarks>
+    /// We only update load lines that are not fully picked.
+    /// Based on validation this should only be load lines with zero work created qty.
+    /// </remarks>
+    protected void updateLoadLineInventoryDimensions()
+    {
+        WHSLoadLine     loadLine;
+
+        ttsbegin;
+
+        // Only needed when changing dimensions
+        loadLine.skipDataMethods(true);
+        update_recordset loadLine
+            setting InventDimId = updateDimId
+            where loadLine.InventTransId    == inventTransId
+            &&    loadLine.InventDimId      != updateDimId
+            &&    loadLine.WorkCreatedQty   == 0;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onLoadLineQtyUpdate</Name>
+				<Source><![CDATA[
+    internal void onLoadLineQtyUpdate(WHSLoadLine _loadLine, InventHandlingQty _inventQtyDiff)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLoadLineQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the load line qty and UOM based on change in qty and UOM of the source order line.
+    /// </summary>
+    protected void updateLoadLineQty()
+    {
+        WHSLoadLine         loadLine;
+        WHSLoadTable        loadTable;
+        WHSShipmentId       shipmentId;
+        WHSLoadId           loadId;
+
+        // DiffHandlingQty will be negative for reduction in qty on the order line and positive for an increase in qty on the order line.
+        diffHandlingQty = newQty - oldQty;
+
+        using (var activityContext = this.instrumentationLogger().autoMaintainLoadLineActivities().maintainLoadLine(diffHandlingQty))
+        {
+            ttsbegin;
+
+            if (autoUpdateShipment)
+            {
+                loadLine = this.locateAutoUpdateLoadLine();
+            }
+            else if (diffHandlingQty > 0)
+            {
+                select firstonly forupdate loadLine
+                    exists join loadTable
+                    where loadTable.LoadId          == loadLine.LoadId
+                    &&    loadLine.InventTransId    == inventTransId
+                    &&    loadTable.LoadStatus      <  WHSLoadStatus::Shipped;
+            }
+            else
+            {
+                //PO Load should not be deleted in case of Load status is Received
+                if (WHSDlvReminderPOLineNotDeleteReceivedLoadFlight::instance().isEnabled() &&
+                    InventTransOrigin::findByInventTransId(inventTransId).ReferenceCategory == InventTransType::Purch)
+                {
+                    select firstonly forupdate loadLine
+                        where loadLine.InventTransId    == inventTransId
+                        &&    loadLine.InventQty        >  loadLine.PickedQty
+                        exists join loadTable
+                            where loadTable.LoadId          == loadLine.LoadId
+                            &&    loadTable.LoadStatus      <  WHSLoadStatus::Received;
+                }
+                else
+                {
+                    select firstonly forupdate loadLine
+                        where loadLine.InventTransId    == inventTransId
+                        &&    loadLine.InventQty        >  loadLine.PickedQty;
+                }
+            }
+
+            if (loadLine.RecId)
+            {
+                this.setOptionalGlobalsByItem(loadLine.ItemId);
+                shipmentId  = loadLine.ShipmentId;
+                loadId      = loadLine.LoadId;
+
+                // For reduction in qty we only reduce the loadLine by the amount we are forced to decrease.
+                if (diffHandlingQty < 0)
+                {
+                    loadLineDiffHandlingQty = newQty - (sumQtyOnLoad - deductedQtyOnLoad);
+                }
+                else  // For increase in qty we always increase by the change in qty of the order line.
+                {
+                    loadLineDiffHandlingQty = diffHandlingQty;
+                }
+
+                loadLine.InventQty += loadLineDiffHandlingQty;
+
+                if (loadLine.InventQty > 0)
+                {
+                    // Convert to loadLine UnitId
+                    loadLine.uom = newUnitId;
+
+                    // Catch weight items store inventQty and Qty in the Catch Weight Unit of Measure.
+                    if (this.parmIsCWItem())
+                    {
+                        loadLine.Qty                 = loadLine.InventQty;
+                        loadLine.QtyLeftToStructure += loadLineDiffHandlingQty;
+                    }
+                    else
+                    {
+                        loadLine.Qty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(loadLine.ItemId,
+                                                                                                            loadLine.InventDimId,
+                                                                                                            loadLine.InventQty,
+                                                                                                            inventUnitId,
+                                                                                                            loadLine.UOM,
+                                                                                                            NoYes::No);
+
+                        // Convert prev qtyLeftToStructure value to new Unit
+                        loadLine.QtyLeftToStructure = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(loadLine.ItemId,
+                                                                                                                        loadLine.InventDimId,
+                                                                                                                        loadLine.QtyLeftToStructure,
+                                                                                                                        oldUnitId,
+                                                                                                                        inventUnitId,
+                                                                                                                        NoYes::No);
+
+                        loadLine.QtyLeftToStructure = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(loadLine.ItemId,
+                                                                                                                        loadLine.InventDimId,
+                                                                                                                        loadLine.QtyLeftToStructure + loadLineDiffHandlingQty,
+                                                                                                                        inventUnitId,
+                                                                                                                        loadLine.UOM,
+                                                                                                                        NoYes::No);
+                    }
+
+                    // Service items work created qty and picked qty is set to match inventQty automatically
+                    // because work is not actually created for service items.
+                    if (loadLine.WorkCreatedQty
+                    && inventTable.ItemType == ItemType::Service)
+                    {
+                        loadLine.WorkCreatedQty = loadLine.InventQty;
+                        loadLine.PickedQty      = loadLine.InventQty;
+                    }
+
+                    if (loadLine.InventQty < loadLine.orig().InventQty)
+                    {
+                        loadLine.updateCrossDockReservedPhysicalQuantity(loadLine.orig().InventQty, loadLine.InventQty);
+                    }
+
+                    loadLine.doUpdateValidateIfCanModify();
+                    this.onLoadLineQtyUpdate(loadLine, loadLineDiffHandlingQty);
+
+                    WHSCatchWeightTelemetryLogger::logExpectedCatchWeightUnit(funcName(), loadLine.ItemId, loadLine.UOM);
+
+                    this.instrumentationLogger().autoMaintainLoadLineActivities().maintainedLoadLine(activityContext, SysAppCRUDOperation::Update);
+                }
+                else
+                {
+                    // Delete loadLine for qty of zero
+                    loadLine.skipDeleteMethod(true);
+                    loadLine.delete();
+
+                    this.instrumentationLogger().autoMaintainLoadLineActivities().maintainedLoadLine(activityContext, SysAppCRUDOperation::Delete);
+                }
+
+                // Update shipment header info
+                if (shipmentId && WHSShipmentTable::exist(shipmentId))
+                {
+                    this.updateShipmentHeader(loadLine.ShipmentId);
+                }
+
+                // Update load header info
+                if (loadId && WHSLoadTable::exist(loadId))
+                {
+                    using (WHSLoadLineWeightCalculationContext context = WHSLoadLineWeightCalculationContext::newFromLoadLine(loadLine))
+                    {
+                        this.updateLoadHeader(loadLine.LoadId);
+                    }
+                }
+            }
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>locateAutoUpdateLoadLine</Name>
+				<Source><![CDATA[
+    private WHSLoadLine locateAutoUpdateLoadLine()
+    {
+        using (var activityContext = this.instrumentationLogger().autoMaintainLoadLineActivities().locateShipment())
+        {
+            WHSLoadLine         loadLine;
+            WHSShipmentTable    shipmentTable;
+
+            select firstonly forupdate loadLine
+                where loadLine.InventTransId == inventTransId
+                    join RecId from shipmentTable
+                        where shipmentTable.ShipmentId == loadLine.ShipmentId;
+
+            this.instrumentationLogger().autoMaintainLoadLineActivities().locatedShipment(activityContext, false);
+            this.instrumentationLogger().logRecordInformation(shipmentTable);
+
+            return loadLine;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if load lines need to be and can be update. Then updates the load lines.
+    /// </summary>
+    /// <remarks>
+    /// The is the entry method for this class.
+    /// </remarks>
+    public void updateLoadLines()
+    {
+        boolean result = true;
+
+        if (!this.canChangeLeadToUpdate())
+        {
+            return;
+        }
+
+        if (InventLocation::isAutoUpdateShipmentAlwaysEnabled(InventDim::find(newInventDimId).InventLocationId))
+        {
+            if (this.shouldAutoUpdateShipment())
+            {
+                autoUpdateShipment = true;
+            }
+            else
+            {
+                return;
+            }
+        }
+
+        if ((mustAutoCreateLoadLine || autoUpdateShipment)
+            && this.orderLineHasMultipleInventDimsOnIssueTransactions())
+        {
+            return;
+        }
+        
+        using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().autoMaintainLoadLineActivities().updateLoadLines())
+        {
+            if (newInventDimId != oldInventDimId)
+            {
+                if (this.canSyncDimensionChange())
+                {
+                    this.updateLoadLineInventoryDimensions();
+                }
+                else
+                {
+                    this.instrumentationLogger().logInformation('HandleValidationFailure: InventDimDifferent');
+                    result = this.handleValidationFailure("@SYS18447",true) && result;
+                }
+            }
+
+            if (result)
+            {
+                if (newQty != oldQty)
+                {
+                    if (newQty < oldQty && this.mustUpdateQty())
+                    {
+                        if (sign(oldQty) > sign(newQty))
+                        {
+                            this.instrumentationLogger().logInformation('HandleValidationFailure: QuantityDifferentPosToNeg');
+                            result = this.handleValidationQtyChangedPosToNeg() && result;
+                        }
+
+                        if (result
+                            && !this.canSyncQtyReduction())
+                        {
+                            this.instrumentationLogger().logInformation('HandleValidationFailure: CanSyncQtyReduction');
+                            result = this.handleValidationFailure("@WAX4656",false) && result;
+                            result = this.handleValidationFailure("@SYS18447",true) && result;
+                        }
+
+                        if (result)
+                        {
+                            this.updateLoadLineQty();
+                        }
+                    }
+                    else if (newQty > oldQty
+                             && (mustAutoCreateLoadLine
+                                 || autoUpdateShipment))
+                    {
+                        if (!this.canSyncQtyIncrease())
+                        {
+                            this.instrumentationLogger().logInformation('HandleValidationFailure: canSyncQtyIncrease');
+                            result = this.handleValidationFailure(this.labelForSyncQtyIncreaseValidationFail(), false) && result;
+                        }
+                        else
+                        {
+                            loadLineIncreased = true;
+
+                            this.updateLoadLineQty();
+                        }
+                    }
+                }
+                else if (newUnitId != oldUnitId) // UnitId change is handled in updateLoadLineQty method
+                {
+                    this.updateLoadLineUnitId();
+                }
+                else if (this.isTMSAddressPhoneReqIdEqual(oldAddress, newAddress))
+                {
+                    if (this.canChangeAddress())
+                    {
+                        this.updateShipmentAddress();
+                    }
+                    else
+                    {
+                        this.instrumentationLogger().logInformation('HandleValidationFailure: TMSAddressPhoneReqIdEqual');
+                        this.handleValidationFailure("@SYS18447", true);
+                    }
+                }
+
+                if (autoUpdateShipment)
+                {
+                    this.assignShipmentToWave();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>labelForSyncQtyIncreaseValidationFail</Name>
+				<Source><![CDATA[
+    protected str labelForSyncQtyIncreaseValidationFail()
+    {
+        return "@WAX4656";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateShipmentExistOnWarehouseChange</Name>
+				<Source><![CDATA[
+    private void validateShipmentExistOnWarehouseChange()
+    {
+        WHSLoadLine loadLine;
+         
+        select firstOnly RecId, LoadId, ShipmentId from loadLine
+            where  loadLine.InventTransId == inventTransId
+                && loadLine.ShipmentId != '';
+         
+        if (loadLine.RecId != 0)
+        {
+            throw error(strFmt("@WAX:WHSLoadLineUpdaterShipmentExistsError", loadLine.LoadId, loadLine.ShipmentId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTMSAddressPhoneReqIdEqual</Name>
+				<Source><![CDATA[
+    private boolean isTMSAddressPhoneReqIdEqual(TMSAddressPhone _oldAddress, TMSAddressPhone _newAddress)
+    {
+        return _newAddress
+            && _oldAddress
+            && _newAddress.parmPostalAddressRecId() != _oldAddress.parmPostalAddressRecId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateShipmentAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the shipment address based on the source order line delivery address.
+    /// </summary>
+    protected void updateShipmentAddress()
+    {
+        if (oldAddress && newAddress)
+        {
+            ttsbegin;
+
+            WHSShipmentTable    shipmentTable;
+            WHSLoadLine         loadLine;
+
+            update_recordSet shipmentTable
+                setting
+                    DeliveryName                  = newAddress.parmName(),
+                    DeliveryPostalAddress         = newAddress.parmPostalAddressRecId(),
+                    CountryRegionISOCode          = newAddress.parmCountryRegion(),
+                    Address                       = newAddress.getAddress()
+                where shipmentTable.ShipmentStatus <= WHSShipmentStatus::Loaded
+                exists join loadLine
+                    where loadLine.ShipmentId == shipmentTable.ShipmentId
+                        && loadLine.InventTransId == inventTransId;
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLoadLineUnitId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the qty and UOM of load line when unit of measuer is changed on the source order line.
+    /// </summary>
+    /// <remarks>
+    /// Invent qty of the load lines should not change.
+    /// </remarks>
+    protected void updateLoadLineUnitId()
+    {
+        WHSLoadLine         loadLine;
+        boolean             firstLoop = true;
+
+        while select forupdate loadLine
+            where loadLine.InventTransId == inventTransId
+        {
+            if (firstLoop)
+            {
+                this.setOptionalGlobalsByItem(loadLine.ItemId);
+                firstLoop = false;
+            }
+
+            // Convert to new Unit of Measure
+            loadLine.uom = newUnitId;
+
+            // Catch weight items store inventQty and Qty in the Catch Weight Unit of Measure.
+            if (this.parmIsCWItem())
+            {
+                loadLine.Qty = loadLine.InventQty;
+            }
+            else
+            {
+                loadLine.Qty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(loadLine.ItemId,
+                                                                                                     loadLine.InventDimId,
+                                                                                                     loadLine.InventQty,
+                                                                                                     inventUnitId,
+                                                                                                     loadLine.UOM,
+                                                                                                     NoYes::No);
+            }
+
+            loadLine.QtyLeftToStructure = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(loadLine.ItemId,
+                                                                                                                loadLine.InventDimId,
+                                                                                                                loadLine.QtyLeftToStructure,
+                                                                                                                oldUnitId,
+                                                                                                                loadLine.UOM,
+                                                                                                                NoYes::No);
+                      
+            loadLine.doUpdateValidateIfCanModify();
+
+            WHSCatchWeightTelemetryLogger::logExpectedCatchWeightUnit(funcName(), loadLine.ItemId, loadLine.UOM);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateShipmentHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the shipment header status based on changes in load line qty.
+    /// </summary>
+    /// <param name="_shipmentId">
+    /// The shipmentId of the shipment that is to be updated
+    /// </param>
+    protected void updateShipmentHeader(WHSShipmentId _shipmentId)
+    {
+        WHSShipmentTable    shipmentTable;
+        WHSLoadLine         loadLine;
+
+        // Only possible status change is from a loaded status to a not loaded status if qty is decreased.
+        // Service items updates won't change shipment status.
+        if (newQty > oldQty && inventTable.ItemType != ItemType::Service)
+        {
+            shipmentTable = WHSShipmentTable::find(_shipmentId, true);
+
+            if (shipmentTable.ShipmentStatus == WHSShipmentStatus::Loaded)
+            {
+                shipmentTable.ShipmentStatus = WHSShipmentStatus::InProcess;
+                shipmentTable.doUpdate();
+            }
+        }
+        else if (newQty < oldQty)
+        {
+            // If all loadLines are fully picked then the shipment is in a loaded status.
+            select firstonly RecId from loadLine
+                where loadLine.ShipmentId   == _shipmentId
+                &&    loadLine.InventQty    >  loadLine.PickedQty;
+
+            if (!loadLine.RecId)
+            {
+                shipmentTable = WHSShipmentTable::find(_shipmentId, true);
+                if (this.canShipmentStatusBeUpdatedToLoaded(shipmentTable))
+                {
+                    shipmentTable.ShipmentStatus = WHSShipmentStatus::Loaded;
+                    shipmentTable.doUpdate();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canShipmentStatusBeUpdatedToLoaded</Name>
+				<Source><![CDATA[
+    private boolean canShipmentStatusBeUpdatedToLoaded(WHSShipmentTable _shipmentTable)
+    {
+        return (_shipmentTable.ShipmentStatus == WHSShipmentStatus::Open
+            || _shipmentTable.ShipmentStatus == WHSShipmentStatus::Waved
+            || _shipmentTable.ShipmentStatus == WHSShipmentStatus::InProcess
+            || _shipmentTable.ShipmentStatus == WHSShipmentStatus::Loaded);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldAutoUpdateShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the load line should be updated for the shipment.
+    /// </summary>
+    /// <returns>
+    /// true if the load line should be updated; otherwise, false.
+    /// </returns>
+    private boolean shouldAutoUpdateShipment()
+    {
+        WHSLoadLine         loadLine;
+        WHSShipmentTable    shipmentTable;
+
+        select firstonly OrderNum, InventTransType from loadLine
+            where loadLine.InventTransId == inventTransId
+                join WorkTransType from shipmentTable
+                    where shipmentTable.ShipmentId == loadLine.ShipmentId;
+
+        if (this.hasOrderBeenReleasedToWarehouse(loadLine.OrderNum, loadLine.InventTransType)
+            && !WHSWaveTable::hasWaveBeenExecutedForOrder(loadLine.OrderNum, shipmentTable.WorkTransType, loadLine.InventTransType))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>orderLineHasMultipleInventDimsOnIssueTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Ensures the load line is not trying to increase based on order line increase across
+    /// more than one dimension set.
+    /// </summary>
+    /// <returns>
+    /// true if order line has transactions associated to one dimension set; otherwise false.
+    /// </returns>
+    private boolean orderLineHasMultipleInventDimsOnIssueTransactions()
+    {
+        InventDim         inventDim;
+        InventTrans       inventTrans;
+        InventTransOrigin inventTransOrigin;
+        boolean           ret;
+
+        select count(RecId) from inventDim
+            exists join inventTrans
+                where (inventTrans.StatusIssue  == StatusIssue::ReservPhysical
+                ||    inventTrans.StatusIssue   == StatusIssue::ReservOrdered
+                ||    inventTrans.StatusIssue   == StatusIssue::OnOrder)
+                &&    inventTrans.StatusReceipt == StatusReceipt::None
+                &&    inventTrans.inventDimId   == inventDim.InventDimId
+                exists join inventTransOrigin
+                    where inventTransOrigin.InventTransId   == this.parmInventTransId()
+                       && inventTransOrigin.RecId           == inventTrans.InventTransOrigin;
+
+        if (inventDim.RecId > 1)
+        {
+            checkFailed("@WAX:Error_LoadLineNotAutomaticallyUpdated");
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOrderBeenReleasedToWarehouse</Name>
+				<Source><![CDATA[
+    private boolean hasOrderBeenReleasedToWarehouse(WHSOrderNum _orderNum, InventTransType _inventTransType)
+    {
+        if (_inventTransType == InventTransType::TransferOrderShip)
+        {
+            return InventTransferTable::find(_orderNum).hasTransferOrderBeenReleasedToWarehouse();
+        }
+        else if (_inventTransType == InventTransType::Sales)
+        {
+            return SalesTable::find(_orderNum).hasSalesOrderBeenReleasedToWarehouse();
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignShipmentToWave</Name>
+				<Source><![CDATA[
+    private void assignShipmentToWave()
+    {
+        WHSShipmentTable shipmentTable = this.retrieveWavedShipment();
+
+        if (shipmentTable.RecId != 0)
+        {
+            WHSWaveTable waveTable = WHSWaveTable::find(shipmentTable.WaveId);
+
+            if (!WHSWaveTemplateTable::validateWaveTemplate(waveTable.waveTemplate().WaveTemplateType, waveTable, shipmentTable.ShipmentId, false))
+            {
+                this.moveShipmentToNewWave(shipmentTable);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveWavedShipment</Name>
+				<Source><![CDATA[
+    private WHSShipmentTable retrieveWavedShipment()
+    {
+        WHSShipmentTable shipmentTable;
+        WHSLoadLine loadLine;
+
+        select firstonly shipmentTable
+            where shipmentTable.WaveId != ''
+            exists join loadLine
+                where loadLine.ShipmentId == shipmentTable.ShipmentId
+                    && loadLine.InventTransId == inventTransId;
+
+        return shipmentTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>moveShipmentToNewWave</Name>
+				<Source><![CDATA[
+    private void moveShipmentToNewWave(WHSShipmentTable _shipmentTable)
+    {
+        ttsbegin;
+
+        WHSWaveTable waveTable = WHSWaveTable::assignOrCreateWave(_shipmentTable);
+
+        WHSWaveLine::createFromWaveIdAndShipment(waveTable.WaveId, _shipmentTable);
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>whsLoadLineSyncIssueHandler</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the instance of the synchronization issue handler.
+    /// </summary>
+    /// <returns>
+    ///    An instance of the <c>WHSLoadLineSyncIssueHandler</c> class.
+    /// </returns>
+    protected WHSLoadLineSyncIssueHandler whsLoadLineSyncIssueHandler()
+    {
+        if (!whsLoadLineSyncIssueHandler)
+        {
+            whsLoadLineSyncIssueHandler = WHSLoadLineSyncIssueHandler::newStandard();
+        }
+
+        return whsLoadLineSyncIssueHandler;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static WHSSrcLineChangeLoadLineUpdater construct()
+    {
+        return new WHSSrcLineChangeLoadLineUpdater();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of <c>WHSSrcLineChangeLoadLineUpdater</c> and sets parameter values.
+    /// </summary>
+    /// <param name="_common">
+    /// The source order line that is being updated.
+    /// </param>
+    /// <param name="_inventTransId">
+    /// The inventTransId of the source order line.
+    /// </param>
+    /// <param name="_newInventDimId">
+    /// The new inventDimId of the source order line.
+    /// </param>
+    /// <param name="_oldInventDimId">
+    /// The old inventDimId of the source order line.
+    /// </param>
+    /// <param name="_newInventQty">
+    /// The new invent qty of the source order line.
+    /// </param>
+    /// <param name="_oldInventQty">
+    /// The old invent qty of the source order line.
+    /// </param>
+    /// <param name="_newUnitId">
+    /// The new unit of measure of the source order line.
+    /// </param>
+    /// <param name="_oldUnitId">
+    /// The old unit of measure of the source order line.
+    /// </param>
+    /// <param name="_mustAutoCreate">
+    /// Determins if parameters set indicate that load lines are should be auto created.
+    /// </param>
+    /// <returns>
+    /// Instance of <c>WHSSrcLineChangeLoadLineUpdater</c>
+    /// </returns>
+    /// <remarks>
+    /// The method should be called after the source order line update so that the common passed in hold the new values.
+    /// </remarks>
+    [SysObsolete('Method is obsoleted to support catch weight items. Callers should redirect their calls to the newFromUpdateParameters method. Extenders should move their logic to wrap the createFromUpdateParameters method.', false, 30\9\2019)]
+    public static WHSSrcLineChangeLoadLineUpdater newFromParameters(
+        Common              _common,
+        InventTransId       _inventTransId,
+        InventDimId         _newInventDimId,
+        InventDimId         _oldInventDimId,
+        InventQty           _newInventQty,
+        InventQty           _oldInventQty,
+        UnitOfMeasureSymbol _newUnitId,
+        UnitOfMeasureSymbol _oldUnitId,
+        NoYesId             _mustAutoCreate)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), WHSSrcLineChangeLoadLineUpdater::retrieveItemId(_inventTransId, _common));
+        
+        return WhsSrcLineChangeLoadLineUpdater::createFromUpdateParameters(_common,
+                                                            _inventTransId,
+                                                            _newInventDimId,
+                                                            _oldInventDimId,
+                                                            _newInventQty,
+                                                            _oldInventQty,
+                                                            _newUnitId,
+                                                            _oldUnitId,
+                                                            _mustAutoCreate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromUpdateParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of <c>WHSSrcLineChangeLoadLineUpdater</c> and sets parameter values.
+    /// </summary>
+    /// <param name="_common">
+    /// The source order line that is being updated.
+    /// </param>
+    /// <param name="_inventTransId">
+    /// The inventTransId of the source order line.
+    /// </param>
+    /// <param name="_newInventDimId">
+    /// The new inventDimId of the source order line.
+    /// </param>
+    /// <param name="_oldInventDimId">
+    /// The old inventDimId of the source order line.
+    /// </param>
+    /// <param name="_newHandlingQty">
+    /// The new handling qty of the source order line.
+    /// </param>
+    /// <param name="_oldHandlingQty">
+    /// The old handling qty of the source order line.
+    /// </param>
+    /// <param name="_newUnitId">
+    /// The new unit of measure of the source order line.
+    /// </param>
+    /// <param name="_oldUnitId">
+    /// The old unit of measure of the source order line.
+    /// </param>
+    /// <param name="_mustAutoCreate">
+    /// Determins if parameters set indicate that load lines are should be auto created.
+    /// </param>
+    /// <returns>
+    /// Instance of <c>WHSSrcLineChangeLoadLineUpdater</c>
+    /// </returns>
+    /// <remarks>
+    /// The method should be called after the source order line update so that the common passed in hold the new values.
+    /// </remarks>
+    [Hookable(false)]
+    public static WHSSrcLineChangeLoadLineUpdater newFromUpdateParameters(
+        Common              _common,
+        InventTransId       _inventTransId,
+        InventDimId         _newInventDimId,
+        InventDimId         _oldInventDimId,
+        InventHandlingQty   _newHandlingQty,
+        InventHandlingQty   _oldHandlingQty,
+        UnitOfMeasureSymbol _newUnitId,
+        UnitOfMeasureSymbol _oldUnitId,
+        NoYesId             _mustAutoCreate)
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightItemLogic(funcName(), WHSSrcLineChangeLoadLineUpdater::retrieveItemId(_inventTransId, _common)))
+        {
+            return WhsSrcLineChangeLoadLineUpdater::createFromUpdateParameters(_common,
+                                                                _inventTransId,
+                                                                _newInventDimId,
+                                                                _oldInventDimId,
+                                                                _newHandlingQty,
+                                                                _oldHandlingQty,
+                                                                _newUnitId,
+                                                                _oldUnitId,
+                                                                _mustAutoCreate);
+        }
+
+        return WHSSrcLineChangeLoadLineUpdater::newFromParameters(_common,
+                                                                _inventTransId,
+                                                                _newInventDimId,
+                                                                _oldInventDimId,
+                                                                _newHandlingQty,
+                                                                _oldHandlingQty,
+                                                                _newUnitId,
+                                                                _oldUnitId,
+                                                                _mustAutoCreate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromUpdateParametersV2</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public static WHSSrcLineChangeLoadLineUpdater newFromUpdateParametersV2(
+        Common              _common,
+        InventTransId       _inventTransId,
+        InventDimId         _newInventDimId,
+        InventDimId         _oldInventDimId,
+        InventHandlingQty   _newHandlingQty,
+        InventHandlingQty   _oldHandlingQty,
+        UnitOfMeasureSymbol _newUnitId,
+        UnitOfMeasureSymbol _oldUnitId,
+        NoYesId             _mustAutoCreate,
+        Common              _orig)
+    {
+        WHSSrcLineChangeLoadLineUpdater whsSrcLineChangeLoadLineUpdater = WHSSrcLineChangeLoadLineUpdater::newFromUpdateParameters(
+            _common,
+            _inventTransId,
+            _newInventDimId,
+            _oldInventDimId,
+            _newHandlingQty,
+            _oldHandlingQty,
+            _newUnitId,
+            _oldUnitId,
+            _mustAutoCreate);
+
+        whsSrcLineChangeLoadLineUpdater.setOldAndNewAddressesFromBuffers(_common, _orig);
+
+        return whsSrcLineChangeLoadLineUpdater;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createFromUpdateParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of <c>WHSSrcLineChangeLoadLineUpdater</c> and sets parameter values.
+    /// </summary>
+    /// <param name="_common">
+    /// The source order line that is being updated.
+    /// </param>
+    /// <param name="_inventTransId">
+    /// The inventTransId of the source order line.
+    /// </param>
+    /// <param name="_newInventDimId">
+    /// The new inventDimId of the source order line.
+    /// </param>
+    /// <param name="_oldInventDimId">
+    /// The old inventDimId of the source order line.
+    /// </param>
+    /// <param name="_newHandlingQty">
+    /// The new handling qty of the source order line.
+    /// </param>
+    /// <param name="_oldHandlingQty">
+    /// The old handling qty of the source order line.
+    /// </param>
+    /// <param name="_newUnitId">
+    /// The new unit of measure of the source order line.
+    /// </param>
+    /// <param name="_oldUnitId">
+    /// The old unit of measure of the source order line.
+    /// </param>
+    /// <param name="_mustAutoCreate">
+    /// Determins if parameters set indicate that load lines are should be auto created.
+    /// </param>
+    /// <returns>
+    /// Instance of <c>WHSSrcLineChangeLoadLineUpdater</c>
+    /// </returns>
+    /// <remarks>
+    /// The method is an extension point and is not meant to be called directly. Callers should call the newFromUpdateParameters method.
+    /// </remarks>
+    [Wrappable(true)]
+    protected static WHSSrcLineChangeLoadLineUpdater createFromUpdateParameters(
+        Common              _common,
+        InventTransId       _inventTransId,
+        InventDimId         _newInventDimId,
+        InventDimId         _oldInventDimId,
+        InventHandlingQty   _newHandlingQty,
+        InventHandlingQty   _oldHandlingQty,
+        UnitOfMeasureSymbol _newUnitId,
+        UnitOfMeasureSymbol _oldUnitId,
+        NoYesId             _mustAutoCreate)
+    {
+        WHSSrcLineChangeLoadLineUpdater         whsSrcLineChangeLoadLineUpdater;
+        WHSSrcLineChangeLoadLineUpdAttribute    whsSrcLinceChangeLoadLineUpdAttribute;
+
+        whsSrcLinceChangeLoadLineUpdAttribute = new WHSSrcLineChangeLoadLineUpdAttribute(tableId2name(_common.TableId));
+
+        whsSrcLineChangeLoadLineUpdater = SysExtensionAppClassFactory::getClassFromSysAttribute(classStr(WHSSrcLineChangeLoadLineUpdater),whsSrcLinceChangeLoadLineUpdAttribute);
+
+        if (classIdGet(whsSrcLineChangeLoadLineUpdater) == classNum(WHSSrcLineChangeLoadLineUpdater)
+            && _common.TableId != tableNum(SalesLine)
+            && _common.TableId != tableNum(InventTransferLine))
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        whsSrcLineChangeLoadLineUpdater.parmInventTransId(_inventTransId);
+        if (!whsSrcLineChangeLoadLineUpdater.getItemId())
+        {
+            whsSrcLineChangeLoadLineUpdater.setItemIdFromCommon(_common);
+        }
+        whsSrcLineChangeLoadLineUpdater.parmNewInventDimId(_newInventDimId);
+        whsSrcLineChangeLoadLineUpdater.parmOldInventDimId(_oldInventDimId);
+        whsSrcLineChangeLoadLineUpdater.parmNewQty(_newHandlingQty);
+        whsSrcLineChangeLoadLineUpdater.parmOldQty(_oldHandlingQty);
+        whsSrcLineChangeLoadLineUpdater.parmOldUnitId(_oldUnitId);
+        whsSrcLineChangeLoadLineUpdater.parmNewUnitId(_newUnitId);
+        whsSrcLineChangeLoadLineUpdater.parmMustAutoCreateLoadLine(_mustAutoCreate);
+
+        return whsSrcLineChangeLoadLineUpdater;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getItemId</Name>
+				<Source><![CDATA[
+    private ItemId getItemId()
+    {
+        return this.itemId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setItemIdFromCommon</Name>
+				<Source><![CDATA[
+    private void setItemIdFromCommon(Common _common)
+    {
+        this.setItemId(WhsSrcLineChangeLoadLineUpdater::retrieveItemIdFromCommon(_common));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setItemId</Name>
+				<Source><![CDATA[
+    private void setItemId(ItemId _itemId)
+    {
+        this.itemId = _itemId;
+        isCWItem    = UnknownNoYes::Unknown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveItemIdFromCommon</Name>
+				<Source><![CDATA[
+    protected static ItemId retrieveItemIdFromCommon(Common _common)
+    {
+        ItemId itemId;
+
+        if (_common.TableId == tableNum(SalesLine))
+        {
+            SalesLine salesLine  = _common as SalesLine;
+            itemId = salesLine.ItemId;
+        }
+        else if (_common.TableId == tableNum(InventTransferLine))
+        {
+            InventTransferLine inventTransferLine  = _common as InventTransferLine;
+            itemId = inventTransferLine.ItemId;
+        }
+        else if (_common.TableId == tableNum(PurchLine))
+        {
+            PurchLine purchLine  = _common as PurchLine;
+            itemId = purchLine.ItemId;
+        }
+        return itemId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveInventTransItemId</Name>
+				<Source><![CDATA[
+    private static ItemId retrieveInventTransItemId(InventTransId _inventTransId)
+    {
+        ItemId itemId = InventTransOrigin::findByInventTransId(_inventTransId).ItemId;
+
+        if (!itemId)
+        {
+            // The InventTransOrigin record might have been deleted, so we try with the WHSLoadLine
+            itemId = (select firstonly ItemId from WHSLoadLine where WHSLoadLine.InventTransId == _inventTransId).ItemId;
+        }
+
+        return itemId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveItemId</Name>
+				<Source><![CDATA[
+    private static ItemId retrieveItemId(InventTransId _inventTransId,  Common _common)
+    {
+        ItemId itemId =  WHSSrcLineChangeLoadLineUpdater::retrieveInventTransItemId(_inventTransId);
+        if (!itemId)
+        {
+            itemId = WHSSrcLineChangeLoadLineUpdater::retrieveItemIdFromCommon(_common);
+        }
+
+        return itemId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    internal WHSInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = WHSInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOldAndNewAddressesFromBuffers</Name>
+				<Source><![CDATA[
+    private void setOldAndNewAddressesFromBuffers(Common _orderLine, Common _originalOrderLine)
+    {
+        if (_orderLine is SalesLine)
+        {
+            if (!(_originalOrderLine is SalesLine))
+            {
+                throw error(Error::wrongUseOfFunction(funcName()));
+            }
+
+            SalesLine salesLine = _orderLine as SalesLine;
+            SalesLine originalSalesLine = _originalOrderLine as SalesLine;
+            if (salesLine.DeliveryPostalAddress != originalSalesLine.DeliveryPostalAddress)
+            {
+                this.parmNewAddress(TMSAddressPhone::initFromSalesLine(salesLine));
+                this.parmOldAddress(TMSAddressPhone::initFromSalesLine(originalSalesLine));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

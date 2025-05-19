@@ -1,0 +1,901 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>CashRegisterProcessingEFSTA_W</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Security.Cryptography.X509Certificates;
+using Microsoft.Dynamics365.LocalizationFramework;
+
+/// <summary>
+/// Class <c>CashRegisterProcessingEFSTA_W</c> performs all the cash operations registration procedures.
+/// </summary>
+public class CashRegisterProcessingEFSTA_W extends CashRegisterProcessingBase
+{
+    URL registerURL;
+
+    boolean validated;
+    boolean alreadySent;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>requestForCertificate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes certificate for https connection.
+    /// </summary>
+    /// <param name = "register">Cash Register.</param>
+    /// <returns>Certificate or null, if there are no certificate's settings.</returns>
+    /// <exception cref="Exception::Error">
+    /// The mandatory parameters are missing.
+    /// </exception>
+    private X509Certificate2 requestForCertificate(CashRegister_W _register)
+    {
+        if (!_register)
+        {
+            throw error(error::wrongUseOfFunction(funcName()));
+        }
+
+        System.Security.Cryptography.X509Certificates.X509Certificate2 certificate;
+        UseAdvCertificateStore useAdvCert = SystemParameters::find().UseAdvCertificateStore;
+
+        if (useAdvCert && _register.KeyVaultCertificateRef)
+        {
+            certificate = KeyVaultCertificateHelper::getDigitalCertificate(_register.KeyVaultCertificateRef);
+        }
+        else if (!useAdvCert && _register.CertificateSubject != null)
+        {
+            certificate = DigitalCertificateManager::getDigitalCertificate(_register.CertificateSubject);
+        }
+
+        return certificate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processAlreadyRegisteredTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs GER-configuration for response, validate correct run of it and mark it as registered
+    /// for that transactions,
+    /// which are already registered in EFR, but are marked as unregistered in the system.
+    /// </summary>
+    /// <param name="_tmpXmlDocResponse">Xml Document received from Fiscal Service.</param>
+    private void processAlreadyRegisteredTransaction(XmlDocument _tmpXmlDocResponse)
+    {
+        alreadySent = true;
+
+        ERmodelDefinitionInputParametersAction responseParameters = new ERmodelDefinitionInputParametersAction();
+        responseParameters.addParameter(CashRegisterProcessingEFSTAConfigConst_W::responseFormatTransDateUserParm, 
+                cashRegisterFiscalTrans.TransDate)
+            .addParameter(CashRegisterProcessingEFSTAConfigConst_W::responseFormatVoucherUserParm,
+                cashRegisterFiscalTrans.Voucher);
+
+        var runner = ERObjectsFactory::createMappingDestinationRunByImportFormatMappingId(
+            cashRegisterFiscalTrans.terminal().register().ResponseFormatId,
+            CashRegisterProcessingEFSTAConfigConst_W::responseFormatIntegrationPoint);
+        runner.withParameter(responseParameters);
+        runner.init();
+        if (runner.promptsContractedModelMapping())
+        {
+            var parameters = runner.getParameters();
+            var traverser = new ERModelDefinitionParametersTraverser(parameters);
+            while (traverser.moveNext())
+            {
+                var current = ERCast::asAny(traverser.current()) as ERIImportFormatDataSourceContract;
+                if (current)
+                {
+                    System.IO.MemoryStream stream = new System.IO.MemoryStream();
+                    System.Xml.XmlDocument xmlDoc = new System.Xml.XmlDocument();
+
+                    xmlDoc.LoadXml(_tmpXmlDocResponse.toString());
+                    xmlDoc.Save(stream);
+                    stream.Seek(0, System.IO.SeekOrigin::Begin);
+                    current.parmInputDataStream(stream);
+                }
+            }
+        }
+        runner.runUnattended();
+
+        this.validateCashTransactionRegistration();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateRegisteredTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that last registered transaction marked as registered
+    /// has the same receipt number as got from Cash Register Service.
+    /// </summary>
+    /// <param name="_responseReceiptNumber">
+    /// Last registered receipt number for Fiscal Register Client.
+    /// </param>
+    /// <remarks>
+    /// If there is some transaction, which was send earlier and wasn't marked as
+    /// registered in system, but is registered in EFR client
+    /// user will get the error message.
+    /// </remarks>
+    /// <exception cref="Exception::Error">
+    /// There is a transaction which is registered in EFR-client and not registered in system.
+    /// </exception>
+    private void validateRegisteredTransactions(CashRegisterReceiptNumber_W _responseReceiptNumber)
+    {
+        CashRegisterFiscalTrans_W lastRegisteredTrans = 
+            CashRegisterFiscalTrans_W::findReceiptNumber(cashRegisterFiscalTrans.CashRegister, _responseReceiptNumber);
+        CashRegisterFiscalTrans_W cashTransaction;
+
+        select minof(Sorting) from cashTransaction
+            where cashTransaction.Status == CashRegisterFiscalTransStatus_W::Created
+                && cashTransaction.CashRegister == cashRegisterFiscalTrans.CashRegister
+                && cashTransaction.Sorting <= lastRegisteredTrans.Sorting;
+      
+        if (cashTransaction.Sorting != 0)
+        {
+
+            CashRegisterFiscalTrans_W unregisteredTransaction = 
+                CashRegisterFiscalTrans_W::findSorting(cashRegisterFiscalTrans.CashRegister, cashTransaction.Sorting);
+            CashRegisterReceiptNumber_W unregisteredReceiptNumber = unregisteredTransaction.ReceiptNumber;
+
+            if (unregisteredReceiptNumber != cashRegisterFiscalTrans.ReceiptNumber)
+            {
+                throw error(strFmt("@FiscalServices:AS_CashRegisterProcessing_WClassMethodValidateAlreadySend_Error", 
+                    unregisteredReceiptNumber));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkCashTransactionConsistency</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks cash transactions consistency between storage and Cash Register Service.
+    /// Does nothing if there are no registered transactions in cash register service.
+    /// Changes transactions status on "Registered" and puts warning 
+    /// if there are registered transactions in cash register and last registered one has the 
+    /// same receipt number.
+    /// Checks that all earlier transactions have equal statuses in storage and in Cash Register Service
+    /// and reports an error for unconsistent ones, if there are registered transactions in cash register
+    /// and last registered one has different receipt number.
+    /// </summary>
+    /// <param name = "_request">Web request.</param>
+    private void checkCashTransactionConsistency(CashRegisterCommunicationWithWebService_W _request)
+    {
+        // there are already registered transactions
+        XmlDocument tmpXmlDocResponse = _request.parmResponseData();
+        logHelper.voucher(cashRegisterFiscalTrans.Voucher)
+                        .transDate(cashRegisterFiscalTrans.TransDate)
+                        .logResponse(tmpXmlDocResponse.outerXml());
+
+        XmlNode valueNode = tmpXmlDocResponse.selectSingleNode(@'/Tra/ESR/@TN');
+        if (valueNode)
+        {
+            CashRegisterReceiptNumber_W responseReceiptNumber = valueNode.value();
+            if (responseReceiptNumber == cashRegisterFiscalTrans.ReceiptNumber)
+            {
+                // this transaction is already registered in EFR client
+                this.processAlreadyRegisteredTransaction(tmpXmlDocResponse);
+                info(strFmt("@FiscalServices:AS_CashRegisterProcessing_WClassMethodValidateAlreadySend_Sended", 
+                    cashRegisterFiscalTrans.ReceiptNumber));
+            }
+            else
+            {
+                // receipt number is different
+                // check that all earlier transactions have same status in Fiscal Service
+                // and in the system
+                this.validateRegisteredTransactions(responseReceiptNumber);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateRequestByReceiptNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Makes response to EFR-client. Based on this response
+    /// transaction will be marked as already registered, or not registered yet,
+    /// or transactions, which were registered in the system earlier will be found.
+    /// </summary>
+    /// <param name = "_requestUrl">URL for request.</param>
+    /// <param name = "_certificate">Certificate for request.</param>
+    /// <param name = "_certificateThumbprint">Thumprint of cash register's certificate.</param>
+    /// <exception cref="Exception::Error">
+    /// There is a transaction which is registered in EFR-client and not registered in system.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Mistakes in https request.
+    /// </exception>
+    private void validateRequestByReceiptNumber(str _requestUrl, X509Certificate2 _certificate, str _certificateThumbprint)
+    {
+        const int httpOK = 200;
+        const int rangeNotOK = 416;
+
+        CashRegisterCommunicationWithWebService_W request = new CashRegisterCommunicationWithWebService_W();
+        int requestResult = request.withRequestURL(_requestUrl)
+                .withContentType(@'application/xml; encoding="utf-8"')
+                .withCertificate(_certificate)
+                .withRegisterCertififcateThumbprint(_certificateThumbprint)
+                .runSyncRequest(false);
+
+        switch (requestResult)
+        {
+            case httpOk :
+                // there are already registered transactions
+                this.checkCashTransactionConsistency(request);
+                break;
+
+            case rangeNotOk :
+                // Receipt was not found; do nothing.
+                break;
+
+            default:
+                str responseData = request.parmErrorResponseDescription() ? request.parmErrorResponseDescription() : '';
+                throw error(strFmt("@FiscalServices:AS_CashRegisterProcessing_WClassMethodValidateAlreadySend_ErrorCode"
+                        + ' ' + "@FiscalServices:AS_CashRegisterProcessing_WClassMethodValidateAlreadySend_ErrorDesc"
+                        + ' ' + '%3', registerURL, requestResult, responseData));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateAlreadySent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates cash register transaction on being already sent.
+    /// If client is working on local machine - there is an API for request fiscal transaction by API.
+    /// If client is working through web - in request we will get last transaction.
+    /// </summary>
+    /// <returns>
+    /// The current object.
+    /// </returns>
+    /// <remarks>
+    /// The <c>ReceiptNumber</c>, when assigned, is assumed to be a unique ID (within the terminal at least).
+    /// </remarks>
+    /// <exception cref="Exception::Error">
+    /// Request to the cash register returned an error.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Cash receipt is being manually registered (sent) not in the order of their creation.
+    /// </exception>
+    public CashRegisterProcessingBase validateAlreadySent()
+    {
+        alreadySent = false;
+
+        if (!cashRegisterFiscalTrans.ReceiptNumber)
+        {
+            return this;
+        }
+
+        CashRegister_W register = CashRegister_W::find(cashRegisterFiscalTrans.CashRegister);
+        registerURL = (cashRegisterFiscalTrans.URL ? cashRegisterFiscalTrans.URL : register.URL);
+        X509Certificate2 certificate = this.requestForCertificate(register);
+        str registerCertififcateThumbprint = register.UseSelfSignedCert ? register.CertificateThumbprint : '';
+        registerURL = registerURL + @'/last?RN=' + register.Code;
+ 
+        this.validateRequestByReceiptNumber(registerURL, certificate, registerCertififcateThumbprint);
+
+        return this;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isEnabled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Defines if the Cash regiser processing is enabled.
+    /// </summary>
+    /// <returns>
+    /// True, if the Cash regiser processing is enabled.
+    /// </returns>
+    public static boolean isEnabled()
+    {
+        #ISOCountryRegionCodes
+        return SysCountryRegionCode::isLegalEntityInCountryRegion([ #isoAT, #isoCZ ]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldRegisterLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks transaction from ledger journal should to be registered.
+    /// </summary>
+    /// <param name = "_paymMode">Transaction's payment mode.</param>
+    /// <param name = "_type1">The first <c>LedgerJournalACType</c>.</param>
+    /// <param name = "_type2">The second <c>LedgerJournalACType</c>.</param>
+    /// <returns>True if transaction from ledger journal should be registered.</returns>
+    private static boolean shouldRegisterLedgerJournalTrans(PaymMode _paymMode,
+        LedgerJournalACType  _type1,
+        LedgerJournalACType _type2)
+    {
+        return _type1 == LedgerJournalACType::Cust
+            && ((_type2 == LedgerJournalACType::RCash && !_paymMode)
+            || CashRegisterPaymMode_W::existsPaymMode(_paymMode));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isEnabledLedgerJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks is <c>LedgerJournalTrans</c> enabled for Cash Register processing.
+    /// </summary>
+    /// <param name = "_ledgerJournalTrans"><c>LedgerJournalTrans</c> object.</param>
+    /// <param name="_paymMode">
+    /// The payment mode ID on the journal line.
+    /// </param>
+    /// <returns>
+    /// True, if the Cash Regiser processing is enabled, false - otherwise.
+    /// </returns>
+    public static boolean isEnabledLedgerJournal(
+        LedgerJournalTrans  _ledgerJournalTrans,
+        PaymMode            _paymMode   = _ledgerJournalTrans.PaymMode)
+    {
+        LedgerJournalACType accountType =
+            _ledgerJournalTrans.LedgerDimension ? _ledgerJournalTrans.AccountType : -1;
+        LedgerJournalACType accounTypeOffset =
+            _ledgerJournalTrans.OffsetLedgerDimension ? _ledgerJournalTrans.OffsetAccountType : -1;
+
+        return CashRegisterProcessingEFSTA_W::isEnabled()
+            && !_ledgerJournalTrans.Invoice
+            && (CashRegisterProcessingEFSTA_W::shouldRegisterLedgerJournalTrans(_paymMode, accountType, accounTypeOffset)
+            || CashRegisterProcessingEFSTA_W::shouldRegisterLedgerJournalTrans(_paymMode, accounTypeOffset, accountType));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaxesFromCustTransToCancel</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets Taxes which are included in Cancel Cust Payment.
+    /// </summary>
+    /// <returns>List of taxes.</returns>
+    private List getTaxesFromCustTransToCancel(List _taxesList)
+    {
+        CashRegisterFiscalTrans_W   cashRegisterFiscalTransToCancel;
+        CashRegisterFiscalTransTax_W cashRegisterFiscalTransTaxToCancel;
+
+        while select Percent, TaxAmount, GrossAmount from cashRegisterFiscalTransTaxToCancel
+        exists join cashRegisterFiscalTransToCancel
+            where cashRegisterFiscalTransToCancel.RecId      == cashRegisterFiscalTransTaxToCancel.FiscalTrans
+                && cashRegisterFiscalTransToCancel.Voucher   == custTransToCancel.Voucher
+                && cashRegisterFiscalTransToCancel.TransDate == custTransToCancel.TransDate
+        {
+            _taxesList.addEnd([
+                cashRegisterFiscalTransTaxToCancel.Percent,
+                -cashRegisterFiscalTransTaxToCancel.TaxAmount,
+                -(cashRegisterFiscalTransTaxToCancel.GrossAmount - cashRegisterFiscalTransTaxToCancel.TaxAmount)]);
+        }
+
+        return _taxesList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaxesFromInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all taxes which are related to Invoice.
+    /// </summary>
+    /// <returns>List of taxes.</returns>
+    private List getTaxesFromInvoice(List _taxesList)
+    {
+        CustSettlement custSettlement, custSettlementInvoice;
+        CustTrans custTransInvoice;
+        TaxTrans taxTrans;
+        Map taxPerTaxValueMap = new Map(Types::Real, Types::Container);
+        MapEnumerator me;
+        container taxAmounts;
+
+        if (CashRegisterPaymMode_W::findPaymMode(custTransPayment.PaymMode).SendTax)
+        {
+            while select SettleAmountCur from custSettlement
+                where custSettlement.TransCompany           == custTransPayment.dataAreaId
+                    && custSettlement.TransRecId            == custTransPayment.RecId
+                    && custSettlement.AccountNum            == custTransPayment.AccountNum
+                    && custSettlement.CanBeReversed         == NoYes::Yes
+            join AmountCur, Voucher, TransDate from custTransInvoice
+                where custTransInvoice.RecId                == custSettlement.OffsetRecid
+            join UtilizedCashDisc from custSettlementInvoice
+                where custSettlementInvoice.TransCompany    == custTransInvoice.dataAreaId
+                    && custSettlementInvoice.TransRecId     == custTransInvoice.RecId
+                    && custSettlementInvoice.AccountNum     == custTransPayment.AccountNum
+                    && custSettlementInvoice.OffsetRecid    == custTransPayment.RecId
+            {
+                if (-custSettlement.SettleAmountCur != custTransInvoice.AmountCur - custSettlementInvoice.UtilizedCashDisc)
+                {
+                    taxPerTaxValueMap = new Map(Types::Real, Types::Container);
+                    break;
+                }
+
+                while select maxof(SourceBaseAmountCur), //Source amount is the same for all grouped tax transaction by SourceRecId
+                sum(SourceTaxAmountCur) from taxTrans
+                    group by TaxValue, SourceTableId, SourceRecId
+                    where taxTrans.Voucher == custTransInvoice.Voucher
+                        && taxTrans.TransDate == custTransInvoice.TransDate
+                {
+                    if (taxPerTaxValueMap.exists(taxTrans.TaxValue))
+                    {
+                        taxAmounts = taxPerTaxValueMap.lookup(taxTrans.TaxValue);
+                        taxAmounts = [conPeek(taxAmounts, 1) + (-taxTrans.SourceTaxAmountCur),
+                                      conPeek(taxAmounts, 2) + (-taxTrans.SourceBaseAmountCur)];
+                    }
+                    else
+                    {
+                        taxAmounts = [-taxTrans.SourceTaxAmountCur, -taxTrans.SourceBaseAmountCur];
+                    }
+
+                    taxPerTaxValueMap.insert(taxTrans.TaxValue, taxAmounts);
+                }
+            }
+
+            me = taxPerTaxValueMap.getEnumerator();
+            while (me.moveNext())
+            {
+                _taxesList.addEnd([
+                    me.currentKey(),
+                    conPeek(me.currentValue(), 1),
+                    conPeek(me.currentValue(), 2)]);
+            }
+        }
+
+        return _taxesList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaxesFromPrepayment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets all Taxes which are related to Ledger Journal Trans.
+    /// </summary>
+    /// <returns>List of taxes.</returns>
+    private List getTaxesFromPrepayment(List _taxesList)
+    {
+        TaxTrans taxTrans;
+
+        while select sum(SourceBaseAmountCur), sum(SourceTaxAmountCur) from taxTrans
+            group by TaxValue
+            where taxTrans.Voucher    == ledgerJournalTrans.Voucher
+                && taxTrans.TransDate == ledgerJournalTrans.TransDate
+        {
+            _taxesList.addEnd([
+                taxTrans.TaxValue,
+                -taxTrans.SourceTaxAmountCur,
+                -taxTrans.SourceBaseAmountCur]);
+        }
+
+        return _taxesList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFiscalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes cash register fiscal transaction.
+    /// </summary>
+    /// <returns>
+    /// The current object.
+    /// </returns>
+    public CashRegisterProcessingBase initFiscalTrans()
+    {
+        CashRegister_W register = terminal.register();
+
+        cashRegisterFiscalTrans.initValue();
+        cashRegisterFiscalTrans.Status          = CashRegisterFiscalTransStatus_W::Created;
+        cashRegisterFiscalTrans.Voucher         = custTransPayment.Voucher;
+        cashRegisterFiscalTrans.TransDate       = custTransPayment.TransDate;
+        cashRegisterFiscalTrans.CurrencyCode    = custTransPayment.CurrencyCode;
+        cashRegisterFiscalTrans.Terminal        = terminal.RecId;
+        cashRegisterFiscalTrans.Operator        = operator.RecId;
+        cashRegisterFiscalTrans.CashRegister    = register.RecId;
+        cashRegisterFiscalTrans.URL             = register.URL;
+
+        if (register.ReceiptNumberSeq)
+        {
+            cashRegisterFiscalTrans.setReceiptNumber(NumberSeq::newGetNumFromId(register.ReceiptNumberSeq).num());
+        }
+        cashRegisterFiscalTrans.ReceiptAmount   = -custTransPayment.AmountCur;
+
+        cashRegisterFiscalTrans.TransId         = 0;
+        cashRegisterFiscalTrans.TransDateTime   = DateTimeUtil::minValue();
+        cashRegisterFiscalTrans.insert();
+
+        this.initFiscalTransTax(cashRegisterFiscalTrans);
+
+        return this;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFiscalTransTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes Taxes, which are related to current Cash transaction.
+    /// </summary>
+    /// <param name = "_cashRegisterFiscalTrans">Cash Transaction.</param>
+    private void initFiscalTransTax(CashRegisterFiscalTrans_W _cashRegisterFiscalTrans)
+    {
+        CashRegisterFiscalTransTax_W    cashRegisterFiscalTransTax;
+
+        TaxValue        taxValue;
+        AmountCur       baseAmount, taxAmount;
+        List            taxesList = new List(Types::Container);
+        ListEnumerator  le;
+
+        cashRegisterFiscalTransTax.initFromFiscalTrans(_cashRegisterFiscalTrans);
+
+        if (custTransToCancel)
+        {
+            taxesList = this.getTaxesFromCustTransToCancel(taxesList);
+        }
+        else
+        {
+            if (ledgerJournalTrans)
+            {
+                taxesList = this.getTaxesFromPrepayment(taxesList);
+            }
+
+            if (taxesList.empty())
+            {
+                taxesList = this.getTaxesFromInvoice(taxesList);
+            }
+        }
+
+        if (!taxesList.empty())
+        {
+            le = taxesList.getEnumerator();
+            while (le.moveNext())
+            {
+                [taxValue, taxAmount, baseAmount]      = le.current();
+
+                cashRegisterFiscalTransTax.Percent     = taxValue;
+                cashRegisterFiscalTransTax.TaxAmount   = taxAmount;
+                cashRegisterFiscalTransTax.GrossAmount = baseAmount + taxAmount;
+                cashRegisterFiscalTransTax.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        #ISOCountryRegionCodes
+
+        validated = false;
+
+        logHelper = new CashRegisterWebRequestLogHelper_W();
+
+        str featureReference = GlobalizationInstrumentationHelper::getFeatureRefByLegalEntityCountryRegion([
+            [#isoAT, GlobalizationConstants::FeatureReferenceAT00014],
+            [#isoCZ, GlobalizationConstants::FeatureReferenceCZ00023]
+        ]);
+        if (featureReference)
+        {
+            GlobalizationInstrumentationHelper::featureRun(featureReference, funcName());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromPaymentTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates new CashRegisterProcessingEFSTA_W object and set up Cust Trans Payment.
+    /// </summary>
+    /// <param name="_custTransPayment>Current Cust Trans Payment.</param>
+    /// <returns><c>CashRegisterProcessingEFSTA_W</c> object.</returns>
+    public CashRegisterProcessingBase newFromPaymentTrans(CustTrans _custTransPayment)
+    {
+        CashRegisterProcessingEFSTA_W cashRegisterProcessing = new CashRegisterProcessingEFSTA_W();
+
+        cashRegisterProcessing.parmCustTransPayment(_custTransPayment);
+
+        return cashRegisterProcessing;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCustTransPayment</Name>
+				<Source><![CDATA[
+    public CustTrans parmCustTransPayment(CustTrans _custTransPayment = custTransPayment)
+    {
+        custTransPayment = _custTransPayment;
+        return custTransPayment;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateRequestFormatParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates parameters, which will be used in GER-format for creating body of http-request.
+    /// </summary>
+    /// <returns>
+    /// Parameters for GER-configuration for generating request.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// The mandatory parameters are missing or have wrong values.
+    /// </exception>
+    private ERIModelDefinitionParamsAction generateRequestFormatParameters()
+    {
+        if (!validated || !cashRegisterFiscalTrans)
+        {
+            throw error(error::wrongUseOfFunction(funcName()));
+        }
+
+        ERModelDefinitionDatabaseContext context = new ERModelDefinitionDatabaseContext();
+
+        QueryBuildDataSource qbdsCashRegisterFiscalTrans;
+        Query queryCashRegisterFiscalTrans_W = new Query();
+        qbdsCashRegisterFiscalTrans = queryCashRegisterFiscalTrans_W.addDataSource(tablenum(CashRegisterFiscalTrans_W));
+        findOrCreateRange_W(qbdsCashRegisterFiscalTrans,
+            fieldNum(CashRegisterFiscalTrans_W, Voucher), cashRegisterFiscalTrans.Voucher);
+        findOrCreateRange_W(qbdsCashRegisterFiscalTrans,
+            fieldNum(CashRegisterFiscalTrans_W, TransDate), queryValue(cashRegisterFiscalTrans.TransDate));
+
+        context.addQuery(tableNum(CashRegisterFiscalTrans_W), queryCashRegisterFiscalTrans_W)
+                .addValue(tableNum(CashRegisterFiscalTransCode_W),
+                    fieldNum(CashRegisterFiscalTransCode_W, FiscalTrans), cashRegisterFiscalTrans.RecId)
+                .addValue(tableNum(CashRegisterFiscalTransTax_W),
+                    fieldNum(CashRegisterFiscalTransTax_W, FiscalTrans),cashRegisterFiscalTrans.RecId);
+
+        return context;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCashTransactionRegistration</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates tax transaction to be correctly registrated.
+    /// There are required Fiscal Codes for countries (for AT - Code, for CZ - Sec).
+    /// </summary>
+    /// <exception cref="Exception::Error">
+    /// Country settings are wrong.
+    /// </exception>
+    private void validateCashTransactionRegistration()
+    {
+        #ISOCountryRegionCodes
+        str requiredTransCodeName;
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoAT]))
+        {
+            requiredTransCodeName = 'Code';
+        }
+        else if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoCZ]))
+        {
+            requiredTransCodeName = 'Sec';
+        }
+        else
+        {
+            throw error("@FiscalServices:AS_CashRegisterProcessing_WClass_sendXMLToFiscalRegisterMethod");
+        }
+
+        CashRegisterFiscalTransCode_W cashRegisterFiscalTransCode;
+
+        select firstonly cashRegisterFiscalTransCode
+            where cashRegisterFiscalTransCode.FiscalTrans == cashRegisterFiscalTrans.RecId
+                && cashRegisterFiscalTransCode.Name == requiredTransCodeName;
+
+        ttsbegin;
+
+        CashRegisterFiscalTrans_W cashRegisterFiscalTransUpdate = CashRegisterFiscalTrans_W::findRecId(cashRegisterFiscalTrans.RecId, true);
+        if (!cashRegisterFiscalTransUpdate)
+        {
+            throw error("@FiscalServices:AS_CashRegisterProcessing_WClass_IncorrectDataBase");
+        }
+
+        if (cashRegisterFiscalTransCode)
+        {
+            logHelper.logImported();
+            cashRegisterFiscalTransUpdate.Status = CashRegisterFiscalTransStatus_W::Registered;
+        }
+        else
+        {
+            delete_from cashRegisterFiscalTransCode
+                    where cashRegisterFiscalTransCode.FiscalTrans == cashRegisterFiscalTrans.RecId;
+
+            cashRegisterFiscalTransUpdate.TransDateTime = utcDateTimeNull();
+            cashRegisterFiscalTransUpdate.TransId = 0;
+            cashRegisterFiscalTransUpdate.IsOffline = NoYes::No;   
+        }
+
+        cashRegisterFiscalTransUpdate.update();
+
+        ttsCommit;
+
+        if (!cashRegisterFiscalTransCode)
+        {
+            throw error("@FiscalServices:AS_CashRegisterProcessing_WClass_sendXMLToFiscalRegisterMethod");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendXMLToFiscalRegister</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sends cash transaction to EFR-client.
+    /// </summary>
+    /// <returns><c>CashRegisterProcessingEFSTA_W</c> object.</returns>
+    /// <exception cref="Exception::Error">
+    /// The mandatory parameters are missing.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Request to the cash register returned an error.
+    /// </exception>
+    public CashRegisterProcessingBase sendXMLToFiscalRegister()
+    {
+        const int httpOk = 200;
+
+        if (alreadySent)
+        {
+            return this;
+        }
+
+        if (!logHelper)
+        {
+            throw error(error::wrongUseOfFunction(funcName()));
+        }
+
+        logHelper.voucher(cashRegisterFiscalTrans.Voucher)
+            .transDate(cashRegisterFiscalTrans.TransDate);
+
+        CashRegister_W register    = cashRegisterFiscalTrans.terminal().register();
+        registerURL = (cashRegisterFiscalTrans.URL ? cashRegisterFiscalTrans.URL : register.URL);
+        str requestUrl  = registerURL + @'/register?RN=' + register.Code;
+
+        str integrationPoint = classStr(ERTableDestination) + '#' + tableStr(CashRegisterFiscalTrans_WEntity);
+        ERmodelDefinitionInputParametersAction responseParameters = new ERmodelDefinitionInputParametersAction();
+        responseParameters.addParameter(CashRegisterProcessingEFSTAConfigConst_W::responseFormatTransDateUserParm, 
+                cashRegisterFiscalTrans.TransDate)
+            .addParameter(CashRegisterProcessingEFSTAConfigConst_W::responseFormatVoucherUserParm,
+                cashRegisterFiscalTrans.Voucher);
+
+        X509Certificate2 certificate = this.requestForCertificate(register);
+        str registerCertififcateThumbprint = cashRegisterFiscalTrans.terminal().register().UseSelfSignedCert ?
+            cashRegisterFiscalTrans.terminal().register().CertificateThumbprint : '';
+
+        CashRegisterCommunicationWithWebService_W request = new CashRegisterCommunicationWithWebService_W();
+        int requestResult = request.withRequestURL(requestUrl)
+                .withContentType(@'application/xml; encoding="utf-8"')
+                .withCertificate(certificate)
+                .withRegisterCertififcateThumbprint(registerCertififcateThumbprint)
+                .withRequestFormatID(cashRegisterFiscalTrans.terminal().register().RequestFormatId)
+                .withRequestFormatParameters(this.generateRequestFormatParameters())
+                .withResponseFormat(cashRegisterFiscalTrans.terminal().register().ResponseFormatId, 
+                    CashRegisterProcessingEFSTAConfigConst_W::responseFormatIntegrationPoint)
+                .withResponseFormatParameters(responseParameters)
+                .runSyncRequest(true);
+
+        logHelper.logRequest(request.parmRequestData().outerXml());
+        logHelper.logResponse(request.parmResponseData().outerXml());
+        if (requestResult != httpOk)
+        {
+            str responseData = request.parmErrorResponseDescription() ? request.parmErrorResponseDescription() : '';
+            throw error(strFmt("@FiscalServices:AS_CashRegisterProcessing_WClass_sendXMLToFiscalRegister_Error" + ' '
+                 + "@FiscalServices:AS_CashRegisterProcessing_WClass_sendXMLToFiscalRegister_Desc" + ' ' + '%3', requestUrl, requestResult, responseData));
+        }
+        else
+        {
+            this.validateCashTransactionRegistration();
+        }
+        return this;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the basic parameters.
+    /// </summary>
+    /// <returns>
+    /// The current object.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Cash register operator cannot be defined.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Cash register terminal cannot be defined.
+    /// </exception>
+    public CashRegisterProcessingBase validate()
+    {
+        if (!operator && cashRegisterFiscalTrans.Operator)
+        {
+            operator = CashRegisterOperator_W::find(cashRegisterFiscalTrans.Operator);
+        }
+
+        if (!operator)
+        {
+            operator = CashRegisterOperator_W::currentOperator();
+        }
+
+        if (!operator)
+        {
+            throw error(strFmt("@FiscalServices:AS_CashRegisterProcessing_WClass_ValidateNoOperator", curUserId()));
+        }
+
+        if (!cashRegisterFiscalTrans && !terminal.RecId)
+        {
+            throw error("@FiscalServices:AS_CashRegisterProcessing_WClass_ValidateNoTerminal");
+        }
+
+        validated = true;
+        return this;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFiscalTransStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the status of the cash register fiscal transaction.
+    /// </summary>
+    /// <returns>
+    /// The current object.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// The status of the cash register fiscal transaction is wrong.
+    /// </exception>
+    public CashRegisterProcessingBase validateFiscalTransStatus()
+    {
+        if (cashRegisterFiscalTrans.Status == cashRegisterFiscalTransStatus_W::Registered)
+        {
+            throw error(strFmt("@FiscalServices:AS_CashRegisterProcessing_WClass_ValidateStatusWrong", cashRegisterFiscalTrans.Status));
+        }
+
+        return this;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates new <c>CashRegisterProcessingEFSTA_W</c> object.
+    /// </summary>
+    /// <returns>
+    /// New <c>CashRegisterProcessingEFSTA_W</c> object.
+    /// </returns>
+    public static CashRegisterProcessingEFSTA_W construct()
+    {
+        CashRegisterProcessingEFSTA_W cashRegisterProcessing = new CashRegisterProcessingEFSTA_W();
+        
+        return cashRegisterProcessing;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

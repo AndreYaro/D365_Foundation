@@ -1,0 +1,2048 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>LedgerAllocationProcessRequest</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>LedgerAllocationProcessRequest</c> class contains the logic to process general ledger allocation requests.
+/// </summary>
+public class LedgerAllocationProcessRequest
+{
+    LedgerAllocationRule        ledgerAllocationRule;
+    LedgerJournalName           ledgerJournalName;
+    LedgerJournalTable          ledgerJournalTable;
+    LedgerJournalTrans          ledgerJournalTrans;
+
+    // Basis
+    Array           basisAmounts;
+    AmountMST       basisTotal;
+    AmountCur       basisTotalAmountAllocated;
+    LineNum         basisLastLine;
+
+    // FixedPercentage
+    Percent         fixedPercentagePercentAllocated;
+    AmountCur       fixedPercentageTotalAmountOffset;
+    AmountCur       fixedPercentageTotalAmountAllocated;
+    int             fixedPercentageNumberOfDestinations;
+    real            fixedPercentageTotalPercentage;
+
+    // FixedWeight
+    AmountCur       fixedWeightAmountRemaining;
+    int             fixedWeightNumberOfDestinations;
+    real            fixedWeightTotalWeight;
+
+    // SpreadEven
+    AmountCur       spreadEvenAmountRemaining;
+    int             spreadEvenNumberOfDestinations;
+
+    TransDate       glPostingDate;
+    TransDate       asOfDate;
+    TransDate       startDate;
+    TransDate       endDate;
+    ReasonRefRecID  reasonRefRecID;
+    PostReleaseDate releaseDate;
+    TransDate       lastRunDate;
+
+    LedgerAllocationRuleID          ruleId;
+    LedgerAllocationZeroSourceMode  zeroSourceMode;
+    LedgerAllocationProcessMode     processMode;
+    LedgerJournalId                 allocationJournalNumber;
+
+    private FinTagRecId finTagRecId;
+
+    UTCTimestamp    utcTimestamp;
+    TimestampString processTimestamp;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>allocate</Name>
+				<Source><![CDATA[
+    // Controls the processing of an Allocation Request for a specified allocation rule.
+    // This involves creation of an allocation journal in the LedgerJournalTable table and creation of its associated
+    // vouchers and their distribution lines in the LedgerJournalTrans table.
+    public void allocate()
+    {
+        boolean beginProcessing = true;
+
+        // Perform pre-processing error checking prior to kicking off the allocation generation
+        if (!this.validateRequest())
+        {
+            throw error("@SYS106317");
+        }
+        else
+        {
+            try
+            {
+                // Pre-processing validation has detected no errors. Get the amounts and currencies to allocate
+                boolean doSourceRecordsExist = this.initSourceAmounts();
+                boolean doZeroSumsExist;
+
+                if (!doSourceRecordsExist)
+                {
+                    beginProcessing = checkFailed(strfmt("@SYS106597", ruleId));
+                }
+                else
+                {
+                    doZeroSumsExist = this.doZeroSumsExist();
+                }
+
+                if ((zeroSourceMode == LedgerAllocationZeroSourceMode::Stop) && (!doSourceRecordsExist || doZeroSumsExist))
+                {
+                    if (doZeroSumsExist)
+                    {
+                        // At least one source currency has a grand total amount = zero
+                        beginProcessing = checkFailed("@SYS106048");
+                    }
+                    throw error("@SYS106317");
+                }
+            }
+            catch
+            {
+                exceptionTextFallThrough();
+            }
+        }
+
+        if (beginProcessing)
+        {
+            boolean voucherCreated = false;
+
+            // All possible pre-processing error situations have passed.  Begin creation of the allocation journal & voucher(s)
+            // The 'try' is needed in case we encounter verification errors on the accounts/dimensions being used on distributions
+            try
+            {
+                ttsbegin;
+
+                if (this.mustCreateJournal() && !this.createJournal())
+                {
+                    throw error("@SYS106627");
+                }
+
+                LedgerAllocationTmpSource ledgerAllocationTmpSource;
+
+                while select * from ledgerAllocationTmpSource
+                        where ledgerAllocationTmpSource.SessionId == sessionId()
+                            && ledgerAllocationTmpSource.TimeStamp == processTimestamp
+                            && ledgerAllocationTmpSource.AmountCur != 0
+                {
+                    voucherCreated = true;
+
+                    // initialize the class variables that must be re-set for each new currency/voucher
+                    this.initForVoucher(0, ledgerAllocationRule, ledgerAllocationTmpSource);
+
+                    // generate the voucher to be used for allocations for this currency
+                    if (!this.createVoucher(ledgerAllocationTmpSource))
+                    {
+                        throw error(strfmt("@SYS106624", ledgerAllocationRule.JournalName));
+                    }
+
+                    this.initDestinationAllocationSettings(ledgerAllocationTmpSource);
+
+                    if ((ledgerAllocationRule.AllocationMethod == LedgerAllocationMethod::Basis) && (basisTotal == 0.0))
+                    {
+                        throw error("@SYS106596");
+                    }
+
+                    this.createVoucherDestinations(ledgerAllocationTmpSource);
+
+                    this.createVoucherOffsets(ledgerAllocationTmpSource);
+
+                    if (LedgerParameters::isChineseVoucher_CN())
+                    {
+                        this.createVoucherType_CN();
+                    }
+                }
+
+                if (voucherCreated)
+                {
+                    ttscommit;
+
+                    if (processMode == LedgerAllocationProcessMode::ProposalOnly)
+                    {
+                        // The allocation journal will not be posted.  Check budget after the journal is created.
+                        BudgetControlAccountingJournalProcessor::submitLedgerJournalTableToCheckBudget(ledgerJournalTable.RecId);
+                    }
+
+                    // update the Last Run Date on the RuleId, since allocation has succeeded
+                    ttsbegin;
+                    LedgerAllocationRules::updateDateLastRun(ruleId, lastRunDate);
+                    ttscommit;
+
+                    if (processMode == LedgerAllocationProcessMode::PostOnly)
+                    {
+                        // Post the created journal
+                        LedgerJournalCheckPost ledgerJournalCheckPost = LedgerJournalCheckPost::construct(ledgerJournalTable.JournalType);
+                        ledgerJournalCheckPost.parmJournalNum(ledgerJournalTable.JournalNum);
+                        ledgerJournalCheckPost.parmPost(true);
+
+                        LedgerJournalCheckPost::processOperation(ledgerJournalCheckPost);
+                    }
+                }
+                else
+                {
+                    throw warning(strfmt("@SYS106597", ruleId));
+                }
+            }
+            catch
+            {
+                // Chain the exception forward so that processes like batch recognize the
+                // error and therefore correctly update their success status.
+                throw Exception::Error;
+            }
+            finally
+            {
+                this.cleanUp();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustCreateJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if new <c>LedgerJournalTable</c> record must be created.
+    /// </summary>
+    /// <returns>true if new <c>LedgerJournalTable</c> record must be created; otherwise, false.</returns>
+    protected boolean mustCreateJournal()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcDestinationValues</Name>
+				<Source><![CDATA[
+    // Computes the distribution value for a destination line, and adjusts totals and remaining amounts
+    protected AmountCur calcDestinationValues(
+        LedgerAllocationMethod _method,
+        LedgerAllocatePct _destinationPercent = 0.0,
+        LedgerAllocationFixedWeight _fixedWeight = 0.0,
+        AmountMST _basis = 0.0,
+        LineNum _ruleDestinationLineNum = 0.0,
+        LedgerAllocationTmpSource _ledgerAllocationTmpSource = null)
+    {
+        AmountCur allocatedAmount;
+
+        switch (_method)
+        {
+            case LedgerAllocationMethod::Basis:
+                if (_basis == 0)
+                {
+                    allocatedAmount = 0.0;
+                }
+                else
+                {
+                    if (_ruleDestinationLineNum == basisLastLine)
+                    {
+                        allocatedAmount = _ledgerAllocationTmpSource.AmountCur - basisTotalAmountAllocated;
+                    }
+                    else
+                    {
+                        allocatedAmount = _ledgerAllocationTmpSource.AmountCur * (_basis / basisTotal);
+                    }
+
+                    allocatedAmount = CurrencyExchangeHelper::amount(allocatedAmount, _ledgerAllocationTmpSource.CurrencyCode);
+                }
+
+                basisTotalAmountAllocated += allocatedAmount;
+                break;
+
+            case LedgerAllocationMethod::FixedPercentage:
+                allocatedAmount = _ledgerAllocationTmpSource.AmountCur * _destinationPercent / 100;
+                allocatedAmount = CurrencyExchangeHelper::amount(allocatedAmount, _ledgerAllocationTmpSource.CurrencyCode);
+
+                fixedPercentageTotalAmountAllocated += allocatedAmount;
+                fixedPercentagePercentAllocated += _destinationPercent;
+
+                // the last amount is the total remaining if we are allocating 100%
+                if ((fixedPercentageNumberOfDestinations == 0 && fixedPercentagePercentAllocated == 100) ||
+                    (fixedPercentagePercentAllocated == 100 && _destinationPercent != 0.0))
+                {
+                    allocatedAmount += (_ledgerAllocationTmpSource.AmountCur - fixedPercentageTotalAmountAllocated);
+                    fixedPercentageTotalAmountAllocated = _ledgerAllocationTmpSource.AmountCur;
+                }
+                break;
+
+            case LedgerAllocationMethod::FixedWeight:
+                if (fixedWeightNumberOfDestinations > 1)
+                {
+                    allocatedAmount = fixedWeightAmountRemaining * (_fixedWeight / fixedWeightTotalWeight);
+                    allocatedAmount = CurrencyExchangeHelper::amount(allocatedAmount, _ledgerAllocationTmpSource.CurrencyCode);
+                    fixedWeightAmountRemaining -= allocatedAmount;
+                    fixedWeightTotalWeight -= _fixedWeight;
+                }
+                else
+                {
+                    allocatedAmount = fixedWeightAmountRemaining;
+                }
+
+                fixedWeightNumberOfDestinations--;
+                break;
+
+            case LedgerAllocationMethod::SpreadEven:
+                if (spreadEvenNumberOfDestinations > 1)
+                {
+                    allocatedAmount = spreadEvenAmountRemaining * (1 / spreadEvenNumberOfDestinations);
+                    allocatedAmount = CurrencyExchangeHelper::amount(allocatedAmount, _ledgerAllocationTmpSource.CurrencyCode);
+                    spreadEvenAmountRemaining -= allocatedAmount;
+                }
+                else
+                {
+                    allocatedAmount = spreadEvenAmountRemaining;
+                }
+
+                spreadEvenNumberOfDestinations--;
+                break;
+        }
+
+        return allocatedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcExchRate</Name>
+				<Source><![CDATA[
+    protected ExchRate calcExchRate(AmountMST _amount, AmountMST _amountCur)
+    {
+        ExchRate    amountRate;
+
+        if (_amountCur != 0)
+        {
+            amountRate = _amount / _amountCur * 100;
+        }
+
+        return amountRate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUp</Name>
+				<Source><![CDATA[
+    //
+    // Remove all records from ledgerAllocationTmpSource for our process (Session# + Timestamp),
+    // or all records for any process that are older than 7 days.
+    protected void cleanUp()
+    {
+        LedgerAllocationTmpSource ledgerAllocationTmpSource;
+        TimestampString removalTimestamp = datetime2str(DateTimeUtil::addDays(utcTimestamp, -7), DateFlags::None);
+
+        delete_from ledgerAllocationTmpSource
+            where (ledgerAllocationTmpSource.SessionId == sessionId()
+                && ledgerAllocationTmpSource.TimeStamp == processTimestamp)
+                || (ledgerAllocationTmpSource.TimeStamp < removalTimestamp);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournal</Name>
+				<Source><![CDATA[
+    //  Create the allocations journal in the LedgerJournalTable table
+    protected boolean createJournal()
+    {
+        boolean ret = true;
+
+        ledgerJournalTable.JournalName = ledgerJournalName.JournalName;
+        ledgerJournalTable.initFromLedgerJournalName();
+        ledgerJournalTable.insert();
+
+        if (ledgerJournalTable.JournalNum == '')
+        {
+            ret = false;
+        }
+        else
+        {
+            allocationJournalNumber = ledgerJournalTable.JournalNum;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createQueryOnSource</Name>
+				<Source><![CDATA[
+    //
+    // Create a query on the source pool records in LedgerAllocationTmpSource table for our session & timestamp and
+    // current currency being processed, with grouping based upon whether/not accounts & dimensions are to be taken from Source
+    protected Query createQueryOnSource(boolean _isUsingAccount, boolean _isUsingDimensions, LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        // Add the data source
+        Query queryLedgerAllocationTmpSource = new Query();
+        QueryBuildDataSource dataSourceLedgerAllocationTmpSource = queryLedgerAllocationTmpSource.addDataSource(tableNum(LedgerAllocationTmpSource));
+
+        // Add selection fields
+        dataSourceLedgerAllocationTmpSource.addSelectionField(fieldNum(LedgerAllocationTmpSource, AmountCur), SelectionField::Sum);
+        dataSourceLedgerAllocationTmpSource.addSelectionField(fieldNum(LedgerAllocationTmpSource, AmountMST), SelectionField::Sum);
+        dataSourceLedgerAllocationTmpSource.addSelectionField(fieldNum(LedgerAllocationTmpSource, AmountMSTSecond), SelectionField::Sum);
+
+        // always use group by because we always need currency code
+        dataSourceLedgerAllocationTmpSource.orderMode(OrderMode::GroupBy);
+
+        dataSourceLedgerAllocationTmpSource.addSortField(fieldNum(LedgerAllocationTmpSource, CurrencyCode));
+
+        if (_isUsingAccount)
+        {
+            // Group by Account
+            dataSourceLedgerAllocationTmpSource.addSortField(fieldNum(LedgerAllocationTmpSource, LedgerDimension));
+        }
+
+        if (_isUsingDimensions)
+        {
+            // Group by Dimensions
+            dataSourceLedgerAllocationTmpSource.addSortField(fieldNum(LedgerAllocationTmpSource, DefaultDimension));
+        }
+
+        QueryBuildRange ledgerAllocationTmpSourceRange = dataSourceLedgerAllocationTmpSource.addRange(fieldNum(LedgerAllocationTmpSource, SessionId));
+        ledgerAllocationTmpSourceRange.value(queryValue(sessionId()));
+
+        ledgerAllocationTmpSourceRange = dataSourceLedgerAllocationTmpSource.addRange(fieldNum(LedgerAllocationTmpSource, TimeStamp));
+        ledgerAllocationTmpSourceRange.value(queryValue(processTimestamp));
+
+        if (_ledgerAllocationTmpSource != null)
+        {
+            // only add these ranges if the record is valid because there is a special case
+            // where the record is null and these ranges will not work in that case
+
+            // source includes the currency + ledger dimension + default dimension to ensure
+            // the exchange rate matches the source amounts that were used to generate it
+            ledgerAllocationTmpSourceRange = dataSourceLedgerAllocationTmpSource.addRange(fieldNum(LedgerAllocationTmpSource, CurrencyCode));
+            ledgerAllocationTmpSourceRange.value(queryValue(_ledgerAllocationTmpSource.CurrencyCode));
+
+            ledgerAllocationTmpSourceRange = dataSourceLedgerAllocationTmpSource.addRange(fieldNum(LedgerAllocationTmpSource, LedgerDimension));
+            ledgerAllocationTmpSourceRange.value(queryValue(_ledgerAllocationTmpSource.LedgerDimension));
+
+            ledgerAllocationTmpSourceRange = dataSourceLedgerAllocationTmpSource.addRange(fieldNum(LedgerAllocationTmpSource, DefaultDimension));
+            ledgerAllocationTmpSourceRange.value(queryValue(_ledgerAllocationTmpSource.DefaultDimension));
+        }
+
+        return queryLedgerAllocationTmpSource;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSpreadEvenDestinations</Name>
+				<Source><![CDATA[
+    //
+    // Create the destination distributions in the case where the allocation method is Spread Even
+    // and Source is to be used for the account or dimension (or both)
+    protected void createSpreadEvenDestinations(RecId _ledgerDimensionId,
+                                                DimensionDefault _dimensionDefault,
+                                                boolean _usingSourceAccounts,
+                                                boolean _usingSourceDimensions,
+                                                CompanyId _companyId = curext(),
+                                                LedgerAllocationTmpSource _ledgerAllocationTmpSource = null)
+    {
+        RecId                       ledgerDimensionId;
+        AmountCur                   allocatedAmount;
+        DimensionDefault            dimensionDefault;
+
+        // use the LedgerAllocationTmpSource parameter to create the query
+        // because it determines the scope of the records included in the query
+        Query offsetQuery = this.createQueryOnSource(_usingSourceAccounts, _usingSourceDimensions, _ledgerAllocationTmpSource);
+
+        QueryRun offsetQueryRun = new QueryRun(offsetQuery);
+
+        // iterate through the source using the query to create the destination distributions
+        while (offsetQueryRun.next())
+        {
+            LedgerAllocationTmpSource ledgerAllocationTmpSource = offsetQueryRun.get(tableNum(LedgerAllocationTmpSource));
+
+            // get the account and/or dimension from the source based on the ranging
+            if (_usingSourceAccounts)
+            {
+                ledgerDimensionId = ledgerAllocationTmpSource.LedgerDimension;
+            }
+            else
+            {
+                ledgerDimensionId = _ledgerDimensionId;
+            }
+
+            if (_usingSourceDimensions)
+            {
+                dimensionDefault = ledgerAllocationTmpSource.DefaultDimension;
+            }
+            else
+            {
+                dimensionDefault = _dimensionDefault;
+            }
+
+            allocatedAmount = this.calcDestinationValues(
+                LedgerAllocationMethod::SpreadEven,
+                0.0, 0.0, 0.0, 0.0, // unused for this allocation method
+                ledgerAllocationTmpSource);
+
+            this.setDistributionValuesV2(
+                ledgerDimensionId,
+                dimensionDefault,
+                allocatedAmount,
+                this.calcExchRate(ledgerAllocationTmpSource.AmountMST, ledgerAllocationTmpSource.AmountCur),
+                this.calcExchRate(ledgerAllocationTmpSource.AmountMSTSecond, ledgerAllocationTmpSource.AmountCur),
+                _companyId);
+
+            ledgerJournalTrans.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVoucher</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates a voucher in the <c>LedgerJournalTrans</c> table.
+    /// </summary>
+    /// <param name="_ledgerAllocationTmpSource">
+    /// The input record.
+    /// </param>
+    /// <returns>
+    ///    true if there is a <c>Voucher</c> field value; otherwise, false.
+    /// </returns>
+    protected boolean createVoucher(LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        boolean ret = true;
+
+        NumberSeq numSeq = NumberSeq::newGetVoucherFromId(ledgerJournalName.NumberSequenceTable);
+        ledgerJournalTrans.JournalNum = ledgerJournalTable.JournalNum;
+        ledgerJournalTrans.Voucher = numSeq.voucher();
+
+        if (ledgerJournalTrans.Voucher == '')
+        {
+            ret = false;
+        }
+        else
+        {
+            // get the text defined for allocations
+            TransactionTxt transactionTxt = TransactionTxt::construct(LedgerTransTxt::LedgerAllocation);
+            transactionTxt.setDate(glPostingDate);
+            transactionTxt.setVoucher(ledgerJournalTrans.Voucher);
+            ledgerJournalTrans.Txt = transactionTxt.txt();
+            ledgerJournalTrans.ReasonRefRecID = ReasonTableRef::checkCreateInCompany(reasonRefRecID, ledgerJournalTrans.DataAreaId);
+            ledgerJournalTrans.ReleaseDate = releaseDate;
+            ledgerJournalTrans.CurrencyCode = _ledgerAllocationTmpSource.CurrencyCode;
+            ledgerJournalTrans.TransDate = glPostingDate;
+            ledgerJournalTrans.AcknowledgementDate = glPostingDate;
+            ledgerJournalTrans.FinTag = finTagRecId;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVoucherDestinations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the destination distributions for the specified ruleId into the <c>LedgerJournalTrans</c> table.
+    /// </summary>
+    /// <param name = "_ledgerAllocationTmpSource">The <c>LedgerAllocationTmpSource</c> record buffer.</param>
+    protected void createVoucherDestinations(LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        if (ledgerAllocationRule.DestinationAccountFrom == LedgerAllocationFromTo::Source &&
+            ledgerAllocationRule.DestinationDimensionFrom == LedgerAllocationFromTo::Source)
+        {
+            this.createSpreadEvenDestinations(
+                0,  // unused for this scenario
+                0,  // unused for this scenario
+                true,
+                true,
+                curExt(),
+                _ledgerAllocationTmpSource);
+        }
+        else
+        {
+            LedgerAllocationRuleDestination ruleDestination;
+            boolean performSave;
+            AmountCur allocatedAmount;
+
+            while select * from ruleDestination
+                where ruleDestination.RuleID == ruleId
+            {
+                [allocatedAmount, performSave] = this.calculateAllocationAmount(ruleDestination, _ledgerAllocationTmpSource);
+
+                if (performSave)
+                {
+                    // populate distribution values into the LedgerJournalTrans fields & insert the row
+                    this.setDistributionValuesV2(
+                        ruleDestination.ToLedgerDimension,
+                        this.getDimensionDefault(ruleDestination, _ledgerAllocationTmpSource),
+                        allocatedAmount,
+                        this.calcExchRate(_ledgerAllocationTmpSource.AmountMST, _ledgerAllocationTmpSource.AmountCur),
+                        this.calcExchRate(_ledgerAllocationTmpSource.AmountMSTSecond, _ledgerAllocationTmpSource.AmountCur),
+                        ruleDestination.ToCompany);
+
+                    ledgerJournalTrans.insert();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDimensionDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the dimension default set.
+    /// </summary>
+    /// <param name = "_ruleDestination">
+    /// The <c>LedgerAllocationRuleDestination</c> buffer.
+    /// </param>
+    /// <param name = "_ledgerAllocationTmpSource">
+    /// The <c>LedgerAllocationTmpSource</c> buffer.
+    /// </param>
+    /// <returns>
+    /// Returns the dimension default value.
+    /// </returns>
+    [Wrappable(true)]
+    protected final DimensionDefault getDimensionDefault(LedgerAllocationRuleDestination _ruleDestination, LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        return _ruleDestination.ToDefaultDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateAllocationAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Computes the distribution value for a destination line, and adjusts totals and remaining amounts.
+    /// </summary>
+    /// <param name = "ruleDestination">
+    /// The <c>LedgerAllocationRuleDestination</c> table buffer.
+    /// </param>
+    /// <param name = "_ledgerAllocationTmpSource">
+    /// The <c>LedgerAllocationTmpSource</c> table buffer.
+    /// </param>
+    /// <returns>
+    /// Container containing the calculated value of Allocated amount and the boolean value to check for save operation.
+    /// </returns>
+    protected container calculateAllocationAmount(LedgerAllocationRuleDestination _ruleDestination, LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        boolean performSave = true;
+        AmountCur allocatedAmount;
+
+        switch (ledgerAllocationRule.AllocationMethod)
+        {
+            case LedgerAllocationMethod::Basis:
+                        allocatedAmount = this.calcDestinationValues(
+                            ledgerAllocationRule.AllocationMethod,
+                            0.0, 0.0, // unused for this allocation method
+                            basisAmounts.value(real2int(_ruleDestination.LineNum)),
+                            _ruleDestination.LineNum,
+                            _ledgerAllocationTmpSource);
+                break;
+
+            case LedgerAllocationMethod::FixedPercentage:
+                        allocatedAmount = this.calcDestinationValues(
+                            ledgerAllocationRule.AllocationMethod,
+                            _ruleDestination.FixedPercent,
+                            0.0, 0.0, 0.0, // unused for this allocation method
+                            _ledgerAllocationTmpSource);
+                break;
+
+            case LedgerAllocationMethod::FixedWeight:
+                        allocatedAmount = this.calcDestinationValues(
+                            ledgerAllocationRule.AllocationMethod,
+                            0.0, // unused for this allocation method
+                            _ruleDestination.FixedWeight,
+                            0.0, 0.0, // unused for this allocation method
+                            _ledgerAllocationTmpSource);
+                break;
+
+            case LedgerAllocationMethod::SpreadEven:
+                // need the ability to loop when using source for accounts and/or dimensions
+                if (ledgerAllocationRule.DestinationAccountFrom == LedgerAllocationFromTo::Source ||
+                            ledgerAllocationRule.DestinationDimensionFrom == LedgerAllocationFromTo::Source)
+                {
+                    this.createSpreadEvenDestinations(
+                                _ruleDestination.ToLedgerDimension,
+                                _ruleDestination.ToDefaultDimension,
+                                (ledgerAllocationRule.DestinationAccountFrom == LedgerAllocationFromTo::Source),
+                                (ledgerAllocationRule.DestinationDimensionFrom == LedgerAllocationFromTo::Source),
+                                _ruleDestination.ToCompany,
+                                _ledgerAllocationTmpSource);
+
+                    performSave = false;
+                }
+                else
+                {
+                    // both Accounts and Dimensions are user defined
+                    allocatedAmount = this.calcDestinationValues(
+                                ledgerAllocationRule.AllocationMethod,
+                                0.0, 0.0, 0.0, 0.0, // unused for this allocation method
+                                _ledgerAllocationTmpSource);
+                }
+                break;
+        }
+
+        container calculatedValues = [allocatedAmount, performSave];
+
+        return calculatedValues;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVoucherOffsets</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the offset distributions for the current ruleId into the <c>LedgerJournalTrans</c> table.
+    /// </summary>
+    /// <param name = "_ledgerAllocationTmpSource">The <c>LedgerAllocationTmpSource</c> record buffer.</param>
+    protected void createVoucherOffsets(LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        AmountCur allocatedAmount;
+        RecId ledgerDimensionId;
+        DimensionDefault dimensionDefault;
+
+        boolean usingSourceAccounts = (ledgerAllocationRule.OffsetAccountFrom == LedgerAllocationFromTo::Source);
+        boolean usingSourceDimensions = (ledgerAllocationRule.OffsetDimensionFrom == LedgerAllocationFromTo::Source);
+
+        if (usingSourceAccounts || usingSourceDimensions)
+        {
+            LedgerAllocationTmpSource ledgerAllocationTmpSource;
+            LedgerAllocationTmpSource ledgerAllocationTmpSourceLast;
+
+            // use the LedgerAllocationTmpSource parameter to create the query
+            // because it determines the scope of the records included in the query
+            Query offsetQuery = this.createQueryOnSource(usingSourceAccounts, usingSourceDimensions, _ledgerAllocationTmpSource);
+
+            QueryRun offsetQueryRun = new QueryRun(offsetQuery);
+
+            while (offsetQueryRun.next())
+            {
+                // Loop through the source using the query to create the offset distributions.
+                // The distribution for a query row is not committed until the next query row is read.
+                // The distribution for the final query row is committed after the loop, in case
+                // its amount needs to be adjusted from the calculated amount.
+
+                if (ledgerAllocationTmpSourceLast != null && allocatedAmount != 0.0)
+                {
+                    ledgerJournalTrans.insert();
+
+                    LedgerJournalTrans_Allocation::createOrUpdate(ledgerJournalTrans.JournalNum, ledgerJournalTrans.Voucher, ledgerJournalTrans.TransDate, dimensionDefault);
+                }
+
+                ledgerAllocationTmpSource = offsetQueryRun.get(tableNum(LedgerAllocationTmpSource)) as LedgerAllocationTmpSource;
+                ledgerAllocationTmpSourceLast = ledgerAllocationTmpSource.data();
+
+                // get the account and/or dimension from the source based on the ranging
+                if (usingSourceAccounts)
+                {
+                    ledgerDimensionId = ledgerAllocationTmpSource.LedgerDimension;
+                }
+                else
+                {
+                    ledgerDimensionId = ledgerAllocationRule.OffsetLedgerDimension;
+                }
+
+                if (usingSourceDimensions)
+                {
+                    dimensionDefault = ledgerAllocationTmpSource.DefaultDimension;
+                }
+                else
+                {
+                    dimensionDefault = ledgerAllocationRule.OffsetDefaultDimension;
+                }
+
+                if (ledgerAllocationRule.AllocationMethod == LedgerAllocationMethod::FixedPercentage)
+                {
+                    if (fixedPercentageTotalPercentage < 100)
+                    {
+                        // if less than 100% allocated we need to adjust amount to offset by percentage
+                        allocatedAmount = (ledgerAllocationTmpSource.AmountCur * fixedPercentagePercentAllocated) / 100;
+                    }
+                    else
+                    {
+                        allocatedAmount = ledgerAllocationTmpSource.AmountCur;
+                    }
+
+                    allocatedAmount = CurrencyExchangeHelper::amount(allocatedAmount, ledgerAllocationTmpSource.CurrencyCode);
+
+                    fixedPercentageTotalAmountOffset += allocatedAmount;
+                }
+                else
+                {
+                    allocatedAmount = this.fetchAllocAmountSourceAccountOrDimensionExists(ledgerAllocationTmpSource);
+                }
+
+                if (allocatedAmount != 0.0)
+                {
+                    // if the amount is zero we won't create the distribution; bypass call so acct/dim validation is not done
+                    this.setDistributionValuesV2(
+                        ledgerDimensionId,
+                        dimensionDefault,
+                        -allocatedAmount,
+                        this.calcExchRate(ledgerAllocationTmpSource.AmountMST, ledgerAllocationTmpSource.AmountCur),
+                        this.calcExchRate(ledgerAllocationTmpSource.AmountMSTSecond, ledgerAllocationTmpSource.AmountCur));
+                }
+            }
+
+            //
+            // The final offset distribution has been populated but not yet committed.
+            // Adjust the distribution value if needed before comitting the row.
+            if (ledgerAllocationTmpSourceLast != null)
+            {
+                if (ledgerAllocationRule.AllocationMethod == LedgerAllocationMethod::FixedPercentage
+                    && fixedPercentageTotalPercentage < 100
+                    && fixedPercentageTotalAmountOffset != fixedPercentageTotalAmountAllocated)
+                {
+                    // if less than 100% allocated we may need to adjust the last offset to balance
+                    allocatedAmount = allocatedAmount + (fixedPercentageTotalAmountAllocated - fixedPercentageTotalAmountOffset);
+
+                    if (allocatedAmount != 0.0)
+                    {
+                        // reset the amount in the record if non-zero
+                        this.setDistributionValuesV2(ledgerDimensionId,
+                                                    dimensionDefault,
+                                                    -allocatedAmount,
+                                                    this.calcExchRate(ledgerAllocationTmpSourceLast.AmountMST, ledgerAllocationTmpSourceLast.AmountCur),
+                                                    this.calcExchRate(ledgerAllocationTmpSourceLast.AmountMSTSecond, ledgerAllocationTmpSourceLast.AmountCur));
+                    }
+                }
+
+                if (allocatedAmount != 0.0)
+                {
+                    // Commit the final offset distribution row if non-zero
+                    ledgerJournalTrans.insert();
+
+                    LedgerJournalTrans_Allocation::createOrUpdate(ledgerJournalTrans.JournalNum, ledgerJournalTrans.Voucher, ledgerJournalTrans.TransDate, dimensionDefault);
+                }
+            }
+        }
+        else
+        {
+            allocatedAmount = this.fetchAllocAmountSourceAccountOrDimensionNotExists(_ledgerAllocationTmpSource);
+
+            if (allocatedAmount != 0.0)
+            {
+                // Create the offset distribution row if non-zero
+                this.setDistributionValuesV2(
+                    ledgerAllocationRule.OffsetLedgerDimension,
+                    ledgerAllocationRule.OffsetDefaultDimension,
+                    -allocatedAmount,
+                    this.calcExchRate(_ledgerAllocationTmpSource.AmountMST, _ledgerAllocationTmpSource.AmountCur),
+                    this.calcExchRate(_ledgerAllocationTmpSource.AmountMSTSecond, _ledgerAllocationTmpSource.AmountCur));
+
+                ledgerJournalTrans.insert();
+
+                LedgerJournalTrans_Allocation::createOrUpdate(ledgerJournalTrans.JournalNum, ledgerJournalTrans.Voucher, ledgerJournalTrans.TransDate, ledgerAllocationRule.OffsetDefaultDimension);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fetchAllocAmountSourceAccountOrDimensionNotExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Fetches the value of Allocated amount when Source Account and Dimension does not exists.
+    /// </summary>
+    /// <param name = "_ledgerAllocationTmpSource">
+    /// The <c>LedgerAllocationTmpSource</c> table buffer.
+    /// </param>
+    /// <returns>
+    /// The value of Allocated amount.
+    /// </returns>
+    [Wrappable(true)]
+    protected final AmountCur fetchAllocAmountSourceAccountOrDimensionNotExists(LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        AmountCur allocatedAmount;
+
+        // user specified for both account and dimensions so only generate one offset distribution
+        if (ledgerAllocationRule.AllocationMethod == LedgerAllocationMethod::FixedPercentage)
+        {
+            allocatedAmount = fixedPercentageTotalAmountAllocated;
+        }
+        else
+        {
+            allocatedAmount = _ledgerAllocationTmpSource.AmountCur;
+        }
+
+        return allocatedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fetchAllocAmountSourceAccountOrDimensionExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Fetch the value of Allocated amount when Source Account and Dimension exists.
+    /// </summary>
+    /// <param name = "_ledgerAllocationTmpSource">
+    /// The <c>LedgerAllocationTmpSource</c> table buffer.
+    /// </param>
+    /// <returns>
+    /// The value of Allocated amount.
+    /// </returns>
+    [Wrappable(true)]
+    protected final AmountCur fetchAllocAmountSourceAccountOrDimensionExists(LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        return _ledgerAllocationTmpSource.AmountCur;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doZeroSumsExist</Name>
+				<Source><![CDATA[
+    private boolean doZeroSumsExist()
+    {
+        LedgerAllocationTmpSource ledgerAllocationTmpSource;
+        boolean zeroTotalsExist = false;
+
+        while select sum(AmountCur) from ledgerAllocationTmpSource
+                group by ledgerAllocationTmpSource.CurrencyCode
+            where ledgerAllocationTmpSource.SessionId == sessionId()
+                && ledgerAllocationTmpSource.TimeStamp == processTimestamp
+        {
+            if (ledgerAllocationTmpSource.AmountCur == 0.0)
+            {
+                zeroTotalsExist = true;
+                break;
+            }
+        }
+
+        return zeroTotalsExist;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVoucherType_CN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the voucher_CN and sets it in table LedgerJournalTrans according to the voucherType.
+    /// </summary>
+    protected void createVoucherType_CN()
+    {
+        LedgerVoucherTypeRule_CN ledgerVoucherTypeRule = LedgerVoucherTypeRule_CN::newFromVoucher(ledgerJournalTrans.JournalNum, ledgerJournalTrans.Voucher);
+
+        if (ledgerVoucherTypeRule)
+        {
+            LedgerVoucherType_CN ledgerVoucherType = ledgerVoucherTypeRule.getVoucherType();
+            if (ledgerVoucherType.RecId != 0 && ledgerJournalTrans.LedgerVoucherType_CN != ledgerVoucherType.RecId)
+            {
+                ledgerJournalTrans.LedgerVoucherType_CN = ledgerVoucherType.RecId;
+                ledgerJournalTrans.Voucher_CN           = NumberSeq_Voucher_CN::newGetVoucherFromCode(ledgerVoucherType.NumberSequenceTable,ledgerJournalTrans.TransDate).voucher();
+                ledgerJournalTrans.write();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLedgerAmounts</Name>
+				<Source><![CDATA[
+    // Determine the amounts to be allocated (from the ledger).
+    // This is done by reading the LedgerAllocationRuleSource rows for the supplied RuleID; building a
+    // query string from the values in those rows; and querying the Ledger using this derived string and
+    // the supplied start/end date range values.  The results are populated into the ledgerAllocationTmpSource table.
+    protected void getLedgerAmounts()
+    {
+        LedgerAllocationRuleSource ruleSource;
+        Map dimensionRange = new Map(Types::Int64, Types::String);
+        Set dimensionRangeIncludeEmpty = new Set(Types::Int64);
+        str emptyQueryStr = SysQuery::valueEmptyString();
+        DimensionAttributeRecId mainAccountDimAttrId = DimensionAttribute::getWellKnownDimensionAttribute(DimensionAttributeType::MainAccount);
+        RecId keyValue;
+
+        Query query = new Query();
+        QueryBuildDataSource qbds = query.addDataSource(tableNum(GeneralJournalAccountEntry));
+
+        // Add fields from GeneralJournalAccountEntry to query
+        qbds.addSelectionField(fieldNum(GeneralJournalAccountEntry, TransactionCurrencyAmount), SelectionField::Sum);
+        qbds.addSelectionField(fieldNum(GeneralJournalAccountEntry, AccountingCurrencyAmount), SelectionField::Sum);
+        qbds.addSelectionField(fieldNum(GeneralJournalAccountEntry, ReportingCurrencyAmount), SelectionField::Sum);
+
+        // Configure the query to do a Group By currency & account/dimension combination
+        qbds.orderMode(OrderMode::GroupBy);
+        qbds.addSortField(fieldNum(GeneralJournalAccountEntry, TransactionCurrencyCode));
+        qbds.addSortField(fieldNum(GeneralJournalAccountEntry, LedgerDimension));
+
+        QueryBuildDataSource qbdsHeader = qbds.addDataSource(tableNum(GeneralJournalEntry));
+        qbdsHeader.joinMode(JoinMode::InnerJoin);
+        qbdsHeader.fetchMode(QueryFetchMode::One2One);
+        qbdsHeader.addLink(fieldNum(GeneralJournalAccountEntry, GeneralJournalEntry), fieldNum(GeneralJournalEntry, RecId));
+        qbdsHeader.addRange(fieldNum(GeneralJournalEntry, PostingLayer)).value(queryValue(CurrentOperationsTax::Current));
+        qbdsHeader.addRange(fieldNum(GeneralJournalEntry, Ledger)).value(SysQuery::value(Ledger::current()));
+
+        QueryBuildRange qbr = qbdsHeader.addRange(fieldNum(GeneralJournalEntry, AccountingDate));
+        qbr.value(SysQuery::range(startDate, endDate));
+
+        // Build the account and dimension range string from LedgerAllocationRuleSource for this rule
+        while select SourceCriteria, FieldSetting, SourceDimensionAttribute from ruleSource
+            where ruleSource.RuleID == ruleId
+        {
+            if (ruleSource.SourceCriteria == '')
+            {
+                // empty SourceCriteria for dimensions needs to map to blank dimension
+                ruleSource.SourceCriteria = emptyQueryStr;
+            }
+
+            // Get the key for the map
+            keyValue = this.setRuleSourceFieldSetting(ruleSource, mainAccountDimAttrId);
+
+            this.processRuleSourceCriteria(query, ruleSource);
+
+            this.createRuleSourceCriteria(ruleSource, keyValue, emptyQueryStr, dimensionRange, dimensionRangeIncludeEmpty);
+        }
+
+        QueryBuildDataSource qbdsDavc = qbds.addDataSource(tableNum(DimensionAttributeValueCombination));
+        qbdsDavc.joinMode(JoinMode::ExistsJoin);
+        qbdsDavc.addLink(fieldNum(GeneralJournalAccountEntry, LedgerDimension), fieldNum(DimensionAttributeValueCombination, RecId));
+        qbdsDavc.fetchMode(QueryFetchMode::One2One);
+
+        LedgerAllocationProcessRequest::createDimensionRanges(qbdsDavc, dimensionRange.getEnumerator(), dimensionRangeIncludeEmpty);
+
+        GeneralJournalAccountEntry result;
+        LedgerAllocationTmpSource ledgerAllocationTmpSourceNew;
+        LedgerAllocationTmpSource ledgerAllocationTmpSourceExisting;
+
+        boolean haveAtLeastOne = false;
+        QueryRun queryRun = new QueryRun(query);
+
+        ttsbegin;
+
+        while (queryRun.next())
+        {
+            result = queryRun.get(tableNum(GeneralJournalAccountEntry)) as GeneralJournalAccountEntry;
+
+            if (haveAtLeastOne && result.TransactionCurrencyAmount == 0 && result.AccountingCurrencyAmount == 0 && result.ReportingCurrencyAmount == 0)
+            {
+                // skip results that sum to zero because they are not relevant after at
+                // least one source record is created to ensure the journal is valid
+                continue;
+            }
+
+            ledgerAllocationTmpSourceNew.clear();
+            ledgerAllocationTmpSourceNew.SessionId = sessionId();
+            ledgerAllocationTmpSourceNew.TimeStamp = processTimestamp;
+            ledgerAllocationTmpSourceNew.CurrencyCode = result.TransactionCurrencyCode;
+
+            // Break ledger dimension into default dimension information
+            ledgerAllocationTmpSourceNew.DefaultDimension = LedgerDimensionDefaultingEngine::getDefaultDimension(
+                LedgerDimensionDefaultingEngine::getDimensionSourcesForLedgerDimension(result.LedgerDimension));
+
+            ledgerAllocationTmpSourceNew.LedgerDimension = LedgerDefaultAccountHelper::getDefaultAccountFromMainAccountRecId(
+                LedgerDimensionFacade::getMainAccountRecIdFromLedgerDimension(result.LedgerDimension));
+
+            if (LedgerAllocationTmpSource::find(
+                ledgerAllocationTmpSourceExisting,
+                ledgerAllocationTmpSourceNew.TimeStamp,
+                ledgerAllocationTmpSourceNew.CurrencyCode,
+                ledgerAllocationTmpSourceNew.LedgerDimension,
+                ledgerAllocationTmpSourceNew.DefaultDimension,
+                true))
+            {
+                ledgerAllocationTmpSourceExisting.AmountCur += result.TransactionCurrencyAmount;
+                ledgerAllocationTmpSourceExisting.AmountMST += result.AccountingCurrencyAmount;
+                ledgerAllocationTmpSourceExisting.AmountMSTSecond += result.ReportingCurrencyAmount;
+                ledgerAllocationTmpSourceExisting.ExchRate = this.calcExchRate(ledgerAllocationTmpSourceExisting.AmountMST, ledgerAllocationTmpSourceExisting.AmountCur);
+                ledgerAllocationTmpSourceExisting.ExchRateSecond = 0.0;
+                ledgerAllocationTmpSourceExisting.update();
+            }
+            else
+            {
+                ledgerAllocationTmpSourceNew.AmountCur = result.TransactionCurrencyAmount;
+                ledgerAllocationTmpSourceNew.AmountMST = result.AccountingCurrencyAmount;
+                ledgerAllocationTmpSourceNew.AmountMSTSecond = result.ReportingCurrencyAmount;
+                ledgerAllocationTmpSourceNew.ExchRate = this.calcExchRate(result.AccountingCurrencyAmount, result.TransactionCurrencyAmount);
+                ledgerAllocationTmpSourceNew.ExchRateSecond = 0.0;
+                ledgerAllocationTmpSourceNew.insert();
+
+                haveAtLeastOne = true;
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initBasisAmounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the basis amount for each destination line for the ruleId being processed, and sum the
+    /// total basis amount across all destination lines.
+    /// </summary>
+    protected void initBasisAmounts()
+    {
+        LedgerAllocationRuleDestination ruleDestination;
+        AmountCur basisAmount;
+        container ruleDates;
+
+        boolean isDistinctDateInterval = LedgerAllocationBasisRules::isDistinctDateInterval(ruleId);
+
+        if (isDistinctDateInterval)
+        {
+            ruleDates = LedgerAllocationBasisRule::getDistinctBasisRuleTransactionDates(ruleId, asOfDate);
+        }
+
+        LedgerAllocationBasisRules basisRule = LedgerAllocationBasisRules::construct(glPostingDate, asOfDate);
+
+        while select BasisId, LineNum from ruleDestination
+            where ruleDestination.RuleID == ruleId
+        {
+            basisRule.initPeriodDates(ruleDestination.BasisId, ruleDates);
+
+            if (isDistinctDateInterval)
+            {
+                basisAmount = basisRule.getBasisTotal(
+                    ruleDestination.BasisId,
+                    ruleDates);
+            }
+            else
+            {
+                basisAmount = basisRule.getBasisTotal(ruleDestination.BasisId);
+            }
+
+            basisAmounts.value(real2int(ruleDestination.LineNum), basisAmount);
+            basisTotal = basisTotal + basisAmount;
+
+            if (basisAmount != 0.0)
+            {
+                basisLastLine = ruleDestination.LineNum;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDestinationAllocationSettings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the total number of destinations to be created, and the appropriate total
+    /// amount (total Percentage, total Weight, total basis amount) needed to calculate the
+    /// individual distribution amounts.
+    /// </summary>
+    /// <param name = "_ledgerAllocationTmpSource">The <c>LedgerAllocationTmpSource</c> table buffer.</param>
+    protected void initDestinationAllocationSettings(LedgerAllocationTmpSource _ledgerAllocationTmpSource = null)
+    {
+        switch (ledgerAllocationRule.AllocationMethod)
+        {
+            case LedgerAllocationMethod::Basis:
+                this.initBasisAmounts();
+                break;
+
+            case LedgerAllocationMethod::FixedPercentage:
+                this.initFixedPercentage();
+                break;
+
+            case LedgerAllocationMethod::FixedWeight:
+                this.initFixedWeight();
+                break;
+
+            case LedgerAllocationMethod::SpreadEven:
+                this.initSpreadEven(
+                    ledgerAllocationRule.DestinationAccountFrom,
+                    ledgerAllocationRule.DestinationDimensionFrom,
+                    _ledgerAllocationTmpSource);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFixedPercentage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Fixed Percentage allocation method requires all destinations to be user-specified.  Thus the
+    /// <c>LedgerAllocationRuleDestination</c> table will contain all of the destinations to distribute to.
+    /// The total percentage to distribute can be less than 100%.
+    /// </summary>
+    protected void initFixedPercentage()
+    {
+        LedgerAllocationRuleDestination ruleDestination;
+
+        // determine the total percentage for all destinations and the total number of destinations
+        select sum(FixedPercent), count(RecId) from ruleDestination
+            where ruleDestination.RuleID == ruleId;
+
+        fixedPercentageTotalPercentage = ruleDestination.FixedPercent;
+        fixedPercentageNumberOfDestinations = any2int(ruleDestination.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFixedWeight</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Fixed Weight allocation method requires all destinations to be user-specified.  Thus the
+    /// <c>LedgerAllocationRuleDestination</c> table will contain all of the destinations to distribute to.
+    /// </summary>
+    protected void initFixedWeight()
+    {
+        LedgerAllocationRuleDestination ruleDestination;
+
+        // determine the total weight for all destinations and the total number of destinations
+        select sum(FixedWeight), count(RecId) from ruleDestination
+            where ruleDestination.RuleID == ruleId;
+
+        fixedWeightTotalWeight = ruleDestination.FixedWeight;
+        fixedWeightNumberOfDestinations = any2int(ruleDestination.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initForVoucher</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize all voucher-related class variables prior to creating a new voucher.
+    /// </summary>
+    /// <param name = "loopCounter">Not used.</param>
+    /// <param name = "_ledgerAllocationRule">The <c>LedgerAllocationRule</c> record.</param>
+    /// <param name = "_ledgerAllocationTmpSource">The <c>LedgerAllocationTmpSource</c> table buffer.</param>
+    protected void initForVoucher(int loopCounter, LedgerAllocationRule _ledgerAllocationRule, LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        switch (_ledgerAllocationRule.AllocationMethod)
+        {
+            case LedgerAllocationMethod::Basis:
+                basisAmounts = new Array(extendedTypeId2Type(extendedTypeNum(AmountMST)));
+                basisLastLine = 0.0;
+                basisTotal = 0.0;
+                basisTotalAmountAllocated = 0.0;
+                break;
+
+            case LedgerAllocationMethod::FixedPercentage:
+                fixedPercentagePercentAllocated = 0.0;
+                fixedPercentageTotalAmountOffset = 0.0;
+                fixedPercentageTotalAmountAllocated = 0.0;
+                fixedPercentageNumberOfDestinations = 0;
+                fixedPercentageTotalPercentage = 0.0;
+                break;
+
+            case LedgerAllocationMethod::FixedWeight:
+                fixedWeightAmountRemaining = _ledgerAllocationTmpSource.AmountCur;
+                fixedWeightNumberOfDestinations = 0;
+                fixedWeightTotalWeight = 0.0;
+                break;
+
+            case LedgerAllocationMethod::SpreadEven:
+                spreadEvenAmountRemaining = _ledgerAllocationTmpSource.AmountCur;
+                spreadEvenNumberOfDestinations = 0;
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the class variables before processing the allocation request.
+    /// </summary>
+    /// <param name="_ruleId">
+    ///    The ID of the rule selected.
+    /// </param>
+    /// <param name="_asOfDate">
+    ///    The date the entries will be posted.
+    /// </param>
+    /// <param name="_glPostingDate">
+    ///    The transaction date for the GL postings.
+    /// </param>
+    /// <param name="_zeroSourceMode">
+    ///    The value of the <c>LedgerAllocationZeroSourceMode</c> type selected on the form.
+    /// </param>
+    /// <param name="_processMode">
+    ///    The value of the <c>LedgerAllocationProcessMode</c> type that determines whether to post the
+    ///    journal.
+    /// </param>
+    /// <param name="_reasonRefRecID">
+    ///    The record ID of the selected <c>ReasonCode</c> field value and <c>ReasonComment</c> field value
+    ///    from <c>ReasonTableRef</c> table.
+    /// </param>
+    /// <param name="_releaseDate">
+    ///    The date that the transaction can be posted.
+    /// </param>
+    /// <param name="_lastRunDate">
+    ///    The date that the allocation was last executed.
+    /// </param>
+    /// <remarks>
+    ///    This method should be called before calling the <c>Allocate</c> method.
+    ///    If the <c>ReleaseDate</c>
+    ///    parameter is blank, the transaction can be posted immediately.
+    /// </remarks>
+    public void initRequest(
+        LedgerAllocationRuleID _ruleId,
+        TransDate _asOfDate,
+        TransDate _glPostingDate,
+        LedgerAllocationZeroSourceMode _zeroSourceMode,
+        LedgerAllocationProcessMode _processMode,
+        ReasonRefRecID  _reasonRefRecID,
+        PostReleaseDate _releaseDate,
+        TransDate _lastRunDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+    {
+        // load the class parameters from the inputs
+        ruleId          = _ruleId;
+        asOfDate        = _asOfDate;
+        glPostingDate   = _glPostingDate;
+        zeroSourceMode  = _zeroSourceMode;
+        processMode     = _processMode;
+        reasonRefRecID  = _reasonRefRecID;
+        releaseDate     = _releaseDate;
+        lastRunDate     = _lastRunDate;
+
+        utcTimestamp    = DateTimeUtil::utcNow();
+        processTimestamp= datetime2str(utcTimestamp, DateFlags::None);
+
+        ledgerAllocationRule = LedgerAllocationRule::find(ruleId);
+
+        // set the date range to be used (need if retrieving source amounts from ledger data)
+        if (ledgerAllocationRule.DateInterval)
+        {
+            // we are doing period balance; get the date range for the date interval chosen based on the 'as of date'
+            LedgerPeriodCode ledgerPeriodCode = LedgerPeriodCode::find(ledgerAllocationRule.DateInterval);
+            startDate = ledgerPeriodCode.fromDate(asOfDate);
+            endDate = ledgerPeriodCode.toDate(asOfDate);
+        }
+        else
+        {
+            // we are doing net change; date range is from start of time up to the 'as of date'
+            startDate = dateNull();
+            endDate = asOfDate;
+        }
+
+        ledgerJournalName = LedgerJournalName::find(ledgerAllocationRule.JournalName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSourceAmounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Prepares the allocation by populating the source amounts and currencies to allocate.
+    /// </summary>
+    /// <returns>true if any source amounts were found; otherwise, false.</returns>
+    protected boolean initSourceAmounts()
+    {
+        LedgerAllocationTmpSource ledgerAllocationTmpSource;
+        CurrencyCode accountingCurrency = Ledger::accountingCurrency();
+
+        if (ledgerAllocationRule.DataSource == LedgerAllocationSource::FixedValue)
+        {
+            ledgerAllocationTmpSource.clear();
+            ledgerAllocationTmpSource.SessionId = sessionId();
+            ledgerAllocationTmpSource.TimeStamp = processTimestamp;
+            ledgerAllocationTmpSource.CurrencyCode = accountingCurrency;
+
+            ledgerAllocationTmpSource.AmountCur = CurrencyExchange::round(ledgerAllocationRule.FixedValue, accountingCurrency);
+            ledgerAllocationTmpSource.AmountMST = ledgerAllocationTmpSource.AmountCur;
+
+            CurrencyExchangeHelper exchHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::current(), asOfDate);
+            ledgerAllocationTmpSource.AmountMSTSecond =
+                exchHelper.calculateAccountingToReportingAdjustment(accountingCurrency, ledgerAllocationRule.FixedValue, true);
+
+            ledgerAllocationTmpSource.ExchRate = this.calcExchRate(ledgerAllocationTmpSource.AmountMST, ledgerAllocationTmpSource.AmountCur);
+            ledgerAllocationTmpSource.ExchRateSecond = 0.0;
+            ledgerAllocationTmpSource.insert();
+        }
+        else
+        {
+            // amount to allocate must be derived from general ledger
+            // determine the amounts to be allocated; these are populated into ledgerAllocationTmpSource table
+            this.getLedgerAmounts();
+
+            CurrencyCode reportingCurrency = Ledger::reportingCurrency();
+
+            if (ledgerAllocationRule.CalculationType == LedgerAllocationMathType::Multiply
+                || ledgerAllocationRule.CalculationType == LedgerAllocationMathType::Divide)
+            {
+                ttsbegin;
+
+                while select forupdate AmountCur, AmountMST, AmountMSTSecond, CurrencyCode from ledgerAllocationTmpSource
+                    where ledgerAllocationTmpSource.SessionId == sessionId()
+                        && ledgerAllocationTmpSource.TimeStamp == processTimestamp
+                {
+                    if (ledgerAllocationRule.CalculationType == LedgerAllocationMathType::Multiply)
+                    {
+                        ledgerAllocationTmpSource.AmountCur = ledgerAllocationTmpSource.AmountCur * ledgerAllocationRule.CalculationAmount;
+                        ledgerAllocationTmpSource.AmountMST = ledgerAllocationTmpSource.AmountMST * ledgerAllocationRule.CalculationAmount;
+                        ledgerAllocationTmpSource.AmountMSTSecond = ledgerAllocationTmpSource.AmountMSTSecond * ledgerAllocationRule.CalculationAmount;
+                    }
+                    else if (ledgerAllocationRule.CalculationType == LedgerAllocationMathType::Divide)
+                    {
+                        ledgerAllocationTmpSource.AmountCur = ledgerAllocationTmpSource.AmountCur / ledgerAllocationRule.CalculationAmount;
+                        ledgerAllocationTmpSource.AmountMST = ledgerAllocationTmpSource.AmountMST / ledgerAllocationRule.CalculationAmount;
+                        ledgerAllocationTmpSource.AmountMSTSecond = ledgerAllocationTmpSource.AmountMSTSecond / ledgerAllocationRule.CalculationAmount;
+                    }
+
+                    ledgerAllocationTmpSource.AmountCur = CurrencyExchangeHelper::amount(ledgerAllocationTmpSource.AmountCur, ledgerAllocationTmpSource.CurrencyCode);
+                    ledgerAllocationTmpSource.AmountMST = CurrencyExchangeHelper::amount(ledgerAllocationTmpSource.AmountMST, accountingCurrency);
+                    ledgerAllocationTmpSource.AmountMSTSecond = CurrencyExchangeHelper::amount(ledgerAllocationTmpSource.AmountMSTSecond, reportingCurrency);
+                    ledgerAllocationTmpSource.update();
+                }
+
+                ttscommit;
+            }
+        }
+
+        select count(RecId) from ledgerAllocationTmpSource
+            where ledgerAllocationTmpSource.SessionId == sessionId()
+                && ledgerAllocationTmpSource.TimeStamp == processTimestamp;
+
+        return ledgerAllocationTmpSource.RecId > 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSpreadEven</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determine the number of destination allocations to be created.
+    /// If Fixed Amount, usingAccounts and usingDimensions will always both be false.
+    /// </summary>
+    /// <param name = "_keepAccountFrom">
+    /// The <c>LedgerAllocationFromTo</c> enumeration value to determine if source accounts are used.
+    /// </param>
+    /// <param name = "_keepDimensionFrom">
+    /// The <c>LedgerAllocationFromTo</c> enumeration value to determine if source dimensions are used.
+    /// </param>
+    /// <param name = "_ledgerAllocationTmpSource">The <c>LedgerAllocationTmpSource</c> table buffer.</param>
+    protected void initSpreadEven(
+        LedgerAllocationFromTo _keepAccountFrom,
+        LedgerAllocationFromTo _keepDimensionFrom,
+        LedgerAllocationTmpSource _ledgerAllocationTmpSource)
+    {
+        boolean usingSourceAccounts = (_keepAccountFrom == LedgerAllocationFromTo::Source);
+        boolean usingSourceDimensions = (_keepDimensionFrom == LedgerAllocationFromTo::Source);
+
+        if (!usingSourceAccounts && !usingSourceDimensions)
+        {
+            // Both Accounts and Dimensions are User Specified: get count from destination table
+            spreadEvenNumberOfDestinations = LedgerAllocationRuleDestinations::destinationRecordCount(ruleId);
+        }
+        else if (usingSourceAccounts && usingSourceDimensions)
+        {
+            // Both Accounts and Dimensions are from Source: get count from temporary source table
+            LedgerAllocationTmpSource ledgerAllocationTmpSource;
+
+            select count(RecId) from ledgerAllocationTmpSource
+                where ledgerAllocationTmpSource.SessionId == sessionId()
+                    && ledgerAllocationTmpSource.TimeStamp == processTimestamp
+                    && ledgerAllocationTmpSource.CurrencyCode == _ledgerAllocationTmpSource.CurrencyCode
+                    && ledgerAllocationTmpSource.DefaultDimension == _ledgerAllocationTmpSource.DefaultDimension
+                    && ledgerAllocationTmpSource.LedgerDimension == _ledgerAllocationTmpSource.LedgerDimension;
+
+            spreadEvenNumberOfDestinations = int642int(ledgerAllocationTmpSource.RecId);
+        }
+        else
+        {
+            // One of Account or Destination is from Source and the other is User Specified;
+            // Need to query for each destination record into the source table to determine the total destination count
+            spreadEvenNumberOfDestinations = 0;
+
+            LedgerAllocationRuleDestination ruleDestination;
+
+            select count(RecId) from ruleDestination
+                where ruleDestination.RuleID == ruleId;
+
+            if (ruleDestination.RecId > 0)
+            {
+                Query destinationQuery = this.createQueryOnSource(usingSourceAccounts, usingSourceDimensions, _ledgerAllocationTmpSource);
+
+                QueryRun destinationQueryRun = new QueryRun(destinationQuery);
+                while (destinationQueryRun.next())
+                {
+                    spreadEvenNumberOfDestinations++;
+                }
+
+                spreadEvenNumberOfDestinations = spreadEvenNumberOfDestinations * int642int(ruleDestination.RecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the class variables prior to processing the allocation request.
+    /// </summary>
+    /// <param name="_ruleId">
+    ///    The ID of the rule selected.
+    /// </param>
+    /// <param name="_asOfDate">
+    ///    The value of the <c>AsOfDate</c>.
+    /// </param>
+    /// <param name="_glPostingDate">
+    ///    The transaction date for the GL postings.
+    /// </param>
+    /// <param name="_zeroSourceMode">
+    ///    The value of the <c>LedgerAllocationZeroSourceMode</c> type selected on the form.
+    /// </param>
+    /// <param name="_processMode">
+    ///    The value of the <c>LedgerAllocationProcessMode</c> type that determines whether to post the
+    ///    journal.
+    /// </param>
+    /// <param name="_reasonRefRecID">
+    ///    The record ID of the selected <c>ReasonCode</c> field value and <c>ReasonComment</c> field value
+    ///    from <c>ReasonTableRef</c> table.
+    /// </param>
+    /// <param name="_releaseDate">
+    ///    The date that the transaction can be posted.
+    /// </param>
+    /// <param name="_lastRunDate">
+    ///    The date that the allocation was last executed.
+    /// </param>
+    /// <remarks>
+    ///    This method should be called by the user prior to calling the <c>Allocate</c> method.
+    ///    If the
+    ///    <c>ReleaseDate</c> parameter is blank, the transaction can be posted immediately.
+    /// </remarks>
+    protected void new(
+        LedgerAllocationRuleID _ruleId,
+        TransDate _asOfDate,
+        TransDate _glPostingDate,
+        LedgerAllocationZeroSourceMode _zeroSourceMode,
+        LedgerAllocationProcessMode _processMode,
+        ReasonRefRecID  _reasonRefRecID,
+        PostReleaseDate _releaseDate,
+        LastInvoiceDate _lastRunDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+    {
+        this.initRequest(_ruleId, _asOfDate, _glPostingDate, _zeroSourceMode, _processMode, _reasonRefRecID, _releaseDate, _lastRunDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAllocationJournalNumber</Name>
+				<Source><![CDATA[
+    public LedgerJournalId parmAllocationJournalNumber(LedgerJournalId _allocationJournalNumber  = allocationJournalNumber)
+    {
+        allocationJournalNumber = _allocationJournalNumber;
+        return allocationJournalNumber;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmFinTagRecId</Name>
+				<Source><![CDATA[
+    internal FinTagRecId parmFinTagRecId(FinTagRecId _finTagRecId = finTagRecId)
+    {
+        finTagRecId = _finTagRecId;
+        return finTagRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDistributionValues</Name>
+				<Source><![CDATA[
+    //
+    // Prior to setting values, validate the account and dimensions to be used.
+    // If validation passes, set the values in the ledgerJournalTrans record for an allocation.
+    [SysObsolete('The setDistributionValues method is obsolete. Use the setDistributionValuesV2 method instead.', false, 25\06\2020)]
+    protected void setDistributionValues(RecId      _ledgerDimensionId,
+                                DimensionDefault    _dimensionDefault,
+                                AmountCur           _amountCur,
+                                ExchRate            _exchRate,
+                                ExchRate            _exchRateSecond = 0, // unused
+                                CompanyId           _company = curext())
+
+    {
+        // Validate the account and dimensions to be used for the distribution
+        if (_company == curext())
+        {
+            if (!LedgerAllocationRules::validateLedgerAccount(_ledgerDimensionId) ||
+                !LedgerAllocationRules::validateDimension(_dimensionDefault))
+            {
+                throw error("@SYS106317");
+            }
+        }
+        else
+        {
+            changecompany(_company)
+            {
+                if (!LedgerAllocationRules::validateLedgerAccount(_ledgerDimensionId, true) ||
+                    !LedgerAllocationRules::validateDimension(_dimensionDefault, true))
+                {
+                    throw error("@SYS106317");
+                }
+            }
+        }
+
+        // Account and Dimension are valid to post to; proceed with creation of distribution
+        changecompany(_company)
+        {
+            ledgerJournalTrans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(_ledgerDimensionId, _dimensionDefault);
+        }
+
+        ledgerJournalTrans.TransactionType = LedgerTransType::Allocation;
+        ledgerJournalTrans.Company = _company;
+
+        if (_amountCur < 0)
+        {
+            ledgerJournalTrans.AmountCurCredit  = -_amountCur;
+            ledgerJournalTrans.AmountCurDebit   = 0;
+        }
+        else
+        {
+            ledgerJournalTrans.AmountCurDebit   = _amountCur;
+            ledgerJournalTrans.AmountCurCredit  = 0;
+        }
+
+        // if creating a distribution, exchange rate cannot = 0 or won't post
+        if (_exchRate == 0.00)
+        {
+            ledgerJournalTrans.ExchRate = 100.00;
+            // secondary rate is never set when exchange rate is 100
+            ledgerJournalTrans.ExchRateSecond = 0.00;
+        }
+        else
+        {
+            ledgerJournalTrans.ExchRate = _exchRate;
+            ledgerJournalTrans.ExchRateSecond = _exchRateSecond;
+        }
+
+        // if the value is cleared then the insert method on the table will set properly
+        ledgerJournalTrans.LineNum = 0.00;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDistributionValuesV2</Name>
+				<Source><![CDATA[
+    // Prior to setting values, validate the account and dimensions to be used.
+    // If validation passes, set the values in the ledgerJournalTrans record for an allocation.
+    protected void setDistributionValuesV2(RecId      _ledgerDimensionId,
+                                DimensionDefault    _dimensionDefault,
+                                AmountCur           _amountCur,
+                                ExchRate            _exchRate,
+                                ReportingCurrencyExchRate _reportingExchRate,
+                                CompanyId           _company = curext())
+
+    {
+        // Validate the account and dimensions to be used for the distribution
+        if (_company == curext())
+        {
+            if (!LedgerAllocationRules::validateLedgerAccount(_ledgerDimensionId) ||
+                !LedgerAllocationRules::validateDimension(_dimensionDefault))
+            {
+                throw error("@SYS106317");
+            }
+        }
+        else
+        {
+            changecompany(_company)
+            {
+                if (!LedgerAllocationRules::validateLedgerAccount(_ledgerDimensionId, true) ||
+                    !LedgerAllocationRules::validateDimension(_dimensionDefault, true))
+                {
+                    throw error("@SYS106317");
+                }
+            }
+        }
+
+        // Account and Dimension are valid to post to; proceed with creation of distribution
+        changecompany(_company)
+        {
+            ledgerJournalTrans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(_ledgerDimensionId, _dimensionDefault);
+        }
+
+        ledgerJournalTrans.TransactionType = LedgerTransType::Allocation;
+        ledgerJournalTrans.Company = _company;
+
+        if (_amountCur < 0)
+        {
+            ledgerJournalTrans.AmountCurCredit  = -_amountCur;
+            ledgerJournalTrans.AmountCurDebit   = 0;
+        }
+        else
+        {
+            ledgerJournalTrans.AmountCurDebit   = _amountCur;
+            ledgerJournalTrans.AmountCurCredit  = 0;
+        }
+
+        // if creating a distribution, exchange rate cannot = 0 or won't post
+        if (_exchRate == 0.00)
+        {
+            ledgerJournalTrans.ExchRate = 100.00;
+        }
+        else
+        {
+            ledgerJournalTrans.ExchRate = _exchRate;
+        }
+
+        if (_reportingExchRate == 0.00)
+        {
+            ledgerJournalTrans.ReportingCurrencyExchRate = 100.00;
+        }
+        else
+        {
+            ledgerJournalTrans.ReportingCurrencyExchRate = _reportingExchRate;
+        }
+
+        // if the value is cleared then the insert method on the table will set properly
+        ledgerJournalTrans.LineNum = 0.00;
+
+        ledgerJournalTrans.FinTag = finTagRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateBasisRules</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The allocation rule is of allocation type = Basis. Iterate through each destination line
+    /// for the rule and validate the Basis Id assigned to that destination line.
+    /// </summary>
+    /// <returns>true if the basis rule is valid; otherwise, false.</returns>
+    protected boolean validateBasisRules()
+    {
+        LedgerAllocationRuleDestination ruleDestination;
+        LedgerAllocationBasisNum basisId;
+        boolean ret = true;
+
+        while select BasisId from ruleDestination
+            where ruleDestination.RuleID == ruleId
+                && ruleDestination.BasisId != ''
+        {
+            basisId = ruleDestination.BasisId;
+
+            if (!LedgerAllocationBasisRule::find(basisId))
+            {
+                ret = checkFailed(strFmt("@SYS104124", basisId));
+            }
+            else
+            {
+                if (!LedgerAllocationBasisRules::isRuleActive(basisId))
+                {
+                    ret = checkFailed(strFmt("@SYS106172", basisId));
+                }
+
+                if (!LedgerAllocationBasisRules::isAsOfDateValid(basisId, asOfDate))
+                {
+                    ret = checkFailed(strFmt("@SYS106171", asOfDate, basisId));
+                }
+
+                // at least one source account must be specified for the basis rule
+                LedgerAllocationBasisRuleSource ledgerAllocationBasisRuleSource;
+
+                select firstonly RecId from ledgerAllocationBasisRuleSource
+                    where ledgerAllocationBasisRuleSource.BasisId == basisId &&
+                        ledgerAllocationBasisRuleSource.FieldSetting == LedgerAllocationAccountDimension::Account;
+
+                if (ledgerAllocationBasisRuleSource == null)
+                {
+                    ret = checkFailed(strFmt("@SYS106595", basisId));
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the lines of the selected journal.
+    /// </summary>
+    /// <returns>
+    /// true if all lines are valid; otherwise, false.
+    /// </returns>
+    protected  boolean validateRequest()
+    {
+        boolean ret = true;
+
+        if (!ledgerAllocationRule)
+        {
+            ret = checkFailed(strFmt("@SYS97692", ruleId, fieldPName(LedgerAllocationRule, RuleId), tablePName(LedgerAllocationRule)));
+        }
+        else
+        {
+            if (!LedgerAllocationRules::isRuleActive(ruleId))
+            {
+                ret = checkFailed("@SYS106011");
+            }
+
+            if (!LedgerAllocationRules::isAsOfDateValid(ruleId, asOfDate))
+            {
+                ret = checkFailed(strFmt("@SYS106012", asOfDate));
+            }
+
+            if (!LedgerFiscalCalendar::checkDateIsValid(Ledger::fiscalCalendar(), glPostingDate))
+            {
+                // infolog msgs are logged within the called method in this situation
+                ret = false;
+            }
+
+            // check if the release date is satisfied or not
+            if ((DateTimeUtil::addDays(releaseDate, 1) > DateTimeUtil::utcNow()) && (processMode == LedgerAllocationProcessMode::ProposalOnly))
+            {
+                info("@SYS114914");
+            }
+
+            if ((ledgerAllocationRule.OffsetAccountFrom == LedgerAllocationFromTo::UserSpecified) &&
+                (!ledgerAllocationRule.OffsetLedgerDimension))
+            {
+                ret = checkFailed("@SYS106070");
+            }
+
+            if (ledgerAllocationRule.DestinationAccountFrom == LedgerAllocationFromTo::UserSpecified)
+            {
+                // at least one destination account must be specified for the rule
+                LedgerAllocationRuleDestination ledgerAllocationRuleDestination;
+
+                select firstonly RecId from ledgerAllocationRuleDestination
+                    where ledgerAllocationRuleDestination.RuleID == ruleId &&
+                        ledgerAllocationRuleDestination.ToLedgerDimension != 0;
+
+                if (ledgerAllocationRuleDestination == null)
+                {
+                    ret = checkFailed("@SYS106071");
+                }
+            }
+
+            if (ledgerAllocationRule.DataSource == LedgerAllocationSource::Ledger)
+            {
+                // at least one source account must be specified for the rule
+                LedgerAllocationRuleSource ledgerAllocationRuleSource;
+
+                select firstonly RecId from ledgerAllocationRuleSource
+                    where ledgerAllocationRuleSource.RuleID == ruleId
+                        && ledgerAllocationRuleSource.FieldSetting == LedgerAllocationAccountDimension::Account
+                        && ledgerAllocationRuleSource.SourceCriteria != '';
+
+                if (ledgerAllocationRuleSource == null)
+                {
+                    ret = checkFailed("@SYS103516");
+                }
+            }
+
+            if (!ledgerJournalName)
+            {
+                ret = checkFailed(strFmt("@SYS97692", ledgerAllocationRule.JournalName, "@SYS35283" ,tablePName(LedgerJournalName)));
+            }
+            else
+            {
+                if (ledgerJournalName.JournalType != LedgerJournalType::Allocation)
+                {
+                    ret = checkFailed("@SYS106594");
+                }
+                else
+                {
+                    if (!JournalStatic::hasUserAccessForGroupId(ledgerJournalName.BlockUserGroupId))
+                    {
+                        // The user is not a member of the user group on the journal
+                        ret = checkFailed("@SYS106265");
+                    }
+                }
+            }
+
+            if (ledgerAllocationRule.AllocationMethod == LedgerAllocationMethod::Basis)
+            {
+                ret = this.validateBasisRules() && ret;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates an instance of the <c>LedgerAllocationProcessRequest</c> class
+    /// </summary>
+    /// <param name="_ruleId">
+    ///    The ID of the rule selected.
+    /// </param>
+    /// <param name="_asOfDate">
+    ///    The value of the <c>AsOfDate</c>.
+    /// </param>
+    /// <param name="_glPostingDate">
+    ///    The transaction date for the GL postings.
+    /// </param>
+    /// <param name="_zeroSourceMode">
+    ///    The value of the <c>LedgerAllocationZeroSourceMode</c> type selected on the form.
+    /// </param>
+    /// <param name="_processMode">
+    ///    The value of the <c>LedgerAllocationProcessMode</c> type on which it depends whether to post the
+    ///    journal.
+    /// </param>
+    /// <param name="_reasonRefRecID">
+    ///    The record ID of the selected <c>ReasonCode</c> field value and <c>ReasonComment</c> field value
+    ///    from the <c>ReasonTableRef</c> table.
+    /// </param>
+    /// <param name="_releaseDate">
+    ///    The date that the transaction can be posted.
+    /// </param>
+    /// <param name="_lastRunDate">
+    ///    The date that the allocation was last executed.
+    /// </param>
+    /// <returns>
+    ///    An instance of the <c>LedgerAllocationProcessRequest</c> class in which fields are initialized with
+    ///    the corresponding values from the parameters.
+    /// </returns>
+    /// <remarks>
+    ///    This method should be called by the user prior to calling the <c>Allocate</c> method.
+    ///    If the
+    ///    <c>ReleaseDate</c> parameter is blank, the transaction can be posted immediately.
+    /// </remarks>
+    public static LedgerAllocationProcessRequest construct(
+        LedgerAllocationRuleID _ruleId,
+        TransDate _asOfDate,
+        TransDate _glPostingDate,
+        LedgerAllocationZeroSourceMode _zeroSourceMode,
+        LedgerAllocationProcessMode _processMode,
+        ReasonRefRecID  _reasonRefRecID,
+        PostReleaseDate _releaseDate,
+        TransDate _lastRunDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+    {
+        return new LedgerAllocationProcessRequest(_ruleId, _asOfDate, _glPostingDate, _zeroSourceMode, _processMode, _reasonRefRecID,_releaseDate, _lastRunDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createDimensionRanges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates query ranges on the dimension attribute value table based on the allocation rule source criteria.
+    /// </summary>
+    /// <param name = "_qbdsDavc">A <c>QueryBuildDataSource</c> object which references the <c>DimensionAttributeValueCombination</c> table.</param>
+    /// <param name = "_dimensionRangeEnumerator">A list of dimension attributes and values to add ranges for.</param>
+    /// <param name = "_dimensionRangeIncludeEmpty">A list of dimension attributes that has explicitly added an empty string as a value.</param>
+    public static void createDimensionRanges(QueryBuildDataSource _qbdsDavc, MapEnumerator _dimensionRangeEnumerator, Set _dimensionRangeIncludeEmpty)
+    {
+        LedgerAllocationProcessHelper::createDimensionRanges(_qbdsDavc, _dimensionRangeEnumerator, _dimensionRangeIncludeEmpty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRuleSourceCriteria</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates query ranges based on the allocation rule source criteria.
+    /// </summary>
+    /// <param name="_query">
+    /// The query to determine the amounts to be allocated from ledger.
+    /// </param>
+    /// <param name="_ruleSource">
+    /// The <c>LedgerAllocationRuleSource</c> record.
+    /// </param>
+    protected void processRuleSourceCriteria(Query _query, LedgerAllocationRuleSource _ruleSource)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setRuleSourceFieldSetting</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the dimension attribute value based on the field setting.
+    /// </summary>
+    /// <param name="_ledgerAllocRuleSource">
+    /// The <c>LedgerAllocationRuleSource</c> record.
+    /// </param>
+    /// <param name="_mainAccountDimAttrId">
+    /// The identifier of the primary dimension attribute.
+    /// </param>
+    /// <returns>
+    /// The unique identifier of the <c>DimensionAttribute</c>.
+    /// </returns>
+    protected RecId setRuleSourceFieldSetting(LedgerAllocationRuleSource _ledgerAllocRuleSource, RecId _mainAccountDimAttrId)
+    {
+        RecId keyValue;
+        if (_ledgerAllocRuleSource.FieldSetting == LedgerAllocationAccountDimension::Account)
+        {
+            keyValue = _mainAccountDimAttrId;
+        }
+        else
+        {
+            keyValue = _ledgerAllocRuleSource.SourceDimensionAttribute;
+        }
+        return keyValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRuleSourceCriteria</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the ledger allocation rule source criteria.
+    /// </summary>
+    /// <param name="_ledgerAllocRuleSource">
+    /// The <c>LedgerAllocationRuleSource</c> record.
+    /// </param>
+    /// <param name="_keyValue">
+    /// The identifier of the primary dimension attribute.
+    /// </param>
+    /// <param name="_emptyQueryStr">
+    /// Empty string.
+    /// </param>
+    /// <param name="_dimensionRange">
+    /// The map to build dimension attribute criteria.
+    /// </param>
+    /// <param name="_dimensionRangeIncludeEmpty">
+    /// The set to track empty values included in the dimension attribute.
+    /// </param>
+    protected void createRuleSourceCriteria(LedgerAllocationRuleSource _ledgerAllocRuleSource, RecId _keyValue, str _emptyQueryStr, Map _dimensionRange, Set _dimensionRangeIncludeEmpty)
+    {
+        if (_ledgerAllocRuleSource.FieldSetting == LedgerAllocationAccountDimension::Account || _ledgerAllocRuleSource.FieldSetting == LedgerAllocationAccountDimension::Dimension)
+        {
+            if (_ledgerAllocRuleSource.SourceCriteria == _emptyQueryStr)
+            {
+                // Track whether empty is included by dimension attribute
+                _dimensionRangeIncludeEmpty.add(_keyValue);
+
+                // Then mark that this dimension attribute exists as criteria
+                if (!_dimensionRange.exists(_keyValue))
+                {
+                    _dimensionRange.insert(_keyValue, _emptyQueryStr);
+                }
+            }
+            else
+            {
+                // Build up criteria
+                if (_dimensionRange.exists(_keyValue) && _dimensionRange.lookup(_keyValue) != _emptyQueryStr)
+                {
+                    _dimensionRange.insert(_keyValue, _dimensionRange.lookup(_keyValue) + ',' + _ledgerAllocRuleSource.SourceCriteria);
+                }
+                else
+                {
+                    _dimensionRange.insert(_keyValue, _ledgerAllocRuleSource.SourceCriteria);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

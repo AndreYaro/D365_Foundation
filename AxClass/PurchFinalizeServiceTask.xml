@@ -1,0 +1,557 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PurchFinalizeServiceTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>PurchFinalizeServiceTask</c> class finalizes a set of purchase orders and lines.
+/// </summary>
+class PurchFinalizeServiceTask extends RunBaseBatch implements BatchRetryable
+{
+    Set                                     purchaseOrders;
+    PurchFinalizeContract                   serviceContract;
+    str                                     purchaseOrdersPack;
+    str                                     serviceContractPack;
+    PurchFinalizeServiceTaskPurchaseOrder   purchaseOrder;
+
+    private PurchInstrumentationLogger instrumentationLogger;
+    
+    #DEFINE.CurrentVersion(2)
+
+    #DEFINE.Version1(1)
+    #LOCALMACRO.ParmList
+        purchaseOrdersPack,
+        serviceContractPack
+    #ENDMACRO
+
+    #LOCALMACRO.ParmListV2
+        purchaseOrdersPack,
+        serviceContractPack
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>categoryName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Displays the category name of the selected category record.
+    /// </summary>
+    /// <param name="_purchLine">
+    /// The purchase order line that contains the category.
+    /// </param>
+    /// <returns>
+    /// The category name that was selected from the category lookup.
+    /// </returns>
+    protected EcoResCategoryName categoryName(PurchLine _purchLine)
+    {
+        return EcoResCategory::find(_purchLine.ProcurementCategory).Name;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAccountDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether any accounting events occurred on a purchase order after the final closing date or in a different fiscal year.
+    /// </summary>
+    /// <param name="_purchTable">
+    /// The purchase order to check.
+    /// </param>
+    /// <returns>
+    /// true if the purchase order or lines do not have accounting events after the complete closing date or in a different fiscal year;
+    /// otherwise, false.
+    /// </returns>
+    protected boolean checkAccountDate(PurchTable _purchTable)
+    {
+        AccountingDate  lastAccountingEventDate = _purchTable.getLastAccountingEventDate();
+        boolean         dateIsValid = true;
+
+        if (lastAccountingEventDate > serviceContract.parmClosingDate())
+        {
+            dateIsValid = checkFailed(strFmt("@SYS333227", _purchTable.PurchId, serviceContract.parmClosingDate(), lastAccountingEventDate));
+        }
+        else if (!_purchTable.checkAccountingDateFiscalYear(serviceContract.parmClosingDate()))
+        {
+            if (PurchFinalizeCheckAccountingDateFiscalYearLabelFlight::instance().isEnabled())
+            {
+                dateIsValid = checkFailed(strFmt("@SCM:PurchFinalizeCheckAccountDateInDifferentFiscalYear",
+                                    _purchTable.PurchId, _purchTable.AccountingDate, serviceContract.parmClosingDate(), "@SYS335906"));
+            }
+            else
+            {
+                dateIsValid = checkFailed("@SYS335906");
+            }            
+        }
+
+        return dateIsValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAdvanceRemaining</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether the advance remaining exists on a purchase order.
+    /// </summary>
+    /// <param name="_purchTable">
+    /// The purchase order to check.
+    /// </param>
+    /// <returns>
+    /// This method always returns true irrespective of remaining advance.
+    /// </returns>
+    protected boolean checkAdvanceRemaining(PurchTable _purchTable)
+    {
+        PurchPrepayTable purchPrepayTable = PurchPrepayTable::findPurchId(_purchTable.PurchId);
+        boolean isAdvanceRemaining = True;
+
+        if (ApplyPrepaymentAmountsforFinalizedPurchaseOrderstoInvoicesforOtherPOsFeature::isEnabled())
+        {
+            purchPrepayTable::checkApplicationRemaining(_purchTable.PurchId, _purchTable.InvoiceAccount);
+        }
+        else
+        {
+            if (purchPrepayTable
+                && purchPrepayTable.amountPrepay() != purchPrepayTable.amountAdvancePosted())
+            {
+                isAdvanceRemaining = checkFailed(strFmt("@SYS333228", _purchTable.PurchId, _purchTable.invoiceName()));
+            }
+        }
+
+        return isAdvanceRemaining;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkCloseNonCompletedLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether a purchase order line is completed.
+    /// </summary>
+    /// <param name="_purchLine">
+    /// The purchase order line to check.
+    /// </param>
+    /// <returns>
+    /// true if the purchase order line is completed; otherwise, false.
+    /// </returns>
+    protected boolean checkCloseNonCompletedLines(PurchLine _purchLine)
+    {
+        PurchQty    invoicedQty;
+        boolean     ret = true;
+
+        if (serviceContract.parmOnlyCompletedLine() == NoYes::Yes)
+        {
+            invoicedQty = _purchLine.invoicedInTotalServer();
+
+            if (_purchLine.PurchQty != invoicedQty)
+            {
+                ret = checkFailed(strFmt("@SYS333226", _purchLine.ItemId ? _purchLine.ItemId : this.categoryName(_purchLine), _purchLine.PurchId, invoicedQty, _purchLine.PurchQty));
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalizeLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finalizes a purchase order or a set of purchase order lines
+    /// </summary>
+    /// <param name="_purchTable">
+    /// The purchase order that should be completed.
+    /// </param>
+    /// <param name="_purchLines">
+    /// A set of purchase order lines that should be completed.
+    /// </param>
+    /// <remarks>
+    /// If the <c>_purchLines</c><c>Set</c> object is empty the purchase order is completed; otherwise the
+    /// purchase order lines in the <c>_purchLines</c><c>Set</c> object will be completed.
+    /// </remarks>
+    protected void finalizeLine(PurchTable _purchTable, Set _purchLines)
+    {
+        SourceDocumentLineList  sourceDocumentLineSubmitList = SourceDocumentLineList::construct();
+        SetEnumerator           se = _purchLines.getEnumerator();
+        PurchLine               purchLine;
+        PurchTable              purchTable;
+        boolean                 updateImplementationFalse = false;
+
+        select count(RecId) from purchLine
+            where   purchLine.PurchId          == _purchTable.PurchId
+                &&  purchLine.IsFinalized      == NoYes::No;
+
+        try
+        {
+            ttsbegin;
+            purchTable = PurchTable::find(_purchTable.PurchId, true);
+            purchTable.FinalizeClosingDate = this.parmServiceContract().parmClosingDate();
+            purchTable.doUpdate();
+
+            if (this.parmServiceContract().parmFinalizeHeader()
+                && _purchLines.elements() == purchLine.RecId)
+            {
+                // Finalize header including all lines
+                using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().purchFinalize().finalizeHeader(purchTable))
+                {
+                    SourceDocumentAccountingStatus headerStatus = SourceDocumentHeader::find(_purchTable.SourceDocumentHeader).AccountingStatus;
+                    boolean headerStatusAllowedForFinalization = (headerStatus != SourceDocumentAccountingStatus::InProcess)
+                        && (headerStatus != SourceDocumentAccountingStatus::None) 
+                        && (headerStatus != SourceDocumentAccountingStatus::Canceled);
+                    
+                    if (headerStatusAllowedForFinalization || !PurchFinalizeDependsSourceDocumentHeaderFlight::instance().isEnabled())
+                    {
+                        SourceDocumentProcessorFacade::submitSourceDocumentImplementation(_purchTable, updateImplementationFalse, SourceDocumentAccountingStatus::Finalized);
+                    }
+                    else
+                    {
+                        checkFailed(strFmt('@SCM:PurchaseOrderFinalizeSourceDocumentHeader', _purchTable.PurchId, headerStatus));
+                    }
+                }
+            }
+            else
+            {
+                while (se.moveNext())
+                {
+                    purchLine = se.current();
+
+                    using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().purchFinalize().finalizeLine(purchLine))
+                    {
+                        SourceDocumentProcessorFacade::submitSourceDocumentLineImplementation(purchLine, updateImplementationFalse, SourceDocumentLineAccountingStatus::Finalized);
+                    }
+                }
+            }
+            ttscommit;
+        }
+
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        SysOperationAttributedDataContractInfo contractInfo;
+
+        contractInfo = SysOperationDataContractInfo::newParameterInfo(
+            '_dataContract',
+            serviceContract,
+            null,
+            null);
+
+        purchaseOrdersPack = SysOperationHelper::base64Encode(purchaseOrders.pack());
+        serviceContractPack = SysOperationHelper::base64Encode(contractInfo.pack());
+
+        if (PurchFinalizeLineRecIdFlight::instance().isEnabled())
+        {
+            return [#CurrentVersion,#ParmListV2(.pack())];
+        }
+        else
+        {
+            return [#Version1,#ParmList(.pack())];
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPurchaseOrders</Name>
+				<Source><![CDATA[
+    public Set parmPurchaseOrders(Set _purchaseOrders = purchaseOrders)
+    {
+        purchaseOrders = _purchaseOrders;
+
+        return purchaseOrders;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmServiceContract</Name>
+				<Source><![CDATA[
+    public PurchFinalizeContract parmServiceContract(PurchFinalizeContract _serviceContract = serviceContract)
+    {
+        serviceContract = _serviceContract;
+
+        return serviceContract;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finalizes purchase orders and lines
+    /// </summary>
+    public void run()
+    {
+        SetEnumerator orderEnumerator = purchaseOrders.getEnumerator();
+
+        while (orderEnumerator.moveNext())
+        {
+            purchaseOrder = orderEnumerator.current();
+
+            PurchTable purchTable = purchaseOrder.parmPurchTable();
+
+            boolean flightPurchFinalizeEnabled = PurchFinalizeLineRecIdFlight::instance().isEnabled();
+            
+            Set purchLines = new Set(Types::Record);
+
+            boolean finalizeOrder = true;
+
+            boolean entireOrder = serviceContract.parmOnlyEntireOrder() == NoYes::Yes
+                        && (purchTable.isInvoiced() || purchTable.isCanceled());
+            boolean checkAccountDate = this.checkAccountDate(purchTable);
+            boolean checkAdvanceRemaining = this.checkAdvanceRemaining(purchTable);
+
+            using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().purchFinalize().taskRun(purchTable, entireOrder, checkAccountDate, checkAdvanceRemaining))
+            {
+                if (checkAccountDate && checkAdvanceRemaining)
+                {
+                    SetEnumerator linesEnumerator;
+                    if (flightPurchFinalizeEnabled)
+                    {
+                        linesEnumerator = purchaseOrder.parmPurchLinesRecId().getEnumerator();
+                    }
+                    else
+                    {
+                        linesEnumerator = purchaseOrder.parmPurchLines().getEnumerator();
+                    }
+
+                    while (linesEnumerator.moveNext())
+                    {
+                        PurchLine purchLine;
+                        if (flightPurchFinalizeEnabled)
+                        {
+                            RecId purchLineRecId = linesEnumerator.current();
+
+                            select firstonly purchLine
+                            where purchLine.RecId == purchLineRecId;
+                        }
+                        else
+                        {
+                            purchLine = linesEnumerator.current();
+                        }
+
+                        if (this.checkCloseNonCompletedLines(purchLine))
+                        {
+                            this.instrumentationLogger().logRecordInformation(purchLine);
+
+                            purchLines.add(purchLine);
+                        }
+                        else if (entireOrder)
+                        {
+                            finalizeOrder = false;
+                        }
+                    }
+                }
+
+                if (finalizeOrder)
+                {
+                    this.finalizeLine(purchTable, purchLines);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runsImpersonated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Indicates whether the <c>PurchFinalizeServiceTask</c> class can be used in the enhanced batch framework.
+    /// </summary>
+    /// <returns>
+    ///    true if the <c>PurchFinalizeServiceTask</c> class can be used in the enhanced batch framework; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    This method always returns true.
+    /// </remarks>
+    public boolean runsImpersonated()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        IdentifierName  parentMethodParameterName;
+        str             key;
+        IdentifierName  contractObjectClassName;
+
+        #localmacro.CurrentContractList
+            parentMethodParameterName,
+            contractObjectClassName,
+            key
+        #endmacro
+
+        boolean status;
+        int version = RunBase::getVersion(_packedClass);
+        SysOperationAttributedDataContractInfo contractInfo;
+        container                               dataContractPacked;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #ParmListV2] = _packedClass;
+                status = true;
+                break;
+            case #Version1:
+                [version, #ParmList] = _packedClass;
+                status = true;
+                break;
+
+            default:
+                status = false;
+        }
+
+        serviceContract = new PurchFinalizeContract();
+        contractInfo = SysOperationDataContractInfo::newParameterInfo(
+            '_dataContract',
+            serviceContract,
+            null,
+            null);
+
+        purchaseOrders = Set::create(SysOperationHelper::base64Decode(purchaseOrdersPack));
+
+        [version, #CurrentContractList, dataContractPacked] = SysOperationHelper::base64Decode(serviceContractPack);
+
+        contractInfo.unpackDataContractObject(dataContractPacked);
+
+        return status;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates an instance of the <c>PurchFinalizeServiceTask</c> class.
+    /// </summary>
+    /// <returns>
+    ///     An instance of the <c>PurchFinalizeServiceTask</c> class.
+    /// </returns>
+    public static PurchFinalizeServiceTask construct()
+    {
+        return new PurchFinalizeServiceTask();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///   Returns the description that appears when finalizing purchase orders.
+    /// </summary>
+    /// <returns>
+    ///   The description that appears when finalizing purchase orders.
+    /// </returns>
+    static ClassDescription description()
+    {
+        return "@SYS332854";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates an instance of the <c>PurchFinalizeServiceTask</c> class.
+    /// </summary>
+    /// <param name="_dataContract">
+    ///    The data contract from the service.
+    /// </param>
+    /// <param name="_packedPurchaseOrders">
+    ///    A container that contains a previously packed set of <c>PurchFinalizeServiceTask</c> classes.
+    /// </param>
+    /// <returns>
+    ///    An instance of the <c>PurchFinalizeServiceTask</c> class.
+    /// </returns>
+    public static PurchFinalizeServiceTask newTask(PurchFinalizeContract _dataContract, container _packedPurchaseOrders)
+    {
+        PurchFinalizeServiceTask task;
+
+        task = PurchFinalizeServiceTask::construct();
+        task.parmServiceContract(_dataContract);
+        task.parmPurchaseOrders(Set::create(_packedPurchaseOrders));
+
+        return task;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    private PurchInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = PurchInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

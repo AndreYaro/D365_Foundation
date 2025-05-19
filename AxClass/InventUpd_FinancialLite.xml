@@ -1,0 +1,692 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventUpd_FinancialLite</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class InventUpd_FinancialLite extends InventUpd_Financial implements WHSILocationLoadTrackingContext, WMSILocationLoadTrackingContext
+{
+    private InventDimGroupSetup inventDimGroupSetup;
+
+    WMSLocationLoadCreateManager    wmsLocationLoadCreateManager;
+    WHSLocationLoadChangeTracker    whsLocationLoadChangeTracker;
+    InventUpd_FinancialLiteStrategy strategy;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(InventMovement _inventMovement)
+    {
+        super(_inventMovement);
+
+        this.validateMovementType();
+
+        strategy = InventUpd_FinancialLiteStrategy::newFromMovement(_inventMovement, this);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAdjustWMSLocationLoad</Name>
+				<Source><![CDATA[
+    public boolean parmAdjustWMSLocationLoad(boolean _adjustWMSLocationLoad = adjustWMSLocationLoad)
+    {
+        return super(_adjustWMSLocationLoad);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWHSLocationLoadChangeTracker</Name>
+				<Source><![CDATA[
+    public WHSLocationLoadChangeTracker parmWHSLocationLoadChangeTracker(WHSLocationLoadChangeTracker _whsLocationLoadChangeTracker = whsLocationLoadChangeTracker)
+    {
+        if (prmisDefault(_whsLocationLoadChangeTracker))
+        {
+            if (!whsLocationLoadChangeTracker)
+            {
+                whsLocationLoadChangeTracker = WHSLocationLoadChangeTracker::construct();
+            }
+        }
+        else
+        {
+            whsLocationLoadChangeTracker = _whsLocationLoadChangeTracker;
+        }
+
+        return whsLocationLoadChangeTracker;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWMSLocationLoadCreateManager</Name>
+				<Source><![CDATA[
+    public WMSLocationLoadCreateManager parmWMSLocationLoadCreateManager(WMSLocationLoadCreateManager _wmsLocationLoadCreateManager = wmsLocationLoadCreateManager)
+    {
+        wmsLocationLoadCreateManager = _wmsLocationLoadCreateManager;
+        return wmsLocationLoadCreateManager;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateNow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Performs the lite financial update.
+    /// </summary>
+    /// <returns>
+    ///     Returns 0.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    ///     Thrown if the class is instantiated with an unsupported movement type.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    ///     Thrown if location mixing constraints are not met.
+    /// </exception>
+    public CostAmountSecCur_RU updateNow()
+    {
+        using (var telemetryTask = new InventUpdateInstrumentationTask(this))
+        {
+			InventDirection     direction;
+
+			this.validateMovementType();
+			this.validateQtySameDirectionAsMovement();
+
+            if (InventUpdFinancialLiteCheckUpdateMovementLiteFlight::instance().isEnabled() && !this.checkUpdateMovementLite())
+            {
+                throw error("@SYS18447");
+            }
+
+			ttsbegin;
+
+			direction       = movement.transQty() > 0  ?
+							InventDirection::Receipt    :
+							InventDirection::Issue;
+
+			if (direction == InventDirection::Receipt
+				&& !this.checkLocationMixingConstraint(inventDimCriteria))
+			{
+				throw error("@SYS18447");
+			}
+
+			if (adjustWMSLocationLoad)
+			{
+				wmsLocationLoadCreateManager = WMSLocationLoadCreateManager::construct();
+			}
+
+            InventQty       qtyToUpdate     = this.parmFinancial();
+            PdsCWInventQty  cwQtyToUpdate   = this.parmPdsCWFinancial();
+
+			InventDim       inventDim;
+			InventDimParm   inventDimParm;
+
+			inventDim.data(this.parmInventDim());
+			inventDimParm.data(this.parmInventDimParm());
+
+			InventTrans inventTrans = strategy.getInventTransactionsToUpdate(direction, inventDim, inventDimParm);
+			boolean checkCountingLocks = true;
+			while (inventTrans)
+			{
+				if (checkCountingLocks
+						&& ((inventTrans.StatusIssue == StatusIssue::None && inventTrans.StatusReceipt > StatusReceipt::Registered)
+						   || (inventTrans.StatusIssue > StatusIssue::Picked && inventTrans.StatusReceipt == StatusReceipt::None)))
+				{
+					if (movement.checkCountingLocks(inventTrans.inventDim()))
+					{
+						checkCountingLocks = false;
+					}
+					else
+					{
+						throw error("@SYS18447");
+					}
+				}
+
+                InventQty           tempUpdatedQty;
+                PdsCWInventQty      tempUpdatedCWQty;
+
+                [tempUpdatedQty, tempUpdatedCWQty] = this.updateTrans(inventTrans, qtyToUpdate, cwQtyToUpdate, direction);
+
+                qtyToUpdate     -= tempUpdatedQty;
+                cwQtyToUpdate   -= tempUpdatedCWQty;
+
+                if (qtyToUpdate == 0 && cwQtyToUpdate   == 0)
+                {
+                    break;
+                }
+
+				next inventTrans;
+			}
+
+            if (qtyToUpdate || cwQtyToUpdate)
+            {
+                throw error(strFmt("@WAX:Error_FinancialLiteEntireQuantityNotUpdated", qtyToUpdate, movement.itemId(), inventDim.preFix(), movement.transRefId(), movement.transId()));
+            }
+
+			if (adjustWMSLocationLoad)
+			{
+				wmsLocationLoadCreateManager.insertRecords();
+			}
+
+            this.updateMovementFinancialLite(direction);
+			
+            ttscommit;
+        }
+
+        return 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMovementFinancialLite</Name>
+				<Source><![CDATA[
+    private void updateMovementFinancialLite(InventDirection _direction)
+    {
+        boolean mustUpdateRemain = (_direction == InventDirection::Receipt && strategy.mustUpdateRemainingQuantity()) ||
+                                   ((_direction == InventDirection::Issue && strategy.mustUpdateRemainingQuantityOnIssue()));
+     
+        if (mustUpdateRemain)            
+        {
+            movement.addRemainPhysical(-this.parmFinancial());
+            movement.addRemainPhysicalUnit(-this.parmFinancialUnit());  
+            movement.pdsCWAddRemainPhysical(-this.parmPdsCWFinancial());
+            movement.updateDoBuffer();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateInventTransForUpdateNow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// An extension point to perform validation of inventory transaction before updating it.
+    /// </summary>
+    /// <param name = "_inventTrans">An inventory transaction to check.</param>
+    [Wrappable(true)]
+    internal void validateInventTransForUpdateNow(InventTrans _inventTrans)
+    {
+        this.checkMandatoryDimensions(_inventTrans);    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkMandatoryDimensions</Name>
+				<Source><![CDATA[
+    private void checkMandatoryDimensions(InventTrans _inventTrans)
+    {
+        InventDim inventDim = _inventTrans.inventDim();
+        InventLocation warehouse = InventLocation::find(inventDim.InventLocationId);
+
+        if (!warehouse.WHSEnabled)
+        {
+            return;
+        }
+
+        if (!inventDimGroupSetup)
+        {
+            inventDimGroupSetup = InventDimGroupSetup::newItemId(movement.itemId());
+        }
+        InventDimGroupFieldSetupEnumerator enumerator = inventDimGroupSetup.getFieldSetupEnumerator();
+
+        while (enumerator.moveNext())
+        {
+            InventDimGroupFieldSetup inventDimGroupFieldSetup = enumerator.current();
+            FieldId inventDimFieldId = inventDimGroupFieldSetup.dimFieldId();
+
+            if (!inventDimGroupFieldSetup.isActive())
+            {
+                continue;
+            }
+
+            if ((inventDimGroupFieldSetup.isMandatory() 
+                && !inventDim.(inventDimFieldId))
+                || (inventDimFieldId == fieldNum(InventDim, wMSLocationId)
+                    && !inventDim.(inventDimFieldId)
+                    && warehouse.InventLocationType != InventLocationType::Transit)) //It is possible that wmsLocationId is not specified for transfer orders shipping from transit warehouse
+            {
+                throw error(strFmt("@WAX:InventTransInvalidDimensionError",
+                            fieldId2pname(inventDim.TableId, inventDimFieldId),
+                            _inventTrans.RecId,
+                            movement.transId(),
+                            _inventTrans.ItemId,
+                            enum2Str(_inventTrans.StatusIssue),
+                            enum2Str(_inventTrans.StatusReceipt),
+                            inventDim.preFix()));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Financially updates the transaction.
+    /// </summary>
+    /// <param name="_inventTrans">
+    ///     <c>InventTrans</c> record to update.
+    /// </param>
+    /// <param name="_qty">
+    ///     Inventory quantity to update.
+    /// </param>
+    /// <param name="_cwQty">
+    ///     Catch weight quantity to update.
+    /// </param>
+    /// <param name="_direction">
+    ///     Direction of the movement.
+    /// </param>
+    /// <returns>
+    ///     A container with the updated inventory quantity and updated catch weight quantity.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    ///     Thrown if unsupported direction is specified.
+    /// </exception>
+    protected container updateTrans(
+        InventTrans     _inventTrans,
+        InventQty       _qty,
+        PDSCWInventQty  _cwQty,
+        InventDirection _direction)
+    {
+        StatusReceipt   statusReceipt;
+        StatusIssue     statusIssue;
+
+        switch (_direction)
+        {
+            case InventDirection::Issue:
+                statusReceipt   = StatusReceipt::None;
+                statusIssue     = StatusIssue::Sold;
+                break;
+
+            case InventDirection::Receipt:
+                statusReceipt   = StatusReceipt::Purchased;
+                statusIssue     = StatusIssue::None;
+                break;
+
+            default:
+                // This should never happen
+                throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        date postingDate = strategy.getPostingDate(_inventTrans);
+
+        // Split transaction if we update less than full quantity
+        if (abs(_qty) < abs(_inventTrans.Qty) || (abs(_cwQty) < abs(_inventTrans.PdsCWQty)))
+        {
+            _inventTrans.updateSplit(_qty, _cwQty);
+        }
+
+        // Calling update and updateSumUp later on can change transaction quantity so we save it now
+        InventQty       updatedQty      = _inventTrans.Qty;
+        PdsCWInventQty  updatedCWQty    = _inventTrans.PdsCWQty;
+
+        // Move to financially updated state
+        movement.transIdSum().setInventTransStatus(_inventTrans, statusReceipt, statusIssue);
+
+        if (!_inventTrans.DateInvent
+            && strategy.mustUpdateInventoryDate())
+        {
+            _inventTrans.DateInvent = postingDate;
+        }
+
+        _inventTrans.ValueOpen                      = InventTransOpen::No;
+        _inventTrans.ValueOpenSecCur_RU             = InventTransOpen::No;
+        _inventTrans.DateClosed                     = postingDate;
+        _inventTrans.DateClosedSecCur_RU            = postingDate;
+        InventUpd_FinancialLite::updateInventTransCostFieldsAsNoFinancialImpact(_inventTrans, postingDate, this.parmCurrencyCode());
+
+        strategy.onUpdatingInventTrans(_inventTrans);
+
+        this.raiseOnHandChangingOnPhysicalStatusUpd(_inventTrans);
+        this.updateInventoryTransaction(_inventTrans);
+
+        return [updatedQty, updatedCWQty];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateInventTransCostFieldsAsNoFinancialImpact</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static void updateInventTransCostFieldsAsNoFinancialImpact(InventTrans _inventTrans, date _postingDate, CurrencyCode _currencyCode)
+    {
+        _inventTrans.DateFinancial  = _postingDate;
+        _inventTrans.DatePhysical   = _postingDate;
+        _inventTrans.CurrencyCode   = _currencyCode;
+
+        // Set as no financial impact
+        _inventTrans.MarkingRefInventTransOrigin    = 0;
+        _inventTrans.Voucher                        = '';
+        _inventTrans.CostAmountAdjustment           = 0;
+        _inventTrans.CostAmountPhysical             = 0;
+        _inventTrans.CostAmountPosted               = 0;
+        _inventTrans.CostAmountSecCurAdjustment_RU  = 0;
+        _inventTrans.CostAmountSecCurPhysical_RU    = 0;
+        _inventTrans.CostAmountSecCurPosted_RU      = 0;
+        _inventTrans.CostAmountSettled              = 0;
+        _inventTrans.CostAmountSettledSecCur_RU     = 0;
+        _inventTrans.CostAmountStd                  = 0;
+        _inventTrans.CostAmountStdSecCur_RU         = 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateInventoryTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update inventory transaction record.
+    /// </summary>
+    /// <param name = "_inventTrans">Inventory transaction record to be updated.</param>
+    protected void updateInventoryTransaction(InventTrans _inventTrans)
+    {
+         this.validateInventTransForUpdateNow(_inventTrans);
+
+        _inventTrans.update();
+
+        if (!this.parmSkipInventTransSumUp())
+        {
+            _inventTrans.updateSumUp();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateMovementType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Validates that the movement is of a supported type.
+    /// </summary>
+    /// <exception cref="Exception::Error">
+    ///     Thrown for unsupported movement types.
+    /// </exception>
+    private void validateMovementType()
+    {
+        if (!this.isMovementTypeValid())
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isMovementTypeValid</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    protected boolean isMovementTypeValid()
+    {
+        return movement is WHSInventMov_Work
+            || movement is WHSInventMov_Container
+            || movement is InventMov_ConsignmentReplenishmentOrder
+            || movement is InventMov_Jour_OwnershipChange
+            || movement is InventMov_Jour_TransferIssue_OwnerEnabled
+            || movement is InventMov_Jour_TransferReceipt_OwnerEnabled
+            || movement is InventMov_Jour_Loss_SumUp_OwnerEnabled
+            || movement is InventMov_Vir_Counting_OwnerEnabled;
+            
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateQtySameDirectionAsMovement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Validate that the update quantity has the same direction as the movement.
+    /// </summary>
+    /// <exception cref="Exception::Error">
+    ///     Thrown if the update quantity has other direction then the movement.
+    /// </exception>
+    private void validateQtySameDirectionAsMovement()
+    {
+        if (this.parmFinancial() * movement.transSign() < 0)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        if (this.parmPdsCWFinancial() * movement.transSign() < 0)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromWorkMovement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of the <c>InventUpd_FinancialLite</c> class based on a work movement.
+    /// </summary>
+    /// <param name="_workMovement">
+    /// <c>WHSInventMov_Work</c> movement to use.
+    /// </param>
+    /// <param name="_qty">
+    /// Inventory quantity to update.
+    /// </param>
+    /// <param name="_cwQty">
+    /// Catch weight quantity to update.
+    /// </param>
+    /// <returns>
+    /// A new instance of the <c>InventUpd_FinancialLite</c> class.
+    /// </returns>
+    [Hookable(false)]
+    internal static InventUpd_FinancialLite newFromWorkMovement(
+        WHSInventMov_Work   _workMovement,
+        InventQty           _qty,
+        PDSCWInventQty      _cwQty)
+    {
+        if (WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightQuantityLogic(funcName(), _workMovement.itemId(), _cwQty))
+        {
+            WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), _workMovement.itemId());
+
+            return InventUpd_FinancialLite::createFromWorkMovement(_workMovement, _qty, 0);
+        }
+
+        return InventUpd_FinancialLite::createFromWorkMovement(_workMovement, _qty, _cwQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createFromWorkMovement</Name>
+				<Source><![CDATA[
+    private static InventUpd_FinancialLite createFromWorkMovement(
+        WHSInventMov_Work   _workMovement,
+        InventQty           _qty,
+        PDSCWInventQty      _cwQty)
+    {
+        WHSCatchWeightTelemetryLogger::logCatchWeightConflictingQuantities(funcName(), _workMovement.itemId(), _cwQty, _qty);
+
+        InventDim inventDim = _workMovement.inventdim();
+
+        InventUpd_FinancialLite financial = InventUpd_FinancialLite::newFromMovement(_workMovement);
+        financial.initDefaultDimensionQuantities(_qty, _cwQty, inventDim, inventDim.toDimParm());
+        financial.parmAdjustWMSLocationLoad(true);
+
+        return financial;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newWHSInventMovContainer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates a new instance of the <c>InventUpd_FinancialLite</c> class based on a container related movement.
+    /// </summary>
+    /// <param name="_movement">
+    ///     <c>WHSInventMov_Container</c> movement to use.
+    /// </param>
+    /// <param name="_inventDim">
+    /// The <c>InvetnDim</c> inventory dimensions to use for the update.
+    /// </param>
+    /// <param name="_inventDimParm">
+    /// The <c>InventDimParm</c> parameters to use for the update.
+    /// </param>
+    /// <returns>
+    ///     A new instance of the <c>InventUpd_FinancialLite</c> class.
+    /// </returns>
+    public static InventUpd_FinancialLite newWHSInventMovContainer(
+        WHSInventMov_Container  _movement,
+        InventDim               _inventDim,
+        InventDimParm           _inventDimParm)
+    {
+        InventUpd_FinancialLite financial = InventUpd_FinancialLite::newFromMovement(_movement);
+        financial.initDefaultDimensionQuantities(_movement.transQty(), _movement.pdsCWTransQty(), _inventDim, _inventDimParm);
+        financial.parmAdjustWMSLocationLoad(true);
+
+        return financial;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromMovement</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    protected static InventUpd_FinancialLite newFromMovement(InventMovement _movement)
+    {
+        InventUpd_FinancialLite financial = new InventUpd_FinancialLite(_movement);
+
+        return financial;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the instance with default values based on the parameters.
+    /// </summary>
+    /// <param name="_qty">
+    /// The quantity to update.
+    /// </param>
+    /// <param name="_inventDim">
+    /// The inventory dimensions used to search for inventory transactions.
+    /// </param>
+    /// <param name="_inventDimParm">
+    /// The <c>InventDimParm</c> parameters used as criteria when searching for inventory transactions.
+    /// </param>
+    protected void initDefault(
+        InventQty           _qty,
+        InventDim           _inventDim,
+        InventDimParm       _inventDimParm)
+    {
+        this.parmInventDim(_inventDim);
+        this.parmInventDimParm(_inventDimParm);
+        this.parmCurrencyCode(CompanyInfoHelper::standardCurrency());
+        this.parmFinancial(_qty);
+
+        this.validateQtySameDirectionAsMovement();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDefaultDimensionQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the instance with default values based on the parameters.
+    /// </summary>
+    /// <param name="_qty">
+    /// The quantity to update.
+    /// </param>
+    /// <param name="_cwQty">
+    /// The catch weight quantity to update.
+    /// </param>
+    /// <param name="_inventDim">
+    /// The inventory dimensions used to search for inventory transactions.
+    /// </param>
+    /// <param name="_inventDimParm">
+    /// The <c>InventDimParm</c> parameters used as criteria when searching for inventory transactions.
+    /// </param>
+    private void initDefaultDimensionQuantities(
+        InventQty           _qty,
+        PDSCWInventQty      _cwQty,
+        InventDim           _inventDim,
+        InventDimParm       _inventDimParm)
+    {
+        this.initDefault(_qty, _inventDim, _inventDimParm);
+
+        this.parmPdsCWFinancial(_cwQty);
+        this.validateQtySameDirectionAsMovement();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newConsignmentProductReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of the <c>InventUpd_FinancialLite</c> class to post financial updates for a consignment product receipt journal line.
+    /// </summary>
+    /// <param name = "_movement">The inventory movement for the financial update.</param>
+    /// <param name = "_consignmentProductReceiptJournalLine">A <c>ConsignmentProductReceiptJournalLine</c> record.</param>
+    /// <returns>An instance of the <c>InventUpd_FinancialLite</c> class.</returns>
+    public static InventUpd_FinancialLite newConsignmentProductReceipt(
+        InventMovement                          _movement,
+        ConsignmentProductReceiptJournalLine    _consignmentProductReceiptJournalLine)
+    {
+        var financial = InventUpd_FinancialLite::newFromMovement(_movement);
+
+        var inventDim = _movement.inventdim();
+
+        financial.initDefault(_consignmentProductReceiptJournalLine.calculateReplenishmentInventoryQuantity(), inventDim, inventDim.toDimParm());
+        financial.parmPackingSlipId(_consignmentProductReceiptJournalLine.productReceiptJournalHeader().InternalProductReceiptNumber);
+
+        return financial;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newOwnerEnabledInventJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of the <c>InventUpd_FinancialLite</c> class to post financial updates for an inventory journal line with an owner enabled item.
+    /// </summary>
+    /// <param name = "_movement">The inventory movement for the financial update.</param>
+    /// <returns>An instance of the <c>InventUpd_FinancialLite</c> class.</returns>
+    public static InventUpd_FinancialLite newOwnerEnabledInventJournal(InventMovement _movement)
+    {
+        var financial = InventUpd_FinancialLite::newFromMovement(_movement);
+
+        var inventDim = _movement.inventdim();
+
+        financial.initDefault(_movement.transQty(), inventDim, inventDim.toDimParm());
+
+        return financial;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkUpdateMovementLite</Name>
+				<Source><![CDATA[
+    private boolean checkUpdateMovementLite()
+    {
+        boolean         ok = true;
+
+        if (!movement.checkUpdateFinancialLite(this))
+        {
+            ok = false;
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsAutoCreateLoadLineInboundShipment</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WhsAutoCreateLoadLineInboundShipment</c> is responisble for creating load lines automatically for inbound order lines.
+/// </summary>
+abstract class WhsAutoCreateLoadLineInboundShipment extends WHSAutoCreateLoadLine
+{
+    
+    private static boolean ReceivingCompletedNewLoadInsteadOfAddToReceivedLoadFlightEnabled = WhsReceivingCompletedNewLoadInsteadOfAddToReceivedLoadFlight::instance().isEnabled();
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>autoCreateInboundLoadLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a load line for an inbound order line.
+    /// </summary>
+    internal final WHSLoadLine autoCreateInboundLoadLine(WHSReceiptOrderLine _inboundOrderLine, InventTransType _inventTransType)
+    {
+        using (var activityContext = this.instrumentationLogger().autoMaintainLoadLineActivities().maintainLoadLine(_inboundOrderLine.Qty))
+        {
+            if (!this.shouldAutoCreateLoadLine())
+            {
+                return null;
+            }
+
+            if (receivingCompletedNewLoadInsteadOfAddToReceivedLoadFlightEnabled)
+            {
+                if (this.nonReceivedLoadExistsForInventTrans(_inboundOrderLine.InventTransId))
+                {
+                    return null;
+                }
+            }
+            else if (WHSLoadLine::existsForInventTransId(_inboundOrderLine.InventTransId))
+            {
+                return null;
+            }
+
+            WHSLoadTable loadTable = this.getOrCreateLoadIfNotExists(_inboundOrderLine, _inventTransType);
+
+            WHSShipmentId shipmentId = this.addInboundLineToShipment(loadTable);
+
+            WHSLoadLine createdLoadLine = this.createLoadLine(loadTable.LoadId, shipmentId, _inboundOrderLine);
+        
+            // When load line is being inserted, its load header maybe modified in some scenarios, for example TMSPurchTable record exists for the purchase order.
+            // When load header is being updated, it may invoke method PurchTable::updateDlvModeFromCarrierService to update delivery mode in the purchase order
+            // and update all purchase lines. This causes purchLine buffer in this class out of sync, if this purchLine buffer is being updated later, update conflict
+            // exception will be thrown. So we need call reread method here to fetch the updated record values.
+            _inboundOrderLine.reread();
+
+            this.instrumentationLogger().autoMaintainLoadLineActivities().maintainedLoadLine(activityContext, SysAppCRUDOperation::Create);    
+    
+            return createdLoadLine;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>nonReceivedLoadExistsForInventTrans</Name>
+				<Source><![CDATA[
+    private boolean nonReceivedLoadExistsForInventTrans(InventTransId _inventTransId)
+    {
+        WHSLoadLine     loadLine;
+        WHSLoadTable    loadTable;
+
+        select firstonly RecId from loadLine
+            where loadLine.InventTransId == _inventTransId
+        exists join loadTable
+            where loadTable.LoadId == loadLine.LoadId
+                && loadTable.loadStatus != WHSLoadStatus::Received 
+                && !loadTable.LoadReceivingCompletedUTCDateTime;
+        
+        return (loadLine.RecId != 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOrCreateLoadIfNotExists</Name>
+				<Source><![CDATA[
+    private WHSLoadTable getOrCreateLoadIfNotExists(WHSReceiptOrderLine _inboundOrderLine, InventTransType _inventTransType)
+    {   
+        InventLocationId inventLocationId = _inboundOrderLine.inventDim().InventLocationId;
+
+        WHSLoadTemplateId loadTemplateId = this.loadTemplateId();
+        TMSLoadPaysFreight loadPaysFreight = this.loadPaysFreight();
+
+        WHSLoadTable loadTable;
+        WHSLoadLine loadLine;
+
+        select firstonly loadTable
+            where loadTable.LoadTemplateId == loadTemplateId
+               && loadTable.LoadPaysFreight == loadPaysFreight
+               && loadTable.InventLocationId == inventLocationId
+               && loadTable.LoadStatus != WHSLoadStatus::Received
+               && !loadTable.LoadReceivingCompletedUTCDateTime
+            exists join loadLine
+                where loadLine.LoadId == loadTable.LoadId
+                   && loadLine.OrderNum == _inboundOrderLine.OrderNumber
+                   && loadLine.InventTransType == _inventTransType
+                   && loadLine.TransportRequest == NoYes::No;
+
+        if (!loadTable)
+        {
+            loadTable = this.createLoadTable(loadTemplateId, WHSLoadDirection::Inbound, _inboundOrderLine.ItemId, inventLocationId, loadPaysFreight);
+        }
+
+        return loadTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLoadLine</Name>
+				<Source><![CDATA[
+    private WHSLoadLine createLoadLine(WHSLoadId _loadId, WHSShipmentId _shipmentId, WHSReceiptOrderLine _inboundOrderLine)
+    {
+        WHSLoadLine loadLine;
+        loadLine.LoadId = _loadId;
+        loadLine.ShipmentId = _shipmentId;
+        loadLine.initFromSourceOrder(_inboundOrderLine);
+
+        WHSPurchLineQtyLeftToLoadView whsPurchLineQtyLeftToLoadView;
+        select QtyLeftToLoad, InventTransId from whsPurchLineQtyLeftToLoadView where whsPurchLineQtyLeftToLoadView.InventTransId == _inboundOrderLine.InventTransId;
+        if (whsPurchLineQtyLeftToLoadView.InventTransId)
+        {
+            Qty qtyToAdd = whsPurchLineQtyLeftToLoadView.QtyLeftToLoad;
+
+            UnitIDBase fromUnit = WHSCatchWeightHelper::inventHandlingUnitId(loadLine.ItemId);
+            Qty qtyUOM = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                loadLine.ItemId,
+                loadLine.InventDimId,
+                qtyToAdd,
+                fromUnit,
+                loadLine.uom,
+                NoYes::No,
+                NoYes::No);
+            loadLine.InventQty = qtyToAdd;
+            loadLine.Qty = qtyUOM;
+        }
+
+        loadLine.QtyLeftToStructure = loadLine.Qty;
+        loadLine.insert();
+        return loadLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadTemplateId</Name>
+				<Source><![CDATA[
+    internal abstract WHSLoadTemplateId loadTemplateId()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadPaysFreight</Name>
+				<Source><![CDATA[
+    internal abstract TMSLoadPaysFreight loadPaysFreight()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addInboundLineToShipment</Name>
+				<Source><![CDATA[
+    internal abstract WHSShipmentId addInboundLineToShipment(WHSLoadTable _loadTable)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOrderBeenReleasedToWarehouse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inbound orders do not support auto update shipment functionality
+    /// so this implementation of hasOrderBeenReleasedToWarehouse will not be used.
+    /// </summary>
+    /// <returns>
+    /// false
+    /// </returns>
+    [Hookable(false)]
+    internal boolean hasOrderBeenReleasedToWarehouse()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createNewShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inbound orders do not support auto update shipment functionality
+    /// so this implementation of createNewShipment will not be used.
+    /// </summary>
+    /// <returns>
+    /// null
+    /// </returns>
+    [Hookable(false)]
+    internal WHSShipmentTable createNewShipment()
+    {
+        return null;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

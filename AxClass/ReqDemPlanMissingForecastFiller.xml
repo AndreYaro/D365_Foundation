@@ -1,0 +1,1194 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqDemPlanMissingForecastFiller</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     This class is responsible for filling missing data points in the generated forecast.
+/// </summary>
+class ReqDemPlanMissingForecastFiller
+{
+    ReqDemPlanCreateForecastDataContract    dataContract;
+    ReqDemPlanForecastAttributeManager      attributeManager;
+    ReqDemPlanAllocationKeyFilterTmp        allocationKeyFilter;
+    ReqDemPlanTaskLoggerInterface           logger;
+    ReqDemPlanDataProcessingHelper          dataHelper;
+
+    boolean                                 isItemEnabled;
+    boolean                                 isWarehouseEnabled;
+    boolean                                 isInventStatusEnabled;
+    date                                    nonFrozenForecastStartDate;
+
+    Set                                     companySet;
+    ReqDemPlanBucketTmp                     forecastDates;
+    boolean                                 reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled;
+    [SysObsolete('This class member is deprecated because it is not used in this class anymore.', false, 28\04\2024)]
+    boolean                                 reqDemPlanMissingForecastFillerDirectSQLFlightIsEnabled = true;
+    private boolean                         reqDemPlanForceOrderInMissingItemsFillerFlightIsEnabled;
+    private boolean                         isReqDemQueryDefaultInventSiteIdFlightEnabled;
+
+    #define.ProductOnlyDimDataSource('productOnly_InventDim')
+    #define.ProductDimDataSource('AllocKey_InventDim')
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getBaseQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Builds a query that is used as a starting point for querying missing items.
+    /// </summary>
+    /// <returns>
+    ///     A query to use as a base for determining missing items.
+    /// </returns>
+    protected Query getBaseQuery()
+    {
+        Query query;
+        int infologLineTry = infologLine();
+
+        try
+        {
+            query = new Query();
+            ReqQueryBuildHelper queryHelper = new ReqQueryBuildHelper(query);
+        
+            // add allocation key filter as root of the query
+		    QueryBuildDataSource qbdsAllocationKeyFilter = queryHelper.addDataSource(tableNum(ReqDemPlanAllocationKeyFilterTmp));
+            queryHelper.selectFields(qbdsAllocationKeyFilter, [fieldNum(ReqDemPlanAllocationKeyFilterTmp, AllocateId), fieldNum(ReqDemPlanAllocationKeyFilterTmp, MinValue)]);
+            queryHelper.orderBy(qbdsAllocationKeyFilter, fieldNum(ReqDemPlanAllocationKeyFilterTmp, AllocateId));
+            queryHelper.groupBySelectedFields(qbdsAllocationKeyFilter);
+
+            // join with allocation key line
+		    QueryBuildDataSource qbdsAllocationKeyLine = queryHelper.addDataSource(tableNum(ForecastItemAllocationLine));
+            queryHelper.setLink(qbdsAllocationKeyLine, fieldNum(ForecastItemAllocationLine, AllocationId), qbdsAllocationKeyFilter, fieldNum(ReqDemPlanAllocationKeyFilterTmp, AllocateId));
+            queryHelper.selectFields(qbdsAllocationKeyLine, conNull());
+
+            // join with inventdim relation 
+		    QueryBuildDataSource qbdsAllocationKeyLineInventDim	= queryHelper.addDataSource(tableNum(InventDim), #ProductDimDataSource);
+            queryHelper.setLink(qbdsAllocationKeyLineInventDim, fieldNum(InventDim, InventDimId), qbdsAllocationKeyLine, fieldNum(ForecastItemAllocationLine, InventDimId));
+            queryHelper.selectFields(qbdsAllocationKeyLineInventDim, conNull());
+
+            // join with item to get Product
+		    QueryBuildDataSource qbdsItem = queryHelper.addDataSource(tableNum(InventTable));
+            queryHelper.setLink(qbdsItem, fieldNum(InventTable, ItemId), qbdsAllocationKeyLine, fieldNum(ForecastItemAllocationLine, ItemId));
+            queryHelper.selectFields(qbdsItem, [fieldNum(InventTable, ItemId), fieldNum(InventTable, Product)]);
+            queryHelper.orderBy(qbdsItem, fieldNum(InventTable, ItemId));
+            queryHelper.groupBySelectedFields(qbdsItem);
+
+            // Add UOM conversion cache datasource
+            QueryBuildDataSource qbdsUomConversion = queryHelper.addDataSource(tableNum(ReqProductForecastingUomConversionCache));
+
+            // join with view on InventItemInventSetup to get default site and warehouse
+		    QueryBuildDataSource qbdsItemSetup = queryHelper.addDataSource(tableNum(InventDistinctProductDefaultSiteWarehouse));
+            queryHelper.setLink(qbdsItemSetup, fieldNum(InventDistinctProductDefaultSiteWarehouse, ItemId), qbdsAllocationKeyLine, fieldNum(ForecastItemAllocationLine, ItemId));
+
+            Enumerator productDims = InventProductDimension::getEnumeratorForEnabledDimensions();
+
+            while (productDims.moveNext())
+            {
+                InventProductDimension productDim = productDims.current();
+                queryHelper.addLink(qbdsItemSetup, productDim.fieldIdInTable(tableStr(InventDistinctProductDefaultSiteWarehouse)), qbdsAllocationKeyLineInventDim, productDim.parmInventDimFieldId());
+            }
+
+            qbdsItemSetup.joinMode(JoinMode::OuterJoin);
+            queryHelper.selectFields(qbdsItemSetup, [fieldNum(InventDistinctProductDefaultSiteWarehouse, DefaultInventSiteId), fieldNum(InventDistinctProductDefaultSiteWarehouse, DefaultInventLocationId)]);
+            queryHelper.groupBySelectedFields(qbdsItemSetup);
+
+            ListEnumerator enabledAttributes = attributeManager.getAllEnabledAttributes().getEnumerator();
+
+            while (enabledAttributes.moveNext())
+            {
+                ReqDemPlanForecastAttribute attribute = enabledAttributes.current();
+
+                int field = this.getFieldFromForecastAttributeType(attribute.Attribute);
+
+                if (field)
+                {
+                    qbdsAllocationKeyLineInventDim.fields().addField(field);
+                }
+            }
+
+            queryHelper.groupBySelectedFields(qbdsAllocationKeyLineInventDim);
+
+            // cross product with forecast dates
+		    QueryBuildDataSource            qbdsForecastDates				= queryHelper.addDataSource(tableNum(ReqDemPlanBucketTmp));
+            queryHelper.selectFields(qbdsForecastDates, [fieldNum(ReqDemPlanBucketTmp, DateValue)]);
+            queryHelper.groupBySelectedFields(qbdsForecastDates);
+
+            // add "not exist join" to current forecast
+		    QueryBuildDataSource qbdsCurrentForecast = queryHelper.addDataSource(tableNum(ReqDemPlanForecast));
+            queryHelper.setLink(qbdsCurrentForecast, fieldNum(ReqDemPlanForecast, ItemId), qbdsAllocationKeyLine, fieldNum(ForecastItemAllocationLine, ItemId));
+            qbdsCurrentForecast.addRange(fieldNum(ReqDemPlanForecast, Version)).value(queryValue(enum2int(ReqDemPlanForecastVersion::Forecasted)));
+            qbdsCurrentForecast.joinMode(JoinMode::NoExistsJoin);
+
+            // do not check invalid field access for any data source table
+            query.checkFieldAccess(false);
+
+            if (isReqDemQueryDefaultInventSiteIdFlightEnabled)
+            {
+                query.addQueryFilter(qbdsItemSetup, fieldStr(InventDistinctProductDefaultSiteWarehouse, DefaultInventSiteId)).value(SysQuery::valueNotEmptyString());
+
+                if (isWarehouseEnabled)
+                {
+                    query.addQueryFilter(qbdsItemSetup, fieldStr(InventDistinctProductDefaultSiteWarehouse, DefaultInventLocationId)).value(SysQuery::valueNotEmptyString());
+                }
+            }
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqDemPlanCreateForecastService::canRetryTransientSqlConnectionError(reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled))
+            {
+                ReqDemPlanCreateForecastService::prepareRetryDataContract(dataContract, allocationKeyFilter);
+                ReqDemPlanCreateForecastService::logTransientErrorRetry(logger);
+                forecastDates = this.createForecastDateRangeTmp(dataContract);
+
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+        catch (Exception::Error)
+        {
+            if (ReqDemPlanCreateForecastService::isTransientSqlConnectionError(infologLineTry) 
+                && ReqDemPlanCreateForecastService::canRetryTransientSqlConnectionError(reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled))
+            {
+                ReqDemPlanCreateForecastService::prepareRetryDataContract(dataContract, allocationKeyFilter);
+                ReqDemPlanCreateForecastService::logTransientErrorRetry(logger);
+                forecastDates = this.createForecastDateRangeTmp(dataContract);
+
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createForecastDateRangeTmp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates date records in the date range of the generated forecast.
+    /// </summary>
+    /// <param name="_dataContract">
+    ///     The data contract containing information about the generated forecast.
+    /// </param>
+    /// <returns>
+    ///     A temporary table buffer containing the generated records.
+    /// </returns>
+    protected ReqDemPlanBucketTmp createForecastDateRangeTmp(ReqDemPlanCreateForecastDataContract _dataContract)
+    {
+        ReqDemPlanBucketTmp         tmpForecastDates;
+        BIDateDimensionsViewPeriods biDatePeriods;
+
+        #localmacro.insertForecastDates
+            insert_recordset tmpForecastDates (DateValue, Bucket)
+            select %1, %2
+                from biDatePeriods
+                group by %1, %2
+                where biDatePeriods.%1 >= _dataContract.parmForecastStartDate()
+                   && biDatePeriods.%1 <= this.forecastEndDate(_dataContract)
+        #endmacro
+
+        new SkipAOSValidationPermission().assert();
+        dataHelper.skipAll(forecastDates);
+
+        switch (_dataContract.parmDateGranularity())
+        {
+            case ReqDemPlanDateGranularity::Day:
+                #insertForecastDates(DateKey, CurrentDateKey);
+                break;
+            case ReqDemPlanDateGranularity::Week:
+                #insertForecastDates(CurrentWeekStart, CurrentWeekKey);
+                break;
+            case ReqDemPlanDateGranularity::Month:
+                #insertForecastDates(CurrentMonthStart, CurrentMonthKey);
+                break;
+            default:
+                throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        return tmpForecastDates;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertMissingDatesForecastEntries</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Inserts the missing forecast entries for items with gaps in the forecast.
+    ///         INSERT INTO ReqDemPlanForecast (DATAAREAID, PARTITION, VERSION, ALLOCATIONKEY, SITE, ITEMID, COLOR, SIZE_, CONFIGURATION, STYLE, WAREHOUSE, STATUSID, CUSTGROUPID, CUSTACCOUNT, LOGISTICSCOUNTRYREGIONCODE, LOGISTICSADDRESSSTATEID, PRODUCT, QTY, ORIGINALQTY, FORECASTDATE, INSIDEFREEZINGHORIZON)
+    ///         SELECT forecastByAttributesForAllocationKeys.DATAAREAID,
+    ///            forecastByAttributesForAllocationKeys.PARTITION,
+    ///            forecastByAttributesForAllocationKeys.VERSION,
+    ///            forecastByAttributesForAllocationKeys.ALLOCATIONKEY,
+    ///            forecastByAttributesForAllocationKeys.SITE,
+    ///            forecastByAttributesForAllocationKeys.ITEMID,
+    ///            forecastByAttributesForAllocationKeys.COLOR,
+    ///            forecastByAttributesForAllocationKeys.SIZE_,
+    ///            forecastByAttributesForAllocationKeys.CONFIGURATION,
+    ///            forecastByAttributesForAllocationKeys.STYLE,
+    ///            forecastByAttributesForAllocationKeys.WAREHOUSE,
+    ///            forecastByAttributesForAllocationKeys.STATUSID,
+    ///            forecastByAttributesForAllocationKeys.CUSTGROUPID,
+    ///            forecastByAttributesForAllocationKeys.CUSTACCOUNT,
+    ///            forecastByAttributesForAllocationKeys.LOGISTICSCOUNTRYREGIONCODE,
+    ///            forecastByAttributesForAllocationKeys.LOGISTICSADDRESSSTATEID,
+    ///            forecastByAttributesForAllocationKeys.PRODUCT,
+    ///            forecastByAttributesForAllocationKeys.MINVALUE,
+    ///            forecastByAttributesForAllocationKeys.MINVALUE,
+    ///            tempdb."DBO".t1287IISSCMF02C09AVKRUT_1155604_804DA530725940D49C2623A4D8473C91.DATEVALUE,
+    ///            CAST (CASE
+    ///                      WHEN tempdb."DBO".t1287IISSCMF02C09AVKRUT_1155604_804DA530725940D49C2623A4D8473C91.DATEVALUE < 10/1/2021 THEN 1
+    ///                      ELSE 0
+    ///                  END AS bit)
+    ///             FROM
+    ///                 (SELECT forecast.DATAAREAID,
+    ///                   forecast.PARTITION,
+    ///                   forecast.VERSION,
+    ///                   forecast.ALLOCATIONKEY,
+    ///                   forecast.SITE,
+    ///                   forecast.ITEMID,
+    ///                   forecast.COLOR,
+    ///                   forecast.SIZE_,
+    ///                   forecast.CONFIGURATION,
+    ///                   forecast.STYLE,
+    ///                   forecast.WAREHOUSE,
+    ///                   forecast.STATUSID,
+    ///                   forecast.CUSTGROUPID,
+    ///                   forecast.CUSTACCOUNT,
+    ///                   forecast.LOGISTICSCOUNTRYREGIONCODE,
+    ///                   forecast.LOGISTICSADDRESSSTATEID,
+    ///                   forecast.PRODUCT,
+    ///                   tempdb."DBO".t6IISSCMF02C09AVKRUT_1155604_AB4D53B164904649B012859A2DC5A494.MINVALUE
+    ///                 FROM ReqDemPlanForecast AS forecast WITH (FORCESEEK,INDEX(I_12825ATTRIBUTESIDX))
+    ///                 JOIN tempdb."DBO".t6IISSCMF02C09AVKRUT_1155604_AB4D53B164904649B012859A2DC5A494 ON forecast.ALLOCATIONKEY = tempdb."DBO".t6IISSCMF02C09AVKRUT_1155604_AB4D53B164904649B012859A2DC5A494.ALLOCATEID
+    ///                     AND forecast.PARTITION = tempdb."DBO".t6IISSCMF02C09AVKRUT_1155604_AB4D53B164904649B012859A2DC5A494.PARTITION
+    ///                     AND forecast.DATAAREAID = tempdb."DBO".t6IISSCMF02C09AVKRUT_1155604_AB4D53B164904649B012859A2DC5A494.DATAAREAID
+    ///                 WHERE forecast.VERSION = 0
+    ///                     AND forecast.PARTITION = getCurrentPartitionRecId()
+    ///                     AND forecast.DATAAREAID = curExt()
+    ///                 GROUP BY tempdb."DBO".t6IISSCMF02C09AVKRUT_1155604_AB4D53B164904649B012859A2DC5A494.MINVALUE,
+    ///                     forecast.PARTITION,
+    ///                     forecast.DATAAREAID,
+    ///                     forecast.VERSION,
+    ///                     forecast.SITE,
+    ///                     forecast.ALLOCATIONKEY,
+    ///                     forecast.ITEMID,
+    ///                     forecast.COLOR,
+    ///                     forecast.SIZE_,
+    ///                     forecast.CONFIGURATION,
+    ///                     forecast.STYLE,
+    ///                     forecast.WAREHOUSE,
+    ///                     forecast.STATUSID,
+    ///                     forecast.CUSTGROUPID,
+    ///                     forecast.CUSTACCOUNT,
+    ///                     forecast.LOGISTICSCOUNTRYREGIONCODE,
+    ///                     forecast.LOGISTICSADDRESSSTATEID,
+    ///                     forecast.PRODUCT) AS forecastByAttributesForAllocationKeys
+    ///             CROSS JOIN tempdb."DBO".t1287IISSCMF02C09AVKRUT_1155604_804DA530725940D49C2623A4D8473C91
+    ///                 WHERE NOT EXISTS
+    ///                 (SELECT 'x'
+    ///                  FROM ReqDemPlanForecast WITH (FORCESEEK, INDEX(I_12825ATTRIBUTESIDX))
+    ///                     WHERE forecastByAttributesForAllocationKeys.DATAAREAID = ReqDemPlanForecast.DATAAREAID
+    ///                         AND forecastByAttributesForAllocationKeys.PARTITION = ReqDemPlanForecast.PARTITION
+    ///                         AND ReqDemPlanForecast.VERSION = 0
+    ///                         AND ReqDemPlanForecast.FORECASTDATE = tempdb."DBO".t1287IISSCMF02C09AVKRUT_1155604_804DA530725940D49C2623A4D8473C91.DATEVALUE
+    ///                         AND forecastByAttributesForAllocationKeys.ALLOCATIONKEY = ReqDemPlanForecast.ALLOCATIONKEY
+    ///                         AND forecastByAttributesForAllocationKeys.ITEMID = ReqDemPlanForecast.ITEMID
+    ///                         AND forecastByAttributesForAllocationKeys.COLOR = ReqDemPlanForecast.COLOR
+    ///                         AND forecastByAttributesForAllocationKeys.SIZE_ = ReqDemPlanForecast.SIZE_
+    ///                         AND forecastByAttributesForAllocationKeys.CONFIGURATION = ReqDemPlanForecast.CONFIGURATION
+    ///                         AND forecastByAttributesForAllocationKeys.STYLE = ReqDemPlanForecast.STYLE
+    ///                         AND forecastByAttributesForAllocationKeys.SITE = ReqDemPlanForecast.SITE
+    ///                         AND forecastByAttributesForAllocationKeys.WAREHOUSE = ReqDemPlanForecast.WAREHOUSE
+    ///                         AND forecastByAttributesForAllocationKeys.STATUSID = ReqDemPlanForecast.STATUSID
+    ///                         AND forecastByAttributesForAllocationKeys.CUSTGROUPID = ReqDemPlanForecast.CUSTGROUPID
+    ///                         AND forecastByAttributesForAllocationKeys.CUSTACCOUNT = ReqDemPlanForecast.CUSTACCOUNT
+    ///                         AND forecastByAttributesForAllocationKeys.LOGISTICSCOUNTRYREGIONCODE = ReqDemPlanForecast.LOGISTICSCOUNTRYREGIONCODE
+    ///                         AND forecastByAttributesForAllocationKeys.LOGISTICSADDRESSSTATEID = ReqDemPlanForecast.LOGISTICSADDRESSSTATEID) 
+    ///             OPTION (RECOMPILE, FORCE ORDER)
+    /// </summary>
+    protected void insertMissingDatesForecastEntries()
+    {
+        new SkipAOSValidationPermission().assert();
+
+        if (ReqDemPlanUpdateStatisticsInMissingDatesFillToggle::instance().isEnabled())
+        {
+            var conn = new Connection();
+            var stmt = conn.createStatement();
+            stmt.executeUpdate("UPDATE STATISTICS " + ReqDemPlanDataProcessingHelper::dbTableName(tableNum(ReqDemPlanForecast)));
+        }
+        
+        const str ForecastTable = 'forecast';
+        const str ForecastByAttributesForAllocationKeys = 'forecastByAttributesForAllocationKeys';
+
+        DictIndex dictIndex = new DictIndex(tableNum(ReqDemPlanForecast), indexNum(ReqDemPlanForecast, AttributesIdx));
+        str indexName = dictIndex.name(DbBackend::Sql);
+
+        str siteField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Site)).name(DbBackend::Sql);
+        str dataAreaIdField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, DataAreaId)).name(DbBackend::Sql);
+        str partitionField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Partition)).name(DbBackend::Sql);
+        str versionField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Version)).name(DbBackend::Sql);
+        str allocationKeyField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, AllocationKey)).name(DbBackend::Sql);
+        str itemIdField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, ItemId)).name(DbBackend::Sql);
+        str colorField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Color)).name(DbBackend::Sql);
+        str sizeField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Size)).name(DbBackend::Sql);
+        str configurationField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Configuration)).name(DbBackend::Sql);
+        str styleField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Style)).name(DbBackend::Sql);
+        str warehouseField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Warehouse)).name(DbBackend::Sql);
+        str statusIdField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, StatusId)).name(DbBackend::Sql);
+        str custGroupIdField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, CustGroupId)).name(DbBackend::Sql);
+        str custAccountField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, CustAccount)).name(DbBackend::Sql);
+        str logisticsCountryRegionCodeField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, LogisticsCountryRegionCode)).name(DbBackend::Sql);
+        str logisticsAddressStateIdField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, LogisticsAddressStateId)).name(DbBackend::Sql);
+        str productVersionField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, ProductVersion)).name(DbBackend::Sql);
+        str productField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Product)).name(DbBackend::Sql);
+        str forecastDateField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, ForecastDate)).name(DbBackend::Sql);
+        str minValueField = new DictField(tableNum(ReqDemPlanAllocationKeyFilterTmp), fieldNum(ReqDemPlanAllocationKeyFilterTmp, MinValue)).name(DbBackend::Sql);
+        str allocationDataAreaIdField = new DictField(tableNum(ReqDemPlanAllocationKeyFilterTmp), fieldNum(ReqDemPlanAllocationKeyFilterTmp, DataAreaId)).name(DbBackend::Sql);
+        str allocationPartitionField = new DictField(tableNum(ReqDemPlanAllocationKeyFilterTmp), fieldNum(ReqDemPlanAllocationKeyFilterTmp, Partition)).name(DbBackend::Sql);
+        str allocationKeyRecIdField = new DictField(tableNum(ReqDemPlanAllocationKeyFilterTmp), fieldNum(ReqDemPlanAllocationKeyFilterTmp, AllocateId)).name(DbBackend::Sql);
+        str dateValueField = new DictField(tableNum(ReqDemPlanBucketTmp), fieldNum(ReqDemPlanBucketTmp, DateValue)).name(DbBackend::Sql);
+        str forecastQtyField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, Qty)).name(DbBackend::Sql);
+        str forecastOriginalQtyField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, OriginalQty)).name(DbBackend::Sql);
+        str insideFreezingHorizonField = new DictField(tableNum(ReqDemPlanForecast), fieldNum(ReqDemPlanForecast, InsideFreezingHorizon)).name(DbBackend::Sql);
+        str forecastedVersion = int2Str(enum2int(ReqDemPlanForecastVersion::Forecasted));
+
+        str sqlStatement = strFmt(
+            'SELECT %1.' + dataAreaIdField +
+                this.add2SQL(', %1.', partitionField) +
+                this.add2SQL(', %1.', versionField) +
+                this.add2SQL(', %1.', allocationKeyField) +
+                this.add2SQL(', %1.', siteField) +
+                this.add2SQL(', %1.', itemIdField) +
+                this.add2SQL(', %1.', colorField) +
+                this.add2SQL(', %1.', sizeField) +
+                this.add2SQL(', %1.', configurationField) +
+                this.add2SQL(', %1.', styleField) +
+                this.add2SQL(', %1.', warehouseField) +
+                this.add2SQL(', %1.', statusIdField) +
+                this.add2SQL(', %1.', custGroupIdField) +
+                this.add2SQL(', %1.', custAccountField) +
+                this.add2SQL(', %1.', logisticsCountryRegionCodeField) +
+                this.add2SQL(', %1.', logisticsAddressStateIdField) +
+                this.add2SQL(', %1.', productVersionField) +
+                this.add2SQL(', %1.', productField) +
+                this.add2SQL(', %2.', minValueField) + ' ' +
+            'FROM ' + tableStr(ReqDemPlanForecast) + ' as %1 WITH (FORCESEEK, INDEX(' + indexName +  ')) ' +
+            'JOIN %2 on ' +
+                '%1.' + allocationKeyField + ' = %2.' + allocationKeyRecIdField +
+                ' AND %1.' + partitionField + ' = %2.' + allocationPartitionField +
+                ' AND %1.' + dataAreaIdField + ' = %2.' + allocationDataAreaIdField + ' ' +
+            'WHERE ' +
+                '%1.' + versionField + ' = ' + forecastedVersion +
+                ' AND %1.' + partitionField + ' = ' + int642Str(getCurrentPartitionRecId()) +
+                ' AND %1.' + dataAreaIdField + ' = ' + '\'' + curExt() + '\' ' +
+            'GROUP BY %2.' + minValueField +
+                this.add2SQL(', %1.', partitionField) +
+                this.add2SQL(', %1.', dataAreaIdField) +
+                this.add2SQL(', %1.', versionField) +
+                this.add2SQL(', %1.', siteField) +
+                this.add2SQL(', %1.', allocationKeyField) +
+                this.add2SQL(', %1.', itemIdField) +
+                this.add2SQL(', %1.', colorField) +
+                this.add2SQL(', %1.', sizeField) +
+                this.add2SQL(', %1.', configurationField) +
+                this.add2SQL(', %1.', styleField) +
+                this.add2SQL(', %1.', warehouseField) +
+                this.add2SQL(', %1.', statusIdField) +
+                this.add2SQL(', %1.', custGroupIdField) +
+                this.add2SQL(', %1.', custAccountField) +
+                this.add2SQL(', %1.', logisticsCountryRegionCodeField) +
+                this.add2SQL(', %1.', logisticsAddressStateIdField) +
+                this.add2SQL(', %1.', productVersionField) +
+                this.add2SQL(', %1.', productField),
+            ForecastTable,
+            allocationKeyFilter.getPhysicalTableName());
+
+        sqlStatement = strFmt(
+            'SELECT %1.' + dataAreaIdField +
+                this.add2SQL(', %1.', partitionField) +
+                this.add2SQL(', %1.', versionField) +
+                this.add2SQL(', %1.', allocationKeyField) +
+                this.add2SQL(', %1.', siteField) +
+                this.add2SQL(', %1.', itemIdField) +
+                this.add2SQL(', %1.', colorField) +
+                this.add2SQL(', %1.', sizeField) +
+                this.add2SQL(', %1.', configurationField) +
+                this.add2SQL(', %1.', styleField) +
+                this.add2SQL(', %1.', warehouseField) +
+                this.add2SQL(', %1.', statusIdField) +
+                this.add2SQL(', %1.', custGroupIdField) +
+                this.add2SQL(', %1.', custAccountField) +
+                this.add2SQL(', %1.', logisticsCountryRegionCodeField) +
+                this.add2SQL(', %1.', logisticsAddressStateIdField) +
+                this.add2SQL(', %1.', productVersionField) +
+                this.add2SQL(', %1.', productField) +
+                this.add2SQL(', %1.', minValueField) +
+                this.add2SQL(', %1.', minValueField) +
+                this.add2SQL(', %2.', dateValueField) + ' ' +
+                ', CAST (CASE WHEN %2.' + dateValueField + ' < %5 THEN 1 ELSE 0 END AS bit) from (%3) as %1 ' +
+            'CROSS JOIN %2 ' +
+            'WHERE NOT EXISTS ' +
+                '(SELECT \'x\' FROM %4 WITH (FORCESEEK, INDEX(' + indexName + ')) ' +
+                    'WHERE %1.' + dataAreaIdField + ' = %4.' + dataAreaIdField +
+                        this.add2SQL(' AND %1.', partitionField) + this.add2SQL(' = %4.', partitionField) +
+                        this.add2SQL(' AND %4.', versionField) + this.add2SQL(' = ', forecastedVersion) +
+                        this.add2SQL(' AND %4.', forecastDateField) + this.add2SQL(' = %2.', dateValueField) +
+                        this.add2SQL(' AND %1.', allocationKeyField) + this.add2SQL(' = %4.', allocationKeyField) +
+                        this.add2SQL(' AND %1.', itemIdField) + this.add2SQL(' = %4.', itemIdField) +
+                        this.add2SQL(' AND %1.', colorField) + this.add2SQL(' = %4.', colorField) +
+                        this.add2SQL(' AND %1.', sizeField) + this.add2SQL(' = %4.', sizeField) +
+                        this.add2SQL(' AND %1.', configurationField) + this.add2SQL(' = %4.', configurationField) +
+                        this.add2SQL(' AND %1.', styleField) + this.add2SQL(' = %4.', styleField) +
+                        this.add2SQL(' AND %1.', siteField) + this.add2SQL(' = %4.', siteField) +
+                        this.add2SQL(' AND %1.', warehouseField) + this.add2SQL(' = %4.', warehouseField) +
+                        this.add2SQL(' AND %1.', statusIdField) + this.add2SQL(' = %4.', statusIdField) +
+                        this.add2SQL(' AND %1.', custGroupIdField) + this.add2SQL(' = %4.', custGroupIdField) +
+                        this.add2SQL(' AND %1.', custAccountField) + this.add2SQL(' = %4.', custAccountField) +
+                        this.add2SQL(' AND %1.', logisticsCountryRegionCodeField) + this.add2SQL(' = %4.', logisticsCountryRegionCodeField) +
+                        this.add2SQL(' AND %1.', logisticsAddressStateIdField) + this.add2SQL(' = %4.', logisticsAddressStateIdField) + 
+                        this.add2SQL(' AND %1.', productVersionField) + this.add2SQL(' = %4.', productVersionField) + ')',
+            ForecastByAttributesForAllocationKeys,
+            forecastDates.getPhysicalTableName(),
+            sqlStatement,
+            tableStr(ReqDemPlanForecast),
+            this.date2SqlDate(nonFrozenForecastStartDate));
+
+        sqlStatement = strfmt(
+            'INSERT INTO ' + tableStr(ReqDemPlanForecast) +
+                ' (' + dataAreaIdField +
+                this.add2SQL(', ', partitionField) +
+                this.add2SQL(', ', versionField) +
+                this.add2SQL(', ', allocationKeyField) +
+                this.add2SQL(', ', siteField)  +
+                this.add2SQL(', ', itemIdField) +
+                this.add2SQL(', ', colorField) +
+                this.add2SQL(', ', sizeField) +
+                this.add2SQL(', ', configurationField) +
+                this.add2SQL(', ', styleField) +
+                this.add2SQL(', ', warehouseField) +
+                this.add2SQL(', ', statusIdField) +
+                this.add2SQL(', ', custGroupIdField) +
+                this.add2SQL(', ', custAccountField) +
+                this.add2SQL(', ', logisticsCountryRegionCodeField) +
+                this.add2SQL(', ', logisticsAddressStateIdField) +
+                this.add2SQL(', ', productVersionField) +
+                this.add2SQL(', ', productField) +
+                this.add2SQL(', ', forecastQtyField) +
+                this.add2SQL(', ', forecastOriginalQtyField) +
+                this.add2SQL(', ', forecastDateField) +
+                this.add2SQL(', ', insideFreezingHorizonField) + 
+            ') %1 OPTION (RECOMPILE, FORCE ORDER)',
+            sqlStatement);
+
+        Connection connection = new Connection();
+        Statement statement = connection.createStatement();
+
+        Statement.executeUpdateWithParameters(sqlStatement, SqlParams::create());
+        statement.close();
+        connection.finalize();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createMissingDatesForecastEntries</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates the missing forecast entries for items with gaps in the forecast.
+    /// </summary>
+    /// <param name="_missingEntriesQueryRun">
+    ///     The <c>QueryRun</c> object that returns the dataset to insert.
+    /// </param>
+    [SysObsolete('This method is made obselete as this code is shifted to insertMissingDatesForecastEntries method.', false, 1\09\2021)]
+    protected void createMissingDatesForecastEntries(QueryRun _missingEntriesQueryRun)
+    {
+        ReqDemPlanAllocationKeyFilterTmp    allocationKey;
+        ReqDemPlanForecast                  dimensionValues;
+        ReqDemPlanBucketTmp                 forecastDate;
+        ReqDemPlanForecast                  forecast;
+        RecordInsertList                    forecastRecordInsertList;
+
+        new SkipAOSValidationPermission().assert();
+        forecastRecordInsertList = new RecordInsertList(tableNum(ReqDemPlanForecast), true, true, true, true, true);
+
+        if (ReqDemPlanUpdateStatisticsInMissingDatesFillToggle::instance().isEnabled())
+        {
+            var conn = new Connection();
+            var stmt = conn.createStatement();
+            stmt.executeUpdate("UPDATE STATISTICS " + ReqDemPlanDataProcessingHelper::dbTableName(tableNum(ReqDemPlanForecast)));
+        }
+
+        ttsBegin;
+
+        while (_missingEntriesQueryRun.next())
+        {
+            forecast.clear();
+
+            dimensionValues         = _missingEntriesQueryRun.get(tableNum(ReqDemPlanForecast));
+            allocationKey           = _missingEntriesQueryRun.get(tableNum(ReqDemPlanAllocationKeyFilterTmp));
+            forecastDate            = _missingEntriesQueryRun.get(tableNum(ReqDemPlanBucketTmp));
+
+            forecast.data(dimensionValues);
+            forecast.Version                = ReqDemPlanForecastVersion::Forecasted;
+            forecast.ForecastDate           = forecastDate.DateValue;
+            forecast.Qty                    = allocationKey.MinValue;
+            forecast.OriginalQty            = forecast.Qty;
+            forecast.InsideFreezingHorizon  = forecast.ForecastDate < nonFrozenForecastStartDate;
+
+            forecastRecordInsertList.add(forecast);
+
+            logger.incrementTaskRecordsProcessed();
+        }
+
+        forecastRecordInsertList.insertDatabase();
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>add2SQL</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Avoids issues when some fields are not available if the appropriate configuration key is turned off. 
+    /// </summary>
+    /// <param name = "_string">The additional string</param>
+    /// <param name = "_field">The field name</param>
+    /// <returns></returns>
+    private str add2SQL(str _string, str _field)
+    {
+        return _field ? _string + _field : '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createMissingItemsForecastEntries</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates the missing forecast entries for items with no forecast at all.
+    /// </summary>
+    /// <param name="_missingEntriesQueryRun">
+    ///     The <c>QueryRun</c> object that returns the dataset to insert.
+    /// </param>
+    protected void createMissingItemsForecastEntries(QueryRun _missingEntriesQueryRun)
+    {
+        // Map<[ItemId, Site, Warehouse], InventStatusId>
+        Map                                 inventStatusCache = new Map(Types::Container, Types::String);
+
+        ReqDemPlanAllocationKeyFilterTmp    allocationKey;
+        ForecastItemAllocationLine          allocationKeyLine;
+        InventDim                           inventDimProductDim;
+        ReqDemPlanBucketTmp                 forecastDate;
+        InventTable                         inventTable;
+        ItemId                              prevItemId;
+        boolean                             skipCurrentItem = false;
+
+        ReqDemPlanForecast                  forecast;
+        RecordInsertList                    forecastRecordInsertList;
+
+        WHSInventStatusId getInventStatus(ItemId _itemId, InventSiteId _siteId, InventLocationId _warehouseId)
+        {
+            container           key = [_itemId, _siteId, _warehouseId];
+            WHSInventStatusId   statusId;
+            InventDim           inventDimForStatusDefaulting;
+
+            if (inventStatusCache.exists(key))
+            {
+                statusId = inventStatusCache.lookup(key);
+            }
+            else
+            {
+                inventDimForStatusDefaulting.clear();
+                inventDimForStatusDefaulting.InventSiteId = forecast.Site;
+                inventDimForStatusDefaulting.InventLocationId = forecast.Warehouse;
+                statusId = WHSInvent::getDefaultStatusByParameters(_itemId, inventDimForStatusDefaulting, false, '', ModuleInventCustVend::Invent);
+                inventStatusCache.insert(key, statusId);
+            }
+
+            return statusId;
+        }
+
+        new SkipAOSValidationPermission().assert();
+        forecastRecordInsertList = new RecordInsertList(tableNum(ReqDemPlanForecast), true, true, true, true, true);
+
+        ttsBegin;
+
+        while (_missingEntriesQueryRun.next())
+        {
+            inventTable = _missingEntriesQueryRun.get(tableNum(InventTable));
+
+            if (!skipCurrentItem || (prevItemId != inventTable.ItemId))
+            {
+                skipCurrentItem = false;
+
+                allocationKey           = _missingEntriesQueryRun.get(tableNum(ReqDemPlanAllocationKeyFilterTmp));
+                forecastDate            = _missingEntriesQueryRun.get(tableNum(ReqDemPlanBucketTmp));
+                allocationKeyLine       = _missingEntriesQueryRun.get(tableNum(ForecastItemAllocationLine));
+                inventDimProductDim     = _missingEntriesQueryRun.get(tableNum(InventDim), 1);
+                InventDistinctProductDefaultSiteWarehouse inventDistinctProductDefaultSiteWarehouse = _missingEntriesQueryRun.get(tableNum(inventDistinctProductDefaultSiteWarehouse));
+
+                forecast.clear();
+
+                // mandatory data
+                forecast.Version = ReqDemPlanForecastVersion::Forecasted;
+                forecast.AllocationKey = allocationKey.AllocateId;
+                forecast.Qty = allocationKey.MinValue;
+                forecast.OriginalQty = forecast.Qty;
+                forecast.ForecastDate = forecastDate.DateValue;
+                forecast.InsideFreezingHorizon = forecast.ForecastDate < nonFrozenForecastStartDate;
+                forecast.ItemId = inventTable.ItemId;
+                forecast.Product = inventTable.Product;
+
+                forecast.Site = inventDistinctProductDefaultSiteWarehouse.DefaultInventSiteId;
+                if (!isReqDemQueryDefaultInventSiteIdFlightEnabled && !forecast.Site)
+                {
+                    skipCurrentItem = true;
+                }
+
+                if (isWarehouseEnabled)
+                {
+                    forecast.Warehouse = inventDistinctProductDefaultSiteWarehouse.DefaultInventLocationId;
+                    if (!isReqDemQueryDefaultInventSiteIdFlightEnabled && !forecast.Warehouse)
+                    {
+                        skipCurrentItem = true;
+                    }
+                }
+
+                if (isInventStatusEnabled)
+                {
+                    forecast.StatusId = getInventStatus(forecast.ItemId, forecast.Site, forecast.Warehouse);
+                    if (!forecast.StatusId)
+                    {
+                        skipCurrentItem = true;
+                    }
+                }
+
+                if (skipCurrentItem)
+                {
+                    logger.appendTaskDetailLog(strFmt("@DMP1525", forecast.ItemId));
+                }
+                else
+                {
+                    InventProductDimension::initTableFromInventDim(forecast, inventDimProductDim);
+
+                    forecastRecordInsertList.add(forecast);
+
+                    logger.incrementTaskRecordsProcessed();
+                }
+            }
+
+            prevItemId = inventTable.ItemId;
+        }
+
+        forecastRecordInsertList.insertDatabase();
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>forecastEndDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Computes the end date of the forecast horizon.
+    /// </summary>
+    /// <param name="_dataContract">
+    ///     The data contract instance.
+    /// </param>
+    /// <returns>
+    ///     The end date of the forecast horizon
+    /// </returns>
+    protected TransDate forecastEndDate(ReqDemPlanCreateForecastDataContract _dataContract)
+    {
+        return _dataContract.actualDemandEndDate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCompaniesToProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Computes the set of companies that need to be processed.
+    /// </summary>
+    /// <param name="_allocationKeyFilter">
+    ///     The item allocation key filter table buffer.
+    /// </param>
+    /// <returns>
+    ///     The set of companies that need to be processed.
+    /// </returns>
+    protected Set getCompaniesToProcess(ReqDemPlanAllocationKeyFilterTmp _allocationKeyFilter)
+    {
+        Set set = new Set(Types::String);
+
+        while select crossCompany dataAreaId from _allocationKeyFilter
+            group by _allocationKeyFilter.dataAreaId
+        {
+            set.add(_allocationKeyFilter.company());
+        }
+
+        return set;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMissingDatesForecastQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Builds a query that determines the missing forecast data per date to insert.
+    /// </summary>
+    /// <returns>
+    ///     A query that determines the missing forecast data per date to insert.
+    /// </returns>
+    protected Query getMissingDatesForecastQuery()
+    {
+        List                            enabledAttributes;
+        ListEnumerator                  attributeFields;
+        FieldId                         currentFieldId;
+
+        Query                           query = new Query();
+        ReqQueryBuildHelper             queryHelper = new ReqQueryBuildHelper(query);
+
+        QueryBuildDataSource            qbdsAllocationKeyFilter;
+        QueryBuildDataSource            qbdsForecast;
+        QueryBuildDataSource            qbdsForecastDates;
+        QueryBuildDataSource            qbdsCurrentForecast;
+
+        query.setSqlRecompileHint();
+
+        // add ReqDemPlanForecast as root of the query
+        qbdsForecast = queryHelper.addDataSource(tableNum(ReqDemPlanForecast));
+        qbdsForecast.addRange(fieldNum(ReqDemPlanForecast, Version)).value(queryValue(enum2int(ReqDemPlanForecastVersion::Forecasted)));
+        queryHelper.selectFields(qbdsForecast, conNull());
+
+        // add allocation key filter to get the min value
+        qbdsAllocationKeyFilter = queryHelper.addDataSource(tableNum(ReqDemPlanAllocationKeyFilterTmp));
+        queryHelper.selectFields(qbdsAllocationKeyFilter, [fieldNum(ReqDemPlanAllocationKeyFilterTmp, MinValue)]);
+        queryHelper.groupBySelectedFields(qbdsAllocationKeyFilter);
+        queryHelper.setLink(qbdsAllocationKeyFilter, fieldNum(ReqDemPlanAllocationKeyFilterTmp, AllocateId), qbdsForecast, fieldNum(ReqDemPlanForecast, AllocationKey));
+
+        // cross product with forecast dates
+        qbdsForecastDates = queryHelper.addDataSource(tableNum(ReqDemPlanBucketTmp));
+        queryHelper.selectFields(qbdsForecastDates, [fieldNum(ReqDemPlanBucketTmp, DateValue)]);
+        queryHelper.orderBy(qbdsForecastDates, fieldNum(ReqDemPlanBucketTmp, DateValue));
+        queryHelper.groupBySelectedFields(qbdsForecastDates);
+
+        // add "not exist join" to current forecast dates (actual join relations added in and after the loop below)
+        qbdsCurrentForecast = queryHelper.addDataSource(tableNum(ReqDemPlanForecast));
+        qbdsCurrentForecast.addRange(fieldNum(ReqDemPlanForecast, Version)).value(queryValue(enum2int(ReqDemPlanForecastVersion::Forecasted)));
+        qbdsCurrentForecast.clearLinks();
+        qbdsCurrentForecast.joinMode(JoinMode::NoExistsJoin);
+
+        // add "group by" fields and "not exist join" relations in sync
+        boolean mustUseAllAttributes = ReqDemPlanUseAllAttributesInMissingDatesFillToggle::instance().isEnabled();
+        enabledAttributes = mustUseAllAttributes ? attributeManager.getAllAttributesExceptCompany() : attributeManager.getAllEnabledAttributes();
+        attributeFields = attributeManager.getAttributeFields(tableNum(ReqDemPlanForecast), enabledAttributes).getEnumerator();
+        while (attributeFields.moveNext())
+        {
+            currentFieldId = attributeFields.current();
+
+            if (currentFieldId == fieldNum(ReqDemPlanForecast, DataAreaId))
+            {
+                continue;
+            }
+
+            qbdsForecast.fields().addField(currentFieldId);
+            qbdsForecast.addGroupByField(currentFieldId);
+
+            queryHelper.addLink(qbdsCurrentForecast, currentFieldId, qbdsForecast, currentFieldId);
+        }
+
+        // include Product in the selection list
+        if (isItemEnabled)
+        {
+            qbdsForecast.fields().addField(fieldNum(ReqDemPlanForecast, Product));
+            qbdsForecast.addGroupByField(fieldNum(ReqDemPlanForecast, Product));
+        }
+
+        // join also by date
+        queryHelper.addLink(qbdsCurrentForecast, fieldNum(ReqDemPlanForecast, ForecastDate), qbdsForecastDates, fieldNum(ReqDemPlanBucketTmp, DateValue));
+
+        // do not check invalid field access for any data source table
+        query.checkFieldAccess(false);
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMissingItemsForecastQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Builds a query that determines the missing forecast data per item to insert.
+    /// </summary>
+    /// <returns>
+    ///     A query that determines the missing forecast data per item to insert.
+    /// </returns>
+    protected Query getMissingItemsForecastQuery()
+    {
+        Query                           query = this.getBaseQuery();
+        ReqQueryBuildHelper             queryHelper = new ReqQueryBuildHelper(query);
+
+        QueryBuildDataSource qbdsItem = query.dataSourceTable(tableNum(InventTable));
+        qbdsItem.fetchMode(QueryFetchMode::One2One);
+
+        // join with UOM conversion cache to filter out items with no valid conversion
+        QueryBuildDataSource qbdsUomConversion = query.dataSourceTable(tableNum(ReqProductForecastingUomConversionCache));
+        queryHelper.setLink(qbdsUomConversion, fieldNum(ReqProductForecastingUomConversionCache, Product), qbdsItem, fieldNum(InventTable, Product));
+        queryHelper.selectFields(qbdsUomConversion, conNull());
+
+        if (reqDemPlanForceOrderInMissingItemsFillerFlightIsEnabled)
+        {
+            query.forceSelectOrder(true);
+        }
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFieldFromForecastAttributeType</Name>
+				<Source><![CDATA[
+    [Hookable]
+    protected int getFieldFromForecastAttributeType(ReqDemPlanForecastAttributeType _attribute)
+    {
+        return ReqDemPlanForecastAttributeManager::convertProductAttributeToInventDimFieldId(_attribute);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Initializes this instance.
+    /// </summary>
+    public void init()
+    {
+        isItemEnabled           = attributeManager.isAttributeEnabled(ReqDemPlanForecastAttributeType::ItemId);
+        isWarehouseEnabled      = attributeManager.isAttributeEnabled(ReqDemPlanForecastAttributeType::Warehouse);
+        isInventStatusEnabled   = attributeManager.isAttributeEnabled(ReqDemPlanForecastAttributeType::StatusId);
+
+        reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled = ReqDemPlanCreateForecastService::isTransientSqlConnectionErrorRetryEnabled();
+        reqDemPlanForceOrderInMissingItemsFillerFlightIsEnabled = ReqDemPlanForceOrderInMissingItemsFillerFlight::instance().isEnabled();
+        isReqDemQueryDefaultInventSiteIdFlightEnabled = ReqDemQueryDefaultInventSiteIdFlight::instance().isEnabled();
+
+        int infologLineTry = infologLine();
+
+        try
+        {
+            companySet = this.getCompaniesToProcess(allocationKeyFilter);
+
+            nonFrozenForecastStartDate = ReqDemPlanDateConverter::construct().addPeriods(
+                dataContract.parmForecastStartDate(),
+                dataContract.parmDateGranularity(),
+                dataContract.parmFreezingHorizon());
+
+            forecastDates = this.createForecastDateRangeTmp(dataContract);
+        }
+        #ReqDemPlanCatchRetryTransientSqlConnectionError(reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled, dataContract, allocationKeyFilter, logger, infologLineTry)
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new()
+    {
+        this.parmLogger(null);
+        dataHelper = ReqDemPlanDataProcessingHelper::construct();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAllocationKeyFilter</Name>
+				<Source><![CDATA[
+    public ReqDemPlanAllocationKeyFilterTmp parmAllocationKeyFilter(ReqDemPlanAllocationKeyFilterTmp _allocationKeyFilter = allocationKeyFilter)
+    {
+        allocationKeyFilter = _allocationKeyFilter;
+        return allocationKeyFilter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAttributeManager</Name>
+				<Source><![CDATA[
+    public ReqDemPlanForecastAttributeManager parmAttributeManager(ReqDemPlanForecastAttributeManager _attributeManager = attributeManager)
+    {
+        attributeManager = _attributeManager;
+        return attributeManager;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDataContract</Name>
+				<Source><![CDATA[
+    public ReqDemPlanCreateForecastDataContract parmDataContract(ReqDemPlanCreateForecastDataContract _dataContract = dataContract)
+    {
+        dataContract = _dataContract;
+        return dataContract;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmLogger</Name>
+				<Source><![CDATA[
+    public ReqDemPlanTaskLoggerInterface parmLogger(ReqDemPlanTaskLoggerInterface _logger = logger)
+    {
+        if (!prmisDefault(_logger))
+        {
+            logger = _logger;
+
+            if (logger == null)
+            {
+                // ensure logger instance is never null
+                logger = ReqDemPlanDummyTaskLogger::construct();
+            }
+        }
+
+        return logger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates missing forecast entries in the <c>ReqDemPlanForecast</c> table,
+    ///     for items that miss partially or fully the required forecast entries.
+    /// </summary>
+    public void run()
+    {
+        this.runMissingDates();
+        this.runMissingItems();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runMissingDates</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates missing forecast entries in the <c>ReqDemPlanForecast</c> table,
+    ///     for items that have gaps in the forecast.
+    /// </summary>
+    public void runMissingDates()
+    {
+        SetEnumerator                       companies;
+        CompanyId                           currentCompany;
+
+        Query                               missingEntriesQuery;
+        QueryRun                            missingEntriesQueryRun;
+
+        companies = companySet.getEnumerator();
+        while (companies.moveNext())
+        {
+            currentCompany = companies.current();
+            changeCompany(currentCompany)
+            {
+                int infologLineTry = infologLine();
+
+                try
+                {
+                    logger.startMonitoredTask(ReqDemPlanTaskCodes::FillMissingDates, "@DMP1523", currentCompany);
+
+                    allocationKeyFilter.clear();
+                    allocationKeyFilter.company(currentCompany);
+
+                    this.insertMissingDatesForecastEntries();
+
+                    logger.finishTask();
+                }
+                catch (Exception::TransientSqlConnectionError)
+                {
+                    if (ReqDemPlanCreateForecastService::canRetryTransientSqlConnectionError(reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled))
+                    {
+                        ReqDemPlanCreateForecastService::prepareRetryDataContract(dataContract, allocationKeyFilter);
+                        ReqDemPlanCreateForecastService::logTransientErrorRetry(logger, true);
+                        forecastDates = this.createForecastDateRangeTmp(dataContract);
+
+                        retry;
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+                catch (Exception::Error)
+                {
+                    if (ReqDemPlanCreateForecastService::isTransientSqlConnectionError(infologLineTry) 
+                        && ReqDemPlanCreateForecastService::canRetryTransientSqlConnectionError(reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled))
+                    {
+                        ReqDemPlanCreateForecastService::prepareRetryDataContract(dataContract, allocationKeyFilter);
+                        ReqDemPlanCreateForecastService::logTransientErrorRetry(logger, true);
+                        forecastDates = this.createForecastDateRangeTmp(dataContract);
+
+                        retry;
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runMissingItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates missing forecast entries in the <c>ReqDemPlanForecast</c> table,
+    ///     for items that don't have any forecast.
+    /// </summary>
+    public void runMissingItems()
+    {
+        SetEnumerator                       companies;
+        CompanyId                           currentCompany;
+
+        Query                               missingEntriesQuery;
+        QueryRun                            missingEntriesQueryRun;
+
+        if (!isItemEnabled)
+        {
+            return;
+        }
+
+        missingEntriesQuery = this.getMissingItemsForecastQuery();
+
+        companies = companySet.getEnumerator();
+        while (companies.moveNext())
+        {
+            currentCompany = companies.current();
+            changeCompany(currentCompany)
+            {
+                int infologLineTry = infologLine();
+
+                try
+                {
+                    logger.startMonitoredTask(ReqDemPlanTaskCodes::FillMissingProducts, "@DMP1524", currentCompany);
+
+                    allocationKeyFilter.clear();
+                    allocationKeyFilter.company(currentCompany);
+
+                    missingEntriesQueryRun = new QueryRun(missingEntriesQuery);
+                    missingEntriesQueryRun.setCursor(allocationKeyFilter);
+                    missingEntriesQueryRun.setCursor(forecastDates);
+
+                    this.createMissingItemsForecastEntries(missingEntriesQueryRun);
+
+                    logger.finishTask();
+                }
+                catch (Exception::TransientSqlConnectionError)
+                {
+                    if (ReqDemPlanCreateForecastService::canRetryTransientSqlConnectionError(reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled))
+                    {
+                        ReqDemPlanCreateForecastService::prepareRetryDataContract(dataContract, allocationKeyFilter);
+                        ReqDemPlanCreateForecastService::logTransientErrorRetry(logger, true);
+                        forecastDates = this.createForecastDateRangeTmp(dataContract);
+
+                        retry;
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+                catch (Exception::Error)
+                {
+                    if (ReqDemPlanCreateForecastService::isTransientSqlConnectionError(infologLineTry) 
+                        && ReqDemPlanCreateForecastService::canRetryTransientSqlConnectionError(reqDemPlanHandleTransientSqlConnectionErrorFlightIsEnabled))
+                    {
+                        ReqDemPlanCreateForecastService::prepareRetryDataContract(dataContract, allocationKeyFilter);
+                        ReqDemPlanCreateForecastService::logTransientErrorRetry(logger, true);
+                        forecastDates = this.createForecastDateRangeTmp(dataContract);
+
+                        retry;
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>date2SqlDate</Name>
+				<Source><![CDATA[
+    private str date2SqlDate(date _date)
+    {
+        utcdatetime datetime = DateTimeUtil::newDateTime(_date, 0);
+        return strFmt('DATEFROMPARTS(%1, %2, %3)', DateTimeUtil::year(datetime), DateTimeUtil::month(datetime), DateTimeUtil::day(datetime));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Initializes a new instance of the <c>ReqDemPlanMissingForecastFiller</c> class
+    ///     based on the given parameters.
+    /// </summary>
+    /// <param name="_dataContract">
+    ///     The data contract instance.
+    /// </param>
+    /// <param name="_allocationKeyFilter">
+    ///     The allocation key filter table buffer.
+    /// </param>
+    /// <param name="_logger">
+    ///     The logger instance
+    /// </param>
+    /// <returns>
+    ///     a new instance of the <c>ReqDemPlanMissingForecastFiller</c> class.
+    /// </returns>
+    public static ReqDemPlanMissingForecastFiller newParameters(
+        ReqDemPlanCreateForecastDataContract    _dataContract,
+        ReqDemPlanAllocationKeyFilterTmp        _allocationKeyFilter,
+        ReqDemPlanTaskLoggerInterface           _logger = null)
+    {
+        ReqDemPlanMissingForecastFiller filler = new ReqDemPlanMissingForecastFiller();
+
+        filler.parmDataContract(_dataContract);
+        filler.parmAttributeManager(_dataContract.attributeManager());
+        filler.parmAllocationKeyFilter(_allocationKeyFilter);
+        filler.parmLogger(_logger);
+        filler.init();
+
+        return filler;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

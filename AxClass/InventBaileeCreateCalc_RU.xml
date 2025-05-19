@@ -1,0 +1,955 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventBaileeCreateCalc_RU</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class InventBaileeCreateCalc_RU extends RunBaseBatch implements BatchRetryable
+{
+    DialogRunbase       dialog;
+
+    TransDate           calcDate;
+    DialogField         dialogCalcDate;
+
+    InventLocationId    inventLocationId;
+    DialogField         dialogInventLocationId;
+
+    CustAccount         custAccount;
+    DialogField         dialogCustAccount;
+    protected const str DialogCustAccountName = 'dialogCustAccount';
+
+    SalesAgreementId    salesAgreementId;
+    DialogField         dialogsalesAgreementId;
+    protected const str DialogSalesAgreementIdName = 'dialogSalesAgreementId';
+
+    Map                 qtyMap;
+    Map                 fromDateMap;
+    Map                 calcItemDataMap;
+    Map                 priceDiscCache;
+    Map                 calcItemIdCache;
+    Set                 calcItemIdSet;
+
+    InventBaileeCalcTable_RU    calcTable;
+    InventBaileeCalcTrans_RU    calcTrans;
+    boolean                     calcTableCreated;
+
+    CustTable                   custTable;
+    SalesAgreementHeader        salesAgreementHeader;
+    SalesAgreementHeaderExt_RU  salesAgreementHeaderExt;
+
+    protected const Version CurrentVersion = 1;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>canGoBatchJournal</Name>
+				<Source><![CDATA[
+    public boolean canGoBatchJournal()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>create</Name>
+				<Source><![CDATA[
+    protected void create()
+    {
+        Query                   query = new Query();
+
+        QueryBuildDataSource qbdsInventOwner = query.addDataSource(tablenum(InventOwner_RU));
+        qbdsInventOwner.addRange(fieldnum(InventOwner_RU, AccountType)).value(queryValue(InventOwnerAccountType_RU::Vend));
+        if (custAccount)
+        {
+            qbdsInventOwner.addRange(fieldnum(InventOwner_RU, AccountNumRelated)).value(custAccount);
+        }
+
+        if (salesAgreementId)
+        {
+            qbdsInventOwner.addRange(fieldnum(InventOwner_RU, RelatedAgreementHeaderExt)).value(
+                queryValue(AgreementHeaderExt_RU::findByAgreementId(salesAgreementId).RecId));
+        }
+
+        QueryBuildDataSource qbdsInventDim = qbdsInventOwner.addDataSource(tablenum(InventDim));
+        qbdsInventDim.joinMode(JoinMode::ExistsJoin);
+        qbdsInventDim.relations(true);
+        qbdsInventDim.addRange(fieldnum(InventDim, InventLocationId)).value(inventLocationId);
+
+        QueryBuildDataSource qbdsInventProfile = qbdsInventDim.addDataSource(tablenum(InventProfile_RU));
+        qbdsInventProfile.joinMode(JoinMode::ExistsJoin);
+        qbdsInventProfile.relations(true);
+        qbdsInventProfile.addRange(fieldnum(InventProfile_RU, InventProfileType)).value(queryValue(InventProfileType_RU::Bailee));
+
+        QueryBuildDataSource qbdsBaileeCalcTable = qbdsInventOwner.addDataSource(tablenum(InventBaileeCalcTable_RU));
+        qbdsBaileeCalcTable.joinMode(JoinMode::NoExistsJoin);
+        qbdsBaileeCalcTable.relations(true);
+        qbdsBaileeCalcTable.addRange(fieldnum(InventBaileeCalcTable_RU, InventLocationId)).value(inventLocationId);
+        qbdsBaileeCalcTable.addRange(fieldnum(InventBaileeCalcTable_RU, CalcDate)).value(strfmt("@GLS111260", calcDate));
+
+        QueryRun queryRun = new QueryRun(query);
+        this.progressInit(this.caption(), SysQuery::countLoops(queryRun));
+        while (queryRun.next())
+        {
+            progress.incCount();
+
+            InventOwner_RU inventOwner = queryRun.get(tablenum(InventOwner_RU));
+
+            this.initCalcTable(inventOwner);
+
+            this.processPrevCalcTrans();
+
+            this.processInventTrans(inventOwner);
+
+            this.processPriceData();
+
+            this.processDateMerge();
+
+            this.createCalcTrans();
+
+            this.createCalcTable();
+        }
+
+        if (! calcTableCreated)
+        {
+            info("@GLS115612");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCalcTable</Name>
+				<Source><![CDATA[
+    protected void createCalcTable()
+    {
+        if (calcTable.CalcId)
+        {
+            calcTable.insert();
+            calcTableCreated = true;
+
+            info(strfmt("@GLS115708", calcTable.CalcId),
+                 '',
+                 SysInfoAction_TableField::newBuffer(calcTable));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCalcTrans</Name>
+				<Source><![CDATA[
+    protected void createCalcTrans()
+    {
+        if (! fromDateMap || ! fromDateMap.elements())
+        {
+            return;
+        }
+
+        MapIterator mapIterator = new MapIterator(fromDateMap);
+        mapIterator.begin();
+        while (mapIterator.more())
+        {
+            calcTrans.clear();
+            calcTrans.initFromInventBaileeCalcTable(calcTable);
+
+            [calcTrans.ItemId,
+             calcTrans.InventBatchId,
+             calcTrans.ToDate,
+             calcTrans.CalcItemId,
+             calcTrans.CalcPrice,
+             calcTrans.Qty] = mapIterator.key();
+            [calcTrans.FromDate] = mapIterator.value();
+
+            Days freeDays = conpeek(calcItemDataMap.lookup([calcTrans.CalcItemId, calcTrans.FromDate]), 2);
+            TransDate prodDate = InventBatch::find(calcTrans.InventBatchId, calcTrans.ItemId).ProdDate;
+            if (prodDate && freeDays && prodDate <= calcTrans.FromDate)
+            {
+                freeDays = max(0,(freeDays - (calcTrans.FromDate - prodDate)));
+                calcTrans.CalcFreeDays = min(freeDays, calcTrans.ToDate - calcTrans.FromDate + 1);
+            }
+
+            InventTable inventTable = InventTable::find(calcTrans.ItemId);
+            calcTrans.NetWeight     = calcTrans.Qty * inventTable.NetWeight;
+            calcTrans.GrossWeight   = calcTrans.Qty * inventTable.grossWeight();
+            calcTrans.Volume        = calcTrans.Qty * inventTable.UnitVolume;
+
+            InventTable calcInventTable = InventTable::find(calcTrans.CalcItemId);
+            calcTrans.CalcQty       = InventBaileeCalcUnitOperation_RU::calc(calcInventTable.inventUnitId(),
+                                                                             calcTrans.Qty,
+                                                                             calcTrans.NetWeight,
+                                                                             calcTrans.GrossWeight,
+                                                                             calcTrans.Volume,
+                                                                             max(0, calcTrans.ToDate - calcTrans.FromDate + 1 - calcTrans.CalcFreeDays));
+            calcTrans.CalcAmountCur = calcTrans.CalcQty * calcTrans.CalcPrice;
+
+            calcTrans.insert();
+
+            mapIterator.next();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        dialog = super();
+
+        dialog.addGroup("@GLS114984");
+
+        dialogCalcDate = dialog.addFieldValue(extendedTypeStr(TransDate), calcDate, "@SYS7402", "@GLS115649");
+        dialogCalcDate.mandatory_RU(true);
+
+        dialogInventLocationId = dialog.addFieldValue(extendedTypeStr(InventLocationId), inventLocationId);
+        dialogInventLocationId.mandatory_RU(true);
+
+        dialog.addGroup("@GLS115589");
+
+        dialog.customFieldName_RU(DialogCustAccountName);
+        dialogCustAccount = dialog.addFieldValue(extendedTypeStr(CustAccount), custAccount);
+        dialogCustAccount.registerOverrideMethod(methodStr(FormStringControl, modified),
+			methodStr(InventBaileeCreateCalc_RU, dialogCustAccount_modified),
+			this);
+
+        dialog.customFieldName_RU(DialogsalesAgreementIdName);
+        dialogSalesAgreementId = dialog.addFieldValue(extendedTypeStr(SalesAgreementId), salesAgreementId);
+        dialogSalesAgreementId.lookupButton(FormLookupButton::Always);
+        dialogSalesAgreementId.registerOverrideMethod(methodStr(FormStringControl, lookup),
+            methodStr(InventBaileeCreateCalc_RU, dialogSalesAgreementId_lookup),
+			this);
+
+        dialog.allowControlMethodOverload_RU(true);
+
+        this.dialogActivateFields();
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialogActivateFields</Name>
+				<Source><![CDATA[
+    protected void dialogActivateFields()
+    {
+        dialogSalesAgreementId.enabled(dialogCustAccount.value() != '');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialogCustAccount_modified</Name>
+				<Source><![CDATA[
+	/// <summary>
+    /// Modified the customer account field, enable the sales agrrement id field.
+    /// </summary>
+    /// <param name = "_control">Form control for customer account.</param>
+    /// <returns>Check the field is modified or not.</returns>
+    protected boolean dialogCustAccount_modified(FormControl _control)
+    {
+        boolean ret = dialog.curFormControl_RU().modified();
+
+        dialog.dialogOnClient_RU().updateServer();
+
+        dialogSalesAgreementId.value('');
+
+        this.dialogActivateFields();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialogSalesAgreementId_lookup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates lookup for dialogSalesAgreementId dialog field.
+    /// </summary>
+    /// <param name = "_control">Form control for sales agreement id.</param>
+    protected void dialogSalesAgreementId_lookup(FormControl _control)
+    {
+        SalesTable salesTable;
+
+        dialog.dialogOnClient_RU().updateServer();
+        salesTable.CustAccount = dialogCustAccount.value();
+        salesAgreementHeader::salesAgreementLookup(dialog.curFormControl_RU(), salesTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCalcItemId</Name>
+				<Source><![CDATA[
+    private ItemId getCalcItemId(ItemId     _itemId,
+                                 TransDate  _transDate)
+    {
+        if (! calcItemIdCache)
+        {
+            calcItemIdCache = new Map(Types::Container, Types::String);
+        }
+
+        if (! calcItemIdCache.exists([_itemId,
+                                      calcTable.InventLocationId,
+                                      custTable.AccountNum,
+                                      salesAgreementHeader.RecId,
+                                      _transDate]))
+        {
+            ItemId calcItemId = InventBaileeCalcSetup_RU::findCalcItem(_itemId,
+                                                                       calcTable.InventLocationId,
+                                                                       custTable.AccountNum,
+                                                                       AgreementClassification::find(salesAgreementHeader.AgreementClassification).Name,
+                                                                       salesAgreementHeader.SalesNumberSequence,
+                                                                       _transDate);
+            if (! calcItemId)
+            {
+                throw error(strfmt("@GLS115702", _itemId));
+            }
+            calcItemIdCache.insert([_itemId,
+                                    calcTable.InventLocationId,
+                                    custTable.AccountNum,
+                                    salesAgreementHeader.RecId,
+                                    _transDate],
+                                   calcItemId);
+        }
+        return calcItemIdCache.lookup([_itemId,
+                                       calcTable.InventLocationId,
+                                       custTable.AccountNum,
+                                       salesAgreementHeader.RecId,
+                                       _transDate]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        calcDate                = dialogCalcDate.value();
+        inventLocationId        = dialogInventLocationId.value();
+        custAccount             = dialogCustAccount.value();
+        salesAgreementId        = dialogSalesAgreementId.value();
+
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNextCalcId</Name>
+				<Source><![CDATA[
+    private InventBaileeCalcId_RU getNextCalcId()
+    {
+        return NumberSeq::newGetNum(InventParameters::numRefInventBaileeCalcId_RU()).num();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPriceData</Name>
+				<Source><![CDATA[
+    private container getPriceData(
+        ItemId          _itemId,
+        TransDate       _transDate,
+        InventQty       _qty)
+    {
+        if (! priceDiscCache)
+        {
+            priceDiscCache = new Map(Types::Container, Types::Container);
+        }
+
+        if (! priceDiscCache.exists([_itemId,
+                                     calcTable.InventLocationId,
+                                     custTable.AccountNum,
+                                     salesAgreementHeaderExt.RecId,
+                                     _transDate,
+                                     _qty]))
+        {
+            PriceDisc_Price priceDisc = new PriceDisc_Price(salesAgreementHeaderExt.RecId,
+                salesAgreementHeader.CustAccount);
+
+            priceDisc.parmModuleType(ModuleInventPurchSales::Sales);
+            priceDisc.parmItemId(_itemId);
+
+            priceDisc.parmUnitID(InventTable::find(_itemId).inventUnitId());
+            priceDisc.parmPriceDate(_transDate);
+            priceDisc.parmQty(_qty);
+            priceDisc.parmAccountNum(custTable.AccountNum);
+            priceDisc.parmCurrencyCode(salesAgreementHeader ? salesAgreementHeader.Currency : custTable.Currency);
+            priceDisc.parmPriceGroupId(custTable.PriceGroup);
+
+            priceDiscCache.insert([_itemId,
+                                   calcTable.InventLocationId,
+                                   custTable.AccountNum,
+                                   salesAgreementHeaderExt.RecId,
+                                   _transDate,
+                                   _qty],
+                                  [priceDisc.price(), priceDisc.inventBaileeFreeDays_RU()]);
+        }
+        return priceDiscCache.lookup([_itemId,
+                                      calcTable.InventLocationId,
+                                      custTable.AccountNum,
+                                      salesAgreementHeaderExt.RecId,
+                                      _transDate,
+                                      _qty]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initCalcTable</Name>
+				<Source><![CDATA[
+    protected void initCalcTable(InventOwner_RU _inventOwner)
+    {
+        calcItemIdCache = null;
+        priceDiscCache  = null;
+        fromDateMap     = null;
+        calcItemDataMap = null;
+        qtyMap          = new Map(Types::Container, Types::Real);
+
+        calcTable.clear();
+        calcTable.initValue();
+        calcTable.CalcDate          = calcDate;
+        calcTable.InventLocationId  = inventLocationId;
+        calcTable.InventOwnerId     = _inventOwner.InventOwnerId;
+
+        custTable               = _inventOwner.custTable();
+        salesAgreementHeaderExt = _inventOwner.salesAgreementHeaderExt();
+        salesAgreementHeader    = salesAgreementHeader::find(salesAgreementHeaderExt.AgreementHeader);
+
+        calcTable.CurrencyCode = salesAgreementHeader.Currency ? salesAgreementHeader.Currency : custTable.Currency;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    public void initParmDefault()
+    {
+        calcDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mergeCalcTrans</Name>
+				<Source><![CDATA[
+    private void mergeCalcTrans()
+    {
+        priceDiscCache = new Map(Types::Container, Types::Container);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [CurrentVersion, calcDate, inventLocationId, custAccount, salesAgreementId];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCalcDate</Name>
+				<Source><![CDATA[
+    public TransDate parmCalcDate(TransDate _calcDate = calcDate)
+    {
+        calcDate = _calcDate;
+        return calcDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCustAccount</Name>
+				<Source><![CDATA[
+    public CustAccount parmCustAccount(CustAccount _custAccount = custAccount)
+    {
+        custAccount = _custAccount;
+        return custAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventLocationId</Name>
+				<Source><![CDATA[
+    public InventLocationId parmInventLocationId(InventLocationId _inventLocationId = inventLocationId)
+    {
+        inventLocationId = _inventLocationId;
+        return inventLocationId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSalesAgreementId</Name>
+				<Source><![CDATA[
+    public SalesAgreementId parmSalesAgreementId(SalesAgreementId _salesAgreementId = salesAgreementId)
+    {
+        salesAgreementId = _salesAgreementId;
+        return salesAgreementId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDateMerge</Name>
+				<Source><![CDATA[
+    private void processDateMerge()
+    {
+        ItemId          itemId;
+        InventBatchId   inventBatchId;
+        TransDate       transDate;
+
+        MapIterator mapIterator = new MapIterator(qtyMap);
+        mapIterator.begin();
+        while (mapIterator.more())
+        {
+            [itemId,
+             inventBatchId,
+             transDate] = mapIterator.key();
+            InventQty qty = mapIterator.value();
+
+            ItemId calcItemId = this.getCalcItemId(itemId, transDate);
+            SalesPrice calcPrice = conpeek(calcItemDataMap.lookup([calcItemId, transDate]), 1);
+
+            this.updateMapFromDate(itemId, inventBatchId, transDate, calcItemId, calcPrice, qty);
+
+            mapIterator.next();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processInventTrans</Name>
+				<Source><![CDATA[
+    protected void processInventTrans(InventOwner_RU _inventOwner)
+    {
+        InventProfile_RU            inventProfile;
+        InventDim                   inventDim;
+        InventTrans                 inventTrans;
+        InventBaileeCalcSetup_RU    calcSetup;
+        DatePhysical                datePhysical;
+
+        while select forupdate inventTrans
+            where inventTrans.GroupRefType_RU   == InventTransGroupRefType_RU::None
+               && inventTrans.GroupRefId_RU     == ''
+               && inventTrans.DatePhysical      <= calcTable.CalcDate
+               && inventTrans.DatePhysical      > dateNull()
+        join InventBatchId from inventDim
+            where inventDim.InventDimId         == inventTrans.InventDimId
+               && inventDim.InventOwnerId_RU    == _inventOwner.InventOwnerId
+               && inventDim.InventLocationId    == inventLocationId
+        join TableId from inventProfile
+            where inventProfile.InventProfileId     == inventDim.InventProfileId_RU
+               && inventProfile.InventProfileType   == InventProfileType_RU::Bailee
+        {
+            if (! calcItemIdSet)
+            {
+                calcItemIdSet = new Set(Types::String);
+                while select calcSetup
+                    group by CalcItemId
+                {
+                    calcItemIdSet.add(calcSetup.CalcItemId);
+                }
+            }
+            if (calcItemIdSet.in(inventTrans.ItemId))
+            {
+                // skip transaction for calc item
+                continue;
+            }
+
+            if (!inventDim.InventBatchId)
+            {
+                warning(strfmt("@GLS115666", inventTrans.ItemId, inventTrans.InventTransOrigin().InventTransId));
+            }
+
+            switch (inventTrans.InventTransOrigin().ReferenceCategory)
+            {
+                case InventTransType::InventTransaction :
+                case InventTransType::InventTransfer    :
+                case InventTransType::InventLossProfit  :
+                    if ((inventTrans.direction() == InventDirection::Receipt) ^
+                        (inventTrans.ReturnInventTransOrigin || inventTrans.Storno_RU))
+                    {
+                        datePhysical = inventTrans.DatePhysical;
+                    }
+                    else
+                    {
+                        datePhysical = inventTrans.DatePhysical + 1;
+                    }
+                    break;
+                case InventTransType::Purch :
+                    datePhysical = inventTrans.DatePhysical;
+                    break;
+                case InventTransType::Sales :
+                    datePhysical = inventTrans.DatePhysical + 1;
+                    break;
+                default :
+                    datePhysical = inventTrans.DatePhysical;
+                    break;
+            }
+
+            this.updateTrans(inventTrans.ItemId, inventDim.InventBatchId, datePhysical, inventTrans.Qty);
+
+            inventTrans.GroupRefType_RU = InventTransGroupRefType_RU::InventBaileeCalc;
+            inventTrans.GroupRefId_RU   = calcTable.CalcId;
+            inventTrans.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPrevCalcTrans</Name>
+				<Source><![CDATA[
+    protected void processPrevCalcTrans()
+    {
+        InventBaileeCalcTrans_RU    calcTransPrev;
+
+        InventBaileeCalcTable_RU calcTablePrev = calcTable.prevCalcTable();
+
+        if (calcTablePrev)
+        {
+            while select * from calcTransPrev
+                where calcTransPrev.CalcId == calcTablePrev.CalcId
+                   && calcTransPrev.ToDate == calcTablePrev.CalcDate
+            {
+                this.updateTrans(calcTransPrev.ItemId, calcTransPrev.InventBatchId, calcTransPrev.ToDate + 1, calcTransPrev.Qty);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPriceData</Name>
+				<Source><![CDATA[
+    private void processPriceData()
+    {
+        ItemId          itemId;
+        InventBatchId   inventBatchId;
+        TransDate       transDate;
+        ItemId          calcItemId;
+        SalesPrice      calcPrice;
+        InventQty       qty, calcQty, tmpQty;
+        Days            calcFreeDays;
+        Map             calcItemQtyMap = new Map(Types::Container, Types::Real);
+
+        MapIterator mapIterator = new MapIterator(qtyMap);
+        mapIterator.begin();
+        while (mapIterator.more())
+        {
+            [itemId, inventBatchId, transDate] = mapIterator.key();
+            qty                                = mapIterator.value();
+
+            InventTable inventTable = InventTable::find(itemId);
+
+            calcItemId = this.getCalcItemId(itemId, transDate);
+            InventTable calcInventTable = InventTable::find(calcItemId);
+            calcQty = InventBaileeCalcUnitOperation_RU::calc(calcInventTable.inventUnitId(),
+                                                             qty,
+                                                             qty * inventTable.NetWeight,
+                                                             qty * inventTable.grossWeight(),
+                                                             qty * inventTable.UnitVolume,
+                                                             1);
+
+            tmpQty = 0;
+            if (calcItemQtyMap.exists([calcItemId, transDate]))
+            {
+                tmpQty = calcItemQtyMap.lookup([calcItemId, transDate]);
+            }
+            calcItemQtyMap.insert([calcItemId, transDate], calcQty + tmpQty);
+
+            mapIterator.next();
+        }
+
+        if (! calcItemDataMap)
+        {
+            calcItemDataMap = new Map(Types::Container, Types::Container);
+        }
+
+        mapIterator = new MapIterator(calcItemQtyMap);
+        mapIterator.begin();
+        while (mapIterator.more())
+        {
+            [calcItemId, transDate] = mapIterator.key();
+            calcQty                 = mapIterator.value();
+
+            [calcPrice, calcFreeDays] = this.getPriceData(calcItemId, transDate, calcQty);
+
+            calcItemDataMap.insert([calcItemId, transDate], [calcPrice, calcFreeDays]);
+
+            mapIterator.next();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        const int RetryNum = 5;
+
+        setprefix(InventBaileeCreateCalc_RU::description());
+
+        if (! this.validate())
+        {
+            throw error("@SYS18447");
+        }
+
+        GlobalizationInstrumentationHelper::featureRun(GlobalizationConstants::FeatureReferenceRU00049, funcName());
+
+        try
+        {
+            ttsbegin;
+
+            this.create();
+
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            error(strFmt("@SYS63093","@GLS115555"));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = RunBase::getVersion(packedClass);
+
+        switch (version)
+        {
+            case CurrentVersion:
+                [version, calcDate, inventLocationId, custAccount, salesAgreementId] = packedClass;
+                break;
+            default:
+                return false;
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMapFromDate</Name>
+				<Source><![CDATA[
+    private void updateMapFromDate(ItemId          _itemId,
+                                   InventBatchId   _inventBatchId,
+                                   ToDate          _toDate,
+                                   ItemId          _calcItemId,
+                                   SalesPrice      _calcPrice,
+                                   InventQty       _qty)
+    {
+        FromDate    fromDate;
+
+        if (! fromDateMap)
+        {
+            fromDateMap = new Map(Types::Container, Types::Date);
+        }
+
+        if (! _qty)
+        {
+            return;
+        }
+
+        if (fromDateMap.exists([_itemId, _inventBatchId, _toDate - 1, _calcItemId, _calcPrice, _qty]))
+        {
+            fromDate = fromDateMap.lookup([_itemId, _inventBatchId, _toDate - 1, _calcItemId, _calcPrice, _qty]);
+            fromDateMap.remove([_itemId, _inventBatchId, _toDate - 1, _calcItemId, _calcPrice, _qty]);
+        }
+        fromDateMap.insert([_itemId, _inventBatchId, _toDate, _calcItemId, _calcPrice, _qty], fromDate ? fromDate : _toDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMapQty</Name>
+				<Source><![CDATA[
+    private void updateMapQty(ItemId        _itemId,
+                              InventBatchId _inventBatchId,
+                              TransDate     _transDate,
+                              InventQty     _qty)
+    {
+        InventQty   qty;
+
+        if (qtyMap.exists([_itemId, _inventBatchId, _transDate]))
+        {
+            qty = qtyMap.lookup([_itemId, _inventBatchId, _transDate]);
+        }
+
+        qtyMap.insert([_itemId, _inventBatchId, _transDate], qty + _qty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTrans</Name>
+				<Source><![CDATA[
+    private void updateTrans(ItemId _itemId, InventBatchId _inventBatchId, TransDate _transDate, InventQty _qty)
+    {
+        TransDate   transDate;
+
+        for (transDate = _transDate; transDate <= calcTable.CalcDate; transDate++)
+        {
+            this.updateMapQty(_itemId, _inventBatchId, transDate, _qty);
+        }
+
+        if (! calcTable.CalcId)
+        {
+            calcTable.CalcId = this.getNextCalcId();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    public boolean validate(Object calledFrom = null)
+    {
+        boolean                     ok = true;
+        InventOwner_RU              inventOwner;
+        InventProfile_RU            inventProfile;
+        InventDim                   inventDim;
+        InventBaileeCalcTable_RU    inventBaileeCalcTable;
+
+        select firstonly inventOwner
+            where inventOwner.AccountType == InventOwnerAccountType_RU::Vend
+               && (! custAccount  || inventOwner.AccountNumRelated       == custAccount)
+               && (! salesAgreementId  || inventOwner.RelatedAgreementHeaderExt  == AgreementHeaderExt_RU::findByAgreementId(salesAgreementId).RecId)
+        exists join inventDim
+            where inventDim.InventOwnerId_RU == inventOwner.InventOwnerId
+               && inventDim.InventLocationId == inventLocationId
+        exists join inventProfile
+            where inventProfile.InventProfileId   == inventDim.InventProfileId_RU
+               && inventProfile.InventProfileType == InventProfileType_RU::Bailee
+        notexists join inventBaileeCalcTable
+            where inventBaileeCalcTable.InventLocationId == inventLocationId
+               && inventBaileeCalcTable.InventOwnerId    == inventOwner.InventOwnerId
+               && inventBaileeCalcTable.CalcDate         >= calcDate;
+
+        if (! calcDate)
+        {
+            ok = checkFailed("@GLS115645");
+        }
+
+        if (! inventLocationId)
+        {
+            ok = checkFailed("@GLS115646");
+        }
+
+        if (! inventOwner)
+        {
+            ok = checkFailed("@GLS115647");
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    static InventBaileeCreateCalc_RU construct()
+    {
+        return new InventBaileeCreateCalc_RU();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static ClassDescription description()
+    {
+        return "@GLS115664";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static void main(Args _args)
+    {
+        InventBaileeCreateCalc_RU inventBaileeCreateCalc = InventBaileeCreateCalc_RU::construct();
+
+        if (inventBaileeCreateCalc.prompt())
+        {
+            inventBaileeCreateCalc.runOperation();
+
+            if (_args && _args.caller() && FormDataUtil::isFormDataSource(_args.record()))
+            {
+                FormDataSource formDataSource = FormDataUtil::getFormDataSource(_args.record());
+                formDataSource.executeQuery();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		<Method><Name>isRetryable</Name><Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public final boolean isRetryable()
+    {
+        return true;
+    }
+]]></Source></Method></Methods>
+	</SourceCode>
+</AxClass>

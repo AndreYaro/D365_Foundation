@@ -1,0 +1,394 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>AssetPostCashDiscount</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///  The <c>AssetPostCashDiscount</c> class is used to calculate
+///  and post any discount transactions generated during the settlement process.
+/// </summary>
+class AssetPostCashDiscount
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>postAssetDiscountTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///   Creates fixed asset transactions associated with discounts.
+    /// </summary>
+    /// <param name = "_custVendTrans">
+    ///   The original <c>CustVendTrans</c> record selected for settlement.
+    /// </param>
+    /// <param name = "_discTrans">
+    ///   The <c>CustVendTrans</c> record associated with discount.
+    /// </param>
+    /// <param name = "_taxOnCashDiscAmount">
+    ///   The amount of tax on the cash discount amount.
+    /// </param>
+    /// <param name = "_ledgerJournalId">
+    ///   The general ledger journal ID.
+    /// </param>
+    /// <param name = "_ledgerVoucher">
+    ///   The <c>LedgerVoucher</c> object used to create ledger transactions.
+    /// </param>
+    /// <param name = "_discountDefaultLedgerDimension">
+    ///   The discount default dimension value.
+    /// </param>
+    /// <param name = "_discountTranscationDimension">
+    ///   The dimension associate with the discount voucher.
+    /// </param>
+    public static void postAssetDiscountTransactions(
+        CustVendTrans _custVendTrans,
+        CustVendTrans _discTrans,
+        AmountMST _taxOnCashDiscAmount,
+        LedgerJournalId _ledgerJournalId,
+        LedgerVoucher _ledgerVoucher,
+        LedgerDimensionDefaultAccount _discountTranscationDimension,
+        LedgerDimensionDefaultAccount _discountDefaultLedgerDimension)
+    {
+        AssetTrans                      assetTrans;
+        AssetBookTableDerived           assetBookTableDerived;
+        AssetTrans                      assetTransGrp;
+        AmountMST                       postedTaxMST;
+        AmountMST                       netAmountMST;
+        AmountMST                       netDiscMST;
+        CurrencyExchangeHelper          exchangeRateHelper;
+
+        // Make sure the first assetTrans found can initialize the cash discount calculation properties.
+        boolean isFirstAssetTrans = true;
+
+        boolean applyUStaxationRules = TaxParameters::find().PurchTaxOnOperations;
+
+        //
+        //  If the _custVendTrans is a Vendor transaction and
+        //  Fixed Assets allows cash discounts to be deducted from the acquisition value.
+        //
+        if (_custVendTrans.TableId == tableNum(VendTrans)   &&
+                AssetParameters::find().DeductCashDisc)
+        {
+            // Find the invoice associated with the transaction which will be used to retrieve 'Tax Reverse on Cash Discount'.
+            VendInvoiceJour vendInvoiceJour = VendInvoiceJour::findFromVendTransVoucher(
+                _custVendTrans.Invoice,
+                _custVendTrans.Voucher,
+                _custVendTrans.TransDate,
+                _custVendTrans.AccountNum);
+
+            TaxIntegrationTaxJurisdictionParameters taxIntegrationTaxJurisdictionParameters;
+            if (vendInvoiceJour)
+            {
+                taxIntegrationTaxJurisdictionParameters = TaxIntegrationFacade::getTaxJurisdictionParametersByTable(vendInvoiceJour);
+            }
+
+            //
+            //  If there are any assetTrans rows that match the custVendTrans
+            //  voucher, transDate, are also Acquisition or Acquisition Adjustment
+            //  type asset transactions, and are not for derived books.
+            //
+            //  Since the AssetTrans table does not indicate which transactions are
+            //  original and which are derived this process is assuming that AP Invoice
+            //  Fixed Asset transactions are only made on original value models
+            //  and not derived ones.
+            //
+            //  Should an AP invoice contain transaction lines for a fixed asset's
+            //  value model and derived value model there would not be anyway to
+            //  distinguish between the derived value model transaction posted directly
+            //  from the AP invoice and the one that was posted as a result of the posting
+            //  of original value model's transactions.
+            //
+            //  One approach to correct this issue would be to make a data model change in the
+            //  AssetTrans table that would clearly identify transactions created through automatic
+            //  derived value model handling.
+            //
+            //  The derived book assets will be handled when the
+            //  original asset book's cash discount is posted.
+            //
+            while select assetTransGrp
+                    group by AssetId, BookId
+                    where assetTransGrp.Voucher    == _custVendTrans.Voucher      &&
+                          assetTransGrp.TransDate  == _custVendTrans.TransDate    &&
+                          (assetTransGrp.TransType == AssetTransType::Acquisition ||
+                           assetTransGrp.TransType == AssetTransType::AcquisitionAdj)
+                notexists join assetBookTableDerived
+                    where assetBookTableDerived.BookIdDerived == assetTransGrp.BookId
+
+            {
+                //  For each matching assetTrans row found.
+                while select assetTrans
+                        where assetTrans.AssetId    == assetTransGrp.AssetId       &&
+                              assetTrans.BookId     == assetTransGrp.BookId        &&
+                              assetTrans.Voucher    == _custVendTrans.Voucher       &&
+                              assetTrans.TransDate  == _custVendTrans.TransDate    &&
+                              (assetTrans.TransType == AssetTransType::Acquisition ||
+                               assetTrans.TransType == AssetTransType::AcquisitionAdj)
+
+                {
+                    //  This is the first or only assetTrans found so initialize the calculation properties.
+                    if (isFirstAssetTrans)
+                    {
+                        TaxTrans taxTransLocal;
+                        TaxGroupHeading taxGroupHeading;
+
+                        // TaxInCostPrice will be excluded from asset transaction amount while calculating
+                        // cash discount when "Tax Reverse on Cash Discount" is turned off at Tax Group level.
+                        if (AssetPostCashDiscountChargeFlight::instance().isEnabled())
+                        {
+                            select sum(TaxInCostPrice), TaxGroup from taxTransLocal
+                                group by TaxGroup
+                                    where taxTransLocal.Voucher == _custVendTrans.Voucher
+                                        && taxTransLocal.TransDate == _custVendTrans.TransDate
+                                        && taxTransLocal.TaxDirection != TaxDirection::UseTax
+                                        && taxTransLocal.TaxOrigin != TaxOrigin::TaxReversed
+                                        && taxTransLocal.TaxOrigin != TaxOrigin::Transfer;
+
+                            taxGroupHeading = TaxGroupHeading::find(taxTransLocal.TaxGroup);
+                        }
+                        else
+                        {
+                            select sum(TaxInCostPrice), TaxGroup from taxTransLocal
+                                group by TaxGroup
+                                    where taxTransLocal.Voucher == _custVendTrans.Voucher
+                                        && taxTransLocal.TransDate == _custVendTrans.TransDate
+                                        && taxTransLocal.TaxDirection != TaxDirection::UseTax
+                                        && taxTransLocal.TaxOrigin != TaxOrigin::TaxReversed
+                                        && taxTransLocal.TaxOrigin != TaxOrigin::Transfer
+                                join TaxReverseOnCashDisc from taxGroupHeading
+                                    where taxGroupHeading.TaxGroup == taxTransLocal.TaxGroup;
+                        }
+
+                        // Whenever "Tax Reverse on Cash Discount" is turned off at Tax Group level
+                        // and "Apply U.S. taxation rules" is turned off at Ledger parameters level
+                        // discount amount should be calculated excluding the tax charge amount from asset transactions amount.
+                        boolean shouldReverseTaxOnCashDisc = taxGroupHeading.TaxReverseOnCashDisc;
+                        if (taxIntegrationTaxJurisdictionParameters && !taxIntegrationTaxJurisdictionParameters.empty())
+                        {
+                            // If the tax calculation service enabled and the parameter "Tax Reverse on Cash Discount" is configured in tax feature setup,
+                            // then it should be retrieved from tax calculation service.
+                            shouldReverseTaxOnCashDisc = taxIntegrationTaxJurisdictionParameters.shouldReverseTaxOnCashDisc();
+                        }
+
+                        if (shouldReverseTaxOnCashDisc && !applyUStaxationRules)
+                        {
+                            AssetPostCashDiscount::postAssetDiscountChargeTransaction(_ledgerVoucher, assetTrans, _custVendTrans, _discTrans, taxTransLocal.TaxGroup);
+                        }
+
+                        if (!shouldReverseTaxOnCashDisc && !applyUStaxationRules)
+                        {
+                            netAmountMST = abs(_custVendTrans.AmountMST) + abs(taxTransLocal.TaxInCostPrice);
+                        }
+                        else
+                        {
+                            netAmountMST = abs(_custVendTrans.AmountMST);
+                        }
+
+                        if (!applyUStaxationRules)
+                        {
+                            // Tax is NOT included in the acquisition price so we need to calc it so we can back it out.
+                            // Get the tax total for the invoice.
+                            if (_ledgerJournalId)
+                            {
+                                taxTransLocal.selectLocked(false);
+                                select sum(TaxAmount) from taxTransLocal
+                                    where taxTransLocal.Voucher          == _custVendTrans.Voucher    &&
+                                          taxTransLocal.TransDate        == _custVendTrans.TransDate  &&
+                                          taxTransLocal.JournalNum       == _ledgerJournalId           &&
+                                          taxTransLocal.TaxDirection     != TaxDirection::UseTax      &&
+                                          taxTransLocal.TaxOrigin        != TaxOrigin::TaxReversed    &&
+                                          taxTransLocal.TaxOrigin        != TaxOrigin::Transfer;
+                                postedTaxMST = taxTransLocal.TaxAmount;
+                            }
+                            else
+                            {
+                                postedTaxMST = Tax::taxTotalMSTVoucherDate(_custVendTrans.Voucher, _custVendTrans.TransDate);
+                            }
+
+                            // As Tax needs to be backed out we also need to back out the tax from the Disc Taken.
+                            netDiscMST = _discTrans.AmountMST -
+                                         abs(CurrencyExchangeHelper::mstAmount(_taxOnCashDiscAmount, _custVendTrans.CurrencyCode, _custVendTrans.TransDate, UnknownNoYes::No, _discTrans.ExchRate));
+                        }
+                        else
+                            // When US Sales Tax Rules are applied the Invoice Amount including the taxes is used to set the acquisition price
+                        {
+                            postedTaxMST = 0;
+
+                            // As Tax does not needs to be backed out we just need the Disc Taken Amount.
+                            netDiscMST = _discTrans.AmountMST;
+                        }
+
+                        netAmountMST -= abs(postedTaxMST);
+
+                        //  Prevent the calculation properties from be re-initialized for this loop.
+                        isFirstAssetTrans = false;
+                    }
+
+                    AssetTrans assetTransPrevCashDisc;
+
+                    select sum(CashDiscBaseAmountMST) from assetTransPrevCashDisc
+                        where assetTransPrevCashDisc.CashDiscBaseTransId == assetTrans.RecId;
+
+                    AmountMST assetNetAmount;
+
+                    // If unused transaction amount more than net amount
+                    if (abs(assetTrans.AmountMST - assetTransPrevCashDisc.CashDiscBaseAmountMST) > netAmountMST)
+                    {
+                        assetNetAmount = netAmountMST;
+                    }
+                    else
+                    {
+                        assetNetAmount = abs(assetTrans.AmountMST - assetTransPrevCashDisc.CashDiscBaseAmountMST);
+                    }
+
+                    AmountMST assetRelatedCashDisc = 0;
+
+                    if (netAmountMST != 0)
+                    {
+                        //  Calculate each assetTrans' portion of the entire custVendTrans' possible cash discount
+                        assetRelatedCashDisc = CurrencyExchangeHelper::amount(assetNetAmount / netAmountMST * netDiscMST);
+                    }
+
+                    // If there is a cash discount amount for the assetTrans.
+                    if (assetRelatedCashDisc)
+                    {
+                        AssetPost assetPost = AssetPost::newCashDiscTrans(assetTrans, _discTrans, _ledgerVoucher, CurrencyExchangeHelper::amount(assetRelatedCashDisc), CurrencyExchangeHelper::amount(assetNetAmount));
+                        //  If the assetPost passes it's validation.
+                        if (assetPost.check())
+                        {
+                            //
+                            //  Post the asset's cash discount to the assetTrans
+                            //  for the value models and for any derived value models.
+                            //
+                            assetPost.post(true, true);
+                            // The settlement engine determines the vendor discount amounts for each
+                            // record associated with the invoice journal including lines that have fixed
+                            // asset assigned to them. The amounts are being posted to the vendor cash discount
+                            // dimensions. If the discount amounts need to be deduct from acquisitions,
+                            // the amounts that are already applied to the Fixed asset acquisition dimensions,
+                            // need to be deduct from the cash discount distributions as the same amount is already
+                            // posted against the fixed asset dimension.
+
+                            LedgerDimensionAccount          ledgerDimensionMerged;
+
+                            LedgerVoucherObject ledgerVoucherObject = _ledgerVoucher.findLedgerVoucherObject();
+
+                            exchangeRateHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::current(), ledgerVoucherObject.parmAccountingDate());
+                            if (_custVendTrans.CashDiscCode)
+                            {
+                                exchangeRateHelper.parmExchangeRate1(_custVendTrans.ExchRate);
+                                exchangeRateHelper.parmReportingExchangeRate1(_custVendTrans.ReportingCurrencyExchRate);
+                            }
+                            else
+                            {
+                                exchangeRateHelper.parmExchangeRate1(_discTrans.ExchRate);
+                                exchangeRateHelper.parmReportingExchangeRate1(_discTrans.ReportingCurrencyCrossRate);
+                            }
+                            exchangeRateHelper.parmExchangeRate2(_custVendTrans.ExchRateSecond);
+                            exchangeRateHelper.parmReportingExchangeRate2(_custVendTrans.ReportingCurrencyExchRateSecondary);
+
+                            // The discount dimension value should be assinged during the main discount process. If not,
+                            // find the dimension value assinged to the current voucher.
+                            if (_discountTranscationDimension)
+                            {
+                                ledgerDimensionMerged = _discountTranscationDimension;
+                            }
+                            else
+                            {
+                                ledgerDimensionMerged = LedgerDimensionFacade::serviceCreateLedgerDimension(
+                                    _discountDefaultLedgerDimension,
+                                    _custVendTrans.DefaultDimension);
+                            }
+
+                            // The discount amount is always calculated in accounting currency, however, the original acquisition transaction can be 
+                            // in any currency. Once the discount is calculated, the amount is converted into transaction currency if needed.
+                            assetRelatedCashDisc = CurrencyExchangeHelper::curAmount(assetRelatedCashDisc, _custVendTrans.CurrencyCode,
+                                _custVendTrans.TransDate, UnknownNoYes::No, _discTrans.ExchRate);
+
+                            LedgerVoucherTransObject ledgerVoucherTransObject = LedgerVoucherTransObject::newTransactionAmountDefault(
+                                ledgerVoucherObject,
+                                LedgerPostingType::VendCashDisc,
+                                ledgerDimensionMerged,
+                                _custVendTrans.CurrencyCode,
+                                assetRelatedCashDisc,
+                                exchangeRateHelper);
+
+                            _ledgerVoucher.addTrans(ledgerVoucherTransObject);
+                        }
+                    }
+
+                    //
+                    //  By reducing the netAmountMST by the assetTrans.amountMST and
+                    //  reducing the netDiscMST by the calculated discount amount
+                    //  each subsequent assetTrans will use only it's percentage of the available
+                    //  net discount amount. Eventually the last transaction should get 100 percent
+                    //  of what is left.
+                    //
+                    //  This methodology reduces the effect of rounding errors by constantly correcting for
+                    //  the percentage of what is actually left of the whole instead of the original amount.
+                    //  EX:  100.00  /  3.00            =    33.3333
+                    //        33.33  *  3.00            =    99.99 (rounding error)
+                    //
+                    //  EX:  100.00           / 3.00    =    33.3333 (33.33)
+                    //      (100.00  - 33.33) / 2.00    =    33.335  (33.34)
+                    //      ( 66.67  - 33.34) / 1.00    =    33.33   (33.33)
+                    //        33.33 + 33.34 + 33.33     =   100.00 (no rounding error)
+                    //  Note: assetRelatedCashDisc and totalAssetRelatedCashDisc are MST amounts
+                    //
+                    netAmountMST                -= assetNetAmount;
+                    netDiscMST                  -= assetRelatedCashDisc;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postAssetDiscountChargeTransaction</Name>
+				<Source><![CDATA[
+    private static void postAssetDiscountChargeTransaction(
+        LedgerVoucher _ledgerVoucher,
+        AssetTrans _assetTrans,
+        CustVendTrans _custVendTrans,
+        CustVendTrans _discTrans,
+        TaxGroup _taxGroup)
+    {
+        Percent percent;
+        if (_custVendTrans.AmountMST)
+        {
+            percent = abs(_discTrans.AmountMST / _custVendTrans.AmountMST);
+        }
+
+        AmountMst discountChargeAmountMst;
+        TaxTrans taxTrans;
+        while select taxTrans
+            where taxTrans.Voucher == _custVendTrans.Voucher
+                && taxTrans.TransDate == _custVendTrans.TransDate
+                && taxTrans.TaxGroup == _taxGroup
+                && taxTrans.TaxDirection != TaxDirection::UseTax
+                && taxTrans.TaxOrigin != TaxOrigin::TaxReversed
+                && taxTrans.TaxOrigin != TaxOrigin::Transfer
+        {
+            discountChargeAmountMst += CurrencyExchangeHelper::amount(taxTrans.TaxInCostPriceMST * percent);
+        }
+
+        if (discountChargeAmountMst != 0)
+        {
+            AssetPost assetPost = AssetPost::newCashDiscTrans(
+                _assetTrans,
+                _discTrans,
+                _ledgerVoucher,
+                discountChargeAmountMst,
+                0);
+
+            if (assetPost.check())
+            {
+                assetPost.post(false, false);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

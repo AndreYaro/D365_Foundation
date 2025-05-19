@@ -1,0 +1,596 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailCDXChannelService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Application.Instrumentation;
+using System.Net;
+using System.Data.SqlClient;
+
+/// <summary>
+/// The <c>RetailCDXChannelService</c> class exposes APIs to perform CDX-related tasks.
+/// </summary>
+class RetailCDXChannelService
+{
+    private const str DefaultChannelDatabaseName = 'Default';
+    private const static str PingQuery = @'SELECT 1';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>RunCDXScheduleFullSync</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs a full sync CDX download schedule batch job on a given data store.
+    /// </summary>
+    /// <param name = "scheduleName">The schedule name.</param>
+    /// <param name = "dataStoreName">The data store name.</param>
+    /// <returns> RefRecId of the batch job created. </returns>
+    public RefRecId RunCDXScheduleFullSync(str scheduleName, str dataStoreName)
+    {
+        // check for valid schedule
+        RetailConnSchedule schedule = RetailConnSchedule::find(scheduleName);
+        System.Exception ex;
+        
+        try
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRunCDXScheduleFullSyncStart();
+
+            if (!schedule)
+            {
+                // schedule does not exist
+                throw Global::error(strfmt("@Retail:RunCDXScheduleInvalidScheduleError", scheduleName));
+            }
+
+            // check for valid data store
+            RetailConnDatabaseProfile dataStore = RetailConnDatabaseProfile::find(dataStoreName);
+
+            if (!dataStore)
+            {
+                // data store does not exist
+                throw Global::error(strfmt("@Retail:RunCDXScheduleInvalidDatastoreError", dataStoreName));
+            }
+
+            container targetDataStore;
+
+            // validate if lastSyncRowVersion exist for the data group
+            // In case there's no data sync row records, we want to schedule for the data group
+            // instead of an individual data store to avoid incremental download jobs to generate full sync packages again
+            // The scenario above happens for environments deploying a RCSU after upgrading the HQ version.
+            if (this.lastSyncRowVersionExists(schedule.RecId, dataStore.DataGroup))
+            {
+                targetDataStore = [dataStore.RecId];
+            }
+
+            RetailCDXScheduleRunner scheduler = new RetailCDXScheduleRunner();
+
+            // setFullSync allows a null container for targetDataStore (hence not initialized), 
+            // which will schedule the job for the whole data group instead of individual data stores.
+            scheduler.setFullSync(schedule.RecId, dataStore.DataGroup, targetDataStore);
+
+            RefRecId batchJobId = RetailCDXScheduleRunner::queueInBatch(scheduler, conNull()); // no recurrence.
+
+            return batchJobId;
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRunCDXScheduleFullSyncFailure(ex.ToString());
+
+            throw Global::error(ex.Message);
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRunCDXScheduleFullSyncStop();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetCDXScheduleFullSyncStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the status associated to the full sync batch job.
+    /// </summary>
+    /// <param name = "batchJobId">The batch job.</param>
+    /// <returns>An instance of CDXJobStatusMap.</returns>
+    public RetailCDXJobStatusMap GetCDXScheduleFullSyncStatus(RefRecId batchJobId)
+    {
+        RetailCDXJobStatusMap jobsMap = new RetailCDXJobStatusMap();
+        BatchJob batchJob;
+        Batch batch;
+        RetailCDXScheduleRunner scheduler;
+        RetailCDXDownloadSession downloadSession;
+        RetailCDXDownloadSessionDataStore downloadSessionDataStore;
+        System.Exception ex;
+
+        ApplicationEventSource::EventWriteRetailCDXChannelServiceGetCDXScheduleFullSyncStatusStart(batchJobId, '', 0);
+
+        //gets the batch associated with the job id that was used by the cdx scheduler
+        // this will contain the parameters of the work done
+        select firstonly * from batch where
+        batch.BatchJobId == batchJobId
+        && batch.ClassNumber == classIdGet(scheduler);
+
+        // gets the batch job instance - this will contain the start/end times of the work done
+        select firstonly * from batchJob
+        where batchJob.RecId == batchJobId;
+        try
+        {
+            if (batch.RecId != 0 && batchJob.RecId != 0)
+            {
+                // retrieve the cdx parameters associated with the job
+                scheduler = batch.object();
+                if (scheduler.unpack(batch.Parameters))
+                {
+                    // there is no correlation between the batch job and CDX sessions - use time to discriminate
+                    EndDateTime batchEnd = batchJob.EndDateTime == utcDateTimeNull()
+                    ? DateTimeUtil::utcNow()
+                    : batchJob.EndDateTime;
+
+                    // for a full sync, status lies in RetailCDXDownloadSessionDataStore
+                    while select RecId, JobID, Schedule, DataGroup, CreatedDateTime from downloadSession
+                        join Status, Session from downloadSessionDataStore
+                    where downloadSession.RecId == downloadSessionDataStore.Session
+                    && downloadSession.Schedule == scheduler.paramScheduleRecID()
+                    && downloadSession.DataGroup ==  scheduler.paramDataGroupRecID()
+                    && downloadSession.CreatedDateTime >= batchJob.StartDateTime
+                    && downloadSession.CreatedDateTime <= batchEnd
+                    {
+                        jobsMap.paramJobsStatus().insert(downloadSession.JobID, downloadSessionDataStore.Status);
+                    }
+                }
+                else
+                {
+                    throw Global::error("@Retail:GetCDXScheduleStatusBatchUnpackingError");
+                }
+            }
+            else
+            {
+                // batch job Id does not exist
+                throw Global::error(strfmt("@Retail:GetCDXScheduleStatusInvalidBatchJobIdError", batchJobId));
+            }
+
+            return jobsMap;
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceGetCDXScheduleFullSyncStatusFailure(ex.ToString());
+            throw Global::error(ex.Message);
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceGetCDXScheduleFullSyncStatusStop(batchJobId, downloadSession.JobID, downloadSessionDataStore.Status);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RunCDXUploadSchedules</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs all upload schedules.
+    /// </summary>
+    /// <returns>A list of batch job ids.</returns>
+    [AifCollectionTypeAttribute('return', Types::Int64)]
+    public List<RefRecId> RunCDXUploadSchedules()
+    {
+        RetailConnSchedule  schedule;
+        List                batchJobIds = new List(Types::Int64);
+        int                 infologLine = infologLine();
+        System.Exception    ex;
+
+        try
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRunCDXUploadSchedulesStart();
+            
+            // Get the RecId of all upload schedules and schedules a batch job for each.
+            while select RecId from schedule
+                where schedule.ScheduleType == RetailCDXDownloadUpload::Upload
+            {
+                RetailCDXScheduleRunner scheduler = new RetailCDXScheduleRunner();
+
+                scheduler.paramScheduleRecID(schedule.RecId);
+
+                RefRecId batchJobId = RetailCDXScheduleRunner::queueInBatch(scheduler, conNull()); // no recurrence.
+
+                batchJobIds.addEnd(batchJobId);
+            }
+
+            return batchJobIds;
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRunCDXUploadSchedulesFailure(ex.ToString());
+            
+            str errorMessage = RetailCDXChannelService::getErrorMessageFromInfolog(infologLine);
+            throw Global::error(strFmt('Failed to create upload batch jobs. %1', errorMessage));
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRunCDXUploadSchedulesStop();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetCDXUploadSchedulesStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the status associated to the upload batch job.
+    /// </summary>
+    /// <param name = "batchJobIds">The list of batch job ids.</param>
+    /// <returns>List of <c>BatchStatus</c>.</returns>
+    /// <remarks>
+    /// In case the batch job doesn't exist, -1 will be retrieved, which is an invalid batch job status.
+    /// </remarks>
+    [AifCollectionTypeAttribute('batchJobIds', Types::Int64)]
+    public RetailCDXBatchJobStatusMap GetCDXUploadSchedulesStatus(List<RefRecId> batchJobIds)
+    {
+        BatchJob                    batchJob;
+        RetailCDXBatchJobStatusMap  returnMap   = new RetailCDXBatchJobStatusMap();
+        ListIterator                iterator    = new ListIterator(batchJobIds);
+        int                         infologLine = infologLine();
+        System.Exception            ex;
+
+        try
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceGetCDXUploadSchedulesStatusStart();
+
+            while (iterator.more())
+            {
+                RefRecId batchJobId = iterator.value();
+
+                select RecId, Status from batchJob
+                    where batchJob.RecId == batchJobId;
+
+                if (batchJob.RecId == 0)
+                {
+                    // the batch job doesn't exist. So we are returning an invalid batch status.
+                    returnMap.parmBatchJobsStatus().insert(batchJobId, -1);
+                }
+                else
+                {
+                    returnMap.parmBatchJobsStatus().insert(batchJobId, batchJob.Status);
+                }
+
+                iterator.next();
+            }
+            return returnMap;
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceGetCDXUploadSchedulesStatusFailure(ex.ToString());
+
+            str errorMessage = RetailCDXChannelService::getErrorMessageFromInfolog(infologLine);
+            throw Global::error(strFmt('Failed to get status of upload batch jobs. %1', errorMessage));
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceGetCDXUploadSchedulesStatusStop();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RegisterScaleUnitEnvironment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers the retail scale unit.
+    /// </summary>
+    /// <param name = "scaleUnit">The retail scale unit contract.</param>
+    /// <returns>The response <c>RetailCDXServiceResponse</c> object of the registration operation.</returns>
+    public RetailCDXServiceResponse RegisterScaleUnitEnvironment(RetailCDXServiceScaleUnitContract scaleUnit)
+    {
+        RetailCDXServiceResponse    response;
+        int                         infologLine = infologLine();
+        System.Exception            ex;
+
+        try
+        {
+            if (!isConfigurationkeyEnabled(configurationKeyNum(Retail)))
+            {
+                str errorMessage = strFmt("@Retail:RegisterScaleUnitEnvironmentRetailConfigKeyDisabled", scaleUnit.parmScaleUnitId());
+                ApplicationEventSource::EventWriteRetailCDXChannelServiceRegisterScaleUnitEnvironmentFailure(errorMessage);
+                return new RetailCDXServiceResponse(false, errorMessage);
+            }
+
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRegisterScaleUnitEnvironmentStart(scaleUnit.parmScaleUnitId());
+            
+            boolean isMigrationScenario = RetailScaleUnitRegistrationUtility::isMigrationScenario();
+
+            RetailScaleUnitRegistrationUtility::registerRetailScaleUnit(scaleUnit);
+            
+            response = new RetailCDXServiceResponse(true);
+            response.parmIsMigrationScenario(isMigrationScenario);
+
+            return response;
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRegisterScaleUnitEnvironmentFailure(ex.ToString());
+
+            str errorMessage = RetailCDXChannelService::getErrorMessageFromInfolog(infologLine);
+            return new RetailCDXServiceResponse(false, errorMessage);
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRegisterScaleUnitEnvironmentStop(scaleUnit.parmScaleUnitId());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UnregisterScaleUnitEnvironment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unregisters the retail scale unit.
+    /// </summary>
+    /// <param name = "scaleUnitId">The retail scale unit id.</param>
+    /// <returns>The response <c>RetailCDXServiceResponse</c> object of the unregistration operation.</returns>
+    public RetailCDXServiceResponse UnregisterScaleUnitEnvironment(str scaleUnitId)
+    {
+        int infologLine = infologLine();
+        System.Exception            ex;
+
+        try
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceUnregisterScaleUnitEnvironmentStart(scaleUnitId);
+            
+            RetailScaleUnitUnregistrationUtility::unregisterRetailScaleUnit(scaleUnitId);
+
+            return new RetailCDXServiceResponse(true);
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceUnregisterScaleUnitEnvironmentFailure(ex.ToString());
+
+            str errorMessage = RetailCDXChannelService::getErrorMessageFromInfolog(infologLine);
+            return new RetailCDXServiceResponse(false, errorMessage);
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceUnregisterScaleUnitEnvironmentStop(scaleUnitId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetScaleUnitDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the details of a retail scale unit.
+    /// </summary>
+    /// <param name = "scaleUnitId">The retail scale unit id.</param>
+    /// <returns>The retail scale unit object.</returns>
+    public RetailCDXServiceScaleUnitContract GetScaleUnitDetails(str scaleUnitId)
+    {
+        return RetailScaleUnitUtility::GetRetailScaleUnitDetails(scaleUnitId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>AddRetailServerIdentity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers an application and its identity provider to enable authentication to a resource server.
+    /// </summary>
+    /// <param name = "identityProviderContract">The RetailIdentityProviderContract contract.</param>
+    public void  AddRetailServerIdentity(RetailIdentityProviderContract identityProviderContract)
+    {
+        int infologLine = infologLine();
+        System.Exception            ex;
+
+        try
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceAddRetailServerIdentityStart();
+
+            if (identityProviderContract == null)
+            {
+                str errorMessage = 'The identity provider contract is null.';
+                throw Global::error(errorMessage);
+            }
+                          
+            RetailIdentityRegistrationUtility::AddRetailServerIdentity(identityProviderContract);
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceAddRetailServerIdentityFailure(ex.ToString());
+
+            str errorMessage = RetailCDXChannelService::getErrorMessageFromInfolog(infologLine);
+            throw Global::error(errorMessage);
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceAddRetailServerIdentityStop();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetAllScaleUnitsDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the details of all retail scale units.
+    /// </summary>
+    /// <returns>Returns the list of <c>RetailCDXServiceScaleUnitContract</c>.</returns>
+    [AifCollectionTypeAttribute('return', Types::Class, classStr(RetailCDXServiceScaleUnitContract))]
+    public List GetAllScaleUnitsDetails()
+    {
+        List           scaleUnitChannelInformationList = new List(Types::Class);
+        List           scaleUnitIds                    = new List(Types::String);
+        ListEnumerator iterator;
+
+        scaleUnitIds = RetailScaleUnitUtility::getRetailCloudScaleUnitIds();
+        iterator = scaleUnitIds.getEnumerator();
+
+        while (iterator.moveNext())
+        {
+            str scaleUnit = iterator.current();
+
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceGetAllScaleUnitsDetailsStart(scaleUnit);
+            RetailCDXServiceScaleUnitContract scaleUnitChannelInformation = RetailScaleUnitUtility::GetRetailScaleUnitDetails(scaleUnit);
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceGetAllScaleUnitsDetailsStop(scaleUnit);
+
+            scaleUnitChannelInformationList.addEnd(scaleUnitChannelInformation);
+        }
+
+        return scaleUnitChannelInformationList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RegisterAadApplication</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers a Microsoft Entra ID application to enable authentication to a resource server.
+    /// </summary>
+    /// <param name = "aadApplicationContract">The RetailAadApplicationContract contract.</param>
+    public void  RegisterAadApplication(RetailAadApplicationContract aadApplicationContract)
+    {
+        int infologLine = infologLine();
+        System.Exception            ex;
+
+        try
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRegisterAadApplicationStart();
+
+            if (aadApplicationContract == null)
+            {
+                str errorMessage = 'The AAD application contract is null.';
+                throw Global::error(errorMessage);
+            }
+
+            RetailIdentityRegistrationUtility::RegisterAadApplication(aadApplicationContract);
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRegisterAadApplicationFailure(ex.ToString());
+
+            str errorMessage = RetailCDXChannelService::getErrorMessageFromInfolog(infologLine);
+            throw Global::error(errorMessage);
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceRegisterAadApplicationStop();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UnRegisterAadApplication</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// UnRegisters an Microsoft Entra ID application.
+    /// </summary>
+    /// <param name = "aadApplicationContract">The RetailAadApplicationContract contract.</param>
+    public void  UnRegisterAadApplication(RetailAadApplicationContract aadApplicationContract)
+    {
+        int infologLine = infologLine();
+        System.Exception            ex;
+
+        try
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceUnRegisterAadApplicationStart();
+
+            if (aadApplicationContract == null)
+            {
+                str errorMessage = 'The Microsoft Entra ID application contract is null.';
+                throw Global::error(errorMessage);
+            }
+
+            RetailIdentityRegistrationUtility::UnRegisterAadApplication(aadApplicationContract);
+        }
+        catch (ex)
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceUnRegisterAadApplicationFailure(ex.ToString());
+
+            str errorMessage = RetailCDXChannelService::getErrorMessageFromInfolog(infologLine);
+            throw Global::error(errorMessage);
+        }
+        finally
+        {
+            ApplicationEventSource::EventWriteRetailCDXChannelServiceUnRegisterAadApplicationStop();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lastSyncRowVersionExists</Name>
+				<Source><![CDATA[
+    private boolean lastSyncRowVersionExists(RefRecId _scheduleRecId, RetailCDXDataGroupRefRecId _dataGroupRecId)
+    {
+        RetailCDXDataGroup              dataGroup;
+        RetailCDXScheduleDataGroup      scheduleDataGroup;
+        RetailConnScheduleJobMapping    scheduleJob;
+        RetailConnSchedulerJobTable     job;
+        RetailCDXRowVersion             lastSyncVer;
+        boolean                         returnValue = true;
+
+        while select JobId from job
+            join Enabled from scheduleJob
+                where   scheduleJob.SchedulerJobId  == job.JobId
+                    &&  scheduleJob.ScheduleRecId   == _scheduleRecId
+            exists join scheduleDataGroup
+                where   scheduleDataGroup.Schedule  == _scheduleRecId
+                    &&  scheduleDataGroup.DataGroup == _dataGroupRecId
+            exists join dataGroup
+                where   dataGroup.ChannelSchema     == job.RetailConnChannelSchema
+                    &&  dataGroup.RecId             == _dataGroupRecId
+        {
+            if (scheduleJob.Enabled == NoYes::Yes)
+            {
+                lastSyncVer = RetailCDXDataSyncRowVersion::getRowVersion(_dataGroupRecId, job.JobId);
+
+                if (lastSyncVer == -1)
+                {
+                    returnValue = false;
+                    break;
+                }
+            }
+        }
+
+        return returnValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getErrorMessageFromInfolog</Name>
+				<Source><![CDATA[
+    private static str getErrorMessageFromInfolog(int _initialInfologLine)
+    {
+        str errorMessage;
+        int currentInfologLine = infologLine();
+
+        for (int i = _initialInfologLine + 1; i <= currentInfologLine; i++)
+        {
+            if (i == _initialInfologLine + 1)
+            {
+                errorMessage = infolog.text(i);
+            }
+            else
+            {
+                errorMessage += '\n' + infolog.text(i);
+            }
+        }
+
+        return errorMessage;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

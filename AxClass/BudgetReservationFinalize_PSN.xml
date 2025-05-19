@@ -1,0 +1,1159 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BudgetReservationFinalize_PSN</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>BudgetReservationFinalize_PSN</c> class finalizes the budget reservation document and lines.
+/// </summary>
+/// <remarks>
+/// This class also contains logic to reduce the carry-forward budget during the finalize process.
+/// </remarks>
+public class BudgetReservationFinalize_PSN
+{
+    BudgetReservationHeader_PSN     budgetReservationHeader;
+    BudgetReservationLine_PSN       budgetReservationLine;
+    BudgetTransactionMultiPost      budgetTransactionMultiPost;
+    TransDate                       finalizeDate;
+    BudgetTransactionCodeRecId      carryForwardBudgetTransactionCodeRecId;
+
+    Map                             budgetModelsMap;
+    Map                             ledgerDimBudgetModelsMap;
+    Map                             countBudgetTransLinesMap;
+    Map                             ledgerDimensionsMap;
+    RecordInsertList                budgetTransLineInsertList;
+    List                            sourceDocumentLinesList;
+    Set                             fundForReduceCarryForwardSet;
+
+    boolean                         foundAccountWithDisabledBudgetControl;
+    boolean                         processFinalizeForDocument;
+    boolean                         processFinalizeForLine;
+    boolean                         processCarryForwardReduction;
+    boolean                         processCarryForwardReductionWithType;
+
+    #define.RetryInterval(500)
+
+    #OCCRetryCount
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkAndSaveReduceCarryFwdDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check and save funds with reduce carry-forward enabled.
+    /// </summary>
+    /// <param name="_sourcedocumentline">
+    /// Source document line record ID stored on the budget reservation line.
+    /// </param>
+    /// <param name="_accountingDate">
+    /// Accounting date stored on budget reservation header record.
+    /// </param>
+    /// <returns>
+    /// true if the ledger dimension with fund has reduce carry-forward enabled; otherwise, false.
+    /// </returns>
+    private boolean checkAndSaveReduceCarryFwdDim(
+        RecId _sourcedocumentline,
+        TransDate _accountingDate)
+    {
+        AccountingDistribution              accountingDistribution;
+        SourceDocumentLine                  sourceDocumentLine;
+        TransDate                           fiscalYearStartDate, fiscalYearEndDate;
+        RecId                               ledgerDimension;
+        boolean                             doReduceCarryForwardBudget;
+    
+        [fiscalYearStartDate, fiscalYearEndDate] = FiscalCalendars::findFiscalYearStartEndDatesByDate(
+            Ledger::fiscalCalendar(CompanyInfo::current(curext())),
+            _accountingDate);
+    
+            while select LedgerDimension, sum(TransactionCurrencyAmount) from accountingDistribution
+                group by accountingDistribution.LedgerDimension
+                where accountingDistribution.TransactionCurrencyAmount != 0.00
+                    && accountingDistribution.AccountingDate >= fiscalYearStartDate
+                    && accountingDistribution.AccountingDate <= fiscalYearEndDate
+                exists join sourceDocumentLine
+                    where sourceDocumentLine.RecId == accountingDistribution.SourceDocumentLine
+                        && (sourceDocumentLine.RecId == _sourcedocumentline
+                            || sourceDocumentLine.ParentSourceDocumentLine == _sourcedocumentline)
+            {
+                ledgerDimension = this.findBudgetLedgerDimension(accountingDistribution.LedgerDimension);
+    
+                // Save funds with reduce carry forward enabled.
+                if (this.isFundEnabledReduceCarryFwdAndUpdateSet(ledgerDimension))
+                {
+                    doReduceCarryForwardBudget = true;
+                }
+            }
+    
+        return doReduceCarryForwardBudget;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkReduceCarryFwdForFundExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the budget reservation header has lines with fund enabled for reduce carry-forward.
+    /// </summary>
+    /// <param name="_budgetReservationHeader">
+    /// Budget reservation header record buffer.
+    /// </param>
+    /// <param name="_budgetReservationLine">
+    /// Budget reservation line record buffer.
+    /// </param>
+    /// <returns>
+    /// true if at least one of the ledger dimensions has a fund with reduce carry-forward enabled; otherwise, false.
+    /// </returns>
+    private boolean checkReduceCarryFwdForFundExists(
+        BudgetReservationHeader_PSN _budgetReservationHeader,
+        BudgetReservationLine_PSN _budgetReservationLine = null)
+    {
+        boolean isReduceBudgetExistsForFund = false;
+    
+        if (_budgetReservationLine == null)
+        {
+            while select sourcedocumentline from budgetReservationLine
+                where budgetReservationLine.BudgetReservationHeader_PSN == _budgetReservationHeader.RecId
+            {
+                // Method "checkAndSaveReduceCarryFwdDim" it not just returning the boolean but also add the record to the "Set", this Set use to create BREs.
+                 isReduceBudgetExistsForFund = this.checkAndSaveReduceCarryFwdDim(budgetReservationLine.sourcedocumentline, _budgetReservationHeader.AccountingDate)
+                                                || isReduceBudgetExistsForFund;
+            }
+        }
+        else
+        {
+            isReduceBudgetExistsForFund = this.checkAndSaveReduceCarryFwdDim(budgetReservationLine.sourcedocumentline, _budgetReservationHeader.AccountingDate);
+        }
+    
+        return isReduceBudgetExistsForFund;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBudgetTransactionHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the <c>BudgetTransactionHeader</c> table record for a specified budget model.
+    /// </summary>
+    /// <param name="_budgetModelId">
+    /// The budget model Id of the new budget transaction header record.
+    /// </param>
+    /// <param name="_transDate">
+    /// The transaction date of the new budget transaction header record.
+    /// </param>
+    /// <returns>
+    /// A newly created <c>BudgetTransactionHeader</c> table record Id.
+    /// </returns>
+    /// <exception cref="M:Exception::Error">
+    /// The creation process encountered an error and was not completed.
+    /// </exception>
+    private RefRecId createBudgetTransactionHeader(
+        BudgetModelId   _budgetModelId,
+        TransDate       _transDate)
+    {
+        BudgetTransactionHeader budgetTransactionHeaderCreate;
+        NumberSeq               numberSeq;
+    
+        numberSeq = NumberSeq::newGetNum(BudgetParameters::numRefBudgetTransactionId());
+    
+        budgetTransactionHeaderCreate.clear();
+        budgetTransactionHeaderCreate.initValue();
+        budgetTransactionHeaderCreate.editBudgetModel(true, _budgetModelId);
+        budgetTransactionHeaderCreate.TransactionNumber = numberSeq.num();
+        budgetTransactionHeaderCreate.setBudgetTransactionCode(carryForwardBudgetTransactionCodeRecId);
+    
+        if (_transDate == dateNull())
+        {
+            budgetTransactionHeaderCreate.Date = PublicSectorUtils::getSystemDateWithUserTimeZoneOffset();
+        }
+        else
+        {
+            budgetTransactionHeaderCreate.Date = _transDate;
+        }
+    
+        budgetTransactionHeaderCreate.TransactionStatus     = BudgetTransactionStatus::Draft;
+        budgetTransactionHeaderCreate.TransferSourceNumber  = budgetReservationHeader.DocumentNumber;
+    
+        if (budgetTransactionHeaderCreate.validateWrite())
+        {
+            ttsbegin;
+    
+            budgetTransactionHeaderCreate.write();
+            budgetTransactionMultiPost.addBudgetTransactionHeaderToPost(budgetTransactionHeaderCreate.TransactionNumber);
+    
+            ttscommit;
+    
+            if (!budgetModelsMap.exists(_budgetModelId) && budgetTransactionHeaderCreate.RecId != 0)
+            {
+                budgetModelsMap.insert(_budgetModelId, budgetTransactionHeaderCreate.RecId);
+            }
+        }
+        else
+        {
+            throw error("@SYS131643");
+        }
+    
+        return budgetTransactionHeaderCreate.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBudgetTransactionLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a budget transaction line.
+    /// </summary>
+    /// <param name="_transDate">
+    /// The transaction date of the new budget transaction line.
+    /// </param>
+    /// <param name="_ledgerAccount">
+    /// The ledger account of the new budget transaction line.
+    /// </param>
+    /// <param name="_lineAmount">
+    /// The amount of the new budget transaction line.
+    /// </param>
+    /// <returns>
+    /// The <c>BudgetTransactionLine</c> table record.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// An error is thrown if the budget transaction line fails validation.
+    /// </exception>
+    private BudgetTransactionLine createBudgetTransactionLine(
+        TransDate               _transDate,
+        LedgerDimensionBase     _ledgerAccount,
+        AmountMST               _lineAmount)
+    {
+        BudgetTransactionLine           budgetTransactionLineCreate;
+        RefRecId                        budgetTransactionHeaderRecId;
+        BudgetReservationLineNumber_PSN countBudgetTransactionLinesCreated;
+        BudgetModel                     budgetModel;
+        CurrencyCode                    currency = Ledger::accountingCurrency();
+    
+        budgetModel = this.findBudgetModelByLedgerDimensionAndDate(_ledgerAccount, _transDate);
+    
+        if (budgetModel.RecId != 0)
+        {
+            budgetTransactionHeaderRecId = this.findBudgetTransactionHeader(budgetModel.ModelId);
+        }
+    
+        if (budgetTransactionHeaderRecId)
+        {
+            // Retrieve the exisiting budget transaction header line count.
+            if (countBudgetTransLinesMap.exists(budgetTransactionHeaderRecId))
+            {
+                countBudgetTransactionLinesCreated = countBudgetTransLinesMap.lookup(budgetTransactionHeaderRecId);
+            }
+        }
+        else
+        {
+            // If the budget transaction header is not found, create one and initialize the line count.
+            budgetTransactionHeaderRecId        = this.createBudgetTransactionHeader(budgetModel.ModelId, _transDate);
+            countBudgetTransactionLinesCreated  = 0;
+        }
+    
+        countBudgetTransactionLinesCreated += 1;
+        countBudgetTransLinesMap.insert(budgetTransactionHeaderRecId, countBudgetTransactionLinesCreated);
+    
+        // Initialize the budget transaction line.
+        budgetTransactionLineCreate.clear();
+        budgetTransactionLineCreate.LineNumber              = countBudgetTransactionLinesCreated;
+        budgetTransactionLineCreate.BudgetTransactionHeader = budgetTransactionHeaderRecId;
+        budgetTransactionLineCreate.Date                    = _transDate;
+        budgetTransactionLineCreate.LedgerDimension         = this.findBudgetLedgerDimension(_ledgerAccount);
+        budgetTransactionLineCreate.BudgetType              = BudgetType::Expense;
+        budgetTransactionLineCreate.TransactionCurrency     = currency;
+    
+        // Create a negative budget transaction to offset the carry-forward budget amount
+        budgetTransactionLineCreate.AccountingCurrencyAmount    = CurrencyExchangeHelper::amount(_lineAmount, currency) * -1;
+        budgetTransactionLineCreate.TransactionCurrencyAmount   = budgetTransactionLineCreate.AccountingCurrencyAmount;
+    
+        if (!(budgetTransactionLineCreate.validateWrite()
+            && BudgetTransactionManager::validateLedgerDimension(budgetTransactionLineCreate.LedgerDimension, budgetTransactionLineCreate.Date)))
+        {
+            throw error("@SYS131643");
+        }
+    
+        return budgetTransactionLineCreate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBudgetTransactionLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the <c>BudgetTransactionLine</c> records.
+    /// </summary>
+    /// <param name="_budgetDetails">
+    /// The <c>BudgetDetails</c> object contains the information for the new <c>BudgetTransactionLine</c> records to be created.
+    /// </param>
+    /// <param name="_sourceDocumentLine">
+    /// The <c>SourceDocumentLine</c> table reference containing data for the new <c>BudgetTransactionLine</c> records to be created.
+    /// </param>
+    private void createBudgetTransactionLines(BudgetSourceInquiryDetails _budgetDetails, SourceDocumentLine _sourceDocumentLine = null)
+    {
+        LedgerRecId                 currentLedgerRecId              = Ledger::current();
+        boolean                     isReductionNeededForThisLine    = false;
+        LedgerDimensionBudget       ledgerDimensionBudgetId;
+        LedgerFund                  ledgerFund;
+        LedgerDimensionBase         ledgerAccount;
+        BudgetReservationLine_PSN   reservationLine;
+    
+        _budgetDetails.resetCurrent();
+    
+        while (_budgetDetails.next())
+        {
+            isReductionNeededForThisLine = false;
+            // Verify the budget control status of the accounts.
+            ledgerAccount = _budgetDetails.currentSourceLedgerDimension();
+    
+            // Check if budget control is disabled for the ledger account with carry-forward budget.
+            if (!foundAccountWithDisabledBudgetControl
+                && _budgetDetails.currentAmountAvailable() > 0
+                && !BudgetControlLedgerDimensionHelper::isLedgerDimensionEnabledForBudgetControl(currentLedgerRecId, ledgerAccount))
+            {
+                foundAccountWithDisabledBudgetControl = true;
+            }
+    
+            ledgerDimensionBudgetId = this.findBudgetLedgerDimension(ledgerAccount);
+            ledgerFund              = LedgerFund::getFundFromLedgerAccount(ledgerDimensionBudgetId);
+            reservationLine         = BudgetReservationLine_PSN::findBySourceDocumentLine(_sourceDocumentLine.RecId);
+    
+            if (processCarryForwardReduction
+                && this.hasReservationLineBeenThroughYearEnd(reservationLine))
+            {
+                if (processCarryForwardReductionWithType || (ledgerFund.RecId != 0 && fundForReduceCarryForwardSet.in(ledgerFund.FundNumber)))
+                {   
+                    isReductionNeededForThisLine = true;
+                }
+            }
+    
+            if (isReductionNeededForThisLine)
+            {
+                if(_budgetDetails.currentAmountAvailable() != 0)
+                {
+                    budgetTransLineInsertList.add(this.createBudgetTransactionLine(
+                            finalizeDate,
+                            ledgerAccount,
+                            _budgetDetails.currentAmountAvailable()));
+                }
+            }   
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasReservationLineBeenThroughYearEnd</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the flag of year end process for the budget reservation line.
+    /// </summary>
+    /// <param name = "_reservationLine">The record of the <c>BudgetReservationLine_PSN</c> table.</param>
+    /// <returns>true if the budget reservation line needs the year end process; otherwise, false.</returns>
+    protected boolean hasReservationLineBeenThroughYearEnd(BudgetReservationLine_PSN _reservationLine)
+    {
+        return _reservationLine.hasLineBeenThroughYearEnd();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createOffsetBudgetTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates budget transactions to offset carried forward budget amounts associated with the budget reservation being finalized.
+    /// </summary>
+    /// <param name="_budgetDetails">
+    /// The <c>BudgetDetails</c> object contains the information for the new <c>BudgetTransactionLine</c> table records to be created.
+    /// </param>
+    /// <param name="_sourceDocumentLine">
+    /// The <c>SourceDocumentLine</c> table reference containing data for the new <c>BudgetTransactionLine</c> records to be created.
+    /// </param>
+    private void createOffsetBudgetTransactions(BudgetSourceInquiryDetails _budgetDetails, SourceDocumentLine _sourceDocumentLine = null)
+    {
+        if (_budgetDetails)
+        {
+            this.createBudgetTransactionLines(_budgetDetails, _sourceDocumentLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalize</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finalizes the budget reservation document header and associated lines.
+    /// </summary>
+    /// <remarks>
+    /// This method also reduces the carry-forward budget if there is any left on the document.
+    /// </remarks>
+    public void finalize()
+    {
+        if (this.validateFinalize())
+        {
+            try
+            {
+                ttsbegin;
+    
+                // Finalize the budget reservation document.
+                if (processFinalizeForDocument && budgetReservationHeader.canFinalizeDocument())
+                {
+                    this.updateHeaderForFinalize();
+    
+                    // Pre-processing for carry-forward reduction.
+                    // This is required to get the list of filtered source document lines, basically filtered out lines which are already finalized.
+                    if (processCarryForwardReduction)
+                    {
+                        if (this.getCarryForwardBudgetTransaction())
+                        {
+                            this.populateBudgetResSrcDocLinesForFinalize();
+                        }
+                        else
+                        {
+                            processCarryForwardReduction = false;
+                        }
+                    }
+    
+                    SourceDocumentProcessorFacade::submitSourceDocumentImplementation(budgetReservationHeader, false, SourceDocumentAccountingStatus::Finalized);
+    
+                    if (processCarryForwardReduction)
+                    {
+                        this.processCarryForwardReduction();
+                    }
+    
+                    // Finalize all associated purchase requisitions.
+                    budgetReservationHeader.finalizePurchaseRequisitionLines();
+                }
+                // Finalize the budget reservation line.
+                else if (processFinalizeForLine && budgetReservationLine.canFinalizeLine())
+                {
+                    this.updateHeaderForFinalize(false);
+    
+                    SourceDocumentProcessorFacade::submitSourceDocumentLineImplementation(budgetReservationLine, false, SourceDocumentLineAccountingStatus::Finalized);
+    
+                    if (processCarryForwardReduction)
+                    {
+                        if (this.getCarryForwardBudgetTransaction())
+                        {
+                            this.processCarryForwardReduction(true);
+                        }
+                    }
+    
+                    // Finalize the associated purchase requisition line.
+                    PurchReqLine::find(budgetReservationLine.PurchReqLine, true).finalizePurchaseRequisitionLine();
+                }
+    
+                ttscommit;
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    sleep(#RetryInterval);
+                    retry;
+                }
+            }
+            catch (Exception::Error)
+            {
+                ttsabort;
+            }
+    
+            this.reportWarnings();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findBudgetLedgerDimension</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the <c>LedgerDimensionBudget</c> record Id for a specified ledger account.
+    /// </summary>
+    /// <param name="_ledgerAccount">
+    /// The ledger account.
+    /// </param>
+    /// <returns>
+    /// A <c>LedgerDimensionBudget</c> record Id.
+    /// </returns>
+    private LedgerDimensionBudget findBudgetLedgerDimension(LedgerDimensionBase _ledgerAccount)
+    {
+        LedgerDimensionBudget  ledgerDimensionBudget;
+    
+        if (ledgerDimensionsMap.exists(_ledgerAccount))
+        {
+            ledgerDimensionBudget = ledgerDimensionsMap.lookup(_ledgerAccount);
+        }
+        else
+        {
+            ledgerDimensionBudget = BudgetTransactionManager::saveBudgetLedgerDimension(_ledgerAccount);
+    
+            ledgerDimensionsMap.insert(_ledgerAccount, ledgerDimensionBudget);
+        }
+    
+        return ledgerDimensionBudget;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findBudgetModelByLedgerDimensionAndDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the <c>BudgetModel</c> table record for a specified ledger dimension and transaction date.
+    /// </summary>
+    /// <param name="_ledgerDimension">
+    /// The ledger dimension.
+    /// </param>
+    /// <param name="_date">
+    /// The transaction date.
+    /// </param>
+    /// <returns>
+    /// A <c>BudgetModel</c> record buffer.
+    /// </returns>
+    private BudgetModel findBudgetModelByLedgerDimensionAndDate(
+        LedgerDimensionBase _ledgerDimension,
+        date _date)
+    {
+        BudgetModel     localBudgetModel;
+        str             key;
+    
+        key = strFmt("%1#%2#%3", Ledger::current(), _ledgerDimension, _date);
+    
+        if (ledgerDimBudgetModelsMap.exists(key))
+        {
+            localBudgetModel = ledgerDimBudgetModelsMap.lookup(key);
+        }
+        else
+        {
+            localBudgetModel = BudgetControlLedgerDimensionHelper::findBudgetModelByLedgerDimensionAndDate(
+                Ledger::current(),
+                _ledgerDimension,
+                _date);
+    
+            ledgerDimBudgetModelsMap.insert(key, localBudgetModel);
+        }
+    
+        return localBudgetModel;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findBudgetTransactionHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the <c>BudgetTransactionHeader</c> table record Id for a specified budget model.
+    /// </summary>
+    /// <param name="_modelId">
+    /// The budget model ID.
+    /// </param>
+    /// <returns>
+    /// A <c>BudgetTransactionHeader</c> record Id.
+    /// </returns>
+    private RefRecId findBudgetTransactionHeader(BudgetModelId _modelId)
+    {
+        RefRecId transactionHeaderRecId;
+    
+        if (budgetModelsMap.exists(_modelId))
+        {
+            transactionHeaderRecId = budgetModelsMap.lookup(_modelId);
+        }
+    
+        return transactionHeaderRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCarryForwardBudgetTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the carry forward <c>BudgetTransactionHeader</c> table record associated
+    /// with the current budget reservation's document number and initializes the related instance variables.
+    /// </summary>
+    /// <returns>
+    /// The <c>BudgetTransactionHeader</c> table record Id.
+    /// </returns>
+    private RefRecId getCarryForwardBudgetTransaction()
+    {
+        BudgetTransactionHeader     carryForwardBudgetTransHeader;
+        BudgetReservationHeader_PSN localBudgetReservationHeader;
+    
+        if (budgetReservationHeader.CarriedForwardBudgetTransactionHeader != 0)
+        {
+            select firstonly RecId, BudgetTransactionCode from carryForwardBudgetTransHeader
+                exists join localBudgetReservationHeader
+                where carryForwardBudgetTransHeader.PrimaryLedger == Ledger::current()
+                    && carryForwardBudgetTransHeader.RecId == localBudgetReservationHeader.CarriedForwardBudgetTransactionHeader
+                    && carryForwardBudgetTransHeader.BudgetTransactionType == BudgetTransactionType::CarryForwardBudget;
+        }
+    
+        if (carryForwardBudgetTransHeader.RecId)
+        {
+            carryForwardBudgetTransactionCodeRecId  = carryForwardBudgetTransHeader.BudgetTransactionCode;
+        }
+    
+        return carryForwardBudgetTransHeader.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeForDocument</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>BudgetReservationFinalize_PSN</c> class instance for finalizing a budget reservation document.
+    /// </summary>
+    /// <param name="_budgetReservationHeader">
+    /// A <c>BudgetReservationHeader_PSN</c> record to be finalized.
+    /// </param>
+    /// <param name="_finalizeDate">
+    /// The finalize date for the given budget reservation document.
+    /// </param>
+    private void initializeForDocument(
+        BudgetReservationHeader_PSN _budgetReservationHeader,
+        TransDate                   _finalizeDate)
+    {
+        budgetReservationHeader         = _budgetReservationHeader;
+        finalizeDate                    = _finalizeDate;
+        processFinalizeForDocument      = true;
+    
+        processCarryForwardReductionWithType    = BudgetReservationType_PSN::isCarryForwardReductionEnabled(budgetReservationHeader.BudgetReservationType_PSN);
+        processCarryForwardReduction            = this.checkReduceCarryFwdForFundExists(budgetReservationHeader)
+                                                    || processCarryForwardReductionWithType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeForLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>BudgetReservationFinalize_PSN</c> class instance for finalizing a budget reservation line.
+    /// </summary>
+    /// <param name="_budgetReservationHeader">
+    /// A <c>BudgetReservationHeader_PSN</c> record associated with the line to be finalized.
+    /// </param>
+    /// <param name="_budgetReservationLine">
+    /// A <c>BudgetReservationLine_PSN</c> record to be finalized.
+    /// </param>
+    /// <param name="_finalizeDate">
+    /// The finalize date of the given budget reservation document.
+    /// </param>
+    private void initializeForLine(
+        BudgetReservationHeader_PSN _budgetReservationHeader,
+        BudgetReservationLine_PSN   _budgetReservationLine,
+        TransDate                   _finalizeDate)
+    {
+        budgetReservationHeader         = _budgetReservationHeader;
+        budgetReservationLine           = _budgetReservationLine;
+        finalizeDate                    = _finalizeDate;
+        processFinalizeForLine          = true;
+    
+        processCarryForwardReductionWithType    = BudgetReservationType_PSN::isCarryForwardReductionEnabled(budgetReservationHeader.BudgetReservationType_PSN);
+    
+        // checkReduceCarryFwdForFundExists function should be called first inorder to save funds with reduce carry-forward enabled to the set.
+        processCarryForwardReduction            = this.checkReduceCarryFwdForFundExists(budgetReservationHeader, budgetReservationLine)
+                                                    || processCarryForwardReductionWithType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isFundEnabledReduceCarryFwdAndUpdateSet</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method checks whether the fund is configured to cancel budget or not and also saves the fund to the set.
+    /// </summary>
+    /// <param name="_ledgerDimension">
+    /// Diplay value of the ledger dimension.
+    /// </param>
+    /// <returns>
+    /// true if the fund is configured to reinstate budget; otherwise, false.
+    /// </returns>
+    public boolean isFundEnabledReduceCarryFwdAndUpdateSet(LedgerDimensionAccount _ledgerDimension)
+    {
+        LedgerFund                          localLedgerFund;
+        boolean                             isCarryForwardReductionEnabledForFund = false;
+    
+        localLedgerFund = LedgerFund::getFundFromLedgerAccount(_ledgerDimension);
+    
+        if ((localLedgerFund.RecId != 0) && localLedgerFund.DoReduceCarryForwardBudget_PSN)
+        {
+            isCarryForwardReductionEnabledForFund = true;
+    
+            if (!fundForReduceCarryForwardSet.in(localLedgerFund.FundNumber))
+            {
+                fundForReduceCarryForwardSet.add(localLedgerFund.FundNumber);
+            }
+        }
+    
+        return isCarryForwardReductionEnabledForFund;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        fundForReduceCarryForwardSet            = new Set(Types::String);
+        ledgerDimensionsMap                     = new Map(Types::Int64, Types::Int64);
+        processCarryForwardReductionWithType    = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateBudgetResSrcDocLinesForFinalize</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates the source document line set collection with the completed source document lines associated with the current budget reservation header.
+    /// </summary>
+    private void populateBudgetResSrcDocLinesForFinalize()
+    {
+        SourceDocumentLine  sourceDocumentLineLocal;
+    
+        sourceDocumentLinesList = new List(Types::Record);
+    
+        while select RecId from sourceDocumentLineLocal
+            where sourceDocumentLineLocal.SourceDocumentHeader == budgetReservationHeader.SourceDocumentHeader
+                && sourceDocumentLineLocal.AccountingStatus == SourceDocumentLineAccountingStatus::Completed
+        {
+             sourceDocumentLinesList.addEnd(sourceDocumentLineLocal);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCarryForwardReduction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reduces the carry-forward budget on the budget reservation document if there is any left in the current fiscal year.
+    /// </summary>
+    /// <param name="_processLineOnly">
+    /// Set to true to process carry-forward on a single line; otherwise, process the whole document.
+    /// </param>
+    private void processCarryForwardReduction(boolean _processLineOnly = false)
+    {
+        SourceDocumentLine          currentSourceDocumentLine;
+        BudgetSourceInquiryDetails  currentBudgetDetails;
+        ListEnumerator              sourceDocumentLineListEnum;
+    
+        budgetTransactionMultiPost  = BudgetTransactionMultiPost::construct();
+    
+        // Initialize class level cache.
+        budgetTransLineInsertList   = new RecordInsertList(tableNum(BudgetTransactionLine));
+        budgetModelsMap             = new Map(Types::String, Types::Int64);
+        countBudgetTransLinesMap    = new Map(Types::Int64, Types::Integer);
+        ledgerDimBudgetModelsMap    = new Map(Types::String, Types::Record);
+    
+        ttsbegin;
+    
+        // Create budget transactions.
+        if (_processLineOnly)
+        {
+            currentSourceDocumentLine   = SourceDocumentLine::find(budgetReservationLine.SourceDocumentLine);
+            currentBudgetDetails        = BudgetSourceSourceDocumentLine::getBudgetSourceInquiryDetails(currentSourceDocumentLine);
+    
+            this.createOffsetBudgetTransactions(currentBudgetDetails, currentSourceDocumentLine);
+        }
+        else
+        {
+            if (sourceDocumentLinesList)
+            {
+                sourceDocumentLineListEnum = sourceDocumentLinesList.getEnumerator();
+    
+                while (sourceDocumentLineListEnum.moveNext())
+                {
+                    currentSourceDocumentLine = sourceDocumentLineListEnum.current();
+                    currentBudgetDetails = BudgetSourceSourceDocumentLine::getBudgetSourceInquiryDetails(currentSourceDocumentLine);
+    
+                    this.createOffsetBudgetTransactions(currentBudgetDetails, currentSourceDocumentLine);
+                }
+            }
+        }
+    
+        budgetTransLineInsertList.insertDatabase();
+    
+        ttscommit;
+    
+        // Post budget transactions.
+        budgetTransactionMultiPost.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reduceCarryForwardTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reduces the carried forward budget transactions in the new year.
+    /// </summary>
+    public void reduceCarryForwardTransactions()
+    {
+        // Populates the source document line set if the process is for whole document.
+        if (processFinalizeForDocument)
+        {
+            this.populateBudgetResSrcDocLinesForFinalize();
+        }
+    
+        if (processCarryForwardReduction && this.getCarryForwardBudgetTransaction())
+        {
+            this.processCarryForwardReduction();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reportWarnings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Shows warning messages on the infolog.
+    /// </summary>
+    // <PubSect>
+    private void reportWarnings()
+    {
+        // Show warning about disabled budget control for an account with carry-forward budget.
+        if (foundAccountWithDisabledBudgetControl)
+        {
+            warning(strFmt("@Budgeting_BudgetReservationPS:BudegetReservationIncludesCarryForwardAccountError", budgetReservationHeader.DocumentNumber));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateHeaderForFinalize</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the budget reservation header finalize closing date and optionally the document state in preparation for finalizing the
+    /// budget reservation header or lines.
+    /// </summary>
+    /// <param name="_setDocumentStatusToFinalize">
+    /// Set to true to update document status to finalized; otherwise, no change to document status; optional.
+    /// </param>
+    private void updateHeaderForFinalize(boolean _setDocumentStatusToFinalize = true)
+    {
+        BudgetReservation_PSN budgetReservation = BudgetReservation_PSN::newFromBudgetReservationHeader_PSN(budgetReservationHeader);
+    
+        // Set finalize closing date on header.
+        budgetReservationHeader.FinalizeClosingDate = finalizeDate;
+    
+        if (_setDocumentStatusToFinalize)
+        {
+            budgetReservation.updateDocumentStatusFields(BudgetReservationDocumentAction_PSN::DocumentFinalize, false);
+        }
+    
+        budgetReservationHeader.update(false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFinalize</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates if the budget reservation document can be finalized.
+    /// </summary>
+    /// <returns>
+    /// true if the budget reservation document can be finalized; otherwise, false.
+    /// </returns>
+    private boolean validateFinalize()
+    {
+        boolean isValid = true;
+    
+        isValid = this.validateFinalizeAccountingDate();
+    
+        if (isValid)
+        {
+            isValid = this.validateReferences();
+        }
+    
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFinalizeAccountingDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the date used for finalizing the budget reservation is not earlier than the accounting date.
+    /// </summary>
+    /// <returns>
+    /// true if the finalize accounting date is after the budget reservation accounting date or is in the same fiscal
+    /// year as the budget reservation accounting date; otherwise, false.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Invalid date error if system date is earlier than budget reservation accounting date or is not in the same
+    /// fiscal year as the budget reservation accounting date.
+    /// </exception>
+    private boolean validateFinalizeAccountingDate()
+    {
+        boolean isValid = true;
+    
+        if (finalizeDate < budgetReservationHeader.AccountingDate)
+        {
+            isValid = checkFailed(strFmt("@Budgeting_BudgetReservationPS:BudgetReservationFinalizeClassFinalizeDateError", budgetReservationHeader.AccountingDate));
+        }
+        else if (!FiscalCalendars::areDatesInSameFiscalYear(
+            CompanyInfoHelper::fiscalCalendarRecId(),
+            finalizeDate,
+            budgetReservationHeader.AccountingDate))
+        {
+            isValid = checkFailed(strFmt("@Budgeting_BudgetReservationPS:BudgetReservationFinalizeClassFinalizeDateNotSameAsAccountingDateError", budgetReservationHeader.AccountingDate));
+        }
+    
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateReferences</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates if the documents referencing the budget reservation document are in a valid state.
+    /// </summary>
+    /// <returns>
+    /// true if the referencing documents are in a valid state; otherwise, false.
+    /// </returns>
+    private boolean validateReferences()
+    {
+        boolean isValid = true;
+
+        if ((processFinalizeForLine && budgetReservationLine.hasDraftReferences()) ||
+            (!processFinalizeForLine && budgetReservationHeader.hasDraftReferences()))
+        {
+            isValid = checkFailed("@Budgeting_BudgetReservationPS:BudgetReservationFinalizeClassGBRCannotBeFinalizedError");
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newForBudgetReservationDocument</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of the <c>BudgetReservationFinalize_PSN</c> class for finalizing a budget reservation document.
+    /// </summary>
+    /// <param name="_budgetReservationHeader">
+    /// A <c>BudgetReservationHeader_PSN</c> table record to be used for instantiation.
+    /// </param>
+    /// <param name="_finalizeDate">
+    /// The finalize date of the given budget reservation document.
+    /// </param>
+    /// <returns>
+    /// A new instance of the <c>BudgetReservationFinalize_PSN</c> class.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Throws an error when on empty buffer of <c>BudgetReservationHeader_PSN</c> is passed as parameter.
+    /// </exception>
+    public static BudgetReservationFinalize_PSN newForBudgetReservationDocument(
+        BudgetReservationHeader_PSN _budgetReservationHeader,
+        TransDate _finalizeDate = dateNull())
+    {
+        BudgetReservationFinalize_PSN budgetReservationFinalize;
+    
+        if (_budgetReservationHeader.RecId == 0)
+        {
+            throw error(Error::missingRecord(funcName()));
+        }
+    
+        if (_finalizeDate == dateNull())
+        {
+            // Default to use the system date when no date is provided.
+            _finalizeDate = PublicSectorUtils::getSystemDateWithUserTimeZoneOffset();
+        }
+    
+        budgetReservationFinalize = new BudgetReservationFinalize_PSN();
+        budgetReservationFinalize.initializeForDocument(_budgetReservationHeader, _finalizeDate);
+    
+        return budgetReservationFinalize;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newForBudgetReservationLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of the <c>BudgetReservationFinalize_PSN</c> class for finalizing a budget reservation line.
+    /// </summary>
+    /// <param name="_budgetReservationHeader">
+    /// A <c>BudgetReservationHeader_PSN</c> table record to be used for instantiation.
+    /// </param>
+    /// <param name="_budgetReservationLine">
+    /// A <c>BudgetReservationLine_PSN</c> table record to be used for finalization.
+    /// </param>
+    /// <param name="_finalizeDate">
+    /// The finalize date of the given budget reservation document.
+    /// </param>
+    /// <returns>
+    /// A new instance of the <c>BudgetReservationFinalize_PSN</c> class.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Throws an error when on empty buffer of <c>BudgetReservationLine_PSN</c> is passed as parameter.
+    /// </exception>
+    public static BudgetReservationFinalize_PSN newForBudgetReservationLine(
+        BudgetReservationHeader_PSN _budgetReservationHeader,
+        BudgetReservationLine_PSN   _budgetReservationLine,
+        TransDate _finalizeDate = dateNull())
+    {
+        BudgetReservationFinalize_PSN budgetReservationFinalize;
+    
+        if (_budgetReservationLine.RecId == 0)
+        {
+            throw error(Error::missingRecord(funcName()));
+        }
+    
+        if (_budgetReservationHeader.RecId == 0)
+        {
+            _budgetReservationHeader = _budgetReservationLine.getBudgetReservationHeader();
+        }
+    
+        if (_finalizeDate == dateNull())
+        {
+            // Default to use the system date when no date is provided.
+            _finalizeDate = PublicSectorUtils::getSystemDateWithUserTimeZoneOffset();
+        }
+    
+        budgetReservationFinalize = new BudgetReservationFinalize_PSN();
+    
+        budgetReservationFinalize.initializeForLine(
+            _budgetReservationHeader,
+            _budgetReservationLine,
+            _finalizeDate);
+    
+        return budgetReservationFinalize;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showFinalizeDialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Displays the budget reservation finalize dialog.
+    /// </summary>
+    /// <param name="_recordToFinalize">
+    /// The record that is being finalized.
+    /// </param>
+    public static void showFinalizeDialog(Common _recordToFinalize)
+    {
+        Args    args = new Args();
+        FormRun finalizeFormRun;
+    
+        args.record(_recordToFinalize);
+        args.name(formStr(BudgetReservationFinalize_PSN));
+    
+        finalizeFormRun = classfactory.formRunClass(args);
+        finalizeFormRun.init();
+        finalizeFormRun.run();
+        finalizeFormRun.wait(true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reverseRemainingProjectCommitmentOnFinalize</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reverses the budget reservation remaining amount on the finalization of budget reservation document.
+    /// </summary>
+    /// <param name="_sourceDocumentLine">
+    /// The <c>SourceDocumentLine</c> buffer.
+    /// </param>
+    /// <remarks>
+    /// Inserts the reversing budget reservation transaction in the <c>ProjFundingLimitTracking</c> table.
+    /// </remarks>
+    public static void reverseRemainingProjectCommitmentOnFinalize(SourceDocumentLine _sourceDocumentLine)
+    {
+        SourceDocumentHeaderRecId referenceSourceDocumentLineRecId;
+        ProjTrans projTrans;
+        ProjSplitBill projSplitBill;
+        QueryRun listOfLimits;
+        ProjFundingLimitTracking projFundingLimitTracking;
+        ProjFundingLimitTracking projFundingLimitTrackingFinalize;
+        ProjFundingLimitTracking projFundingLimitTrackingRef;
+        ProjFundingLimit projFundingLimit;
+        AccountingDistribution accountingDistribution;
+        ProjectAccountingDistribution projectAccountingDistribution;
+
+        if (_sourceDocumentLine.SourceRelationType == tableNum(BudgetReservationLine_PSN))
+        {
+            // Checks whether budget reservation line is linked with the purchase requisition line.
+            referenceSourceDocumentLineRecId = BudgetReservationLine_PSN::getPurchaseRequisitionLineSourceDocumentLineRecId(_sourceDocumentLine.RecId);
+        }
+        else if (_sourceDocumentLine.SourceRelationType == tableNum(PurchReqLine))
+        {
+            // Checks whether the purchase requisition line is linked with the budget reservation line.
+            referenceSourceDocumentLineRecId = BudgetReservationLine_PSN::getBudgetReservationLineSourceDocumentLineRecId(_sourceDocumentLine.RecId);
+        }
+
+        select firstOnly accountingDistribution
+            where accountingDistribution.SourceDocumentLine == _sourceDocumentLine.RecId;
+
+        projectAccountingDistribution = projectAccountingDistribution::findByAccountingDistribution(accountingDistribution.RecId);
+
+        projTrans = ProjFundingLimitTrackingManager::createProjTransFromProjDist(projectAccountingDistribution, accountingDistribution);
+
+        if (projTrans)
+        {
+            projSplitBill = ProjSplitBill::construct(projTrans);
+            listOfLimits = projSplitBill.getTransLimits();
+            listOfLimits.reset();
+
+            while(listOfLimits.next())
+            {
+                projFundingLimit = listOfLimits.get(tableNum(ProjFundingLimit));
+
+                select sum(Amount) from projFundingLimitTracking
+                    where (projFundingLimitTracking.SourceDocumentLine == _sourceDocumentLine.RecId
+                        || (projFundingLimitTracking.SourceDocumentLine == referenceSourceDocumentLineRecId
+                            && referenceSourceDocumentLineRecId))
+                        && projFundingLimitTracking.ProjFundingLimit == projFundingLimit.RecId;
+
+                if (projFundingLimitTracking.Amount != 0)
+                {
+                    select firstOnly projFundingLimitTrackingRef
+                        where projFundingLimitTrackingRef.AccountingDistribution == accountingDistribution.RecId
+                            && projFundingLimitTrackingRef.ProjFundingLimit == projFundingLimit.RecId;
+
+                    projFundingLimitTrackingFinalize.ProjFundingLimit = projFundingLimit.RecId;
+                    projFundingLimitTrackingFinalize.SourceDocumentHeader = accountingDistribution.SourceDocumentHeader;
+                    projFundingLimitTrackingFinalize.SourceDocumentLine = accountingDistribution.SourceDocumentLine;
+                    projFundingLimitTrackingFinalize.AccountingDistribution = accountingDistribution.RecId;
+                    projFundingLimitTrackingFinalize.SourceAccountingDistribution = projFundingLimitTrackingRef.AccountingDistribution;
+                    projFundingLimitTrackingFinalize.ProjectAccountingDistribution = projectAccountingDistribution.RecId;
+                    projFundingLimitTrackingFinalize.sdCreditLine = projFundingLimitTrackingRef.sdCreditLine;
+                    projFundingLimitTrackingFinalize.LimitError = projFundingLimitTrackingRef.LimitError;
+                    projFundingLimitTrackingFinalize.Reversing = NoYes::Yes;
+                    projFundingLimitTrackingFinalize.Amount = -projFundingLimitTracking.Amount;
+                    projFundingLimitTrackingFinalize.insert();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

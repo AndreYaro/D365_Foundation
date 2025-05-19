@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSWaveTaskCreatorAllocate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WHSWaveTaskCreatorAllocate</c> class is responsible for creating the needed batch tasks for running a wave allocation.
+/// </summary>
+[WHSWaveTaskCreatorAttribute(methodStr(WHSPostEngineBase, allocateWave))]
+class WHSWaveTaskCreatorAllocate implements WHSWaveTaskICreator
+{
+    WHSPostEngine       postEngine;
+    BatchHeader         batchHeader;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createFinalTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a batch task that will be the final task run.
+    /// </summary>
+    /// <param name = "_batchGroupId">A batch group Id.
+    /// </param>  
+    /// <param name = "_workCreateId">A Work Create Id.
+    /// </param>
+    /// <returns>
+    /// An instance of <c>WHSwavePostAllocationShippint</c>.
+    /// </returns>
+    /// <remarks>
+    /// The batch task should be dependent on all other task created during classes execution.
+    /// </remarks>
+    private WHSWaveFinalizeAllocationShipping createFinalTask(
+        BatchGroupId    _batchGroupId,
+        WHSWorkCreateId _workCreateId)
+    {
+        var waveFinalizeAllocationShipping = WHSWaveFinalizeAllocationShipping::construct();
+        waveFinalizeAllocationShipping.initFromPostEngine(postEngine);
+        waveFinalizeAllocationShipping.parmWorkCreateId(_workCreateId);
+        waveFinalizeAllocationShipping.batchInfo().parmGroupId(_batchGroupId);
+        batchHeader.addTask(waveFinalizeAllocationShipping);
+
+        return waveFinalizeAllocationShipping;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingAllocations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the pending allocation queue records for the wave to be used in a top picking fashion.
+    /// </summary>
+    /// <returns>
+    /// The number of pending allocation records that were created.
+    /// </returns>
+    private int createPendingAllocations()
+    {
+        WHSWavePendingAllocation        pendingAllocation;
+        WHSLoadLine                     loadLine;
+        WHSWaveLine                     waveLine;
+
+        // These values won't change for all records inserted.
+        var waveId = postEngine.parmWaveTable().WaveId;
+        var waveExecutionID = postEngine.parmWaveExecutionId();
+
+        ttsBegin;
+
+        insert_recordset pendingAllocation (WaveId, WaveExecutionId, ItemId, InventDimIdAboveLocation)
+            select waveId, waveExecutionId, ItemId, InventDimId from loadLine
+                group by ItemId, InventDimId
+                where loadLine.InventQty  != loadLine.WorkCreatedQty
+                &&    loadLine.LoadId     != ''
+                exists join waveLine
+                where waveLine.ShipmentId == loadLine.ShipmentId
+                &&    waveLine.WaveId     == waveId;
+
+        int numOfQueueRecords = int642int(pendingAllocation.RowCount());
+
+        ttsCommit;
+
+        return numOfQueueRecords;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a batch job with tasks to process wave allocation.
+    /// </summary>
+    public void createTasks()
+    {
+        WHSWaveTable waveTable = postEngine.parmWaveTable();
+        using (var perfTask = WHSInstrumentationWaveProcessingPerformanceTask::newTaskCreation(waveTable, postEngine.parmWaveExecutionId(), funcName()))
+        {
+            ttsbegin;
+
+            Counter numOfQueueRecords = this.createPendingAllocations();
+            perfTask.setNumOfQueueRecords(numOfQueueRecords);
+
+            if (numOfQueueRecords <= 0)
+            {
+				// Technically this is not really an error, which is why we do a warning instead, but we still
+				// throw an exception to ensure that correct wave clean up is called.
+				throw warning("@WAX:WaveProcessingNoLinesToAllocate");
+            }
+
+            var postMethodTaskConfig = WHSWavePostMethodTaskConfiguration::find(methodStr(WHSPostEngineBase, allocateWave), waveTable.InventLocationId);
+            WHSMaximumBatchTasks numOfBatchTasks = this.determineNumberOfBatchTasksToUse(numOfQueueRecords, postMethodTaskConfig);
+            perfTask.setMaximumBatchTasks(postMethodTaskConfig.MaximumBatchTasks)
+                .setNumOfBatchTasks(numOfBatchTasks);
+
+            if (numOfBatchTasks <= 0)
+            {
+				// If there are no allocation tasks then we did not have anything on the wave that needs work created.
+				// Throw an error to ensure that correct wave clean up is called.
+				throw error("@WAX:WaveAllocationTasksNotCreatedError");
+            }
+
+            // Construct a batch header for the allocation tasks
+            batchHeader = BatchHeader::construct();
+            batchHeader.parmCaption(strFmt("@WAX:WaveAllocationBatchJobDescription", waveTable.WaveId));
+
+            // Generate a work created Id for all allocation done during this run of the wave.
+            WHSWorkCreateId workCreateId = NumberSeq::newGetNum(WHSParameters::numRefWHSWorkCreateId()).num();
+
+            //determine what batch group to use
+            var batchGroupId = postMethodTaskConfig.WaveBatchGroup();
+
+            if (WHSParameters::find().WaveProgressLog)
+            {
+                int totalLoadLines = postEngine.parmWaveTable().numberOfLoadLinesToAllocate();
+                WHSWaveMethodStatusHandler waveMethodStatusHandler = WHSWaveMethodStatusHandler::newWaveMethodStatusHandler(
+                                                                            waveTable.WaveId,
+                                                                            methodStr(WHSPostEngineBase, allocateWave),
+                                                                            totalLoadLines);
+                waveMethodStatusHandler.updateWaveStepProgressToStarted();
+            }
+
+            // Create a final task that will depend on the completion of all other allocation tasks.
+            WHSWaveFinalizeAllocationShipping waveFinalizeAllocationShipping = this.createFinalTask(batchGroupId, workCreateId);
+
+            // Create an allocation task for each batch helper
+            for (Counter i = 1; i <= numOfBatchTasks; i++)
+            {
+                var wavePendingAllocationProcessor = WHSWavePendingAllocationProcessor::newFromPostEngine(postEngine);
+                wavePendingAllocationProcessor.parmWorkCreateId(workCreateId);
+                wavePendingAllocationProcessor.batchInfo().parmCaption(strFmt("@WAX:WaveAllocationBatchTaskDescription", waveTable.WaveId, i));
+                wavePendingAllocationProcessor.batchInfo().parmGroupId(batchGroupId);
+
+                batchHeader.addTask(wavePendingAllocationProcessor);
+                // The post allocation batch task is dependent on all allocation tasks
+                batchHeader.addDependency(waveFinalizeAllocationShipping, wavePendingAllocationProcessor, BatchDependencyStatus::FinishedOrError);
+            }
+
+            batchHeader.save();
+            WHSWaveTableBatch::createSingleWaveBatchRelationship(waveTable.RecId, batchHeader.parmBatchHeaderId());
+            perfTask.setBatchHeaderId(batchHeader.parmBatchHeaderId());
+        
+            ttscommit;
+        }
+
+        WHSPostEngineBase::immediatelyStartNextBatchTaskForWave();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineNumberOfBatchTasksToUse</Name>
+				<Source><![CDATA[
+    protected WHSMaximumBatchTasks determineNumberOfBatchTasksToUse(
+        Counter                             _numberOfQueueRecords,
+        WHSWavePostMethodTaskConfiguration  _postMethodTaskConfig)
+    {
+        return min(_numberOfQueueRecords, _postMethodTaskConfig.MaximumBatchTasks);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPostEngine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the <c>WHSPostEngine</c> parameter.
+    /// </summary>
+    /// <param name = "_postEngine">The value to set.</param>
+    /// <returns>The value of the <c>WHSPostEngine</c> parameter.</returns>
+    /// <remarks>It is the responsibility of the consumer to correctly dispose the <c>WHSPostEngine</c> instance.</remarks>
+    public WHSPostEngine parmPostEngine(WHSPostEngine _postEngine = postEngine)
+    {
+        postEngine = _postEngine;
+
+        return postEngine;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

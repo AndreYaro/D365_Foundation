@@ -1,0 +1,575 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSLocatePutawayCluster</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Class used for deferred locating of putaway clusters.
+/// </summary>
+final class WHSLocatePutawayCluster
+{
+    private WHSClusterProfile clusterProfile;
+
+    private WHSInstrumentationLogger instrumentationLogger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>combineWorkHeaders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Combines two work headers.
+    /// </summary>
+    /// <param name="_targetWorkTable">
+    /// The target work header combined to.
+    /// </param>
+    /// <param name="_combineWorkTable">
+    /// The work header that will be combined onto the target work header.
+    /// </param>
+    /// <returns>
+    /// A single combined work header.
+    /// </returns>
+    private WHSWorkTable combineWorkHeaders(
+        WHSWorkTable _targetWorkTable,
+        WHSWorkTable _combineWorkTable)
+    {
+        WHSWorkTable targetWorkTable = WHSWorkTable::find(_targetWorkTable.WorkId, true);
+
+        if (targetWorkTable.LoadId
+        &&  targetWorkTable.LoadId != _combineWorkTable.LoadId)
+        {
+            targetWorkTable.LoadId = '';
+        }
+        
+        if (targetWorkTable.OrderNum
+        &&  targetWorkTable.OrderNum != _combineWorkTable.OrderNum)
+        {
+            targetWorkTable.OrderNum = '';
+        }
+        
+        if (targetWorkTable.ShipmentId
+        &&  targetWorkTable.ShipmentId != _combineWorkTable.ShipmentId)
+        {
+            targetWorkTable.ShipmentId = '';
+        }
+        
+        targetWorkTable.update();
+         
+        return targetWorkTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>consolidateClusteredWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Consolidates clustered work headers onto a single LP/Work header.
+    /// </summary>
+    /// <param name="_workClusterTable">
+    /// The putaway cluster table whose case level work headers will be combined.
+    /// </param>
+    /// <returns>
+    /// A consolidated work header record.
+    /// </returns>
+    private WHSWorkTable consolidateClusteredWork(WHSWorkClusterTable _workClusterTable)
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().consolidateClusteredWork())
+        {
+            WHSWorkClusterLine  workClusterLine;
+            WHSWorkLine         workLine;
+            WHSWorkTable        workTable;
+            WHSWorkId           prevWorkId;
+            WHSWorkTable        newWorkTable;
+            WHSWorkLine         newWorkLine;
+            int                 consolidatedWorkHeaderCount;
+            int                 consolidatedWorkLineCount;
+            int                 newWorkLineCount;
+            Map                 combinedWorkLinesMap = new Map(Types::Int64, Types::Record);
+        
+            WHSLicensePlate::createLicensePlate(_workClusterTable.ClusterId);
+        
+            while select WorkId from workClusterLine
+                where workClusterLine.ClusterId == _workClusterTable.ClusterId
+                join workTable
+                    where workTable.WorkId == workClusterLine.WorkId
+                       && (!WHSLocatePutawayClusterAddWorkStatusFilterToConsolidateClusteredWorkFlight::instance().isEnabled()
+                           || (workTable.WorkStatus != WHSWorkStatus::Combined 
+                               && workTable.WorkStatus != WHSWorkStatus::Closed
+                               && workTable.WorkStatus != WHSWorkStatus::Cancelled))
+                    join forupdate workLine
+                        where workLine.WorkId == workTable.WorkId
+            {
+                consolidatedWorkLineCount++;
+
+                if (workClusterLine.WorkId != prevWorkId)
+                {
+                    newWorkLine.clear();
+                    prevWorkId = workClusterLine.WorkId;
+                }
+
+                if (!newWorkTable)
+                {
+                    newWorkTable.setWorkId();
+                    newWorkTable.initFromWorkTable(workTable);
+                    newWorkTable.TargetLicensePlateId = _workClusterTable.ClusterId;
+                
+                    newWorkTable.insert();
+                
+                    this.instrumentationLogger().logRecordInformation(newWorkTable);
+
+                    prevWorkId = workTable.WorkId;
+                }
+                else if (workTable.WorkId != prevWorkId)
+                {
+                    // Combine work header information
+                    newWorkTable = this.combineWorkHeaders(newWorkTable, workTable);
+
+                    consolidatedWorkHeaderCount++;
+
+                    prevWorkId = workTable.WorkId;
+                }
+            
+                // Combine work lines accross the work headers per workTemplateLine
+                if (combinedWorkLinesMap.exists(workLine.WorkTemplateLineRecId))
+                {
+                    newWorkLine = combinedWorkLinesMap.lookup(workLine.WorkTemplateLineRecId);
+                    // Possible the work line was updated since it was put in the map.
+                    newWorkLine.selectForUpdate(true);
+                    newWorkLine.reread();
+                    newWorkLine.combineWorkLines(workLine);
+                }
+                else
+                {
+                    newWorkLine.data(workLine);
+                    newWorkLine.WorkId = newWorkTable.WorkId;
+                    newWorkLine.RecId = 0;
+                    newWorkLine.LineNum = newWorkLine.LineNum + newWorkLineCount;
+                
+                    newWorkLine.insert();
+
+                    newWorkLineCount++;
+                
+                    // The final put worklines should not be combined so don't insert into the map.
+                    // Final put lines will not have workTemplateLineRecId specified because for putaway locating the final put lines are created before the worktemplate is selected.
+                    if (newWorkLine.WorkTemplateLineRecId)
+                    {
+                        combinedWorkLinesMap.insert(newWorkLine.WorkTemplateLineRecId, newWorkLine);
+                    }
+                }
+            
+                // Update the status of the work being clustered
+                workLine.WorkStatus         = WHSWorkStatus::Closed;
+                workLine.QtyRemain          = 0;
+                workLine.InventQtyRemain    = 0;
+
+                workLine.update();
+                        
+                if (workTable.WorkStatus != WHSWorkStatus::Combined)
+                {
+                    WHSWorkTable updateWorkTable = WHSWorkTable::find(workTable.WorkId, true);
+                    updateWorkTable.WorkStatus = WHSWorkStatus::Combined;
+
+                    updateWorkTable.update();
+                }
+            
+                // Move inventory to the cluster Id licenase plate and create WITs for new work.
+                this.consolidateInventoryOntoClusterId(workLine, newWorkLine, _workClusterTable.ClusterId);
+            }
+
+            // Add new work header to cluster.
+            WHSWorkClusterLine::createWorkClusterLine(_workClusterTable.ClusterId, newWorkTable.WorkId, newWorkTable.TargetLicensePlateId);
+        
+            this.instrumentationLogger().clusterPutawayActivities().consolidatedClusteredWork(activityContext, consolidatedWorkHeaderCount, consolidatedWorkLineCount, newWorkLineCount);
+
+            return newWorkTable;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>consolidateInventoryOntoClusterId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Consolidates all inventory onto a single license plate which is the parent cluster Id and adjust the workInventTrans records appropriately.
+    /// </summary>
+    /// <param name="_origWorkLine">
+    /// The original work line whose inventory will be moved.
+    /// </param>
+    /// <param name="_newWorkLine">
+    /// The new work line the inventory will be consolidated to.
+    /// </param>
+    /// <param name="_clusterId">
+    /// The cluster Id which will become the inventory license plate.
+    /// </param>
+    private void consolidateInventoryOntoClusterId(
+        WHSWorkLine     _origWorkLine,
+        WHSWorkLine     _newWorkLine,
+        WHSClusterId    _clusterId)
+    {
+        WHSWorkInventTrans  workInventTrans;
+        
+        // Loop over the WITs for the workLines and execute them to move inventory onto the cluster License Plate.
+        while select workInventTrans
+            where workInventTrans.WorkId    == _origWorkLine.WorkId
+            &&    workInventTrans.LineNum   == _origWorkLine.LineNum
+        {
+            WHSWorkInventTrans  newWorkInventTrans;
+            
+            // Create an identical WIT on the new work header but for the new dimensions.
+            newWorkInventTrans.initFromWorkInventTrans(workInventTrans);
+            newWorkInventTrans.InventDimIdTo = workInventTrans.InventDimIdTo;
+            
+            InventDim fromInventDim = InventDim::find(workInventTrans.InventDimIdFrom);
+            fromInventDim.LicensePlateId = WHSWorkTable::find(_origWorkLine.WorkId).TargetLicensePlateId;
+            
+            this.moveInventoryToNewLP(workInventTrans, fromInventDim, _clusterId);
+            
+            // Set from dim on new WIT.
+            InventDim newInventDim;
+            newInventDim.initFromInventDim(fromInventDim);
+            newInventDim.LicensePlateId = _clusterId;
+            newInventDim = InventDim::findOrCreate(newInventDim);
+            
+            newWorkInventTrans.InventDimIdFrom = newInventDim.inventDimId;
+            newWorkInventTrans.WorkId = _newWorkLine.WorkId;
+            newWorkInventTrans.LineNum = _newWorkLine.LineNum;
+            
+            // Check to see if we need to update existing WIT
+            WHSWorkInventTrans updateWorkInventTrans = WHSWorkInventTrans::find(newWorkInventTrans.WorkId, newWorkInventTrans.LineNum, newWorkInventTrans.ItemId, newWorkInventTrans.InventTransIdParent, newWorkInventTrans.InventDimIdFrom, true);
+            
+            if (updateWorkInventTrans.RecId != 0)
+            {
+                updateWorkInventTrans.increaseQty(newWorkInventTrans.InventQtyRemain);
+            }
+            else
+            {
+                newWorkInventTrans.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>moveInventoryToNewLP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Moves inventory from the current receipt dimensions onto a single license plate which is the parent cluster Id.
+    /// </summary>
+    /// <param name="_workInventTrans">
+    /// A <c>WHSWorkInventTrans</c> record that is associated to the work on the cluster.
+    /// </param>
+    /// <param name="_fromInventDimCritera">
+    /// The from dimension criteria based on the workInventTrans.
+    /// </param>
+    /// <param name="_clusterId">
+    /// The cluster Id which will become the inventory license plate.
+    /// </param>
+    private void moveInventoryToNewLP(
+        WHSWorkInventTrans  _workInventTrans,
+        InventDim           _fromInventDimCritera,
+        WHSClusterId        _clusterId)
+    {
+        InventDimParm   inventDimParm;
+        InventSum       inventSum;
+        InventDim       physInventDim;
+
+        inventDimParm.initFromInventDim(_fromInventDimCritera);
+        _workInventTrans.selectForUpdate(true);
+    
+        if (InventUseDimOfInventSumToggle::instance().isEnabled())
+        {
+            // Move inventory to new License plate.
+            while select PhysicalInvent, InventDimId, #InventDimGroupAllFields from inventSum
+                where   inventSum.ItemId == _workInventTrans.ItemId
+                    &&  #InventDimFieldsFilter(inventSum, _fromInventDimCritera, inventDimParm)
+            {
+                InventDim toInventDim;
+                toInventDim.initFromInventSum(inventSum);
+                toInventDim.LicensePlateId = _clusterId;
+                toInventDim = InventDim::findOrCreate(toInventDim);
+    
+                WHSInvent::moveWorkQty(_workInventTrans, inventSum.inventDimId, toInventDim.inventDimId, inventSum.PhysicalInvent);
+            }
+        }
+        else
+        {
+            // Move inventory to new License plate.
+            while select PhysicalInvent from inventSum
+            where inventSum.ItemId == _workInventTrans.ItemId
+                #InventDimInnerJoin(inventSum.InventDimId, physInventDim, _fromInventDimCritera, inventDimParm)
+            {
+                InventDim toInventDim;
+                toInventDim.initFromInventDim(physInventDim);
+                toInventDim.LicensePlateId = _clusterId;
+                toInventDim = InventDim::findOrCreate(toInventDim);
+    
+                WHSInvent::moveWorkQty(_workInventTrans, physInventDim.inventDimId, toInventDim.inventDimId, inventSum.PhysicalInvent);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>locateClusterAsSingleWorkHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Consolidates all work headers and inventory within a putaway work cluster.
+    /// </summary>
+    /// <param name="_workClusterTable">
+    /// The cluster table that will be consolidated.
+    /// </param>
+    private void locateClusterAsSingleWorkHeader(WHSWorkClusterTable _workClusterTable)
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().locateClusterAsSingleWorkHeader())
+        {
+            WHSWorkTable clusteredWork = this.consolidateClusteredWork(_workClusterTable);
+    
+            this.locateWorkHeader(clusteredWork);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>locateClusterAtClose</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Locates work within a putaway cluster when the cluster is closed.
+    /// </summary>
+    /// <param name="_workClusterTable">
+    /// The work cluster that will be located.
+    /// </param>
+    [Hookable(false)]
+    internal void locateClusterAtClose(WHSWorkClusterTable _workClusterTable)
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().locateClusterAtClose())
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                throw error(strFmt("@SCM:TransactionExpected", funcName()));
+            }
+
+            clusterProfile = WHSClusterProfile::find(_workClusterTable.ClusterProfileId);
+
+            this.instrumentationLogger().logRecordInformation(clusterProfile);
+
+            // Method should only be used for locating putaway clusers that are located at cluster close
+            if (_workClusterTable.ClusterType       != WHSClusterType::Putaway
+            ||  clusterProfile.PutawayClusterLocate != WHSPutawayClusterLocate::ClusterClose)
+            {
+                throw error(Error::wrongUseOfFunction(funcName()));
+            }
+    
+            // If consolidation is on then we locate the cluster as a whole
+            if (clusterProfile.WorkUnitBreak == WHSWorkUnitBreak::Consolidate)
+            {
+                this.locateClusterAsSingleWorkHeader(_workClusterTable);
+            }
+            else
+            {
+                // Else we locate per work header in the cluster.
+                this.locateClusterPerWorkHeader(_workClusterTable);
+            }
+
+            this.instrumentationLogger().clusterPutawayActivities().locatedClusterAtClose(activityContext, clusterProfile.WorkUnitBreak);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>locateClusterPerWorkHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Individually locates work headers within a putaway cluster.
+    /// </summary>
+    /// <param name="_workClusterTable">
+    /// The cluster whose work headers will be located.
+    /// </param>
+    private void locateClusterPerWorkHeader(WHSWorkClusterTable _workClusterTable)
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().locateClusterPerWorkHeader())
+        {
+            WHSWorkClusterLine  workClusterLine;
+            WHSWorkTable        workTable;
+            int                 locatedWorkHeaderCount;
+    
+            while select workTable
+                exists join workClusterLine
+                where workTable.WorkId          == workClusterline.WorkId
+                &&    workClusterLine.ClusterId == _workClusterTable.ClusterId
+            {
+                locatedWorkHeaderCount++;
+
+                this.locateWorkHeader(workTable);
+            }
+
+            this.instrumentationLogger().clusterPutawayActivities().locatedClusterPerWorkHeader(activityContext, locatedWorkHeaderCount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>locateWorkHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Locates a single work header within a putaway cluster.
+    /// </summary>
+    /// <param name="_workTable">
+    /// The work header that will be located.
+    /// </param>
+    [Hookable(false)]
+    public void locateWorkHeader(WHSWorkTable _workTable)
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().locateWorkHeader())
+        {
+            WMSLocationId   putLocationId;
+            WHSWorkLine     putWorkLine;
+    
+            select firstonly putWorkLine
+                order by LineNum desc
+                where putWorkLine.WorkId        == _workTable.WorkId
+                &&    putWorkLine.WorkType      == WHSWorkType::Put
+                &&    putWorkLine.WMSLocationId == '';
+    
+            this.instrumentationLogger().logRecordInformation(putWorkLine);
+
+            if (putWorkLine.RecId != 0)
+            {
+                WHSLocationDirective    locationDirective = new WHSLocationDirective();
+                InventQty               inventQty;
+                Qty                     qty;
+                UnitOfMeasureSymbol     unitId;
+                Set                     excludeLocationId = new Set(Types::String);
+                WHSWorkExecute          workExecute = new WHSWorkExecute();
+
+                if (!clusterProfile)
+                {
+                    clusterProfile = WHSClusterProfile::find(_workTable.ClusterProfileId);
+                }
+
+                if (clusterProfile.WorkUnitBreak == WHSWorkUnitBreak::Consolidate)
+                {
+                    locationDirective.setPutawayClusterWorkId(_workTable.WorkId);
+                }
+    
+                while (inventQty != putWorkLine.InventQtyWork)
+                {
+                    if (putWorkLine.ItemId) // Single Sku Put
+                    {
+                        [putLocationId, qty, unitId, inventQty] = locationDirective.findPickPutLocation(putWorkLine.InventDimId,
+                                                                                                        putWorkLine.InventTransId,
+                                                                                                        putWorkLine.ItemId,
+                                                                                                        putWorkLine.InventQtyWork,
+                                                                                                        putWorkLine.whsWorkTable().WorkTransType,
+                                                                                                        putWorkLine.WorkType,
+                                                                                                        clusterProfile.LocDirHintCode,
+                                                                                                        WHSLoadLine::findbyRecId(putWorkLine.LoadLineRefRecId).PackingQty,
+                                                                                                        excludeLocationId);
+                    }
+                    else // Multi Sku Put
+                    {
+                        [putLocationId, qty, unitId, inventQty] = locationDirective.findPickPutLocationMultiSKU(_workTable.InventLocationId,
+                                                                                                                _workTable.WorkTransType,
+                                                                                                                putWorkLine.WorkType,
+                                                                                                                clusterProfile.LocDirHintCode);
+                        if (putLocationId)
+                        {
+                            qty = putWorkLine.QtyWork;
+                            unitId = putWorkLine.UnitId;
+                            inventQty = putWorkLine.InventQtyWork;
+                        }
+    
+                    }
+    
+                    if (putLocationId)
+                    {
+                        // If the location satisfies the full qty then we can update location of the work line.
+                        if (inventQty == putWorkLine.InventQtyWork)
+                        {
+                            workExecute.updateWorkLineLocation(putWorkLine.WorkId, putWorkLine.LineNum, putLocationId);
+                        }
+                        else
+                        {
+                            // If the location does not satisfy the full qty then add it to the location to exclude.
+                            excludeLocationId.add(putLocationId);
+                        }
+                    }
+                    else
+                    {
+                        // If not location was found then break out of the loop.
+                        break;
+                    }
+                }
+
+                if (putLocationId && clusterProfile.WorkUnitBreak == WHSWorkUnitBreak::Consolidate)
+                {
+                    WHSWorkLine tmpWorkLine;
+
+                    while select forUpdate tmpWorkLine
+                        order by LineNum desc
+                        where tmpWorkLine.WorkId == _workTable.WorkId
+                    {
+                        if (tmpWorkLine.WorkType == WHSWorkType::Pick)
+                        {
+                            break;
+                        }
+
+                        if (tmpWorkLine.WMSLocationId == '')
+                        {
+                            tmpWorkLine.WMSLocationId = putLocationId;
+                            tmpWorkLine.update();
+                        }
+                    }
+                }
+            }
+
+            this.instrumentationLogger().clusterPutawayActivities().locatedWorkHeader(activityContext, clusterProfile.WorkUnitBreak, putLocationId != '');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    private WHSInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = WHSInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    private void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    static public WHSLocatePutawayCluster construct()
+    {
+        return new WHSLocatePutawayCluster();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

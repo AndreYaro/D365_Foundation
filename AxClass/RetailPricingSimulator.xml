@@ -1,0 +1,1662 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailPricingSimulator</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Collections.Generic;
+using System.Reflection;
+using Microsoft.Dynamics.Commerce.Runtime.Services.PricingEngine;
+
+using CrtSalesTransaction = Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesTransaction;
+using CrtSalesLine = Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine;
+using CrtDiscountLine = Microsoft.Dynamics.Commerce.Runtime.DataModel.DiscountLine;
+using CrtPriceLine = Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceLine;
+using CrtPriceAdjustmentPriceLine = Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceAdjustmentPriceLine;
+using CrtTradeAgreementPriceLine = Microsoft.Dynamics.Commerce.Runtime.DataModel.TradeAgreementPriceLine;
+using CrtSalesAffiliationLoyaltyTier = Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesAffiliationLoyaltyTier;
+using CrtRetailAffiliationType = Microsoft.Dynamics.Commerce.Runtime.DataModel.RetailAffiliationType;
+using CrtSalesAgreementPriceLine = Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesAgreementPriceLine;
+using CrtAttributeTextValue = Microsoft.Dynamics.Commerce.Runtime.DataModel.AttributeTextValue;
+using CrtPriceAndDiscountCalculationParameters = Microsoft.Dynamics.Commerce.Runtime.Services.PricingEngine.PriceAndDiscountCalculationParameters;
+
+/// <summary>
+/// This class contains methods to calculate prices and discounts on pricing simulator sales transaction.
+/// </summary>
+class RetailPricingSimulator
+{
+    #OCCRetryCount
+
+    System.Guid transactionId;
+    RefRecId salesTransactionId;
+    RetailPricingSimulatorSalesTransaction psSalesTransaction;
+    RetailChannelTable retailChannelTable;
+    CustTable custTable;
+    Price totalCostPrice;
+    System.DateTime simulationDate;
+    System.DateTimeOffset dateTimeOffset;
+    System.String channelCurrency;
+    IPricingDataAccessor pricingManager;
+    RetailCurrencyOperations currencyAndRoundingHelper;
+
+    RetailTempOrderItem tempOrderItem;
+
+    CrtSalesTransaction crtSalesTransaction;
+    PricingEngineDiagnosticsObject diagnosticsObjectPrices;
+    PricingEngineDiagnosticsObject diagnosticsObjectDiscounts;
+    Set selectedDiscounts;
+    Set selectedPriceAdjustments;
+    Set selectedTradeAgreements;
+    Set selectedSalesAgreements;
+    String255 pricingSimulatorSalesLineNum;
+    RecId recId;
+    boolean isPropertyBasedMode;
+
+    private const str discountOfferIdProperty = 'DiscountOfferId';
+    private const str discountCodeProperty = 'Code';
+    private const str salesTransactionCouponsProperty = 'Coupons';
+
+    private static readonly InventDimId InventDimIdAllBlank = InventDim::inventDimIdBlank();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>calculatePricesAndDiscounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the price and discounts using pricing engine.
+    /// </summary>
+    public void calculatePricesAndDiscounts()
+    {
+        // Calculate only if salesTransactionId is initialized.
+        if (salesTransactionId)
+        {
+            // Create crt sales transaction object and add sales lines to it.
+            this.addLineItemsToCrtSalesTransaction();
+
+            // Add affliations and loyalty tiers to transaction.
+            this.addAffiliationsAndLoyaltyPrograms();
+
+            // Add coupons to transaction.
+            RetailPricingEngineHelper::SetCouponsForPriceSimulator(crtSalesTransaction, salesTransactionId);
+
+            // Initialize pricing data manager object.
+            this.initializeChannelPricingParameters();
+
+            PricingEngine::SetCollectDiagnostics(crtSalesTransaction, true);
+
+            // If sales agreement feature is enabled, then set transaction type as customer order as default value does not support it.
+            if (FeatureStateProvider::isFeatureEnabled(RetailSalesAgreementPriceSupportFeature::instance()))
+            {
+                crtSalesTransaction.set_TransactionTypeValue(enum2int(RetailTransactionType::CustomerOrder));
+
+                SalesAgreementHeader saHeader = SalesAgreementHeader::findAgreementId(psSalesTransaction.SalesAgreementId);
+                crtSalesTransaction.set_SalesAgreementRecordId(saHeader.RecId);
+            }
+
+            // Calculate prices.
+            this.calculatePricesForOrder();
+
+            diagnosticsObjectPrices = PricingEngine::GetPricingEngineDiagnosticsObject(crtSalesTransaction);
+
+            PricingEngine::SetCollectDiagnostics(crtSalesTransaction, true);
+
+            this.calculateDiscountsForOrder();
+
+            diagnosticsObjectDiscounts = PricingEngine::GetPricingEngineDiagnosticsObject(crtSalesTransaction);
+
+            try
+            {
+                ttsBegin;
+
+                // Update each sales line with price and discount details.
+                this.updatePriceAndDiscountsInDbTable();
+
+                // Update total details for transaction.
+                this.updateTransactionTotals();
+
+                // Update the automatically linked sales agreement id.
+                this.updateSalesAgreementId(crtSalesTransaction.SalesAgreementRecordId);
+
+                // Update analysis tables.
+                this.updateAnalysisData();
+
+                ttsCommit;
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculatePricesForOrder</Name>
+				<Source><![CDATA[
+    protected void calculatePricesForOrder()
+    {
+        PricingEngine::CalculatePricesForTransaction(
+                crtSalesTransaction,
+                pricingManager,
+                currencyAndRoundingHelper,
+                custTable.PriceGroup,
+                channelCurrency,
+                dateTimeOffset);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateDiscountsForOrder</Name>
+				<Source><![CDATA[
+    protected void calculateDiscountsForOrder()
+    {
+        // Calculate discounts.
+        CrtPriceAndDiscountCalculationParameters calculationParameters = new CrtPriceAndDiscountCalculationParameters();
+        if (!RetailPricingImprovedAlgorithmForArrangeLineGroupsFlight::instance().isEnabled())
+        {
+            calculationParameters.MaxLoopCountForLegacyArrangeLineGroups = -1;
+        }
+        PricingEngine::CalculateDiscountsForLines(
+            pricingManager,
+            crtSalesTransaction,
+            currencyAndRoundingHelper,
+            channelCurrency,
+            custTable.LineDisc,
+            custTable.MultiLineDisc,
+            custTable.EndDisc,
+            false, // calculateSimpleDiscountOnly
+            dateTimeOffset,
+            calculationParameters);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransactionIdString</Name>
+				<Source><![CDATA[
+    protected str getTransactionIdString()
+    {
+        return int642Str(salesTransactionId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAffiliationsAndLoyaltyPrograms</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds loyalty program+Tier and retail affiliations to the sales transaction.
+    /// </summary>
+    private void addAffiliationsAndLoyaltyPrograms()
+    {
+        CLRObject                           clrSalesAffiliations;
+        RetailPricingSimulatorAffiliation   psAffiliations;
+        RetailPricingSimulatorPriceGroup    psPriceGroups;
+        PriceDiscGroup                      priceDiscGroup;
+        RetailAffiliationPriceGroup         affiliationPriceGroup;
+
+        CrtSalesAffiliationLoyaltyTier crtSalesAffiliationLoyaltyTier;
+
+        clrSalesAffiliations = crtSalesTransaction.get_AffiliationLoyaltyTierLines();
+
+        // Add retail affiliations.
+        while select RetailPricingSimulatorSalesTransaction, RetailAffiliation, AffiliationType
+            from psAffiliations
+                where psAffiliations.RetailPricingSimulatorSalesTransaction == salesTransactionId
+                && psAffiliations.AffiliationType == RetailAffiliationType::General
+        {
+            crtSalesAffiliationLoyaltyTier = new CrtSalesAffiliationLoyaltyTier();
+            crtSalesAffiliationLoyaltyTier.set_AffiliationId(psAffiliations.RetailAffiliation);
+            crtSalesAffiliationLoyaltyTier.set_AffiliationType(CrtRetailAffiliationType::General);
+            clrSalesAffiliations.Add(crtSalesAffiliationLoyaltyTier);
+        }
+
+        //Add loyalty tiers.
+        while select RetailPricingSimulatorSalesTransaction, RetailAffiliation, RetailLoyaltyTier, AffiliationType
+            from psAffiliations
+                where psAffiliations.RetailPricingSimulatorSalesTransaction == salesTransactionId
+                && psAffiliations.AffiliationType == RetailAffiliationType::Loyalty
+        {
+            crtSalesAffiliationLoyaltyTier = new CrtSalesAffiliationLoyaltyTier();
+
+            crtSalesAffiliationLoyaltyTier.set_AffiliationId(psAffiliations.RetailAffiliation);
+            crtSalesAffiliationLoyaltyTier.set_LoyaltyTierId(psAffiliations.RetailLoyaltyTier);
+            crtSalesAffiliationLoyaltyTier.set_AffiliationType(CrtRetailAffiliationType::Loyalty);
+
+            clrSalesAffiliations.Add(crtSalesAffiliationLoyaltyTier);
+        }
+
+        //Add retail affiliations and loyalty tiers price groups.
+        while select RetailPricingSimulatorSalesTransaction, RetailDiscountPriceGroup
+            from psPriceGroups
+                where psPriceGroups.RetailPricingSimulatorSalesTransaction == salesTransactionId
+        join priceDiscGroup
+                where priceDiscGroup.RecId == psPriceGroups.RetailDiscountPriceGroup
+        join affiliationPriceGroup
+                where priceDiscGroup.RecId == affiliationPriceGroup.PriceDiscGroup
+        {
+            crtSalesAffiliationLoyaltyTier = new CrtSalesAffiliationLoyaltyTier();
+
+            crtSalesAffiliationLoyaltyTier.set_AffiliationId(affiliationPriceGroup.RetailAffiliation);
+            crtSalesAffiliationLoyaltyTier.set_LoyaltyTierId(affiliationPriceGroup.RetailLoyaltyTier);
+            if (affiliationPriceGroup.RetailLoyaltyTier > 0)
+            {
+                crtSalesAffiliationLoyaltyTier.set_AffiliationType(CrtRetailAffiliationType::Loyalty);
+            }
+            else
+            {
+                crtSalesAffiliationLoyaltyTier.set_AffiliationType(CrtRetailAffiliationType::General);
+            }
+
+            clrSalesAffiliations.Add(crtSalesAffiliationLoyaltyTier);
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addCatalogToSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds catalog information to sales transaction line.
+    /// </summary>
+    /// <param name="crtsalesTransLine">
+    /// Transaction line to which catalog is to be added.
+    /// </param>
+    private void addCatalogToSalesLine(CrtSalesLine crtsalesTransLine)
+    {
+        RetailPricingSimulatorCatalog      psCatalogs;
+        RetailPricingSimulatorPriceGroup   psPriceGroups;
+        PriceDiscGroup                     priceDiscGroup;
+        RetailCatalogPriceGroup            catalogPriceGroup;
+
+        // Add catalogs to sales line.
+        while select RetailPricingSimulatorSalesTransaction, Catalog
+            from psCatalogs
+                where psCatalogs.RetailPricingSimulatorSalesTransaction == salesTransactionId
+        {
+            crtsalesTransLine.AddCatalogId(psCatalogs.Catalog);
+        }
+
+        // Add catalogs price groups to sales line.
+        while select RetailPricingSimulatorSalesTransaction, RetailDiscountPriceGroup
+            from psPriceGroups
+                where psPriceGroups.RetailPricingSimulatorSalesTransaction == salesTransactionId
+            join priceDiscGroup
+                where priceDiscGroup.RecId == psPriceGroups.RetailDiscountPriceGroup
+            join catalogPriceGroup
+                where priceDiscGroup.RecId == catalogPriceGroup.PriceDiscGroup
+        {
+            crtsalesTransLine.AddCatalogId(catalogPriceGroup.Catalog);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addLineItemsToCrtSalesTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds line items to the salestransaction object.
+    /// </summary>
+    private void addLineItemsToCrtSalesTransaction()
+    {
+        str     lineId;
+        int     salesLinesOrderField = 1;
+        SalesUnit                       defaultSalesUnit;
+
+        CLRObject                       clrSalesLines;
+        RetailPricingSimulatorSalesLine psSalesLines;
+        InventTableModule inventTableSales;
+        RetailTransactionId transactionIdString = this.getTransactionIdString();
+
+        CrtSalesLine crtSalesLine;
+
+        crtSalesTransaction = new CrtSalesTransaction();
+        crtSalesTransaction.set_Id(transactionIdString);
+        crtSalesTransaction.set_ChannelId(retailChannelTable.RecId);
+
+        this.addAttributesToCrtSalesTransaction();
+
+        clrSalesLines = crtSalesTransaction.get_SalesLines();
+
+        // Iterate over PricingSimulatorSalesLine table.
+        // For each current transaction's line, create a crt sales line object and
+        // add it to crt sales transaction.
+        while select *
+            from psSalesLines
+            order by psSalesLines.SalesLineNum
+            where psSalesLines.RetailPricingSimulatorSalesTransaction == salesTransactionId
+        outer join UnitId from inventTableSales
+            where inventTableSales.ItemId == psSalesLines.DisplayProductNumber
+                && inventTableSales.ModuleType == ModuleInventPurchSales::Sales
+        {
+            if (this.shouldSkipCreateCRTSalesLine(psSalesLines))
+            {
+                continue;
+            }
+
+            crtSalesLine = new CrtSalesLine();
+
+            crtSalesLine.set_ItemId(psSalesLines.DisplayProductNumber);
+            crtSalesLine.set_InventoryDimensionId(psSalesLines.InventDimId);
+
+            InventDim inventDim = InventDim::find(psSalesLines.InventDimId);
+            crtSalesLine.set_InventorySiteId(inventDim.InventSiteId);
+            crtSalesLine.set_InventoryLocationId(inventDim.InventLocationId);
+
+            crtSalesLine.set_Quantity(psSalesLines.Quantity);
+            crtSalesLine.set_SalesOrderUnitOfMeasure(UnitOfMeasure::find(psSalesLines.UoM).Symbol);
+
+            if (psSalesLines.Variant)
+            {
+                crtSalesLine.set_ProductId(psSalesLines.Variant);
+                crtSalesLine.set_MasterProductId(psSalesLines.Product);
+
+                Microsoft.Dynamics.Commerce.Runtime.DataModel.ProductVariant productVariant = this.getProductVariant(psSalesLines.DisplayProductVariantNumber, psSalesLines.DisplayProductNumber, psSalesLines.InventDimId);
+                crtSalesLine.set_Variant(productVariant);
+            }
+
+            // Set original Unit Of Measure for the sales line and then update the line to force UOM conversion.
+            defaultSalesUnit = InventTableModule::find(psSalesLines.DisplayProductNumber, ModuleInventPurchSales::Sales).UnitId;
+            crtSalesLine.set_OriginalSalesOrderUnitOfMeasure(defaultSalesUnit);
+            RetailPricingUnitOfMeasureConversionHelper::updateCrtUnitOfMeasureConversion(
+               crtSalesLine,
+               psSalesLines.DisplayProductNumber,
+               UnitOfMeasure::find(psSalesLines.UoM).Symbol,
+               defaultSalesUnit);
+
+            this.addCatalogToSalesLine(crtSalesLine);
+
+            // Generate line id.
+            lineId = strRFix(int2str(salesLinesOrderField), 3, '0');
+            crtSalesLine.set_LineId(lineId);
+            crtSalesLine.set_LineNumber(salesLinesOrderField);
+
+            if (psSalesLines.RecId == this.parmRetailPricingSimulatorSalesLineRecId())
+            {
+                this.parmPricingSimulatorSalesLineNum(lineId);
+            }
+
+            RetailPricingUnitOfMeasureConversionHelper::updateCrtUnitOfMeasureConversion(
+                crtSalesLine,
+                psSalesLines.DisplayProductNumber,
+                UnitOfMeasure::find(psSalesLines.UoM).Symbol,
+                inventTableSales.UnitId);
+
+            this.setCRTSalesLineFromPSSalesLine(crtSalesLine, psSalesLines);
+
+            this.addAttributesToCrtSalesLine(crtSalesLine, psSalesLines);
+
+            clrSalesLines.Add(crtSalesLine);
+            salesLinesOrderField++;
+        }
+
+        crtSalesTransaction.set_IsTaxIncludedInPrice(retailChannelTable.PriceIncludesSalesTax);
+        crtSalesTransaction.set_CustomerId(custTable.AccountNum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAttributesToCrtSalesTransaction</Name>
+				<Source><![CDATA[
+    private void addAttributesToCrtSalesTransaction()
+    {
+        CLRObject clrAttributeValues = crtSalesTransaction.get_AttributeValues();
+
+        RetailPricingSimulatorInstanceValue instanceValue = RetailPricingSimulatorInstanceValue::findByTransaction(psSalesTransaction.RecId);
+        if (instanceValue.RecId)
+        {
+            this.addAttributesByInstanceValue(clrAttributeValues, instanceValue.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAttributesToCrtSalesLine</Name>
+				<Source><![CDATA[
+    private void addAttributesToCrtSalesLine(CrtSalesLine crtSalesLine, RetailPricingSimulatorSalesLine psSalesLine)
+    {
+        CLRObject clrAttributeValues = crtSalesLine.get_AttributeValues();
+
+        RetailPricingSimulatorInstanceValue instanceValue = RetailPricingSimulatorInstanceValue::findByTransaction(psSalesLine.RetailPricingSimulatorSalesTransaction, psSalesLine.SalesLineNum);
+        if (instanceValue.RecId)
+        {
+            this.addAttributesByInstanceValue(clrAttributeValues, instanceValue.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAttributesByInstanceValue</Name>
+				<Source><![CDATA[
+    private void addAttributesByInstanceValue(CLRObject clrAttributeValues, RecId instanceValueRecId)
+    {
+        EcoResAttributeValue ecoResAttributeValue;
+        EcoResTextValue ecoResTextValue; // Only text type is supported.
+
+        while select Attribute from ecoResAttributeValue
+                where ecoResAttributeValue.InstanceValue == instanceValueRecId
+            join TextValue from ecoResTextValue
+                where ecoResTextValue.RecId == ecoResAttributeValue.Value
+        {
+            EcoResAttribute ecoResAttribute = EcoResAttribute::find(ecoResAttributeValue.Attribute);
+
+            CrtAttributeTextValue crtAttributeTextValue = new CrtAttributeTextValue();
+            crtAttributeTextValue.set_Name(ecoResAttribute.Name);
+            crtAttributeTextValue.set_TextValue(ecoResTextValue.TextValue);
+
+            clrAttributeValues.add(crtAttributeTextValue);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldSkipCreateCRTSalesLine</Name>
+				<Source><![CDATA[
+    [Replaceable]
+    protected boolean shouldSkipCreateCRTSalesLine(RetailPricingSimulatorSalesLine _psSalesLine)
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCRTSalesLineFromPSSalesLine</Name>
+				<Source><![CDATA[
+    protected void setCRTSalesLineFromPSSalesLine(
+        CrtSalesLine _crtSalesLine,
+        RetailPricingSimulatorSalesLine _psSalesLine)
+    {
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDateTimeInChannelTimeZone</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the date after applying channel time zone.
+    /// </summary>
+    /// <returns>
+    /// The CLR converted date time.
+    /// </returns>
+    private System.DateTimeOffset getDateTimeInChannelTimeZone()
+    {
+        utcDateTime simulationDateTime;
+        System.DateTime dateTime, dateTimeUtc;
+        System.DateTimeOffset dateTimeOffsetUtc, dateTimeOffsetChannel;
+        RetailChannelTable channel = RetailChannelTable::findByRecId(retailChannelTable.RecId);
+
+        simulationDateTime = psSalesTransaction.SimulationDateTime;
+        dateTime = Global::utcDateTime2SystemDateTime(simulationDateTime);
+
+        dateTimeUtc = new System.DateTime(dateTime.get_Ticks(), System.DateTimeKind::Utc);
+
+        dateTimeOffsetUtc = new System.DateTimeOffset(dateTimeUtc, System.TimeSpan::Zero);
+
+        if (channel.RecId != 0)
+        {
+            dateTimeOffsetChannel =  System.TimeZoneInfo::ConvertTimeBySystemTimeZoneId(dateTimeOffsetUtc, channel.ChannelTimeZoneInfoId);
+        }
+        else
+        {
+            // Get the company timezone
+            DataArea dataArea;
+            select firstonly TimeZone from dataArea where dataArea.Id == curExt();
+
+            dateTimeOffsetChannel = System.TimeZoneInfo::ConvertTimeBySystemTimeZoneId(
+                dateTimeOffsetUtc,
+                DateTimeUtil::getTimeZoneId(dataArea.timeZone));
+        }
+
+        return dateTimeOffsetChannel;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeChannelPricingParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes pricing paramaeters for the selected channel.
+    /// </summary>
+    private void initializeChannelPricingParameters()
+    {
+        UserId                          userId = curUserId();
+        RetailTransactionId             transactionIdString = this.getTransactionIdString();
+
+        boolean includeDisabledDiscounts = (psSalesTransaction.IncludeDisabledDiscounts == NoYes::No) ? false : true;
+
+        this.initializeDataAcessor(includeDisabledDiscounts);
+        this.initializeCurrencyOperations();
+
+        dateTimeOffset = this.getDateTimeInChannelTimeZone();
+
+        this.insertTempOrderItem();
+
+        // If the feature is enabled, we need the Product to be the variant product id.
+        if (RetailPricingFeatureToggle::shouldUseRetailPricingDataManagerV3())
+        {
+            if (!includeDisabledDiscounts || !RetailPricingKillSwitch::isPriceSimulatorSupportsDisabledDiscountsWhenPerformanceImprovementFeatureEnabled())
+            {
+                update_recordSet tempOrderItem
+                    setting Product = tempOrderItem.Variant
+                    where tempOrderItem.Variant != 0;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTempOrderItem</Name>
+				<Source><![CDATA[
+    protected void insertTempOrderItem()
+    {
+        RetailPricingSimulatorSalesLine psSalesLines;
+        InventDim inventDim;
+
+        if (RetailPricingDisableGetPriceTradeAgreementsBySearchCriteriaFlight::instance().isEnabled())
+        {
+            insert_recordset tempOrderItem(itemId, inventDimId, retailVariantId, Product, Variant, LineNum)
+            select DisplayProductNumber, InventDimId, DisplayProductVariantNumber,Product, Variant, SalesLineNum
+                from psSalesLines
+                    group by DisplayProductNumber, InventDimId, DisplayProductVariantNumber,Product, Variant, SalesLineNum
+                        where psSalesLines.RetailPricingSimulatorSalesTransaction == salesTransactionId;
+        }
+        else
+        {
+            try
+            {
+                insert_recordset tempOrderItem(itemId, inventDimId, retailVariantId, Product, Variant, LineNum, InventSiteId, InventLocationId)
+                    select DisplayProductNumber, InventDimId, DisplayProductVariantNumber, Product, Variant, SalesLineNum from psSalesLines
+                        group by DisplayProductNumber, InventDimId, DisplayProductVariantNumber,Product, Variant, SalesLineNum
+                            where psSalesLines.RetailPricingSimulatorSalesTransaction == salesTransactionId
+                        outer join InventSiteId, InventLocationId from inventDim
+                            group by InventSiteId, InventLocationId
+                                where psSalesLines.InventDimId == inventDim.inventDimId;
+            }
+            catch (Exception::Error)
+            {
+                throw error("@RetailPricing:InvalidInventDimIds");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeDataAcessor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the data accessor.
+    /// </summary>
+    /// <param name = "_includeDisabledDiscounts">If disabled discounts should be considered, use <c>true</c>, otherwise <c>false</c>.</param>
+    /// <remarks>
+    /// When implementing a new discount type, override this method to register the custom data accessor needed to instantiate the new discount.
+    /// </remarks>
+    protected void initializeDataAcessor(boolean _includeDisabledDiscounts)
+    {
+        // If the feature is enabled, the option to include disabled discounts will be discard.
+        if (RetailPricingFeatureToggle::shouldUseRetailPricingDataManagerV3())
+        {
+            if (_includeDisabledDiscounts && RetailPricingKillSwitch::isPriceSimulatorSupportsDisabledDiscountsWhenPerformanceImprovementFeatureEnabled())
+            {
+                var pricingManagerLocal = new RetailPricingDataManagerSimulator(retailChannelTable.RecId, this.getTransactionIdString(), _includeDisabledDiscounts, tempOrderItem, true);
+                pricingManagerLocal.parmIsPriceSimulatorPropertyBasedMode(isPropertyBasedMode);
+                pricingManager = pricingManagerLocal;
+            }
+            else
+            {
+                var pricingManagerLocal = new RetailPricingDataManagerV3(retailChannelTable.RecId, this.getTransactionIdString(), tempOrderItem, true);
+                pricingManagerLocal.parmIsPriceSimulatorPropertyBasedMode(isPropertyBasedMode);
+                pricingManager = pricingManagerLocal;
+            }
+        }
+        else
+        {
+            var pricingManagerLocal = new RetailPricingDataManagerSimulator(retailChannelTable.RecId, this.getTransactionIdString(), _includeDisabledDiscounts, tempOrderItem, true);
+            pricingManagerLocal.parmIsPriceSimulatorPropertyBasedMode(isPropertyBasedMode);
+            pricingManager = pricingManagerLocal;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeCurrencyOperations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the Currency operations implementation.
+    /// </summary>
+    protected void initializeCurrencyOperations()
+    {
+        currencyAndRoundingHelper = new RetailCurrencyOperations(CompanyInfoHelper::standardCurrency());;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(RefRecId _salesTransactionId)
+    {
+        salesTransactionId = _salesTransactionId;
+
+        transactionId = System.Guid::NewGuid();
+
+        totalCostPrice = 0;
+
+        psSalesTransaction = RetailPricingSimulatorSalesTransaction::findByRef(_salesTransactionId);
+
+        retailChannelTable = RetailChannelTable::findByRecId(psSalesTransaction.RetailChannelTable);
+        custTable = custTable::find(psSalesTransaction.CustAccount);
+
+        this.initChannelCurrency();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initChannelCurrency</Name>
+				<Source><![CDATA[
+    protected void initChannelCurrency()
+    {
+        if (psSalesTransaction.ChannelCurrency != '')
+        {
+            channelCurrency = psSalesTransaction.ChannelCurrency;
+            return ;
+        }
+
+        channelCurrency = retailChannelTable.Currency;
+
+        if (channelCurrency == '')
+        {
+            channelCurrency = custTable.Currency;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePriceAndDiscountsInDbTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the calculated price and discounts in the RetailPricingSimulatorSalesLine table.
+    /// </summary>
+    protected void updatePriceAndDiscountsInDbTable()
+    {
+        RetailPricingSimulatorSalesLine psSalesLine;
+        CLRObject clrSalesLines, enumeratorSalesLine, clrDiscountLines, enumeratorDiscountsLine, clrPriceLines, enumeratorPriceLines;
+
+        CrtSalesLine crtSalesLine;
+        CrtDiscountLine  crtDiscountLine;
+        CrtPriceLine crtPriceLine;
+
+        selectedDiscounts = new Set(Types::String);
+        selectedPriceAdjustments = new Set(Types::String);
+        selectedTradeAgreements = new Set(Types::String);
+        selectedSalesAgreements = new Set(Types::String);
+        clrSalesLines = crtSalesTransaction.get_SalesLines();
+        enumeratorSalesLine = clrSalesLines.GetEnumerator();
+
+        // Delete existing lines for current transaction from PricingSimulatorSalesLine object,
+        // As pricing engine can split lines after pricing and dicount calculations.
+        RetailPricingSimulatorAttributeHelper::deleteEcoResAttributeValuesForSalesLine(psSalesLine);
+        delete_from psSalesLine
+            where psSalesLine.RetailPricingSimulatorSalesTransaction == salesTransactionId;
+
+        // Iterate over sales line clr object and update PricingSimulatorSalesLine table.
+        while (enumeratorSalesLine.MoveNext())
+        {
+            Price price, costPrice;
+            DiscAmount discountAmount;
+            str offerName, combinedOfferName;
+            Qty salesQty;
+
+            EcoResProduct ecoResProduct;
+            InventDimCombination inventDimCombination;
+            InventTableModule inventTableModule;
+            UnitOfMeasureSymbol uomSymbol;
+            UnitOfMeasureSymbol productDefaultUoMSymbol;
+
+            crtSalesLine = enumeratorSalesLine.get_Current();
+
+            price = 0;
+            costPrice = 0;
+            discountAmount = 0;
+            offerName = '';
+            combinedOfferName = '';
+
+            psSalesLine.clear();
+
+            psSalesLine.RetailPricingSimulatorSalesTransaction = salesTransactionId;
+
+            this.initSalesLine(crtSalesLine, psSalesLine);
+
+            psSalesLine.Product = InventTable::find(crtSalesLine.get_ItemId()).Product;
+            ecoResProduct = EcoResProduct::find(psSalesLine.Product);
+            psSalesLine.ProductName = ecoResProduct.productName();
+
+            //Get the default uom symbol of product.
+            productDefaultUoMSymbol = InventTableModule::find(ecoResProduct.releasedItemId(), ModuleInventPurchSales::Sales).UnitId;
+
+            inventDimCombination = this.findInventDimCombination(crtSalesLine, psSalesLine);
+            psSalesLine.Variant = inventDimCombination.DistinctProductVariant;
+            psSalesLine.DisplayProductVariantNumber = inventDimCombination.RetailVariantId;
+
+            salesQty = crtsalesLine.get_Quantity();
+            psSalesLine.Quantity = salesQty;
+
+            uomSymbol = crtSalesLine.get_SalesOrderUnitOfMeasure();
+            psSalesLine.UoM = UnitOfMeasure::findBySymbol(uomSymbol).RecId;
+
+            price = crtSalesLine.get_Price();
+            discountAmount = crtSalesLine.get_DiscountAmount();
+
+            // Total price = line price * quantity sold * unit of measure conversion factor.
+            psSalesLine.OriginalPrice = price * salesQty;
+
+            // Total discount amount
+            psSalesLine.DiscountAmount = discountAmount;
+
+            // Calculate Disc percentage.
+            if (psSalesLine.OriginalPrice)
+            {
+                psSalesLine.DiscPct = psSalesLine.DiscountAmount * 100 / psSalesLine.OriginalPrice;
+            }
+
+            // Net sales price.
+            psSalesLine.SalesPrice = psSalesLine.OriginalPrice - psSalesLine.DiscountAmount;
+
+            // Find purch record for item to calculate margin on line.
+            inventTableModule = InventTableModule::find(psSalesLine.DisplayProductNumber, ModuleInventPurchSales::Purch);
+
+            // Calculate line margin percentage.
+            if (inventTableModule.Price)
+            {
+                real unitQuantityOfMeasure = EcoResProductUnitConverter::convertForReleasedProduct(
+                        inventTableModule.ItemId,
+                        crtSalesLine.get_InventoryDimensionId(),
+                        1,
+                        UnitOfMeasure::findBySymbol(uomSymbol).RecId,
+                        UnitOfMeasure::findBySymbol(inventTableModule.UnitId).RecId,
+                        NoYes::No,
+                        NoYes::No);
+
+                real priceUnit = (inventTableModule.PriceUnit == 0) ? 1 : inventTableModule.PriceUnit;
+
+                // Cost price = purchase price * unit of measure conversion factor / price unit * quantity sold.
+                costPrice = inventTableModule.Price * unitQuantityOfMeasure / priceUnit * salesQty;
+
+                if (psSalesLine.SalesPrice == 0)
+                {
+                    psSalesLine.Margin = 0;
+                }
+                else
+                {
+                    psSalesLine.Margin = (psSalesLine.SalesPrice - costPrice) * 100 / psSalesLine.SalesPrice;
+                }
+                totalCostPrice += costPrice;
+            }
+
+            clrDiscountLines = crtSalesLine.get_DiscountLines();
+            enumeratorDiscountsLine = clrDiscountLines.GetEnumerator();
+            // Iterate over discount line to update name of the discount on each line.
+            while (enumeratorDiscountsLine.MoveNext())
+            {
+                crtDiscountLine = enumeratorDiscountsLine.get_Current();
+                offerName = this.updateSelectedDiscounts(crtSalesLine, crtDiscountLine);
+
+                // If offer name is non-blank on discount line, append it to final string
+                if (offerName != '')
+                {
+                    combinedOfferName +=  ' , ' + offerName;
+                }
+            }
+
+            // Remove empty prefix from offer name string.
+            if (combinedOfferName != '')
+            {
+                psSalesLine.OfferName = subStr(combinedOfferName, 4, strLen(combinedOfferName));
+            }
+
+            if (RetailPricingEngineHelper::classHasProperty(crtSalesLine.GetType(), 'PriceLines'))
+            {
+                clrPriceLines = RetailPricingEngineHelper::getObjectPropertyIfExistsInClass(crtSalesLine, 'PriceLines');
+
+                enumeratorPriceLines = clrPriceLines.GetEnumerator();
+
+                // Iterate over price lines to set the "Selected" flag for the selected price adjusments.
+                while (enumeratorPriceLines.MoveNext())
+                {
+                    crtPriceLine = enumeratorPriceLines.get_Current();
+
+                    if (crtPriceLine is CrtPriceAdjustmentPriceLine)
+                    {
+                        offerName = this.updateSelectedAdjustments(crtSalesLine, crtPriceLine);
+                    }
+                    else if (crtPriceLine is CrtTradeAgreementPriceLine)
+                    {
+                        selectedTradeAgreements.add(crtPriceLine.OriginId);
+                    }
+                    else if (crtPriceLine is CrtSalesAgreementPriceLine)
+                    {
+                        selectedSalesAgreements.add(crtPriceLine.OriginId);
+                    }
+                }
+            }
+
+            psSalesLine.insert();
+            this.insertLinePricingData(crtSalesLine, psSalesLine);
+            this.insertLineAttributeValues(crtSalesLine, psSalesLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAnalysisData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the analysis tables related the retail simulatation transaction.
+    /// </summary>
+    private void updateAnalysisData()
+    {
+        if (diagnosticsObjectDiscounts != null)
+        {
+            ttsbegin;
+            RetailPricingSimulatorSalesTransaction simulatorTransaction = RetailPricingSimulatorSalesTransaction::findByRef(salesTransactionId, true);
+            simulatorTransaction.PricingDiagnostics = diagnosticsObjectDiscounts.ToString();
+
+            simulatorTransaction.update();
+            ttscommit;
+        }
+
+        // Update discount considered table.
+        RetailPricingSimulatorDiscount pricingDiscount;
+
+        // Remove all current discounts considered.
+        delete_from pricingDiscount
+            where pricingDiscount.RetailPricingSimulatorTransactionId == salesTransactionId;
+
+        // Insert the discounts which were considered.
+        CLRObject discountsConsidered = diagnosticsObjectDiscounts.DiscountsConsidered;
+        this.InsertRetailDiscountAnalysisData(discountsConsidered);
+
+        discountsConsidered = diagnosticsObjectPrices.PriceAdjustmentsConsidered;
+        this.InsertRetailDiscountAnalysisData(discountsConsidered);
+
+        this.updateDiscountForRows(pricingDiscount);
+
+        RetailDiscountMultibuy multiBuyDiscount;
+
+        update_recordset pricingDiscount
+            setting
+                DiscountMethod = multiBuyDiscount.MultibuyDiscountType
+            join multiBuyDiscount
+            where multiBuyDiscount.OfferId == pricingDiscount.OfferId
+                && multiBuyDiscount.PeriodicDiscountType == RetailDiscountOfferTypeBase::Multibuy
+                && pricingDiscount.RetailPricingSimulatorTransactionId == salesTransactionId;
+
+        RetailDiscountMixAndMatch retailDiscountMixAndMatch;
+
+        update_recordset pricingDiscount
+            setting
+                DiscountMethod = retailDiscountMixAndMatch.MixAndMatchDiscountType
+            join retailDiscountMixAndMatch
+            where retailDiscountMixAndMatch.OfferId == pricingDiscount.OfferId
+                && (retailDiscountMixAndMatch.PeriodicDiscountType == RetailDiscountOfferTypeBase::MixAndMatch
+                    || retailDiscountMixAndMatch.PeriodicDiscountType == RetailDiscountOfferTypeBase::LeastExpensiveFavorRetailer)
+                && pricingDiscount.RetailPricingSimulatorTransactionId == salesTransactionId;
+
+        RecordInsertList tradeAgreementInsertList = new RecordInsertList(tableNum(RetailPricingSimulatorPriceDiscTable));
+
+        CLRObject tradeAgreementsConsidered = TypeHelperForAx::CreateListOfType(new Microsoft.Dynamics.Commerce.Runtime.DataModel.TradeAgreement().GetType());
+
+        tradeAgreementsConsidered.AddRange(diagnosticsObjectPrices.TradeAgreementsConsidered);
+        tradeAgreementsConsidered.AddRange(diagnosticsObjectDiscounts.TradeAgreementsConsidered);
+
+        RetailPricingSimulatorPriceDiscTable tradeAgreement;
+
+        delete_from tradeAgreement
+            where tradeAgreement.RetailPricingSimulatorTransactionId == salesTransactionId;
+
+        if (tradeAgreementsConsidered)
+        {
+            CLRObject tradeAgreementsConsideredEnumerator = tradeAgreementsConsidered.GetEnumerator();
+
+            // Enumerate through trade agreement list and insert it into RetailPricingSimulatorPriceDiscTable table.
+            while (tradeAgreementsConsideredEnumerator.MoveNext())
+            {
+                Microsoft.Dynamics.Commerce.Runtime.DataModel.TradeAgreement tradeAgreementConsidered = tradeAgreementsConsideredEnumerator.get_Current();
+                tradeAgreement = this.initTradeAgreement(tradeAgreementConsidered);
+                if (selectedTradeAgreements.in(tradeAgreementConsidered.RecordId.ToString()))
+                {
+                    tradeAgreement.Selected = NoYes::Yes;
+                }
+                tradeAgreementInsertList.add(tradeAgreement);
+            }
+
+            tradeAgreementInsertList.insertDatabase();
+        }
+
+        // Update Sales Agreement Data
+        CLRObject salesAgreementsConsidered = TypeHelperForAx::CreateListOfType(new Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesAgreementLine().GetType());
+        RecordInsertList salesAgreementInsertList = new RecordInsertList(tableNum(RetailPricingSimulatorSalesAgreement));
+
+        salesAgreementsConsidered.AddRange(diagnosticsObjectPrices.SalesAgreementsConsidered);
+
+        RetailPricingSimulatorSalesAgreement salesAgreement;
+
+        delete_from salesAgreement
+            where salesAgreement.RetailPricingSimulatorTransactionId == salesTransactionId;
+
+        if (salesAgreementsConsidered)
+        {
+            CLRObject salesAgreementsConsideredEnumerator = salesAgreementsConsidered.GetEnumerator();
+
+            // Enumerate through sales agreement list and insert it into RetailPricingSimulatorSalesAgreement table.
+            while (salesAgreementsConsideredEnumerator.MoveNext())
+            {
+                Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesAgreementLine salesAgreementConsidered = salesAgreementsConsideredEnumerator.get_Current();
+                salesAgreement = this.initSalesAgreement(salesAgreementConsidered);
+                if (selectedSalesAgreements.in(salesAgreementConsidered.RecordId.ToString()))
+                {
+                    salesAgreement.Selected = NoYes::Yes;
+                }
+                salesAgreementInsertList.add(salesAgreement);
+            }
+
+            salesAgreementInsertList.insertDatabase();
+        }
+
+        RetailPricingSimulatorPriceGroupV2 priceGroup;
+        RecordInsertList priceGroupList = new RecordInsertList(tableNum(RetailPricingSimulatorPriceGroupV2));
+
+        delete_from priceGroup
+            where priceGroup.RetailPricingSimulatorSalesTransaction == salesTransactionId;
+
+        Set priceGroups = this.getApplicablePriceGroups();
+
+        if (priceGroups.elements() > 0)
+        {
+            SetEnumerator setEnumerator = priceGroups.getEnumerator();
+
+            // Enumerate through price group list and insert it into RetailPricingSimulatorPriceGroupV2 table.
+            while (setEnumerator.MoveNext())
+            {
+                System.String priceGroupId = setEnumerator.current();
+
+                priceGroup.clear();
+                priceGroup.RetailPricingSimulatorSalesTransaction = salesTransactionId;
+                priceGroup.PriceDiscGroupId = priceGroupId;
+                priceGroupList.add(priceGroup);
+            }
+
+            priceGroupList.insertDatabase();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getApplicablePriceGroups</Name>
+				<Source><![CDATA[
+    internal protected Set getApplicablePriceGroups()
+    {
+        Set priceGroups = new Set(Types::String);
+
+        CLRObject priceGroupApplicable = diagnosticsObjectPrices.PriceGroupsApplicable;
+
+        if (priceGroupApplicable.get_Count() > 0)
+        {
+            CLRObject priceGroupApplicableEnumerator = priceGroupApplicable.GetEnumerator();
+
+            // Enumerate through price group list and insert it into Set.
+            while (priceGroupApplicableEnumerator.MoveNext())
+            {
+                System.String priceGroupId = priceGroupApplicableEnumerator.get_Current();
+
+                priceGroups.add(priceGroupId);
+            }
+        }
+
+        return priceGroups;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertLinePricingData</Name>
+				<Source><![CDATA[
+    private void insertLinePricingData(
+        CrtSalesLine _crtSalesLine, RetailPricingSimulatorSalesLine _salesLine)
+    {
+        RetailPricingSimulatorLineDiscount discountLine;
+        RecordInsertList tradeAgreementRecordList
+            = new RecordInsertList(tableNum(RetailPricingSimulatorLinePriceDiscTable));
+        RecordInsertList discountRecordList
+            = new RecordInsertList(tableNum(RetailPricingSimulatorLineDiscount));
+        CLRObject clrDiscountLines = _crtSalesLine.get_DiscountLines();
+        CLRObject enumeratorDiscountLine = clrDiscountLines.GetEnumerator();
+
+        // Populate applied discounts.
+        while (enumeratorDiscountLine.MoveNext())
+        {
+            CrtDiscountLine crtDiscountLine = enumeratorDiscountLine.get_Current();
+
+            if (crtDiscountLine.get_CustomerDiscountTypeValue() > 0) // trade agreement discount
+            {
+                RetailPricingSimulatorLinePriceDiscTable lineDiscountTradeAgreement;
+                CLRObject tradeAgreementIdsEnumerator = crtDiscountLine.get_AppliedTradeAgreementIds().GetEnumerator();
+                while (tradeAgreementIdsEnumerator.moveNext())
+                {
+                    str tradeAgreementId = tradeAgreementIdsEnumerator.get_Current();
+                    // any2Int64() returns 0 for string that cannot be converted to int64.
+                    PriceDiscTable tradeAgreementData = PriceDiscTable::findRecId(any2Int64(tradeAgreementId));
+                    if (tradeAgreementData)
+                    {
+                        lineDiscountTradeAgreement = this.initLineTradeAgreement(tradeAgreementData, _salesLine, null);
+                        tradeAgreementRecordList.add(lineDiscountTradeAgreement);
+                    }
+                }
+            }
+            else if (crtDiscountLine.get_OfferId())
+            {
+                discountLine = this.initLineDiscount(crtDiscountLine, _salesLine);
+                discountRecordList.add(discountLine);
+            }
+        }
+
+        discountRecordList.insertDatabase();
+
+        // Populate applied trade agreements.
+        if (RetailPricingEngineHelper::classHasProperty(_crtSalesLine.GetType(), 'PriceLines'))
+        {
+            CrtPriceLine crtPriceLine;
+
+            RetailPricingSimulatorLinePriceDiscTable tradeAgreement;
+
+            RetailPricingSimulatorLineDiscount priceAdjustment;
+            RecordInsertList priceAdjustmentRecordList
+                = new RecordInsertList(tableNum(RetailPricingSimulatorLineDiscount));
+
+            RetailPricingSimulatorLineSalesAgreement salesAgreement;
+            RecordInsertList salesAgreementRecordList
+                = new RecordInsertList(tableNum(RetailPricingSimulatorLineSalesAgreement));
+
+            CLRObject clrPriceLines = RetailPricingEngineHelper::getObjectPropertyIfExistsInClass(_crtSalesLine, 'PriceLines');
+            CLRObject enumeratorPriceLines = clrPriceLines.GetEnumerator();
+
+            while (enumeratorPriceLines.MoveNext())
+            {
+                crtPriceLine = enumeratorPriceLines.get_Current();
+
+                if (crtPriceLine is CrtPriceAdjustmentPriceLine)
+                {
+                    RetailPeriodicDiscount priceAdjustmentData =
+                        RetailPeriodicDiscount::findByOfferId(crtPriceLine.get_OriginId());
+                    if (priceAdjustmentData)
+                    {
+                        priceAdjustment = this.initLinePriceAdjustment(priceAdjustmentData, _salesLine, crtPriceLine);
+                        priceAdjustmentRecordList.add(priceAdjustment);
+                    }
+                }
+                else if (crtPriceLine is CrtTradeAgreementPriceLine)
+                {
+                    PriceDiscTable tradeAgreementData = PriceDiscTable::findRecId(crtPriceLine.get_RecordId());
+                    if (tradeAgreementData)
+                    {
+                        tradeAgreement = this.initLineTradeAgreement(tradeAgreementData, _salesLine, crtPriceLine);
+                        tradeAgreementRecordList.add(tradeAgreement);
+                    }
+                }
+                else if (crtPriceLine is CrtSalesAgreementPriceLine)
+                {
+                    AgreementLine salesAgreementData = AgreementLine::find(crtPriceLine.get_RecordId());
+                    if (salesAgreementData)
+                    {
+                        salesAgreement = this.initLineSalesAgreement(salesAgreementData, _salesLine);
+                        salesAgreementRecordList.add(salesAgreement);
+                    }
+                }
+            }
+
+            priceAdjustmentRecordList.insertDatabase();
+            tradeAgreementRecordList.insertDatabase();
+            salesAgreementRecordList.insertDatabase();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertLineAttributeValues</Name>
+				<Source><![CDATA[
+    private void insertLineAttributeValues(CrtSalesLine _crtSalesLine, RetailPricingSimulatorSalesLine _psSalesLine)
+    {
+        CLRObject clrAttributeValues = _crtSalesLine.get_AttributeValues();
+        if (clrAttributeValues.get_Count() == 0)
+        {
+            return; // If the sales line does not have attributes, no need to create EcoResAttributeValue and related data.
+        }
+
+        RetailPricingSimulatorInstanceValue instanceValue = RetailPricingSimulatorInstanceValue::findOrCreate(_psSalesLine.RetailPricingSimulatorSalesTransaction, _psSalesLine.SalesLineNum);
+
+        CLRObject enumeratorAttributeValue = clrAttributeValues.GetEnumerator();
+        Map attributeNameValueMap = new Map(Types::String, Types::String);
+        while (enumeratorAttributeValue.MoveNext())
+        {
+            CrtAttributeTextValue crtAttributeValue = enumeratorAttributeValue.get_Current() as CrtAttributeTextValue; // Supports only textValue attributes.
+            attributeNameValueMap.insert(crtAttributeValue.get_Name(), crtAttributeValue.get_TextValue());
+        }
+
+        if (!attributeNameValueMap.empty())
+        {
+            // Default value has been created by RetailPricingSimulatorInstanceValue::findOrCreate, so we just need to find and update the record.
+            EcoResAttribute ecoResAttribute;
+            EcoResAttributeValue ecoResAttributeValue;
+            EcoResTextValue ecoResTextValue;
+
+            while select ecoResAttributeValue
+                    where ecoResAttributeValue.InstanceValue == instanceValue.RecId
+                join forupdate ecoResTextValue
+                    where ecoResAttributeValue.Value == ecoResTextValue.RecId
+            {
+                ecoResAttribute = EcoResAttribute::find(ecoResAttributeValue.Attribute);
+                ecoResTextValue.TextValue = attributeNameValueMap.lookup(ecoResAttribute.Name);
+                ecoResTextValue.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initLineDiscount</Name>
+				<Source><![CDATA[
+    protected RetailPricingSimulatorLineDiscount initLineDiscount(
+        CrtDiscountLine _crtDiscountLine, RetailPricingSimulatorSalesLine _salesLine)
+    {
+        // We cannot declare a map object, so use clear() method instead.
+        RetailPricingSimulatorLineDiscount discountLine;
+
+        discountLine.SalesTransactionId = salesTransactionId;
+        discountLine.SalesLineId = _salesLine.RecId;
+
+        discountLine.ConcurrencyMode = any2Enum(_crtDiscountLine.get_ConcurrencyModeValue());
+        discountLine.OfferId = _crtDiscountLine.get_OfferId();
+        discountLine.Name = _crtDiscountLine.get_OfferName();
+        discountLine.PeriodicDiscountType = any2Enum(_crtDiscountLine.get_PeriodicDiscountTypeValue());
+
+        discountLine.Selected = NoYes::Yes;
+
+        discountLine.EffectiveDiscountAmount = this.currencyAndRoundingHelper.Round(_crtDiscountLine.EffectiveAmount);
+        discountLine.EffectiveDiscountAmountPerUnit = this.currencyAndRoundingHelper.Round(_crtDiscountLine.EffectiveAmount / abs(_salesLine.Quantity));
+
+        return discountLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initLinePriceAdjustment</Name>
+				<Source><![CDATA[
+    protected RetailPricingSimulatorLineDiscount initLinePriceAdjustment(
+        RetailPeriodicDiscount _priceAdjustment, RetailPricingSimulatorSalesLine _salesLine, CrtPriceAdjustmentPriceLine _crtPriceLine)
+    {
+        // We cannot declare a map object, so use clear() method instead.
+        RetailPricingSimulatorLineDiscount discountLine;
+
+        discountLine.SalesTransactionId = salesTransactionId;
+        discountLine.SalesLineId = _salesLine.RecId;
+
+        discountLine.ConcurrencyMode = _priceAdjustment.ConcurrencyMode;
+        discountLine.OfferId = _priceAdjustment.OfferId;
+        discountLine.Name = _priceAdjustment.Name;
+        discountLine.PeriodicDiscountType = _priceAdjustment.PeriodicDiscountType;
+
+        discountLine.Selected = NoYes::Yes;
+
+        return discountLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initLineTradeAgreement</Name>
+				<Source><![CDATA[
+    protected RetailPricingSimulatorLinePriceDiscTable initLineTradeAgreement(
+        PriceDiscTable _tradeAgreement, RetailPricingSimulatorSalesLine _salesLine, CrtTradeAgreementPriceLine _crtPriceLine)
+    {
+        RetailPricingSimulatorLinePriceDiscTable lineTradeAgreement;
+
+        lineTradeAgreement.SalesTransactionId = salesTransactionId;
+        lineTradeAgreement.SalesLineId = _salesLine.RecId;
+
+        lineTradeAgreement.relation = _tradeAgreement.relation;
+        lineTradeAgreement.AccountCode = _tradeAgreement.AccountCode;
+        lineTradeAgreement.AccountRelation = _tradeAgreement.AccountRelation;
+        lineTradeAgreement.ItemCode = _tradeAgreement.ItemCode;
+        lineTradeAgreement.ItemRelation = _tradeAgreement.ItemRelation;
+
+        InventDim inventDim = InventDim::find(_tradeAgreement.InventDimId);
+
+        lineTradeAgreement.ColorId = inventDim.InventColorId;
+        lineTradeAgreement.SizeId = inventDim.InventSizeId;
+        lineTradeAgreement.StyleId = inventDim.InventStyleId;
+        lineTradeAgreement.ConfigurationId = inventDim.ConfigId;
+        lineTradeAgreement.SiteId = inventDim.InventSiteId;
+        lineTradeAgreement.WarehouseId = inventDim.InventLocationId;
+
+        lineTradeAgreement.UnitId = _tradeAgreement.UnitId;
+        lineTradeAgreement.Amount = _tradeAgreement.Amount;;
+        lineTradeAgreement.Percent1 = _tradeAgreement.Percent1;
+        lineTradeAgreement.Percent2 = _tradeAgreement.Percent2;
+
+        lineTradeAgreement.Selected = NoYes::Yes;
+
+        return lineTradeAgreement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initLineSalesAgreement</Name>
+				<Source><![CDATA[
+    protected RetailPricingSimulatorLineSalesAgreement initLineSalesAgreement(
+        AgreementLine _salesAgreementLine, RetailPricingSimulatorSalesLine _salesLine)
+    {
+        RetailPricingSimulatorLineSalesAgreement lineSalesAgreement;
+
+        lineSalesAgreement.SalesAgreementLineRecId = _salesAgreementLine.RecId;
+        lineSalesAgreement.RetailPricingSimulatorTransactionId = salesTransactionId;
+        lineSalesAgreement.SalesLineId = _salesLine.RecId;
+        lineSalesAgreement.ItemId = _salesAgreementLine.ItemId;
+        lineSalesAgreement.CommitmentType = _salesAgreementLine.AgreementLineType;
+        lineSalesAgreement.MaxIsEnforced = _salesAgreementLine.IsMaxEnforced;
+        lineSalesAgreement.IsPriceAndDiscountFixed = _salesAgreementLine.IsPriceInformationMandatory;
+        lineSalesAgreement.Selected = NoYes::Yes;
+        lineSalesAgreement.DiscountPercentage = _salesAgreementLine.LineDiscountPercent;
+
+        // Special line type.
+        if (_salesAgreementLine.AgreementLineType == CommitmentType::ProductQuantity)
+        {
+            AgreementLineQuantityCommitment quantityLine = (_salesAgreementLine as AgreementLineQuantityCommitment);
+            lineSalesAgreement.DiscountAmount = quantityLine.LineDiscountAmount;
+            lineSalesAgreement.Price = quantityLine.PricePerUnit;
+            lineSalesAgreement.PriceUnit = quantityLine.PriceUnit;
+            lineSalesAgreement.Unit = quantityLine.ProductUnitOfMeasure;
+        }
+
+        SalesAgreementHeader agreementHeader = SalesAgreementHeader::find(_salesAgreementLine.Agreement);
+        lineSalesAgreement.SalesAgreementId = agreementHeader.SalesNumberSequence;
+        lineSalesAgreement.CustomerAccount = agreementHeader.CustAccount;
+        lineSalesAgreement.SalesAgreementHeaderRecId = agreementHeader.RecId;
+
+        InventDim inventDim = InventDim::find(_salesAgreementLine.InventDimId);
+        lineSalesAgreement.ColorId = inventDim.InventColorId;
+        lineSalesAgreement.SizeId = inventDim.InventSizeId;
+        lineSalesAgreement.StyleId = inventDim.InventStyleId;
+        lineSalesAgreement.ConfigurationId = inventDim.configId;
+        lineSalesAgreement.SiteId = inventDim.InventSiteId;
+        lineSalesAgreement.WarehouseId = inventDim.InventLocationId;
+
+        return lineSalesAgreement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTradeAgreement</Name>
+				<Source><![CDATA[
+    protected RetailPricingSimulatorPriceDiscTable initTradeAgreement(
+        Microsoft.Dynamics.Commerce.Runtime.DataModel.TradeAgreement _tradeAgreementConsidered)
+    {
+        RetailPricingSimulatorPriceDiscTable tradeAgreement;
+        int accountCode = _tradeAgreementConsidered.AccountCode;
+        tradeAgreement.AccountCode = accountCode;
+        tradeAgreement.AccountRelation = _tradeAgreementConsidered.AccountRelation;
+        tradeAgreement.Amount = _tradeAgreementConsidered.Amount;
+        int itemCode = _tradeAgreementConsidered.ItemCode;
+        tradeAgreement.ItemCode = itemCode;
+        tradeAgreement.ItemRelation = _tradeAgreementConsidered.ItemRelation;
+        tradeAgreement.ColorId = _tradeAgreementConsidered.ColorId;
+        tradeAgreement.SizeId = _tradeAgreementConsidered.SizeId;
+        tradeAgreement.StyleId = _tradeAgreementConsidered.StyleId;
+        tradeAgreement.ConfigurationId = _tradeAgreementConsidered.ConfigId;
+        tradeAgreement.SiteId = _tradeAgreementConsidered.SiteId;
+        tradeAgreement.WarehouseId = _tradeAgreementConsidered.WarehouseId;
+        tradeAgreement.Percent1 = _tradeAgreementConsidered.PercentOne;
+        tradeAgreement.Percent2 = _tradeAgreementConsidered.PercentTwo;
+        PriceType relation = any2Enum(_tradeAgreementConsidered.Relation);
+        tradeAgreement.relation = relation;
+        tradeAgreement.UnitId = _tradeAgreementConsidered.UnitOfMeasureSymbol;
+        tradeAgreement.RetailPricingSimulatorTransactionId = salesTransactionId;
+
+        return tradeAgreement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSalesAgreement</Name>
+				<Source><![CDATA[
+    protected RetailPricingSimulatorSalesAgreement initSalesAgreement(
+        Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesAgreementLine _salesAgreementConsidered)
+    {
+        RetailPricingSimulatorSalesAgreement salesAgreement;
+
+        salesAgreement.RetailPricingSimulatorTransactionId = salesTransactionId;
+        salesAgreement.SalesAgreementId = _salesAgreementConsidered.SalesAgreementId;
+        salesAgreement.ItemId = _salesAgreementConsidered.ItemId;
+        salesAgreement.ColorId = _salesAgreementConsidered.ColorId;
+        salesAgreement.SizeId = _salesAgreementConsidered.SizeId;
+        salesAgreement.StyleId = _salesAgreementConsidered.StyleId;
+        salesAgreement.ConfigurationId = _salesAgreementConsidered.ConfigurationId;
+        salesAgreement.SiteId = _salesAgreementConsidered.SiteId;
+        salesAgreement.WarehouseId = _salesAgreementConsidered.WarehouseId;
+        salesAgreement.CustomerAccount = _salesAgreementConsidered.CustomerAccount;
+        salesAgreement.CommitmentType = _salesAgreementConsidered.LineType;
+        salesAgreement.Price = _salesAgreementConsidered.PricePerUnit;
+        salesAgreement.Unit = _salesAgreementConsidered.UnitOfMeasure;
+        salesAgreement.PriceUnit = _salesAgreementConsidered.PriceUnit;
+        salesAgreement.DiscountAmount = _salesAgreementConsidered.LineDiscountAmount;
+        salesAgreement.DiscountPercentage = _salesAgreementConsidered.LineDiscountPercent;
+        salesAgreement.MaxIsEnforced = _salesAgreementConsidered.IsMaxCommittedValueEnforced;
+        salesAgreement.IsPriceAndDiscountFixed = _salesAgreementConsidered.IsPriceAndDiscountFixed;
+
+        return salesAgreement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransactionTotals</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates RetailPricingSimulatorSalesTransaction table fields with the transaction aggregated summary.
+    /// </summary>
+    private void updateTransactionTotals()
+    {
+        RetailPricingSimulatorSalesLine psSalesLines;
+
+        select sum(SalesPrice), sum(DiscountAmount), count(Quantity)
+            from psSalesLines
+                where psSalesLines.RetailPricingSimulatorSalesTransaction == salesTransactionId;
+
+        psSalesTransaction = RetailPricingSimulatorSalesTransaction::findByRef(salesTransactionId, true);
+
+        psSalesTransaction.TransactionTotal = psSalesLines.SalesPrice;
+        psSalesTransaction.TotalDiscount = psSalesLines.DiscountAmount;
+        psSalesTransaction.LineItemCount = psSalesLines.Quantity;
+
+        // calculate net margin on transaction.
+        psSalesTransaction.TotalMargin = (psSalesLines.SalesPrice != 0) ? (psSalesLines.SalesPrice - totalCostPrice) * 100 / psSalesLines.SalesPrice : 0;
+
+        psSalesTransaction.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesAgreementId</Name>
+				<Source><![CDATA[
+    private void updateSalesAgreementId(int64 _salesAgreementRecId)
+    {
+        if (_salesAgreementRecId != 0)
+        {
+            SalesAgreementHeader saHeader = SalesAgreementHeader::find(_salesAgreementRecId);
+            psSalesTransaction = RetailPricingSimulatorSalesTransaction::findByRef(salesTransactionId, true);
+            psSalesTransaction.SalesAgreementId = saHeader.SalesNumberSequence;
+
+            psSalesTransaction.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InsertRetailDiscountAnalysisData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets discounts considered and inserts into AX table RetailPricingSimulatorDiscount.
+    /// </summary>
+    /// <param name = "discountsConsidered">An instance of List<string>.</param>
+    private void InsertRetailDiscountAnalysisData(CLRObject discountsConsidered)
+    {
+        RetailPricingSimulatorDiscount pricingDiscount;
+        RecordInsertList discountRecordInsertList = new RecordInsertList(tableNum(RetailPricingSimulatorDiscount));
+
+        if (discountsConsidered)
+        {
+            CLRObject discountsConsideredEnumerator = discountsConsidered.GetEnumerator();
+
+            // Enumerate through discountsConsidered list and insert into table RetailPricingSimulatorDiscount.
+            while (discountsConsideredEnumerator.MoveNext())
+            {
+                pricingDiscount = null;
+                pricingDiscount.OfferId = discountsConsideredEnumerator.get_Current();
+                pricingDiscount.RetailPricingSimulatorTransactionId = salesTransactionId;
+
+                if (selectedDiscounts.in(pricingDiscount.OfferId) || selectedPriceAdjustments.in(pricingDiscount.OfferId))
+                {
+                    pricingDiscount.Selected = NoYes::Yes;
+                }
+
+                discountRecordInsertList.add(pricingDiscount);
+            }
+        }
+
+        discountRecordInsertList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct a new instance of <c>RetailPricingSimulator</c> using the plugin framework to decice which implementation will be instantiated.
+    /// </summary>
+    /// <param name="_salesTransactionId">
+    /// RecId of PricingSimulatorSalesTransaction table.
+    /// </param>
+    /// <returns>
+    /// A new instance of <c>RetailPricingSimulator</c>.
+    /// </returns>
+    public static RetailPricingSimulator construct(RefRecId _salesTransactionId)
+    {
+        return RetailPricingCalculatorCreator::getInstance().createPricingSimulator(_salesTransactionId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct a new instance of default <c>RetailPricingSimulator</c>.
+    /// </summary>
+    /// <param name="_salesTransactionId">
+    /// RecId of PricingSimulatorSalesTransaction table.
+    /// </param>
+    /// <returns>
+    /// A new instance of <c>RetailPricingSimulator</c>.
+    /// </returns>
+    /// <remarks>
+    /// Internal usage only.
+    /// </remarks>
+    internal static RetailPricingSimulator constructDefault(RefRecId _salesTransactionId)
+    {
+        return new RetailPricingSimulator(_salesTransactionId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRetailPricingSimulatorSalesLineRecId</Name>
+				<Source><![CDATA[
+    public RecId parmRetailPricingSimulatorSalesLineRecId(RecId _recId = recId)
+    {
+        if (!prmIsDefault(_recId))
+        {
+            recId = _recId;
+        }
+        return recId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPricingSimulatorSalesLineNum</Name>
+				<Source><![CDATA[
+    public String255 parmPricingSimulatorSalesLineNum(String255 _pricingSimulatorSalesLineNum = pricingSimulatorSalesLineNum)
+    {
+        pricingSimulatorSalesLineNum = _pricingSimulatorSalesLineNum;
+
+        return pricingSimulatorSalesLineNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsPropertyBasedMode</Name>
+				<Source><![CDATA[
+    internal boolean parmIsPropertyBasedMode(boolean _isPropertyBasedMode = isPropertyBasedMode)
+    {
+        isPropertyBasedMode = _isPropertyBasedMode;
+        return isPropertyBasedMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDiscountForRows</Name>
+				<Source><![CDATA[
+    protected void updateDiscountForRows(RetailPricingSimulatorDiscount _pricingDiscount)
+    {
+        // Update data for rows in the discount considered table.
+        RetailPeriodicDiscount retailDiscount;
+
+        update_recordset _pricingDiscount
+            setting
+                Name = retailDiscount.Name,
+                ConcurrencyMode = retailDiscount.ConcurrencyMode,
+                PeriodicDiscountType = retailDiscount.PeriodicDiscountType,
+                Status = retailDiscount.Status,
+                PricingPriorityNumber = retailDiscount.PricingPriorityNumber
+            join retailDiscount
+            where retailDiscount.OfferId == _pricingDiscount.OfferId
+                && _pricingDiscount.RetailPricingSimulatorTransactionId == salesTransactionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSelectedAdjustments</Name>
+				<Source><![CDATA[
+    protected str updateSelectedAdjustments(Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine _crtSalesLine, Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceAdjustmentPriceLine _crtPriceLine)
+    {
+        str offerName = _crtPriceLine.OriginId;
+        selectedPriceAdjustments.add(offerName);
+        return offerName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSelectedDiscounts</Name>
+				<Source><![CDATA[
+    protected str updateSelectedDiscounts(Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine _crtSalesLine, Microsoft.Dynamics.Commerce.Runtime.DataModel.DiscountLine _crtDiscountLine)
+    {
+        str offerName = _crtDiscountLine.get_OfferName();
+        selectedDiscounts.add(_crtDiscountLine.get_OfferId());
+        return offerName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSalesLine</Name>
+				<Source><![CDATA[
+    protected void initSalesLine(Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine _crtSalesLine, RetailPricingSimulatorSalesLine _psSalesLine)
+    {
+        _psSalesLine.LineNum = _crtSalesLine.get_LineId();
+        _psSalesLine.SalesLineNum = _crtSalesLine.get_LineNumber();
+        _psSalesLine.DisplayProductNumber = _crtSalesLine.get_ItemId();
+        _psSalesLine.InventDimId = _crtSalesLine.get_InventoryDimensionId() ? _crtSalesLine.get_InventoryDimensionId() : InventDimIdAllBlank;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInventDimCombination</Name>
+				<Source><![CDATA[
+    protected InventDimCombination findInventDimCombination(Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine _crtSalesLine, RetailPricingSimulatorSalesLine _psSalesLine)
+    {
+        InventDim currentInventDim = InventDim::find(_psSalesLine.InventDimId);
+        InventDim variantInventDim;
+        variantInventDim.InventColorId = currentInventDim.InventColorId;
+        variantInventDim.InventSizeId = currentInventDim.InventSizeId;
+        variantInventDim.InventStyleId = currentInventDim.InventStyleId;
+        variantInventDim.configId = currentInventDim.configId;
+
+        InventDim variantInventDimInDB = InventDim::findDim(variantInventDim);
+
+        return InventDimCombination::find(_psSalesLine.DisplayProductNumber, variantInventDimInDB.inventDimId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProductVariant</Name>
+				<Source><![CDATA[
+    public Microsoft.Dynamics.Commerce.Runtime.DataModel.ProductVariant getProductVariant(RetailValidationId _variantId,
+        ItemId _itemId,
+        InventDimId _inventDimId)
+    {
+        
+
+        InventDim inventDim = InventDim::find(_inventDimId);
+        InventDim variantDim;
+        variantDim.InventColorId = inventDim.InventColorId;
+        variantDim.InventSizeId = inventDim.InventSizeId;
+        variantDim.InventStyleId = inventDim.InventStyleId;
+        variantDim.configId = inventDim.configId;
+
+        Microsoft.Dynamics.Commerce.Runtime.DataModel.ProductVariant productVariant = 
+            Microsoft.Dynamics.Commerce.Runtime.DataModel.ProductVariant::CreateVariant(inventDim.InventColorId, inventDim.InventSizeId, inventDim.InventStyleId, inventDim.configId);
+
+        productVariant.set_VariantId(_variantId);
+        productVariant.set_ItemId(_itemId);
+        productVariant.set_InventoryDimensionId(_inventDimId);
+        productVariant.set_DistinctProductVariantId(InventDimCombination::findByInventDim(_itemId, variantDim).DistinctProductVariant);
+
+        return productVariant;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

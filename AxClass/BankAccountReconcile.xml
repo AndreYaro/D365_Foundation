@@ -1,0 +1,719 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BankAccountReconcile</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public final class BankAccountReconcile extends RunBase
+{
+    #ISOCountryRegionCodes
+
+    private BankAccountStatement bankAccountStatement;
+    private DialogField dialogJournalNum;
+    private Counter progressCounter;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkAccountNum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Checks whether any bank transactions exist for the given bank statement that do not have a ledger account specified.
+    /// </summary>
+    /// <returns>
+    ///     true if no bank transaction was found; otherwise, false.
+    /// </returns>
+    protected boolean checkAccountNum()
+    {
+        BankAccountTrans bankAccountTrans;
+
+        select firstonly bankAccountTrans
+            where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && bankAccountTrans.Included == NoYes::Yes
+                && bankAccountTrans.Reconciled == NoYes::No
+                && !bankAccountTrans.LedgerDimension
+                && (bankAccountTrans.CurrencyCode == bankAccountTrans.BankTransCurrencyCode || !bankAccountTrans.BankTransCurrencyCode)
+                && (bankAccountTrans.AmountCorrect || bankAccountTrans.Manual);
+
+        if (bankAccountTrans)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAcknowledgementDate</Name>
+				<Source><![CDATA[
+    private boolean checkAcknowledgementDate()
+    {
+        boolean isValidDate = true;
+        BankAccountTrans bankAccountTrans;
+
+        select firstonly bankAccountTrans
+            where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && bankAccountTrans.AcknowledgementDate <  bankAccountTrans.TransDate;
+
+        if (bankAccountTrans)
+        {
+            // The Posting date (TransDate) cannot preceed the Acknowledgment Date
+            isValidDate = false;
+        }
+
+        return isValidDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCorrect</Name>
+				<Source><![CDATA[
+    private void createCorrect()
+    {
+        BankAccountTrans bankAccountTrans;
+        Counter progressTotal;
+        NoYes multiCurrency;
+
+        #define.CheckMainAccountBlocked(true)
+
+        multiCurrency = BankAccountTable::find(bankAccountStatement.AccountId).BankMultiCurrency;
+
+        select count(RecId) from bankAccountTrans
+            where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && bankAccountTrans.Included == NoYes::Yes
+                && bankAccountTrans.Reconciled == NoYes::No
+                && (bankAccountTrans.CurrencyCode == bankAccountTrans.BankTransCurrencyCode
+                    || !bankAccountTrans.BankTransCurrencyCode
+                    || multiCurrency)
+                && (bankAccountTrans.AmountCorrect || bankAccountTrans.Manual);
+
+        progressTotal = any2int(bankAccountTrans.RecId);
+
+        if (progressTotal)
+        {
+            this.progressInit("@SYS25781", progressTotal, #AviFormLetter);
+            progress.setText("@SYS26577");
+
+            while select bankAccountTrans
+                where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                    && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                    && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                    && bankAccountTrans.Included == NoYes::Yes
+                    && bankAccountTrans.Reconciled == NoYes::No
+                    && (bankAccountTrans.CurrencyCode == bankAccountTrans.BankTransCurrencyCode
+                        || !bankAccountTrans.BankTransCurrencyCode
+                        || multiCurrency)
+                    && (bankAccountTrans.AmountCorrect || bankAccountTrans.Manual)
+            {
+                if (!bankAccountTrans.BankTransType
+                    && !bankAccountTrans.LedgerDimension)
+                {
+                    throw error(
+                        strFmt("@Bank:BankTransactionTypeShouldBeSpecified",
+                            bankAccountTrans.TransDate,
+                            bankAccountTrans.AmountCur,
+                            bankAccountTrans.AmountCorrect)
+                     );
+                }
+
+                this.displayProgress(bankAccountTrans.Voucher, bankAccountTrans.TransDate);
+
+                if (FeatureStateProvider::isFeatureEnabled(BankManualBankTransPickLatestExchRateByTransDateFeature::instance())
+                    && bankAccountTrans.Manual == NoYes::Yes)
+                {
+                    bankAccountTrans.selectForUpdate(true);
+                    bankAccountTrans.calcAmountMST();
+                    bankAccountTrans.calcAmountReportingCurrency();
+
+                    if (bankAccountTrans.shouldCalculateReportingCurrencyAmount_RU())
+                    {
+                        bankAccountTrans.calcReportingCurrencyAmount_RU();
+                    }
+
+                    bankAccountTrans.update();
+                }
+
+                this.createLedgerTrans(
+                    bankAccountTrans,
+                    bankAccountTrans.LedgerDimension,
+                    #CheckMainAccountBlocked);
+            }
+
+            progress = null;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerTrans</Name>
+				<Source><![CDATA[
+    private void createLedgerTrans(
+        BankAccountTrans _bankAccountTrans,
+        LedgerDimensionDefaultAccount _ledgerAccount,
+        boolean _skipBlockedForManualEntryCheck = false)
+    {
+        RefRecId numberSequenceId;
+        LedgerJournalTable ledgerJournalTable;
+        AmountCur amountCur;
+        AmountCur taxAmountCur;
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+        GeneralJournalEntry generalJournalEntry;
+        LedgerEntryJournal ledgerEntryJournal;
+        TaxBankAccountReconcile taxBankAccountReconcile;
+        LedgerPostingController ledgerPostingController;
+        LedgerVoucher ledgerPostingJournal;
+        LedgerVoucherObject ledgerPostingReference;
+        LedgerVoucherTransObject ledgerVoucherTransObject;
+        CurrencyExchangeHelper exchangeRateHelper;
+        LedgerDimensionAccount mergedLedgerDimension;
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntry;
+
+        LedgerBondClient_RU ledgerBondClient;
+        boolean countryRegion_RU = (SysCountryRegionCode::isLegalEntityInCountryRegion([ #isoRU ]));
+        boolean isCancelFeatureEnabled = BankParameters::find().AllowEditBankAccountStatement;
+
+        Voucher newVoucher =_bankAccountTrans.Voucher;
+
+        if (_bankAccountTrans.Manual == NoYes::Yes)
+        {
+            amountCur = _bankAccountTrans.AmountCur + _bankAccountTrans.AmountCorrect;
+        }
+        else
+        {
+            amountCur = _bankAccountTrans.AmountCorrect;
+            
+            if (isCancelFeatureEnabled)
+            {
+                newVoucher = this.createNewVoucher();
+
+                BankTransCorrectionVoucherHistory::insertCorrectionAmountVoucher(
+                    _bankAccountTrans.RecId,
+                    _bankAccountTrans.Voucher,
+                    newVoucher,
+                    NoYes::No);
+            }
+        }
+
+        select firstonly RecId from subledgerVoucherGeneralJournalEntry
+            where subledgerVoucherGeneralJournalEntry.Voucher == _bankAccountTrans.Voucher
+                && subledgerVoucherGeneralJournalEntry.AccountingDate == _bankAccountTrans.TransDate
+                && subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == _bankAccountTrans.DataAreaId
+            join RecId from generalJournalEntry
+                where generalJournalEntry.RecId == subledgerVoucherGeneralJournalEntry.GeneralJournalEntry
+                    && generalJournalEntry.Ledger == Ledger::current()
+            join JournalNumber from ledgerEntryJournal
+                where ledgerEntryJournal.RecId == generalJournalEntry.LedgerEntryJournal
+            join RecId from generalJournalAccountEntry
+                where generalJournalAccountEntry.GeneralJournalEntry == generalJournalEntry.RecId;
+
+        if (ledgerEntryJournal != null)
+        {
+            select firstonly NumberSequenceTable from ledgerJournalTable
+                where ledgerJournalTable.JournalNum == ledgerEntryJournal.JournalNumber;
+
+            numberSequenceId = ledgerJournalTable.NumberSequenceTable;
+        }
+
+        if (!numberSequenceId)
+        {
+            numberSequenceId = BankParameters::numRefBankReconcileVoucher().numberSequenceTable().RecId;
+        }
+
+        ledgerPostingJournal = LedgerVoucher::newLedgerPost(
+            DetailSummary::Detail,
+            SysModule::Bank,
+            NumberSequenceTable::find(numberSequenceId).NumberSequence);
+
+        ledgerPostingJournal.parmSkipBlockedForManualEntryCheck(_skipBlockedForManualEntryCheck);
+        ledgerPostingJournal.parmCheckBlockedDimensions(false);
+
+        ledgerPostingController = LedgerPostingController::newForLedgerPostingJournal(ledgerPostingJournal);
+
+        ledgerPostingReference = LedgerVoucherObject::newVoucher(
+            newVoucher,
+            _bankAccountTrans.TransDate,
+            SysModule::Bank,
+            LedgerTransType::Bank);
+
+        ledgerPostingReference.parmAcknowledgementDate(_bankAccountTrans.AcknowledgementDate);
+        ledgerPostingReference.parmVoucherCheck(false);
+        ledgerPostingReference.lastTransTxt(_bankAccountTrans.Txt);
+
+        if (countryRegion_RU)
+        {
+            ledgerBondClient = ledgerPostingReference.ledgerBondClient_RU();
+        }
+
+        ledgerPostingController.addReference(ledgerPostingReference);
+
+        taxBankAccountReconcile = new TaxBankAccountReconcile(NoYes::Yes, _bankAccountTrans);
+        taxAmountCur = taxBankAccountReconcile.calcAndPost(ledgerPostingController);
+
+        ledgerPostingReference = ledgerPostingJournal.findLedgerVoucherObject();
+
+        exchangeRateHelper = CurrencyExchangeHelper::newExchangeDate(
+            Ledger::primaryLedger(CompanyInfo::findDataArea(curext()).RecId),
+            ledgerPostingReference.parmAccountingDate());
+
+        mergedLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(BankAccountTable::findLedgerDimension(_bankAccountTrans.AccountId), _bankAccountTrans.DefaultDimension);
+
+        ledgerVoucherTransObject = LedgerVoucherTransObject::newTransactionAmountDefault(
+            ledgerPostingReference,
+            LedgerPostingType::Bank,
+            mergedLedgerDimension,
+            _bankAccountTrans.CurrencyCode,
+            amountCur,
+            exchangeRateHelper);
+
+        if (BankStmtReconcileRecordPostingExchangeRateFlight::instance().isEnabled()
+            && !BankAccountTable::isAdvancedBankReconciliationEnabled(_bankAccountTrans.AccountId)
+            && _bankAccountTrans.AmountCorrect)
+        {
+            if (_bankAccountTrans.ExchRateMST)
+            {
+                exchangeRateHelper.parmExchangeRate1(_bankAccountTrans.ExchRateMST);
+                AmountMST amountMST = exchangeRateHelper.calculateTransactionToAccounting(_bankAccountTrans.CurrencyCode, amountCur, true);
+                ledgerVoucherTransObject.parmAccountingCurrencyAmount(amountMST);
+            }
+
+            if (_bankAccountTrans.ExchRateRep)
+            {
+                exchangeRateHelper.parmReportingExchangeRate1(_bankAccountTrans.ExchRateRep);
+                AmountMST amountRep = exchangeRateHelper.calculateTransactionCurrencyToReportingCurrency(_bankAccountTrans.CurrencyCode, amountCur);
+                ledgerVoucherTransObject.parmReportingCurrencyAmount(amountRep);
+            }
+        }
+
+        ledgerVoucherTransObject.parmTransTxt(_bankAccountTrans.Txt);
+        ledgerPostingController.addTrans(ledgerVoucherTransObject);
+
+        mergedLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(_ledgerAccount, _bankAccountTrans.DefaultDimension);
+
+        ledgerVoucherTransObject = LedgerVoucherTransObject::newTransactionAmountDefault(
+            ledgerPostingReference,
+            LedgerPostingType::Bank,
+            mergedLedgerDimension,
+            _bankAccountTrans.CurrencyCode,
+            -amountCur + taxAmountCur,
+            exchangeRateHelper);
+
+        if (BankStmtReconcileRecordPostingExchangeRateFlight::instance().isEnabled()
+            && !BankAccountTable::isAdvancedBankReconciliationEnabled(_bankAccountTrans.AccountId)
+            && _bankAccountTrans.AmountCorrect)
+        {
+            if (_bankAccountTrans.ExchRateMST)
+            {
+                exchangeRateHelper.parmExchangeRate1(_bankAccountTrans.ExchRateMST);
+                AmountMST amountMST = exchangeRateHelper.calculateTransactionToAccounting(_bankAccountTrans.CurrencyCode, -amountCur + taxAmountCur, true);
+                ledgerVoucherTransObject.parmAccountingCurrencyAmount(amountMST);
+            }
+
+            if (_bankAccountTrans.ExchRateRep)
+            {
+                exchangeRateHelper.parmReportingExchangeRate1(_bankAccountTrans.ExchRateRep);
+                AmountMST amountRep = exchangeRateHelper.calculateTransactionCurrencyToReportingCurrency(_bankAccountTrans.CurrencyCode, -amountCur + taxAmountCur);
+                ledgerVoucherTransObject.parmReportingCurrencyAmount(amountRep);
+            }
+        }
+
+        ledgerVoucherTransObject.parmTaxParentReferenceTableId(_bankAccountTrans.TableId);
+        ledgerVoucherTransObject.parmTaxParentReferenceRecId(_bankAccountTrans.RecId);
+        ledgerVoucherTransObject.parmTransTxt(_bankAccountTrans.Txt);
+        ledgerPostingController.addTrans(ledgerVoucherTransObject);
+
+        // <GEERU>
+        if (countryRegion_RU
+            && ledgerBondClient)
+        {
+            ledgerBondClient.bondLog2Log();
+            ledgerBondClient.removeCurrentLogObject();
+        }
+        // </GEERU>
+
+        ledgerPostingController.post();
+
+        if (isCancelFeatureEnabled && _bankAccountTrans.Manual == NoYes::No)
+        {
+            LedgerTransVoucherLink::createLedgerTransVoucherLink(_bankAccountTrans.Voucher, _bankAccountTrans.TransDate, newVoucher, _bankAccountTrans.TransDate);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createNewVoucher</Name>
+				<Source><![CDATA[
+    private Voucher createNewVoucher()
+    {
+        NumberSeq numberSeq = NumberSeq::newGetVoucher(BankParameters::numRefBankReconcileVoucher());
+
+        if (numberSeq == null)
+        {
+            throw error(strFmt("@SYS26165","@SYS24040"));
+        }
+
+        return numberSeq.voucher();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayProgress</Name>
+				<Source><![CDATA[
+    public void displayProgress(Voucher _voucher, TransDate _transDate)
+    {
+        this.progressUpdate(strFmt("@SYS26801", _voucher, date2StrUsr(_transDate, DateFlags::FormatAll)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>progressUpdate</Name>
+				<Source><![CDATA[
+    public void progressUpdate(str text)
+    {
+        progressCounter++;
+        progress.setCount(progressCounter);
+        progress.setText(text);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Contains the code that does the actual job of the class.
+    /// </summary>
+    public void run()
+    {
+        #OCCRetryCount
+
+        if (!this.validate())
+        {
+            throw error("@SYS21628");
+        }
+
+        try
+        {
+            SysInstrumentationLogger logger = SysInstrumentationLoggerFactory::CreateLogger(BankInstrumentationConstants::SourceNameSimpleBankReconciliation);
+            SysInstrumentationActivity activity = SysInstrumentationActivity::construct(BankInstrumentationConstants::SimpleBankReconciliationReconcile, BankInstrumentationConstants::BankNamespace);
+
+            using (SysInstrumentationActivityContext activityContext = logger.activityContextWithCustomProperties(activity))
+            {
+                ttsbegin;
+
+                this.createCorrect();
+                NumberOfRecords numOfLines = this.setReconciled();
+
+                TransactionLog::create(TransactionLogType::BankReconciliation, "@SYS23703");
+
+                ttscommit;
+
+                info("@SYS24505");
+
+                activityContext.addCustomProperty(BankInstrumentationConstants::LineCountMagnitude, ApplicationCommonInstrumentationMagnitude::log10Magnitude(numOfLines));
+
+            }
+        }
+
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+
+        catch (Exception::UpdateConflict)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::UpdateConflictNotRecovered;
+            }
+            else
+            {
+                retry;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setParameters</Name>
+				<Source><![CDATA[
+    public void setParameters(BankAccountStatement _bankAccountStatement)
+    {
+        bankAccountStatement = _bankAccountStatement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setReconciled</Name>
+				<Source><![CDATA[
+    private NumberOfRecords setReconciled()
+    {
+        BankAccountTrans bankAccountTrans;
+        NumberOfRecords counter;
+
+        while select forupdate bankAccountTrans
+            where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && bankAccountTrans.Included == NoYes::Yes
+                && bankAccountTrans.Reconciled == NoYes::No
+        {
+            this.updateBankTransToReconciled(bankAccountTrans);
+
+            counter = counter + 1;
+        }
+
+        if (bankAccountStatement)
+        {
+            this.updateBankAccountStatementToReconciled(bankAccountStatement);
+        }
+        else
+        {
+            throw error("@SYS53066");
+        }
+
+        return counter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBankTransToReconciled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates bank transaction reconciled status.
+    /// </summary>
+    /// <param name = "_bankAccountTrans">
+    /// A <c>BankAccountTrans</c> table buffer.
+    /// </param>
+    protected void updateBankTransToReconciled(BankAccountTrans _bankAccountTrans)
+    {
+        _bankAccountTrans.Reconciled = NoYes::Yes;
+        _bankAccountTrans.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBankAccountStatementToReconciled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates bank account statement reconciled date.
+    /// </summary>
+    /// <param name = "_bankAccountStatement">
+    /// A <c>BankAccountStatement</c> table buffer.
+    /// </param>
+    protected void updateBankAccountStatementToReconciled(BankAccountStatement _bankAccountStatement)
+    {
+        _bankAccountStatement.ReconcileDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        _bankAccountStatement.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    public boolean validate(Object _calledFrom = null)
+    {
+        boolean ret = true;
+
+        BankAccountTrans bankAccountTrans;
+        str cancelPendingCheques;
+        str cancelPendingDepositSlips;
+        BankAccountTable bankAccountTable;
+
+        if (!bankAccountStatement.AccountStatementDate)
+        {
+            ret = checkFailed("@SYS25889");
+        }
+
+        if (!this.checkAccountNum())
+        {
+            ret = checkFailed("@SYS25151");
+        }
+
+        bankAccountTable = BankAccountTable::find(bankAccountStatement.AccountId);
+
+        if (bankAccountTable)
+        {
+            ret = bankAccountTable.checkIsActiveForAllTransactions();
+        }
+
+        if (LedgerParameters::find().AcknowledgementDate_IT)
+        {
+            GlobalizationInstrumentationHelper::featureRun(GlobalizationConstants::FeatureReferenceIT00010, funcName());
+            if (!this.checkAcknowledgementDate())
+            {
+                // Posting date may not exceed competence date.
+                ret = checkFailed("@SYS99223");
+            }
+        }
+
+        // Get the list of checks and deposit slips that are pending cancellation
+        while select ChequeNum, DepositNum from bankAccountTrans
+            where bankAccountTrans.AccountId == bankAccountStatement.AccountId
+                && bankAccountTrans.AccountStatement == bankAccountStatement.AccountStatementNum
+                && bankAccountTrans.AccountStatementDate == bankAccountStatement.AccountStatementDate
+                && bankAccountTrans.Included == NoYes::Yes
+                && bankAccountTrans.Reconciled == NoYes::No
+                && bankAccountTrans.CancelPending == NoYes::Yes
+        {
+            if (bankAccountTrans.ChequeNum != '')
+            {
+                cancelPendingCheques += strFmt('%1%2',
+                    cancelPendingCheques == '' ? '' : ', ',
+                    bankAccountTrans.ChequeNum);
+            }
+            else if (bankAccountTrans.DepositNum != '')
+            {
+                cancelPendingDepositSlips += strFmt('%1%2',
+                    cancelPendingDepositSlips == '' ? '' : ', ',
+                    bankAccountTrans.DepositNum);
+            }
+        }
+
+        if (this.mustPriorStatementsBeReconciled())
+        {
+            // Reconciliation is not allowed for bank statement while prior date, unreconciled bank statement exist
+            BankAccountStatement priorBankAccountStatement;
+        
+            select firstonly RecId, AccountStatementDate from priorBankAccountStatement
+            where priorBankAccountStatement.AccountId == bankAccountStatement.AccountId
+                && priorBankAccountStatement.AccountStatementDate < bankAccountStatement.AccountStatementDate
+                && priorBankAccountStatement.ReconcileDate == dateNull();
+        
+            if (priorBankAccountStatement)
+            {
+                ret = checkFailed(strFmt("@CashManagement:CashBankMgmt_BankStatement_ReconcileAccount_Validation", bankAccountStatement.AccountStatementDate, priorBankAccountStatement.AccountStatementDate));
+            }
+        }
+
+        // Reconciliation is not allowed for checks that are pending cancellation
+        if (cancelPendingCheques != '')
+        {
+            ret = checkFailed(strFmt("@SYS120017", cancelPendingCheques));
+        }
+
+        // Reconciliation is not allowed for deposit slips that are pending cancellation
+        if (cancelPendingDepositSlips != '')
+        {
+            ret = checkFailed(strFmt("@SYS120019", cancelPendingDepositSlips));
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustPriorStatementsBeReconciled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines whether to check the bank statement can reconcile with the bank statement date.
+    /// </summary>
+    /// <returns>
+    ///     true if to check the bank statement can reconcile; otherwise, false.
+    /// </returns>
+    protected boolean mustPriorStatementsBeReconciled()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args args)
+    {
+        BankAccountReconcile bankAccountReconcile;
+        BankAccountStatement bankAccountStatement;
+        BankIReconciliationForm reconciliationForm;
+
+        if (args.dataset() == tablenum(BankAccountTrans)
+            && args.caller() is BankIReconciliationForm)
+        {
+            reconciliationForm = args.caller();
+
+            bankAccountStatement = reconciliationForm.bankAccountStatement();
+
+            if (!bankAccountStatement.ReconcileDate)
+            {
+                bankAccountReconcile = new BankAccountReconcile();
+                bankAccountReconcile.setParameters(bankAccountStatement);
+                bankAccountReconcile.runOperation();
+            }
+        }
+        else
+        {
+            throw error("@SYS53065");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postBankTransactionCorrection</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts the correction amount on bank account transaction.
+    /// </summary>
+    /// <param name="_bankAccountTransRecid">
+    /// The bank account transaction record id.
+    /// </param>
+    public static void postBankTransactionCorrection(
+        RefRecId _bankAccountTransRecid)
+    {
+        BankAccountTrans bankAccountTrans;
+        BankAccountReconcile bankAccountReconcile;
+
+        bankAccountTrans = BankAccountTrans::findByRecId_CN(_bankAccountTransRecid);
+
+        Debug::assert(bankAccountTrans.RecId != 0
+            && bankAccountTrans.AmountCorrect != 0
+            && bankAccountTrans.Manual == NoYes::No);
+
+        bankAccountReconcile = new BankAccountReconcile();
+        bankAccountReconcile.createLedgerTrans(bankAccountTrans, bankAccountTrans.LedgerDimension);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

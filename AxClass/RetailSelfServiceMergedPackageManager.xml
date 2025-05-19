@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailSelfServiceMergedPackageManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Security.Cryptography.X509Certificates;
+using Microsoft.Dynamics.ApplicationPlatform.Environment;
+using Microsoft.Dynamics.Commerce.Deployment.RetailLcsClient;
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+public class RetailSelfServiceMergedPackageManager
+{
+    private RetailAssetLibraryHelper assetLibHelper;
+
+    private static CommerceHQEventSource logger = CommerceHQEventSource::Log;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a new instance of <c>RetailSelfServiceMergedPackageManager</c>.
+    /// </summary>
+    /// <param name = "assetLibrary">The asset helper library instance.</param>
+    internal void new(RetailAssetLibraryHelper assetLibrary = null)
+    {
+        var environment = EnvironmentFactory::GetApplicationEnvironment();
+
+        if (assetLibrary)
+        {
+            this.assetLibHelper = assetLibrary;
+        }
+        else
+        {
+            var lcsConfig = environment.LCS;
+
+            if (lcsConfig.LCSApiEndPoint != '' && lcsConfig.LCSClientCertificateThumbprint != '')
+            {
+                int fromLine = Global::infologLine();
+
+                try
+                {
+                    logger.EventWriteSelfServiceLcsProxyInitializationBegin(lcsConfig.LCSAPIEndPoint, lcsConfig.LCSClientCertificateThumbprint);
+                    X509Certificate2 certificate = SysLCSHelper::GetCert(lcsConfig.LCSClientCertificateThumbprint);
+                    utcdatetime certExpirationDate = Global::clrSystemDateTime2UtcDateTime(certificate.NotAfter);
+
+                    logger.EventWriteSelfServiceLCSCertificateExpirationDate(
+                        lcsConfig.LCSClientCertificateThumbprint, certificate.NotAfter);
+
+                    if (certExpirationDate <= DateTimeUtil::utcNow())
+                    {
+                        // Show warning to customer when cert was expired.
+                        Global::warning("@RetailSelfServiceInstaller:LcsCertExpired");
+                        logger.EventWriteSelfServiceLCSCertificateWasExpired(
+                            lcsConfig.LCSClientCertificateThumbprint, certificate.NotAfter);
+                    }
+                    else if (certExpirationDate <= DateTimeUtil::addMonths(DateTimeUtil::utcNow(), 1))
+                    {
+                        // Show warning to customer when cert expiration date is within 1 month.
+                        Global::warning(strFmt("@RetailSelfServiceInstaller:LcsCertWillExpire", certExpirationDate));
+                    }
+
+                    System.Uri lcsEndpoint = new System.Uri(lcsConfig.LCSAPIEndPoint);
+                    int64 projectId = lcsConfig.ProjectId;
+                    this.assetLibHelper = new RetailAssetLibraryHelper(certificate, lcsEndpoint, projectId);
+                    logger.EventWriteSelfServiceLcsProxyInitializationEnd(lcsConfig.LCSAPIEndPoint, lcsConfig.LCSClientCertificateThumbprint);
+                }
+                catch (Exception::Error)
+                {
+                    str exceptionMessage = RetailTransactionServiceUtilities::getInfologMessages(fromLine);
+                    logger.EventWriteSelfServiceLcsProxyInitializationFailed(lcsConfig.LCSAPIEndPoint, lcsConfig.LCSClientCertificateThumbprint,
+                        exceptionMessage, System.Environment::StackTrace);
+                }
+            }
+            else
+            {
+                logger.EventWriteSelfServiceMissingLcsConfigurations(
+                    lcsConfig.LCSAPIEndPoint, lcsConfig.LCSClientCertificateThumbprint);
+            }
+
+            str hostingEnvironment = enum2Str(environment.Common.HostingEnvironment);
+            logger.EventWriteSelfServiceHostingEnvironmentType(hostingEnvironment);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkForUpdates</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check for updates of the given package type, and update the record in the tables <c>RetailSelfServicePackageLcsInfo</c>
+    /// and <c>RetailSelfServicePackageInfo</c>.
+    /// </summary>
+    /// <param name = "packageType">The type of package which is being retrieved.</param>
+    internal void checkForUpdates(PackageType packageType,
+        utcdatetime beginCreatedDatetime = DateTimeUtil::addYears(DateTimeUtil::utcNow(), -1),
+        utcdatetime endCreatedDatetime = DateTimeUtil::utcNow())
+    {
+        int fromLine = Global::infologLine();
+        logger.EventWriteSelfServiceCheckForPackageUpdatesBegin(enum2Str(packageType));
+
+        // if someone adds some assets on legacy table, populate the merged packages table.
+        RetailSelfServiceMigrationHelper::refreshAssetsFromRetailSelfServicePackageInfo(packageType);
+
+        if (this.assetLibHelper)
+        {
+            RetailAssetLibraryHelper assetLibraryHelper = this.assetLibHelper;
+            assetLibraryHelper.refreshLcsSharedAssets(packageType, false, false, beginCreatedDatetime, endCreatedDatetime);
+
+            if (assetLibHelper.getProjectId() <=  0)
+            {
+                assetLibHelper.setProjectIdFromEnvironmentCertificate();
+            }
+
+            assetLibraryHelper.refreshLcsProjectAssets(packageType, false, false, beginCreatedDatetime, endCreatedDatetime);
+        }
+
+        logger.EventWriteSelfServiceCheckForPackageUpdatesEnd(enum2Str(packageType));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generatePackageDownloadLink</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate a Url download link for user to download the selected package.
+    /// </summary>
+    /// <param name = "mergedPackagesRecId">The record identifier from table <c>RetailSelfServiceMergedPackages</c>.</param>
+    /// <param name = "packageType">The self-service package type. This parameter is being used for table <c>RetailSelfServicePackageInfo</c> only.</param>
+    /// <param name = "retryWithUploadOnFailure">If link generation fails, specifies if we should try uploading packages and try again.
+    /// This parameter is being used for table <c>RetailSelfServicePackageInfo</c> only.
+    /// </param>
+    /// <returns>A url for user to download the self-service installer package.</returns>
+    internal str generatePackageDownloadLink(RefRecId mergedPackagesRecId, PackageType packageType, boolean retryWithUploadOnFailure = false)
+    {
+        str downloadLink;
+        str exceptionMessage;
+
+        logger.EventWriteSelfServiceGeneratePackageDownloadLinkBegin(mergedPackagesRecId, enum2Str(packageType), retryWithUploadOnFailure);
+
+        RetailSelfServiceMergedPackages mergedPackagesTable;
+
+        select firstonly mergedPackagesTable
+        where mergedPackagesTable.RecId == mergedPackagesRecId;
+
+        if (!mergedPackagesTable)
+        {
+            // Record identifier is not found on table RetailSelfServiceMergedPackages.
+            exceptionMessage = strFmt("@RetailSelfServiceInstaller:IdentifierNotFoundOnTable",
+                mergedPackagesRecId, tableStr(RetailSelfServiceMergedPackages));
+            logger.EventWriteSelfServiceGeneratePackageDownloadLinkFailed(mergedPackagesRecId, enum2Str(packageType),
+                retryWithUploadOnFailure, exceptionMessage, System.Environment::StackTrace);
+            throw Global::error(exceptionMessage);
+        }
+        else
+        {
+            str packageDownloadUrl;
+
+            if (mergedPackagesTable.PackageOrigin == RetailSelfServicePackageOrigin::BlobStorage)
+            {
+                // Get download link from legacy table (RetailSelfServicePackageInfo)
+                downloadLink = RetailSelfServicePackageManager::generatePackageDownloadLinkByPackageReference(
+                    mergedPackagesTable.TableReferenceId, retryWithUploadOnFailure);
+            }
+            else if (mergedPackagesTable.PackageOrigin == RetailSelfServicePackageOrigin::Lcs)
+            {
+                if (!assetLibHelper)
+                {
+                    exceptionMessage = "@RetailSelfServiceInstaller:AssetLibraryProxyIsNull";
+                    logger.EventWriteSelfServiceGeneratePackageDownloadLinkFailed(mergedPackagesRecId, enum2Str(packageType),
+                        retryWithUploadOnFailure, exceptionMessage, System.Environment::StackTrace);
+                    throw Global::error(exceptionMessage);
+                }
+                else
+                {
+                    if (assetLibHelper.getProjectId() <=  0)
+                    {
+                        assetLibHelper.setProjectIdFromEnvironmentCertificate();
+                    }
+
+                    downloadLink = this.assetLibHelper.generatePackageDownloadLink(mergedPackagesRecId);
+                }
+            }
+            else
+            {
+                // Currently we only support tables RetailSelfServicePackageInfo and RetailSelfServicePackageLcsInfo
+                // given a table identifier.
+                exceptionMessage = strFmt("@RetailSelfServiceInstaller:UnknownPackageOrigin",
+                    enum2Str(mergedPackagesTable.PackageOrigin));
+                logger.EventWriteSelfServiceGeneratePackageDownloadLinkFailed(mergedPackagesRecId, enum2Str(packageType),
+                        retryWithUploadOnFailure, exceptionMessage, System.Environment::StackTrace);
+                throw Global::error(exceptionMessage);
+            }
+        }
+
+        logger.EventWriteSelfServiceGeneratePackageDownloadLinkEnd(mergedPackagesRecId, enum2Str(packageType), retryWithUploadOnFailure);
+        return downloadLink;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateDownloadPackageReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates a package reference before it gets downloaded.
+    /// </summary>
+    /// <param name = "record">The record of the device.</param>
+    /// <param name = "mergedPackageRefColumnIdentifier">The field identifier of merged self-service package column reference.</param>
+    /// <returns>True if package reference is valid, false otherwise.</returns>
+    internal static boolean validateDownloadPackageReference(Common record, FieldId mergedPackageRefColumnIdentifier)
+    {
+        boolean hasValidReference = false;
+
+        if (!record)
+        {
+            // Should not happen if the caller is from Forms type.
+            Global::warning("@WAX2216");
+        }
+        else if (record.(mergedPackageRefColumnIdentifier) == 0)
+        {
+            // Record exists but user has not yet selected the self-service package for this particular record.
+            warning("@RetailSelfServiceInstaller:NoPackageRefSelected");
+        }
+        else
+        {
+            // Validate merged package reference
+            RetailSelfServiceMergedPackages packageReference = RetailSelfServiceMergedPackages::findByRecId(record.(mergedPackageRefColumnIdentifier));
+
+            if (packageReference)
+            {
+                // Validate package origin from respective tables
+                if (packageReference.PackageOrigin == RetailSelfServicePackageOrigin::BlobStorage)
+                {
+                    RetailSelfServicePackageInfo blobPackage = RetailSelfServicePackageInfo::findByRecId(packageReference.TableReferenceId);
+
+                    if (blobPackage)
+                    {
+                        hasValidReference = true;
+                    }
+                }
+                else if (packageReference.PackageOrigin == RetailSelfServicePackageOrigin::Lcs)
+                {
+                    RetailSelfServicePackageLcsInfo lcsPackage;
+
+                    select firstonly lcsPackage
+                    where lcsPackage.RecId == packageReference.TableReferenceId;
+
+                    if (lcsPackage)
+                    {
+                        hasValidReference = true;
+                    }
+                }
+            }
+
+            if (!hasValidReference)
+            {
+                Global::warning("@RetailSelfServiceInstaller:PackageRefSelectedNotValid");
+            }
+        }
+
+        return hasValidReference;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkForAllPackageUpdates</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check for package updates for all package types.
+    /// </summary>
+    internal void checkForAllPackageUpdates()
+    {
+        if (!assetLibHelper)
+        {
+            return;
+        }
+
+        assetLibHelper.resetAssetsFound();
+
+        this.checkForUpdates(PackageType::ModernPosWithoutOffline);
+        this.checkForUpdates(PackageType::ModernPosWithOffline);
+        this.checkForUpdates(PackageType::ModernPosWindowsPhone);
+        this.checkForUpdates(PackageType::ModernPosAndroid);
+        this.checkForUpdates(PackageType::ModernPosiOS);
+        this.checkForUpdates(PackageType::HardwareStation);
+        this.checkForUpdates(PackageType::RetailStoreScaleUnit);
+        this.checkForUpdates(PackageType::AsyncServerConnectorService);
+        this.checkForUpdates(PackageType::RealtimeServiceAX63);
+        this.checkForUpdates(PackageType::HardwarePeripheralSimulator);
+
+        int projectAssetsFound = this.assetLibHelper.getProjectAssetsFound();
+        int sharedAssetsFound = this.assetLibHelper.getSharedAssetsFound();
+
+        if (projectAssetsFound > 0)
+        {
+            Global::info(strFmt("@RetailSelfServiceInstaller:ProjectAssetPackageUpdate", projectAssetsFound));
+        }
+        else
+        {
+            Global::info("@RetailSelfServiceInstaller:NoProjectAssetPackageUpdate");
+        }
+
+        if (sharedAssetsFound > 0)
+        {
+            Global::info(strFmt("@RetailSelfServiceInstaller:SharedAssetPackageUpdate", sharedAssetsFound));
+        }
+        else
+        {
+            Global::info("@RetailSelfServiceInstaller:NoSharedAssetPackageUpdate");
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

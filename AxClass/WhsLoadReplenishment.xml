@@ -1,0 +1,585 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsLoadReplenishment</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WhsLoadReplenishment</c> class is used to run batch job for load demand replenishment.
+/// </summary>
+public class WhsLoadReplenishment extends RunBaseBatch implements BatchRetryable, SysErrorMessageHelpScopeIBatchProvider
+{
+    QueryRun                queryRun;
+    WHSReplenishTemplateId  replenTemplateId;
+    DialogField             dialogReplenTemplateId;
+
+    #define.CurrentVersion(2)
+    #LOCALMACRO.CurrentList
+        replenTemplateId
+    #ENDMACRO
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>buildQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds query to be executed in batch run.
+    /// </summary>
+    /// <returns>
+    /// The query to be executed in batch run.
+    /// </returns>
+    Query buildQuery()
+    {
+        Query   query;
+
+        query = new Query(queryStr(WHSLoadReplenishment));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateApplicableDemand</Name>
+				<Source><![CDATA[
+    [Hookable]
+    private InventQty calculateApplicableDemand(WHSLoadLine _loadLine, WHSApplicableDemand _applicableDemand)
+    {
+        InventQty   demandQty;
+
+        switch (_applicableDemand)
+        {
+            case WHSApplicableDemand::FullQty:
+                demandQty = _loadLine.InventQty;
+                break;
+            case WHSApplicableDemand::LooseQty:
+                if (real2int(_loadLine.PackingQty))
+                {
+                    demandQty = real2int(_loadLine.InventQty) mod real2int(_loadLine.PackingQty);
+                }
+                else
+                {
+                    demandQty = _loadLine.InventQty;
+                }
+                break;
+        }
+
+        return demandQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateReplenishQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Calculates the quantity that needs to be replenished for the given load demand.
+    /// </summary>
+    /// <param name = "_loadDemand">
+    ///     The load demand that replenishment should be calculated for.
+    /// </param>
+    /// <returns>
+    ///     The quantity that should be replenished in order to satisfy the load demand.
+    /// </returns>
+    protected InventQty calculateReplenishQty(WHSTmpLoadDemand _loadDemand)
+    {
+        InventQty       availQty;
+        QueryRun        locQr;
+        WMSLocation     location;
+        InventDim       inventDim;
+
+        locQr = new QueryRun(WHSReplenishmentTemplateLine::findByRecId(_loadDemand.RefRecId).LocationQuery);
+
+        while (locQr.next())
+        {
+            location = locQr.get(tableNum(WMSLocation));
+
+            inventDim = InventDim::find(_loadDemand.InventDimId);
+            if (inventDim.InventLocationId == location.InventLocationId)
+            {
+                inventDim.clearInventDimId();
+                inventDim.wmsLocationId = location.wmsLocationId;
+
+                availQty += WHSInventOnHand::getWorkPhysicalAvailHandlingQtyByInventDim(_loadDemand.ItemId, 
+																						inventDim,	
+																						true);
+            }
+        }
+
+        return _loadDemand.Qty > availQty ? _loadDemand.Qty - availQty : 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createReplenishmentWork</Name>
+				<Source><![CDATA[
+    private void createReplenishmentWork(WHSTmpLoadDemand _tmpLoadDemand)
+    {
+        InventQty                       demandQty;
+        WHSWorkCreateReplenishment      workCreate;
+        WHSReplenishmentTemplateLine    replenTemplateLine;
+        WHSTmpWorkLine                  replenPutTmpWorkLine;
+        InventDim                       replenDim;
+        WHSWorkCreateId                 workCreateId;
+        int                             workHeaders;
+
+        try
+        {
+            while select _tmpLoadDemand
+                join replenTemplateLine
+                where replenTemplateLine.RecId == _tmpLoadDemand.RefRecId
+            {
+                demandQty = this.calculateReplenishQty(_tmpLoadDemand);
+
+                if (!demandQty)
+                {
+                    continue;
+                }
+
+                if (workCreate)
+                {
+                    workCreate.dispose();
+                }
+                workCreate = new WHSWorkCreateReplenishment(replenTemplateLine, workCreateId ? workCreateId : '');
+                workCreateId = workCreate.parmWorkCreateId();
+                workCreate.parmReplenishmentTemplateLine(replenTemplateLine);
+                workCreate.parmTmpLoadDemand(_tmpLoadDemand);
+                workCreate.parmReplenQty(demandQty);
+                workCreate.parmLocDirHintCode(replenTemplateLine.LocDirHintCode);
+                workCreate.parmReplenUOM(replenTemplateLine.ReplenishmentUOM);
+                workCreate.createTempTablePut();
+                demandQty -= workCreate.parmWorkCreatedQty();
+                if (demandQty > 0)
+                {
+                    // Could not find a place to put all of the replenishment
+                    warning (strFmt("@WAX4215", _tmpLoadDemand.ItemId));
+                }
+            }
+
+            // If we have any put replenishment lines then create a work create class so we can create replenishment work.
+            select firstonly replenPutTmpWorkLine
+                    where replenPutTmpWorkLine.WorkCreateId  == workCreateId     &&
+                          replenPutTmpWorkLine.WorkType      == WHSWorkType::Put &&
+                          replenPutTmpWorkLine.WorkTransType == WHSWorkTransType::Replenishment;
+
+            if (replenPutTmpWorkLine.RecId)
+            {
+                // Create instance of work create class
+                if (workCreate)
+                {
+                    workCreate.dispose();
+                }
+                workCreate = new WHSWorkCreateReplenishment(WHSReplenishmentTemplateLine::findByRecId(replenPutTmpWorkLine.RefRecId), workCreateId);
+            }
+
+            // Combine replenishment Put TmpWorkLines that are for the same location and inventDimId
+            // Now we know item, demand Qty, and put location: Create replen pick work lines (createTempTable)
+            while select sum(InventQty) from replenPutTmpWorkLine
+                group by replenPutTmpWorkLine.ItemId, replenPutTmpWorkLine.wmsLocationId, replenPutTmpWorkLine.InventDimId
+                where replenPutTmpWorkLine.WorkCreateId  == workCreateId     &&
+                      replenPutTmpWorkLine.WorkType      == WHSWorkType::Put &&
+                      replenPutTmpWorkLine.WorkTransType == WHSWorkTransType::Replenishment
+            {
+                replenDim = InventDim::find(replenPutTmpWorkLine.InventDimId);
+                replenDim.wmsLocationId = replenPutTmpWorkLine.wmsLocationId;
+                replenDim = InventDim::findOrCreate(replenDim);
+
+                workCreate.parmReplenQty(replenPutTmpWorkLine.InventQty);
+                workCreate.parmReplenItemId(replenPutTmpWorkLine.ItemId);
+                workCreate.parmReplenInventDim(InventDim::find(replenDim.InventDimId));
+
+                // Create tmp table (pick replenishment lines)
+                workCreate.createTempTable();
+            }
+
+            // Delete unneeded replenishment tmpWorkLines that are puts.
+            delete_from replenPutTmpWorkLine
+                where replenPutTmpWorkLine.WorkCreateId     == workCreateId     &&
+                      replenPutTmpWorkLine.WorkType         == WHSWorkType::Put &&
+                      replenPutTmpWorkLine.WorkTransType    == WHSWorkTransType::Replenishment;
+
+            // Process tmpTable for replenishment
+            if (workCreate != null)
+            {
+                workCreate.processTempTable();
+                workCreate.cleanupTempTable();
+
+                workCreate.blockReplenishmentOverflowWorkExceedingCapacity();
+            }
+
+            workHeaders =  WHSWorkTable::countWorkHeaders(workCreateId);
+            if (workCreateId && workHeaders > 0)
+            {
+                info(strFmt("@WAX2010", workHeaders, workCreateId));
+            }
+            else
+            {
+                info("@WAX2013");
+            }
+        }
+        catch
+        {
+            // Delete all tmpWorkLines for this workCreateId
+            delete_from replenPutTmpWorkLine
+                where replenPutTmpWorkLine.WorkCreateId == workCreateId;
+        }
+        finally
+        {
+            if (workCreate)
+            {
+                workCreate.dispose();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTmpDemandForLoad</Name>
+				<Source><![CDATA[
+    private WHSTmpLoadDemand createTmpDemandForLoad(WHSLoadId _loadId, WHSTmpLoadDemand _tmpLoadDemand)
+    {
+        WHSLoadLine                     loadLine;
+        WHSReplenishmentTemplateLine    replenTemplateLine;
+        InventTrans                     inventTrans;
+        InventTransOrigin               inventTransOrigin;
+        InventDim                       inventDim;
+        boolean                         replenLineSucceeded;
+
+        while select loadLine
+            where loadLine.LoadId == _loadId
+        {
+            replenLineSucceeded = false;
+
+            // Select inventTrans so we can get a starting point for our dim.
+            select firstonly inventTrans
+                where inventTrans.InventDimId   == loadLine.InventDimId
+                &&    inventTrans.StatusReceipt == StatusReceipt::None
+                &&    (inventTrans.StatusIssue  == StatusIssue::ReservPhysical
+                ||     inventTrans.StatusIssue  == StatusIssue::ReservOrdered
+                ||     inventTrans.StatusIssue  == StatusIssue::OnOrder)
+                exists join inventTransOrigin
+                where inventTrans.InventTransOrigin     == inventTransOrigin.RecId
+                &&    inventTransOrigin.InventTransId   == loadLine.InventTransId;
+
+            if (!inventTrans.RecId)
+            {
+                continue;
+            }
+
+            while select ItemQuery, ApplicableDemand, RecId from replenTemplateLine
+                where replenTemplateLine.ReplenishTemplateId == replenTemplateId
+            {
+                if (replenLineSucceeded)
+                {
+                    break;
+                }
+
+                if (!WHSReplenishmentTemplateLine::isProductSelectionFound(replenTemplateLine.RecId, loadLine.ItemId, loadLine.InventDimId))
+                {
+                    continue;
+                }
+
+                replenLineSucceeded = true;
+
+                // Location and LP should be blanked out if they happen to be filled in.
+                inventDim = inventTrans.inventDim();
+                inventDim.wmsLocationId = '';
+                inventDim.LicensePlateId = '';
+                inventDim = InventDim::findOrCreate(inventDim);
+
+                if (WHSTmpLoadDemand::find(loadLine.ItemId, inventDim.InventDimId, _tmpLoadDemand, true).RecId)
+                {
+                    _tmpLoadDemand.Qty += this.calculateApplicableDemand(loadLine, replenTemplateLine.ApplicableDemand);
+                    _tmpLoadDemand.update();
+                }
+                else
+                {
+                    _tmpLoadDemand.clear();
+                    _tmpLoadDemand.InventDimId = inventDim.InventDimId;
+                    _tmpLoadDemand.ItemId = loadLine.ItemId;
+                    _tmpLoadDemand.RefRecId = replenTemplateLine.RecId;
+                    _tmpLoadDemand.Qty = this.calculateApplicableDemand(loadLine, replenTemplateLine.ApplicableDemand);
+                    if (_tmpLoadDemand.Qty > 0)
+                    {
+                        _tmpLoadDemand.insert();
+                    }
+                }
+            }
+
+            if (!replenLineSucceeded)
+            {
+                // Load Line did not match any replenishment template lines
+                warning(strFmt("@WAX4226", loadLine.ItemId));
+            }
+        }
+        return _tmpLoadDemand;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        DialogRunbase   drb;
+
+        drb = super();
+
+        dialogReplenTemplateId = drb.addFieldValue(extendedTypeStr(WHSReplenishTemplateId), replenTemplateId, "@WAX1907", "@WAX2103");
+        drb.allowUpdateOnSelectCtrl(true);
+
+        return drb;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        boolean ret;
+
+        ret = super();
+
+        replenTemplateId = dialogReplenTemplateId.value();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    void new()
+    {
+        super();
+
+        queryRun = new QueryRun(this.buildQuery());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList, queryRun.pack()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRun</Name>
+				<Source><![CDATA[
+    public QueryRun queryRun()
+    {
+        return queryRun;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    void run()
+    {
+        using (SysErrorMessageHelpScope scope = SysErrorMessageHelpScope::newErrorContextBatchServer(this))
+        {
+            WHSTmpLoadDemand    tmpLoadDemand;
+            WHSLoadId           prevLoadId;
+            WHSLoadTable        loadTable;
+
+            if (WHSReplenishmentTemplate::find(replenTemplateId).ReplenishmentType != WHSReplenishmentType::LoadDemand)
+            {
+                throw error("@WAX4211");
+            }
+
+            while (queryRun.next())
+            {
+                loadTable = queryRun.get(tableNum(WHSLoadTable));
+
+                if (loadTable.LoadId != prevLoadId)
+                {
+                    // Calculate replenishment for load
+                    tmpLoadDemand = this.createTmpDemandForLoad(loadTable.LoadId, tmpLoadDemand);
+                    prevLoadId = loadTable.LoadId;
+                }
+            }
+
+            this.createReplenishmentWork(tmpLoadDemand);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runsImpersonated</Name>
+				<Source><![CDATA[
+    public boolean runsImpersonated()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQuerySelectButton</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether to show query select button in dialog or not.
+    /// </summary>
+    /// <returns>
+    /// True if to show query select button in dialog.
+    /// </returns>
+    boolean showQuerySelectButton()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQueryValues</Name>
+				<Source><![CDATA[
+    public boolean showQueryValues()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version     version = RunBase::getVersion(packedClass);
+        boolean     ret = true;
+        container   packedQuery;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList, packedQuery] = packedClass;
+                if (!packedQuery)
+                {
+                    ret = false;
+                }
+                else
+                {
+                    queryRun = new QueryRun(packedQuery);
+                }
+                break;
+            default:
+                ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    static WHSLoadReplenishment construct()
+    {
+        return new WHSLoadReplenishment();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static ClassDescription description()
+    {
+        return "@WAX4185";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static void main(Args args)
+    {
+        WHSLoadReplenishment replenishment = WHSLoadReplenishment::construct();
+
+        using (SysErrorMessageHelpScope scope = SysErrorMessageHelpScope::newErrorContextBatchController(replenishment))
+        {
+            if (replenishment.prompt())
+            {
+                replenishment.runOperation();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>errorMessageHelpScopeFormName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the form name used for the error context using a <c>SysErrorMessageHelpScope</c> class.
+    /// </summary>
+    /// <returns>The form name used for the error context.</returns>
+    [Hookable(false)]
+    public FormName errorMessageHelpScopeFormName()
+    {
+        return strFmt('%1_%2', formStr(Dialog), classStr(WhsLoadReplenishment));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>errorMessageHelpScopeActionName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the action name used for the error context using a <c>SysErrorMessageHelpScope</c> class.
+    /// </summary>
+    /// <returns>The action name used for the error context.</returns>
+    [Hookable(false)]
+    public str errorMessageHelpScopeActionName()
+    {
+        return menuItemActionStr(WHSLoadReplenishment);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailDocumentOperationProcessingBatch</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>RetailDocumentOperationProcessingBatch</c> class is used to processing operations to process operation in Queued, Error status.
+/// </summary>
+internal class RetailDocumentOperationProcessingBatch extends SysOperationServiceController implements BatchRetryable
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a RetailDocumentOperationProcessingBatch. RetailDocumentOperationProcessingBatch is used to execute processingOperations.
+    /// </summary>
+    /// <param name="_executionMode">
+    /// The execution mode to use when executing the service operation.
+    /// </param>
+    public void new(SysOperationExecutionMode _executionMode = SysOperationExecutionMode::ScheduledBatch)
+    {
+        super();
+        this.parmClassName(classStr(RetailDocumentOperationProcessingBatch));
+        this.parmMethodName(methodStr(RetailDocumentOperationProcessingBatch, processingOperations));
+        this.parmExecutionMode(_executionMode);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustGoBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Conveys whether the job must be run in batch.
+    /// </summary>
+    /// <returns>Always returns true.</returns>
+    public boolean mustGoBatch()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processingOperations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Query all operation instances in Queued and Error status. For the operations in Queued status, it will use processDocumentOperation provided by RetailDocumentOperationService to process the operations. For the operations in Error status, it will use retryDocumentOperation provided by RetailDocumentOperationService to retry the operations.
+    /// </summary>
+    public void processingOperations()
+    {
+        Batch batch = BatchHeader::getCurrentBatchTask();
+        RetailDocumentOperation retailDocumentOperationTable;
+        RetailDocumentOperationConfigurationManager configurationManagerInstance = RetailDocumentOperationConfigurationManager::instance;
+        utcdatetime processingOperationsStartTime = DateTimeUtil::utcNow();
+
+        if (RetailAsyncStoreOrderPickupFeatureExposure::isEnabled() 
+            || FeatureStateProvider::isFeatureEnabled(RetailAsyncOrderCancellationFeature::instance())
+            || RetailInventoryServiceIntegrationHelper::isUsingInventoryServiceAsDataSource())
+        {
+            this.mergeDocumentOperationRequest();
+        }
+
+        while select retailDocumentOperationTable
+            order by retailDocumentOperationTable.CommittedDateTime ASC
+            where retailDocumentOperationTable.Status == RetailDocumentOperationStatus::Queued
+        {
+            RetailDocumentOperationConfigurationBase config = configurationManagerInstance.getOperationConfiguration(retailDocumentOperationTable.OperationName);
+            int processingTimeLimitInSeconds = config.getProcessingTimeLimitInSeconds();
+            utcdatetime processingOperationsLimitTime = DateTimeUtil::addSeconds(processingOperationsStartTime, processingTimeLimitInSeconds);
+            if(RetailDocumentOperationProcessingBatch::isBatchProcessingTimeout(processingOperationsLimitTime))
+            {
+                RetailDocumentOperationLogger::logBatchTaskWarning(batch.RecId, strFmt('%1 processing timeout. Processing time limit %2 seconds', classStr(RetailDocumentOperationProcessingBatch), processingTimeLimitInSeconds));
+                return;
+            }
+
+            RetailDocumentOperationService::processDocumentOperation(retailDocumentOperationTable.RecId);
+        }
+
+        while select retailDocumentOperationTable
+            order by retailDocumentOperationTable.CommittedDateTime ASC
+            where retailDocumentOperationTable.Status == RetailDocumentOperationStatus::RetriableError && retailDocumentOperationTable.NextRetryTime <= processingOperationsStartTime
+        {
+            RetailDocumentOperationConfigurationBase config = configurationManagerInstance.getOperationConfiguration(retailDocumentOperationTable.OperationName);
+            int maxRetryCount = config.getMaxRetryCount();
+            int processingTimeLimitInSeconds = config.getProcessingTimeLimitInSeconds();
+            utcdatetime processingOperationsLimitTime = DateTimeUtil::addSeconds(processingOperationsStartTime, processingTimeLimitInSeconds);
+            if(RetailDocumentOperationProcessingBatch::isBatchProcessingTimeout(processingOperationsLimitTime))
+            {
+                RetailDocumentOperationLogger::logBatchTaskWarning(batch.RecId, strFmt('%1 processing timeout. Processing time limit %2 seconds', classStr(RetailDocumentOperationProcessingBatch), processingTimeLimitInSeconds));
+                return;
+            }
+
+            if (retailDocumentOperationTable.RetryCount >= maxRetryCount)
+            {
+                RetailDocumentOperationProcessingBatch::tryUpdateOperationToFailed(retailDocumentOperationTable.RecId);
+            }
+            else
+            {
+                RetailDocumentOperationService::retryDocumentOperation(retailDocumentOperationTable.RecId);
+                RetailDocumentOperation retailDocumentOperationRow = RetailDocumentOperation::findByOperationRecId(retailDocumentOperationTable.RecId);
+                if (retailDocumentOperationRow.Status != RetailDocumentOperationStatus::Succeeded && retailDocumentOperationRow.RetryCount >= maxRetryCount)
+                {
+                    RetailDocumentOperationProcessingBatch::tryUpdateOperationToFailed(retailDocumentOperationTable.RecId);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mergeDocumentOperationRequest</Name>
+				<Source><![CDATA[
+    private void mergeDocumentOperationRequest()
+    {
+        RetailDocumentOperationRequest docOperationRequest;
+        RetailDocumentOperation docOperation;
+
+        RecordInsertList newDocOperationList = new RecordInsertList(tableNum(RetailDocumentOperation));
+        
+        RetailTmpRecId recIdOfRecordsToDelete;
+        RecordInsertList recordsToDeleteList = new RecordInsertList(
+            tableNum(RetailTmpRecId), 
+            true /* _skipInsertMethod */, 
+            true /* _skipDatabaseLog */, 
+            true /* _skipEvents */, 
+            true /* _skipAosValidation */, 
+            true /* _skipRLSValidation */, 
+            recIdOfRecordsToDelete);
+
+        ttsbegin;
+
+        // Every record that already exists in RetailDocumentOperation can safely be marked for deletion.
+        insert_recordset recIdOfRecordsToDelete (ReferenceRecId)
+            select RecId
+            from docOperationRequest
+            exists join docOperation
+            where docOperationRequest.RequestId == docOperation.RequestId;
+
+        // Now for the records that do not exist in RetailDocumentOperation, create new ones based on the data from RetailDocumentOperationRequest
+        while select docOperationRequest
+            notexists join docOperation
+            where docOperationRequest.RequestId == docOperation.RequestId
+        {
+            // Add the record to RetailDocumentOperation
+            RetailDocumentOperation newDocOperation = docOperationRequest.toDocumentOperation();
+            newDocOperationList.add(newDocOperation);
+            
+            // Save the RecId of RetailDocumentOperationRequest so that we can delete it later.
+            RetailTmpRecId localTmpRecId;
+            localTmpRecId.ReferenceRecId = docOperationRequest.RecId;
+            recordsToDeleteList.add(localTmpRecId);
+        }
+
+        // Flush changes to the DB.
+        newDocOperationList.insertDatabase();
+        recordsToDeleteList.insertDatabase();
+
+        // Truncate the operation requests table.
+        delete_from docOperationRequest
+            exists join recIdOfRecordsToDelete
+                where docOperationRequest.RecId == recIdOfRecordsToDelete.ReferenceRecId;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isBatchProcessingTimeout</Name>
+				<Source><![CDATA[
+    private static boolean isBatchProcessingTimeout(utcdatetime processingOperationsLimitTime)
+    {
+        utcdatetime now = DateTimeUtil::utcNow();
+        if(now > processingOperationsLimitTime)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tryUpdateOperationToFailed</Name>
+				<Source><![CDATA[
+    private static boolean tryUpdateOperationToFailed(RefRecId documentOperationRecId)
+    {
+        // in case, other processing task just updated retry count, so need to check app lock
+        using (ReqReaderWriterLock innerLock = ReqReaderWriterLock::construct())
+        {
+            str operationAppLockName = int642Str(documentOperationRecId);
+            if (innerLock.tryEnterUpdateLock(operationAppLockName))
+            {
+                RetailDocumentOperationService::updateOperationToFailed(documentOperationRecId, RetailDocumentOperationProcessingErrorCode::MaximumRetryCountExceeded);
+                return true;
+            }
+            else
+            {
+                RetailDocumentOperationLogger::logOperationMessage(emptyGuid(), documentOperationRecId, '', 'Failed to get app lock when try to update operation to failed status for operation processing batch');
+                return false;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        SysOperationServiceController controller = new RetailDocumentOperationProcessingBatch();
+
+        if (controller.prompt())
+        {
+            controller.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

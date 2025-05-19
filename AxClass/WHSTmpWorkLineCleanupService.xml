@@ -1,0 +1,359 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSTmpWorkLineCleanupService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WHSTmpWorkLineCleanupService</c> class is used to clean up <c>WHSTmpWorkLine</c> records.
+/// </summary>
+internal final class WHSTmpWorkLineCleanupService extends SysOperationServiceBase
+{
+    private const int ValidDayRangeForWaveInExecutionState = 7;
+    private const int RecordsToDeleteBatchSize = 100;
+    
+    private NumberOfRecords cleanupCounter;
+    private NumberOfRecords backupCounter;
+
+    private WHSInstrumentationLogger instrumentationLogger;
+
+    private boolean deleteTmpWorkLineRecordsWithoutWaveIdFlight = WHSTmpWorkLineCleanupLinesWithoutWaveIdFlight::instance().isEnabled();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal void execute()
+    {
+        if (!WHSTmpWorkLineCleanupFlight::instance().isEnabled())
+        {
+            info(strFmt("@WAX:WHSTmpWorkLineCleanupDeletedRecordsCount", cleanupCounter));
+            return;
+        }
+
+        using (var activityContext = this.instrumentationLogger().tmpWorkLineCleanupServiceActivities().execute())
+        {
+            using (var activityContextProcessCleanup = this.instrumentationLogger().tmpWorkLineCleanupServiceActivities().processTmpWorkLineDeletion())
+            {
+                boolean shouldRetainTmpWorkTable = WHSParameters::find().RetainTmpWorkTable;
+                
+                this.instrumentationLogger().tmpWorkLineCleanupServiceActivities().isTmpWorkLinesArchived(activityContextProcessCleanup, shouldRetainTmpWorkTable);
+
+                if (shouldRetainTmpWorkTable && !this.anyActiveWaveExists())
+                {
+                    this.archiveOrphanTmpWorkLineWithWave();
+                    this.archiveOrphanTmpWorkLinesWithoutWave();
+                }
+
+                this.instrumentationLogger().tmpWorkLineCleanupServiceActivities().backupCounter(activityContextProcessCleanup, backupCounter);
+
+                this.purgeOrphanTmpWorkLineTable();
+                this.instrumentationLogger().tmpWorkLineCleanupServiceActivities().cleanupCounter(activityContextProcessCleanup, cleanupCounter);
+            }
+
+            info(strFmt("@WAX:WHSTmpWorkLineCleanupDeletedRecordsCount", cleanupCounter));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>purgeOrphanTmpWorkLineTable</Name>
+				<Source><![CDATA[
+    private void purgeOrphanTmpWorkLineTable()
+    {
+        str sqlStatement = this.sqlStatement();
+
+        while (true)
+        {
+            int deletedRows = this.runSQLStatement(sqlStatement);
+            cleanupCounter += deletedRows;
+
+            if (!deletedRows)
+            {
+                break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runSQLStatement</Name>
+				<Source><![CDATA[
+    private int runSQLStatement(str _sqlStatement)
+    {
+        Connection connection = new Connection();
+        SqlStatementExecutePermission permission = new SqlStatementExecutePermission(_sqlStatement);
+        permission.assert();
+        Statement statement = connection.createStatement();
+        int deletedRows;
+
+        try
+        {
+            connection.ttsbegin();
+            deletedRows = statement.executeUpdateWithParameters(_sqlStatement, SqlParams::create());
+            connection.ttscommit();
+        }
+        catch
+        {
+            if (connection != null)
+            {
+                connection.ttsabort();
+            }
+
+            throw;
+        }
+        finally
+        {
+            CodeAccessPermission::revertAssert();
+            statement.close();
+            connection.finalize();
+        }
+        // Since the select statement has a 'if not exists' in the beginning, executeUpdateWithParameters can return -1 if the condition fails.
+        return deletedRows >= 0 ? deletedRows : 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sqlStatement</Name>
+				<Source><![CDATA[
+    private str sqlStatement()
+    {
+       /*
+IF NOT EXISTS
+(
+        SELECT TOP 1 WAVEID
+            FROM WHSWAVETABLE T1 WITH(NOLOCK)
+        WHERE
+            T1.PARTITION = %1
+            AND T1.DATAAREAID = '%2'
+            AND (T1.WAVESTATUS = 1 OR T1.EXECUTE_ = 1)
+            AND T1.EXECUTINGUTCDATETIME >= DATEADD(day, -7, CONVERT(date, GETDATE()))
+)
+BEGIN
+    DELETE TOP(%4) FROM WHSTMPWORKLINE
+        WHERE
+            PARTITION = %1
+            AND DATAAREAID = '%2'
+            AND EXISTS (
+                SELECT TOP 1 T1.RECID
+                    FROM
+                        WHSTMPWORKLINE T1,
+                        WHSWAVETABLE EXISTSWAVE
+                    WHERE
+                        T1.WAVEID	        = EXISTSWAVE.WAVEID
+                        AND T1.DATAAREAID	= EXISTSWAVE.DATAAREAID
+                        AND T1.PARTITION	= EXISTSWAVE.PARTITION
+                        AND T1.WAVEID		= WHSTMPWORKLINE.WAVEID
+                        AND T1.ITEMID		= WHSTMPWORKLINE.ITEMID
+                        AND T1.PARTITION    = %1
+                        AND T1.DATAAREAID   = '%2'
+                        AND EXISTSWAVE.WAVESTATUS   <> 1
+                        AND EXISTSWAVE.EXECUTE_     = 0
+                UNION
+                SELECT TOP 1 T2.RECID
+                    FROM WHSTMPWORKLINE T2
+                    WHERE
+                        T2.DATAAREAID	    = WHSTMPWORKLINE.DATAAREAID
+                        AND T2.PARTITION	= WHSTMPWORKLINE.PARTITION
+                        AND T2.WAVEID       = WHSTMPWORKLINE.WAVEID
+                        AND T2.ITEMID       = WHSTMPWORKLINE.ITEMID
+                        AND T2.WAVEID       <> ''
+                        AND NOT EXISTS (SELECT RECID
+                                        FROM WHSWAVETABLE WAVEDOESNOTEXIST WITH(NOLOCK)
+                                        WHERE
+                                            WAVEDOESNOTEXIST.WAVEID		    = T2.WAVEID
+                                            AND WAVEDOESNOTEXIST.DATAAREAID	= T2.DATAAREAID
+                                            AND WAVEDOESNOTEXIST.PARTITION	= T2.PARTITION
+                                        )
+                UNION -- Flighted
+                SELECT TOP 1 T3.RECID
+                    FROM WHSTMPWORKLINE T3
+                    WHERE
+                        T3.DATAAREAID	    = WHSTMPWORKLINE.DATAAREAID
+                        AND T3.PARTITION	= WHSTMPWORKLINE.PARTITION
+                        AND T3.RECID	    = WHSTMPWORKLINE.RECID
+                        AND T3.WAVEID       = ''
+                        AND T3.CREATEDDATETIME < DATEADD(day, -7, CONVERT(date, GETDATE()))
+            )
+END
+       */
+
+       str sqlStatment = @'
+IF NOT EXISTS
+(
+        SELECT TOP 1 WAVEID
+            FROM WHSWAVETABLE T1 WITH(NOLOCK)
+        WHERE
+            T1.PARTITION = %1
+            AND T1.DATAAREAID = %2
+            AND (T1.WAVESTATUS = 1 OR T1.EXECUTE_ = 1)
+            AND T1.EXECUTINGUTCDATETIME >= DATEADD(day, -%3, CONVERT(date, GETDATE()))
+)
+BEGIN
+    DELETE TOP(%4) FROM WHSTMPWORKLINE
+        WHERE
+            PARTITION = %1
+            AND DATAAREAID = %2
+            AND EXISTS (
+                SELECT TOP 1 T1.RECID
+                    FROM
+                        WHSTMPWORKLINE T1,
+                        WHSWAVETABLE EXISTSWAVE
+                    WHERE
+                        T1.WAVEID	        = EXISTSWAVE.WAVEID
+                        AND T1.DATAAREAID	= EXISTSWAVE.DATAAREAID
+                        AND T1.PARTITION	= EXISTSWAVE.PARTITION
+                        AND T1.WAVEID		= WHSTMPWORKLINE.WAVEID
+                        AND T1.ITEMID		= WHSTMPWORKLINE.ITEMID
+                        AND T1.PARTITION    = %1
+                        AND T1.DATAAREAID   = %2
+                        AND EXISTSWAVE.WAVESTATUS   <> 1
+                        AND EXISTSWAVE.EXECUTE_     = 0
+                UNION
+                SELECT TOP 1 T2.RECID
+                    FROM WHSTMPWORKLINE T2
+                    WHERE
+                        T2.DATAAREAID	    = WHSTMPWORKLINE.DATAAREAID
+                        AND T2.PARTITION	= WHSTMPWORKLINE.PARTITION
+                        AND T2.WAVEID       = WHSTMPWORKLINE.WAVEID
+                        AND T2.ITEMID       = WHSTMPWORKLINE.ITEMID
+                        AND T2.WAVEID       <> %5
+                        AND NOT EXISTS (SELECT RECID
+                                        FROM WHSWAVETABLE WAVEDOESNOTEXIST WITH(NOLOCK)
+                                        WHERE
+                                            WAVEDOESNOTEXIST.WAVEID		    = T2.WAVEID
+                                            AND WAVEDOESNOTEXIST.DATAAREAID	= T2.DATAAREAID
+                                            AND WAVEDOESNOTEXIST.PARTITION	= T2.PARTITION
+                                        )
+                %6
+                )
+END;';
+
+        SqlSystem sqlSystem = new SqlSystem();
+        str sqlStatmentRecordsWithoutWaveId;
+
+        if (deleteTmpWorkLineRecordsWithoutWaveIdFlight)
+        {
+            sqlStatmentRecordsWithoutWaveId = @'
+                UNION
+                SELECT TOP 1 T3.RECID
+                    FROM WHSTMPWORKLINE T3
+                    WHERE
+                        T3.DATAAREAID	    = WHSTMPWORKLINE.DATAAREAID
+                        AND T3.PARTITION	= WHSTMPWORKLINE.PARTITION
+                        AND T3.RECID	    = WHSTMPWORKLINE.RECID
+                        AND T3.WAVEID       = %1
+                        AND T3.CREATEDDATETIME < DATEADD(day, -%2, CONVERT(date, GETDATE()))
+';
+            sqlStatmentRecordsWithoutWaveId = strFmt(sqlStatmentRecordsWithoutWaveId,
+                sqlSystem.sqlLiteral(''),
+                ValidDayRangeForWaveInExecutionState);
+        }
+
+        return strFmt(sqlStatment, 
+                    sqlSystem.sqlLiteral(getCurrentPartitionRecId(), true),
+                    sqlSystem.sqlLiteral(curext()),
+                    ValidDayRangeForWaveInExecutionState,
+                    RecordsToDeleteBatchSize,
+                    sqlSystem.sqlLiteral(''),
+                    sqlStatmentRecordsWithoutWaveId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>anyActiveWaveExists</Name>
+				<Source><![CDATA[
+    private boolean anyActiveWaveExists()
+    {
+        utcDateTime waveInExecutingStateDateTime = DateTimeUtil::addDays(DateTimeUtil::utcNow(),
+                                                                -ValidDayRangeForWaveInExecutionState);
+        WHSWaveTable waveTable;
+
+        select firstonly RecId
+            from waveTable
+            where (waveTable.WaveStatus == WHSWaveStatus::Executing
+                || waveTable.Execute == NoYes::Yes)
+                && waveTable.ExecutingUTCDateTime >= waveInExecutingStateDateTime;
+
+        return waveTable.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>archiveOrphanTmpWorkLineWithWave</Name>
+				<Source><![CDATA[
+    private void archiveOrphanTmpWorkLineWithWave()
+    {
+        WHSTmpWorkLine tmpWorkLine;
+        WHSWaveTable existsInWaveTable;
+
+        while select forupdate tmpWorkLine
+            exists join existsInWaveTable
+            where existsInWaveTable.WaveId == tmpWorkLine.WaveId
+                && existsInWaveTable.WaveStatus != WHSWaveStatus::Executing
+                && existsInWaveTable.Execute == NoYes::No
+        {
+            this.archiveTmpWorkLine(tmpWorkLine);
+            backupCounter++;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>archiveOrphanTmpWorkLinesWithoutWave</Name>
+				<Source><![CDATA[
+    private void archiveOrphanTmpWorkLinesWithoutWave()
+    {
+        WHSTmpWorkLine tmpWorkLine;
+        WHSWaveTable doesNotExistInWaveTable;
+
+        while select forupdate tmpWorkLine
+            notexists join doesNotExistInWaveTable
+            where doesNotExistInWaveTable.WaveId == tmpWorkLine.WaveId
+                && tmpWorkLine.WaveId != ''
+        {
+            this.archiveTmpWorkLine(tmpWorkLine);
+            backupCounter++;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>archiveTmpWorkLine</Name>
+				<Source><![CDATA[
+    private void archiveTmpWorkLine(WHSTmpWorkLine _tmpWorkLine)
+    {
+        WHSTmpWorkLineHistory tmpWorkLineHistory;
+        tmpWorkLineHistory.initFromWHSTmpWorkLine(_tmpWorkLine);
+        tmpWorkLineHistory.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    private WHSInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = WHSInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

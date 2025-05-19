@@ -1,0 +1,766 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventCostClosingCancel_End</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>InventCostClosingCancel_End</c> class will trigger the posting of the records created during
+///    the cancellation into ledger.
+/// </summary>
+/// <remarks>
+///    The following postings will be done by triggering the
+///    <c>
+///       InventAdjustPostClosingCancel
+///    </c>
+///     class.
+///    <list type="bullet">
+///       <item>
+///          <description>ProdIndirectTrans - Production indirect cost.</description>
+///       </item>
+///       <item>
+///          <description>InventSettlement - Inventory settlements.</description>
+///       </item>
+///       <item>
+///          <description>InventCostTransVariance - Inventory cost transaction variances.</description>
+///       </item>
+///    </list>
+/// </remarks>
+class InventCostClosingCancel_End extends InventCostClosingCancel implements BatchRetryable
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>cancelNextWIPCalculations_RU</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void cancelNextWIPCalculations_RU()
+    {
+        #ISOCountryRegionCodes
+
+        ProdWIPHistoricalCostTable_RU   wipHistoricalCostTable;
+
+        Set                             prodIdSet = new Set(Types::String);
+
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]))
+        {
+            while select wipHistoricalCostTable
+                group by ProdId
+                where wipHistoricalCostTable.TransDate                  == cancelClosing.TransDate  &&
+                      wipHistoricalCostTable.Voucher                    == cancelClosing.Voucher    &&
+                      wipHistoricalCostTable.Cancelled                  == NoYes::No                &&
+                      wipHistoricalCostTable.PostedFromInventClosing    == NoYes::Yes
+            {
+                if (ProdTable::find(wipHistoricalCostTable.ProdId).prodParametersDim().CalculatingWIP_RU)
+                {
+                    prodIdSet.add(wipHistoricalCostTable.ProdId);
+                }
+            }
+
+            if (!prodIdSet.empty())
+            {
+                // cancel next calculation (from cancelClosing.TransDate date)
+                ProdCalculatingWIPCancelEngine_RU::newFromInventClosingCancel(prodIdSet, cancelClosing.Voucher, cancelClosing.TransDate).run();
+
+                // run WIP calculation on the cancelClosing.TransDate date
+                SetEnumerator setEnumerator = prodIdSet.getEnumerator();
+                while (setEnumerator.moveNext())
+                {
+                    ProdCalculatingWIPEngine_RU::runFromInventClosingCancel(setEnumerator.current(),
+                                                                            NumberSeq::newGetNum(ProdParameters::numRefProdCalcVoucherId()).num(),
+                                                                            inventClosing.TransDate);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAndDeleteVirtualTransfer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks whether the records in the list balance, and deletes them if they do, or generates a warning
+    ///    if they do not.
+    /// </summary>
+    /// <param name="_listInventTrans">
+    ///    The list of <c>InventTrans</c> records.
+    /// </param>
+    /// <param name="_inventSum">
+    ///    The sum of the <c>InventTrans</c> records in the list.
+    /// </param>
+    /// <remarks>
+    ///    This method is meant to delete the <c>InventTrans</c> records that make up one inventory closing
+    ///    virtual transfer.
+    /// </remarks>
+
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void checkAndDeleteVirtualTransfer(List _listInventTrans, InventSum _inventSum)
+    {
+        InventTrans         inventTrans;
+        InventTransPosting  inventTransPosting;
+        ListEnumerator      le;
+        boolean             last;
+
+        if (_inventSum.isAllFieldsZero())
+        {
+            le = _listInventTrans.getEnumerator();
+            last = !le.moveNext();
+
+            while (!last)
+            {
+                inventTrans = le.current();
+                inventTrans.skipTTSCheck(true);
+
+                last = !le.moveNext();
+
+                if (last)
+                {
+                    delete_from inventTransPosting
+                    where inventTransPosting.InventTransOrigin == inventTrans.InventTransOrigin;
+
+                    Debug::assert(inventTransPosting.RowCount() == 2);
+
+                    inventTrans.delete();
+                }
+                else
+                {
+                    inventTrans.delete(NoYes::No, NoYes::No);
+                }
+            }
+        }
+        else
+        {
+            le = _listInventTrans.getEnumerator();
+            while (le.moveNext())
+            {
+                inventTrans = le.current();
+
+                error(strFmt("@SYS111324", inventTrans.ItemId, inventTrans.DatePhysical));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteVirtualTransfersSetbased</Name>
+				<Source><![CDATA[
+    protected void deleteVirtualTransfersSetbased()
+    {
+        InventTransOrigin                   inventTransOrigin;
+        InventTrans                         inventTrans;
+        InventCostClosingCancelInventTrans  inventTransToBeDeleted;
+
+        this.checkVirtualTransfers();
+
+        // Select all inventTrans that need to be deleted into the temp table;
+        insert_recordset inventTransToBeDeleted (DateFinancial, Voucher, InventTransOrigin, InventDimId, TransRecId, ItemId)
+        select DateFinancial, Voucher, inventTransOrigin, InventDimId, RecId, ItemId from inventTrans
+            where inventTrans.Voucher  == cancelClosing.Voucher
+            && inventTrans.ValueOpen == InventTransOpen::Yes
+            && inventTrans.QtySettled == 0.0
+            && inventTrans.CostAmountSettled == 0.0
+            && inventTrans.CostAmountAdjustment == 0.0
+        exists join inventTransOrigin
+        where inventTransOrigin.RecId == inventTrans.inventTransOrigin
+            && inventTransOrigin.ReferenceCategory == InventTransType::SummedUp;
+
+        this.excludeUnexpectedVirtualTransferTrans(inventTransToBeDeleted);
+
+        // Delete inventTransPosting
+        InventTransPosting          inventTransPosting;
+        delete_from inventTransPosting
+            exists join inventTransToBeDeleted
+            where inventTransPosting.InventTransOrigin == inventTransToBeDeleted.InventTransOrigin;
+
+        // Delete inventSettlement (this is in inventTrans.Delete() method)
+        InventSettlement            inventSettlement;
+        delete_from inventSettlement
+        exists join inventTransToBeDeleted
+            where inventTransToBeDeleted.TransRecId == inventSettlement.TransRecId
+            && inventTransToBeDeleted.ItemId == inventSettlement.ItemId;
+
+        // Delete InventTransOriginTransfer (this is in inventTransOrigin.delete())
+        InventTransOriginTransfer   inventTransOriginTransfer;
+        delete_from inventTransOriginTransfer
+        exists join inventTransToBeDeleted
+            where inventTransOriginTransfer.IssueInventTransOrigin == inventTransToBeDeleted.InventTransOrigin
+            || inventTransOriginTransfer.ReceiptInventTransOrigin == inventTransToBeDeleted.InventTransOrigin;
+
+        // Delete inventTransOrigin
+        inventTransOrigin.skipEvents(true);
+        inventTransOrigin.skipDataMethods(true);
+        inventTransOrigin.skipDeleteActions(true);
+        delete_from inventTransOrigin
+            exists join inventTransToBeDeleted
+            where inventTransToBeDeleted.inventTransOrigin == inventTransOrigin.RecId;
+
+        // Delete inventTrans
+        inventTrans.skipEvents(true);
+        inventTrans.skipDataMethods(true);
+        inventTrans.skipDeleteActions(true);
+        delete_from inventTrans
+            exists join inventTransToBeDeleted
+            where inventTransToBeDeleted.TransRecId == InventTrans.RecId;
+
+        // Mark undeleted transaction as closed just in case they will be wrongly settled with other normal transactions.
+        update_recordset inventTrans
+            setting ValueOpen = InventTransOpen::No
+            where inventTrans.Voucher == cancelClosing.Voucher
+            && InventTrans.ValueOpen == InventTransOpen::Yes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkVirtualTransfers</Name>
+				<Source><![CDATA[
+    private void checkVirtualTransfers()
+    {
+        InventTransOrigin   inventTransOrigin;
+        InventTrans         inventTrans;
+
+        // Check inventTrans should have 0 amount, if they don't, those inventTrans won't be deleted
+        while select firstonly10 inventTrans
+            where inventTrans.ValueOpen == InventTransOpen::Yes
+                && inventTrans.Voucher  == cancelClosing.Voucher
+            join inventTransOrigin
+            where inventTransOrigin.RecId == inventTrans.inventTransOrigin
+                && inventTransOrigin.ReferenceCategory == InventTransType::SummedUp
+                && (inventTrans.QtySettled != 0.0 
+                || inventTrans.CostAmountSettled != 0.0
+                || inventTrans.CostAmountAdjustment != 0.0)
+        {
+            warning(strFmt("@SYS111324", inventTrans.ItemId, inventTrans.DatePhysical));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>excludeUnexpectedVirtualTransferTrans</Name>
+				<Source><![CDATA[
+    private void excludeUnexpectedVirtualTransferTrans(InventCostClosingCancelInventTrans _inventTransToBeDeleted)
+    {
+        // The view has groupby: DateFinancial, Voucher, and InventTransOrigin
+        // Range: CostAmountAdjustment = 0, CostAmountSettled = 0, QtySettled = 0, ValueOpen = Yes, inventTransType = SummedUp
+        // Having: sum(qty) != 0 or sum(CostAmountPosted) != 0
+        InventCostClosingCancelInventTransCheckView  inventTransForExcluded;
+
+        // costValue (this.CostAmountPosted + this.CostAmountAdjustment) check on CostAmountAdjustment is not necessary
+        // because we should assume costAmountAdjustment = 0
+        // this covers the logic in deleteVirtualTransfers calling inventSum.subInventTransOnSum() and checkAndDeleteVirtualTransfer when inventSum.isAllFieldsZero() = false
+        select firstonly inventTransForExcluded
+            where inventTransForExcluded.Voucher  == cancelClosing.Voucher;
+
+        if (inventTransForExcluded.Voucher != "")
+        {
+            warning(strFmt("@SCM:InventoryClosingCancellationErrorText", cancelClosing.Voucher));
+        }
+
+        // For _inventTransToBeDeleted which comes from inventTrans, non-duplicate index is Voucher, DateFinancial and ValueOpen
+        // and valueOpen = 1 is already set when insert records into _inventTransToBeDeleted
+        delete_from _inventTransToBeDeleted
+            exists join inventTransForExcluded
+            where _inventTransToBeDeleted.Voucher == inventTransForExcluded.Voucher
+            && _inventTransToBeDeleted.DateFinancial == inventTransForExcluded.DateFinancial
+            && _inventTransToBeDeleted.InventTransOrigin == inventTransForExcluded.InventTransOrigin
+            && _inventTransToBeDeleted.inventDimId == inventTransForExcluded.InventDimId
+            && inventTransForExcluded.Voucher == cancelClosing.Voucher;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks the status of the records that should be processed.
+    /// </summary>
+    /// <returns>
+    ///    false, if one of the checks fails; otherwise, true.
+    /// </returns>
+    /// <remarks>
+    ///    In addition to the checks of the parent class, a check is made to make sure that all inventory
+    ///    settlement records have been marked as canceled.
+    /// </remarks>
+    protected boolean checkStatus()
+    {
+        boolean                     ret;
+        InventSettlement            inventSettlement;
+        InventTrans                 inventTrans;
+
+        void checkRecord(Common _record)
+        {
+            if (_record.RecId)
+            {
+                error("@SYS117092");
+                ret = false;
+            }
+
+            _record.clear();
+        }
+
+        ret = super();
+
+        // There should not exist a non canceled record
+        // excepte from the ones where the physical transaction was updated financialli
+        if (ret == true)
+        {
+            // First of all, check all the settlements not type physical value
+            select firstonly RecId from inventSettlement
+                where inventSettlement.Voucher          == cancelClosing.Voucher
+                   && inventSettlement.TransDate        == cancelClosing.TransDate
+                   && inventSettlement.Cancelled        == NoYes::No
+                   && inventSettlement.TransRecId       != 0
+                   && inventSettlement.SettleModel            != InventSettleModel::PhysicalValue
+                   && inventSettlement.InventTransCurrency_RU == inventTransCurrency;
+
+            checkRecord(inventSettlement);
+        }
+
+        if (ret == true)
+        {
+            // Now check all the ones that are physical value and where the transaction is still
+            // not financially updated
+            select firstonly RecId from inventSettlement
+                where inventSettlement.Voucher          == cancelClosing.Voucher
+                       && inventSettlement.TransDate    == cancelClosing.TransDate
+                       && inventSettlement.Cancelled    == NoYes::No
+                       && inventSettlement.TransRecId   != 0
+                       && inventSettlement.SettleModel  == InventSettleModel::PhysicalValue
+                       && inventSettlement.InventTransCurrency_RU == inventTransCurrency
+                exists join inventTrans
+                    where inventTrans.RecId             == inventSettlement.TransRecId   &&
+                          inventTrans.StatusReceipt     == StatusReceipt::None &&
+                          inventTrans.StatusIssue       == StatusIssue::Deducted;
+
+            checkRecord(inventSettlement);
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteVirtualTransfers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Deletes the virtual <see cref="T:InventTrans" /> records, created during the closing for weighted
+    ///    average items.
+    /// </summary>
+
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void deleteVirtualTransfers()
+    {
+        InventTransId       inventTransId;
+        InventTransOrigin   inventTransOrigin;
+        InventTrans         inventTrans;
+        InventSum           inventSum;
+        List                listInventTrans = new List(Types::Record);
+
+        #ISOCountryRegionCodes
+        boolean             countryRegion_RU = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]);
+
+        while select InventTransId from inventTransOrigin
+            order by InventTransId
+            where inventTransOrigin.ReferenceCategory == InventTransType::SummedUp
+            join forupdate inventTrans
+                where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+                   && inventTrans.ValueOpen         == InventTransOpen::Yes
+                   && inventTrans.Voucher           == cancelClosing.Voucher
+                   && (!countryRegion_RU ||
+                        inventTrans.ValueOpenSecCur_RU == InventTransOpen::Yes)
+        {
+            if (inventTransOrigin.InventTransId != inventTransId)
+            {
+                if (inventTransId)
+                {
+                    this.checkAndDeleteVirtualTransfer(listInventTrans, inventSum);
+                    listInventTrans = new List(Types::Record);
+                }
+
+                inventSum.clear();
+                listInventTrans = new List(Types::Record);
+                inventTransId   = inventTransOrigin.InventTransId;
+            }
+
+            if (inventTrans.QtySettled           == 0.0 &&
+                inventTrans.CostAmountSettled    == 0.0 &&
+                inventTrans.CostAmountAdjustment == 0.0 &&
+                    (!countryRegion_RU                                 ||
+                        (inventTrans.QtySettledSecCur_RU            == 0.0 &&
+                            inventTrans.CostAmountSettledSecCur_RU      == 0.0 &&
+                            inventTrans.CostAmountSecCurAdjustment_RU   == 0.0)
+                    )
+                )
+            {
+                inventSum.subInventTransOnSum(inventTrans);
+                listInventTrans.addEnd(inventTrans);
+            }
+            else
+            {
+                error(strFmt("@SYS111324", inventTrans.ItemId, inventTrans.DatePhysical));
+            }
+        }
+
+        this.checkAndDeleteVirtualTransfer(listInventTrans, inventSum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Performs all steps during the ending stage of the inventory cancellation.
+    /// </summary>
+    /// <remarks>
+    ///    The following steps will be performed:
+    ///    <list type="bullet">
+    ///       <item>
+    ///          <description>
+    ///             Update the ledger (by calling the <c>InventAdjustPostClosingCancel</c> class)
+    ///          </description>
+    ///       </item>
+    ///       <item>
+    ///          <description>Update the inventory closing records.</description>
+    ///       </item>
+    ///       <item>
+    ///          <description>Cancel the inventory cost transaction sum records.</description>
+    ///       </item>
+    ///    </list>
+    /// </remarks>
+    protected void execute()
+    {
+        setPrefix("@SYS17508");
+
+        // Check if I am allowed to proceed
+        if (this.checkStatus())
+        {
+            this.openPreClosedInventTrans();
+
+            // Create the ledger postings
+            if (inventTransCurrency == InventTransCurrency_RU::PrimaryCur)
+            {
+                this.updateLedger();
+            }
+            else
+            {
+                this.updateLedgerSecCur_RU();
+            }
+
+            #ISOCountryRegionCodes
+            boolean countryRegion_RU = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]);
+
+            CostManagementInstrumentationLogger instrumentationLogger = CostManagementInstrumentationLogger::createLogger(classStr(InventCostClosingCancel_End));
+            using (var processTaskActivityContext = instrumentationLogger.deleteVirtualTransfersActivities().deleteVirtualTransfers(cancelClosing))
+            {
+                // For localization, we are still using the old way
+                if (FeatureStateProvider::isFeatureEnabled(InventCostClosingCancelLinebasedDeletionFeature::instance())
+                || countryRegion_RU)
+                {
+                    // Get rid of all the virtual transfer records that might have been created
+                    // during inventory closing
+                    this.deleteVirtualTransfers();
+                }
+                else
+                {
+                    this.deleteVirtualTransfersSetbased();
+                }
+            }
+
+            // Now update the records
+            this.updateInventClosing();
+            this.updateCancelClosing();
+
+            this.cancelNextWIPCalculations_RU();
+
+            // Remove the inventCostTransSum records that have not been removed yet
+            InventCostTransSumCalcCancel::cancelFromInventClosing(cancelClosing);
+        }
+
+
+        this.writeInfoLog();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postExecute</Name>
+				<Source><![CDATA[
+    protected void postExecute()
+    {
+        // This is run outside the transaction scope to reduce locking
+        InventCostProdRecalcMultiJob::constructFromInventoryCloseAndDoBatch(inventClosing.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLast</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Suppresses the retrieving of the last values.
+    /// </summary>
+    /// <remarks>
+    /// This class must always run with the currently passed values. Therefore, no last values are
+    /// retrieved from the <see cref="T:SysLastValue" /> table.
+    /// </remarks>
+
+    public void getLast()
+    {
+        // This is a RunBaseBatch derivative class. Manually restore the user's settings on the batch tab since
+        // super() is not being called.
+        xSysLastValue::getLast(this.batchInfo());
+
+        // Do not get last values for this batch task
+        return;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets the caption for a batch record.
+    /// </summary>
+    /// <param name="batch">
+    ///    The batch record where the caption should be set.
+    /// </param>
+
+    public void initBatch(Batch batch)
+    {
+        super(batch);
+
+        batch.Caption = InventCostClosingCancel_End::description(inventTransCurrency);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>openPreClosedInventTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Opens pre-closed inventory transactions.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void openPreClosedInventTrans()
+    {
+        InventTrans                             inventTrans;
+        InventClosingNonFinancialInventTrans    inventClosingNonFinancialTrans;
+
+        if (inventTransCurrency == InventTransCurrency_RU::PrimaryCur)
+        {
+            update_recordset inventTrans
+                setting DateClosed = dateNull(),
+                        ValueOpen = InventTransOpen::Yes
+            exists join inventClosingNonFinancialTrans
+                where inventClosingNonFinancialTrans.InventClosing == cancelClosingRecId
+                   && inventClosingNonFinancialTrans.AllowCancel == NoYes::Yes
+                   && inventClosingNonFinancialTrans.InventTrans == inventTrans.RecId;
+        }
+        else
+        {
+            update_recordset inventTrans
+                setting DateClosedSecCur_RU = dateNull(),
+                        ValueOpenSecCur_RU = InventTransOpen::Yes
+            exists join inventClosingNonFinancialTrans
+                where inventClosingNonFinancialTrans.InventClosing == cancelClosingRecId
+                   && inventClosingNonFinancialTrans.AllowCancel == NoYes::Yes
+                   && inventClosingNonFinancialTrans.InventTrans == inventTrans.RecId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCancelClosing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the inventory closing record that was canceled.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateCancelClosing()
+    {
+        cancelClosing = InventClosing::find(cancelClosing.Voucher, cancelClosing.TransDate, true);
+
+        cancelClosing.Active            = NoYes::No;
+        cancelClosing.InventCostStatus  = InventCostStatus::Ended;
+        cancelClosing.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateInventClosing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the inventory closing record that was used to cancel an inventory closing.
+    /// </summary>
+
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateInventClosing()
+    {
+        inventClosing = InventClosing::find(inventClosing.Voucher, inventClosing.TransDate, true);
+
+        inventClosing.createTransactionLog();
+        inventClosing.End = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+
+        inventClosing.InventCostStatus = InventCostStatus::Ended;
+
+        inventClosing.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLedger</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Triggers the ledger postings if the original closing had set the flag to update the ledger.
+    /// </summary>
+
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateLedger()
+    {
+        InventAdjustPost        post;
+
+        #ISOCountryRegionCodes
+
+        if (inventClosing.Ledger)
+        {
+            post   = InventAdjustPostClosingCancel::newFromCurrency_RU(inventClosing.Voucher,
+                                                       inventClosing.TransDate,
+                                                       inventClosing.AdjustmentSpec,
+                                                       InventClosing::ledgerTransTxt(inventClosing.AdjustmentType),
+                                                       NoYes::Yes,
+                                                       cancelClosing.Voucher,
+                                                       true,
+                                                       true,
+                                                       InventClosing::numberSequenceReference(cancelClosing.AdjustmentType).numberSequenceTable().NumberSequence,
+                                                       cancelClosing.TransDate,
+                                                       cancelClosing.InventCostStatus == InventCostStatus::Ended ? true : false,
+                                                       inventTransCurrency);
+
+            if (cancelClosing.StornoAdjustment_RU != UnknownNoYes::Unknown)
+            {
+                post.parmStorno_RU(cancelClosing.StornoAdjustment_RU == UnknownNoYes::Yes);
+            }
+
+            post.parmAdjust_RU(cancelClosing.AdjustmentType == InventAdjustmentType::InventOnHand || cancelClosing.AdjustmentType == InventAdjustmentType::Transaction);
+
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoCZ,#isoEE,#isoHU,#isoLT,#isoLV,#isoPL]))
+            {
+                post.parmPreviousAdjustmentCorrection(cancelClosing.LedgerCorrection);
+            }
+
+            post.updateNow();
+        }
+        else if (InventAdjustPost::checkPostProject(inventClosing.Voucher,inventClosing.TransDate))
+        {
+            InventAdjustPost::updateProjectNoLedger(inventClosing.Voucher,inventClosing.TransDate);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLedgerSecCur_RU</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Triggers the ledger postings if the original closing had set the flag update ledger.
+    /// </summary>
+
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateLedgerSecCur_RU()
+    {
+        InventAdjustPost post;
+
+        if (inventClosing.Ledger)
+        {
+            post = new InventAdjustPostClosingCancelSecCur_RU(inventClosing.Voucher,
+                                                              inventClosing.TransDate,
+                                                              inventClosing.AdjustmentSpec,
+                                                              InventClosing::ledgerTransTxt(inventClosing.AdjustmentType, InventTransCurrency_RU::SecondaryCur),
+                                                              NoYes::Yes,
+                                                              cancelClosing.Voucher,
+                                                              true,
+                                                              true,
+                                                              InventClosing::numberSequenceReference(cancelClosing.AdjustmentType, InventTransCurrency_RU::SecondaryCur).numberSequenceTable().NumberSequence,
+                                                              cancelClosing.TransDate,
+                                                              cancelClosing.InventCostStatus == InventCostStatus::Ended ? true : false);
+
+            if (cancelClosing.StornoAdjustment_RU != UnknownNoYes::Unknown)
+            {
+                post.parmStorno_RU(cancelClosing.StornoAdjustment_RU == UnknownNoYes::Yes);
+            }
+
+            post.parmAdjust_RU(cancelClosing.AdjustmentType == InventAdjustmentType::InventOnHand || cancelClosing.AdjustmentType == InventAdjustmentType::Transaction);
+
+            post.updateNow();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static InventCostClosingCancel_End construct()
+    {
+        return new InventCostClosingCancel_End();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static ClassDescription description(InventTransCurrency_RU _inventTransCurrency = InventTransCurrency_RU::PrimaryCur)
+    {
+        if (_inventTransCurrency == InventTransCurrency_RU::SecondaryCur)
+        {
+            return "@GLS112124";
+        }
+
+        return "@SYS117090";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

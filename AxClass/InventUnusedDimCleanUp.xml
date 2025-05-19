@@ -1,0 +1,905 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventUnusedDimCleanUp</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class InventUnusedDimCleanUp extends RunBaseBatch implements BatchRetryable
+{
+    private DialogField     dialogDeleteInventDimFrom;
+    private DialogField     dialogDeleteInventDimFTo;
+
+    private utcdatetime     deleteInventDimCreatedAfter;
+    private utcDateTime     deleteInventDimCreatedBefore;
+
+    NoYes           cleanUpDummyField;
+
+    DialogRunbase   dialog;
+
+    UserConnection  lockingConnection;
+    boolean         locked;
+
+    public const int  DoNotDeleteNewInventDimDays = 14;
+    private const int YearMonthInterval = 12;
+    private boolean   isInventUnusedDimCleanupWithDateRangeEnabled =  InventUnusedDimCleanupWithDateRangeFlight::instance().isEnabled();
+
+    #DEFINE.CurrentVersion(2)
+    #LOCALMACRO.CurrentList
+        cleanUpDummyField,
+        deleteInventDimCreatedAfter,
+        deleteInventDimCreatedBefore
+    #Endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>abortSerialize</Name>
+				<Source><![CDATA[
+    protected void abortSerialize()
+    {
+        /* This method aborts the transaction on the alternate connection and thereby releasing the lock
+        that was created using "serialize" method. */
+
+        lockingConnection.ttsabort();
+        locked = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSQLDeleteStr</Name>
+				<Source><![CDATA[
+    private str buildSQLDeleteStr(int _recordsToDeleteBatchSize)
+    {
+        /* Build up the following SQL statement
+        DELETE TOP(%1) FROM INVENTDIM
+        WHERE INVENTDIM.PARTITION=5637144576 AND INVENTDIM.DATAAREAID='USMF'.
+        AND EXISTS (SELECT 'x' FROM INVENTDIMCLEANUP T2
+        WHERE T2.PARTITION=5637144576 AND T2.DATAAREAID='USMF' AND T2.INVENTDIMID=INVENTDIM.INVENTDIMID)
+        */
+        SqlSystem sqlSystem = new SqlSystem();
+        int64 currentPartitionRecID = getCurrentPartitionRecId();
+        str directSQL = strFmt('DELETE TOP(%1) FROM INVENTDIM', _recordsToDeleteBatchSize);
+        // PARTITION and DATAAREAID
+        str currentPartitionIdLiteral = sqlSystem.sqlLiteral(currentPartitionRecID, true);
+        str dataAreaIdLiteral = sqlSystem.sqlLiteral(curext());
+
+        directSQL += strFmt(
+            ' WHERE INVENTDIM.PARTITION = %1 AND INVENTDIM.DATAAREAID = %2' +
+            ' AND EXISTS (SELECT \'x\' FROM INVENTDIMCLEANUP T2' +
+            ' WHERE T2.PARTITION = %1 AND T2.DATAAREAID = %2 AND T2.INVENTDIMID=INVENTDIM.INVENTDIMID)',
+            currentPartitionIdLiteral, dataAreaIdLiteral);
+
+        return directSQL;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyInventDimToCleanUpTable</Name>
+				<Source><![CDATA[
+    protected void copyInventDimToCleanUpTable()
+    {
+        InventDim inventDim;
+        InventDimCleanUp inventDimCleanUp;
+
+        #OCCRetryCount
+
+        try
+        {
+            ttsbegin;
+
+            if (!isInventUnusedDimCleanupWithDateRangeEnabled)
+            {
+                insert_recordset inventDimCleanUp (InventDimId)
+                select InventDimId from inventDim
+                where inventDim.CreatedDateTime < DateTimeUtil::addDays(DateTimeUtil::utcNow(), -DoNotDeleteNewInventDimDays);
+            }
+            else
+            {
+                insert_recordset inventDimCleanUp (InventDimId)
+                select InventDimId from inventDim
+                where inventDim.CreatedDateTime >= deleteInventDimCreatedAfter
+                   && inventDim.CreatedDateTime < deleteInventDimCreatedBefore;
+            }
+
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteAllInventDimCleanUp</Name>
+				<Source><![CDATA[
+    protected void deleteAllInventDimCleanUp()
+    {
+        InventDimCleanUp inventDimCleanUp;
+
+        #OCCRetryCount
+
+        try
+        {
+            ttsbegin;
+            delete_from inventDimCleanUp;
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteInventDimCleanUp</Name>
+				<Source><![CDATA[
+    protected void deleteInventDimCleanUp( Connection _connection, TableId _tableId, FieldId _fieldId )
+    {
+        DictTable dictTable_InventDimCleanUp = new DictTable(tableNum(InventDimCleanUp));
+        DictTable dictTable_Table = new DictTable(_tableId);
+
+        SqlSystem                       sqlSystem = new SqlSystem();
+
+        // As the Inventory Dimension is being used in tableId.fieldId, we will remove
+        // it from InventDimCleanUp
+
+        _connection.ttsbegin();
+
+        /* DELETE FROM InventDimCleanUp
+             WHERE (DataAreaId = current_company)
+             AND (Partition = current_partition)
+             AND EXISTS
+                (SELECT 'x' FROM tableName T
+                    WHERE (DataAreaId = current_company)
+                      AND (Partition = current_partition)
+                      AND (InventDimCleanUp.InventDimId = T.fieldName)) */
+
+        str sqlStr = 'DELETE FROM ' +      dictTable_InventDimCleanUp.name(DbBackend::Sql);
+        sqlStr += ' WHERE (' +          dictTable_InventDimCleanUp.fieldName(fieldNum(InventDimCleanUp,DataAreaId),DbBackend::Sql);
+        sqlStr += ' = ' +               sqlSystem.sqlLiteral(curext()) + ') ';
+        sqlStr += ' AND (' +            dictTable_InventDimCleanUp.fieldName(fieldNum(InventDimCleanUp,Partition),DbBackend::Sql);
+        sqlStr += ' = ' +               sqlSystem.sqlLiteral(getcurrentpartitionrecid()) + ') ';
+        sqlStr += 'AND EXISTS ';
+        sqlStr += '(SELECT \'x\' FROM ' + dictTable_Table.name(DbBackend::Sql) + ' T';
+        sqlStr += ' WHERE (' +          dictTable_InventDimCleanUp.fieldName(fieldNum(InventDimCleanUp,DataAreaId),DbBackend::Sql);
+        sqlStr += ' = ' +               sqlSystem.sqlLiteral(curext()) + ')';
+        sqlStr += ' AND (' +            dictTable_InventDimCleanUp.fieldName(fieldNum(InventDimCleanUp,Partition),DbBackend::Sql);
+        sqlStr += ' = ' +               sqlSystem.sqlLiteral(getcurrentpartitionrecid()) + ') ';
+        sqlStr += ' AND (' +            dictTable_InventDimCleanUp.name(DbBackend::Sql);
+        sqlStr += '.' +                 dictTable_InventDimCleanUp.fieldName(fieldNum(InventDimCleanUp,InventDimId),DbBackend::Sql);
+        sqlStr += ' = T.' +             dictTable_Table.fieldName( _fieldId, DbBackend::Sql);
+        sqlStr += '))';
+
+        Statement statement = _connection.createStatement();
+
+        SqlStatementExecutePermission permission = new SqlStatementExecutePermission(sqlStr);
+        permission.assert();
+
+        statement.executeUpdateWithParameters(sqlStr, SqlParams::create());
+
+        _connection.ttscommit();
+
+        // the permissions needs to be reverted back to original condition.
+        CodeAccessPermission::revertAssert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteUnusedInventDimIds</Name>
+				<Source><![CDATA[
+    protected void deleteUnusedInventDimIds()
+    {
+        InventDim inventDim;
+        InventDimCleanUp inventDimCleanUp;
+        int64 sumOfDeletedRows = 0;
+
+        #OCCRetryCount
+
+        try
+        {
+            int recordsToDeleteBatchSize = this.getRecordsToDeleteBatchSize();
+            int deletedRows = recordsToDeleteBatchSize;
+
+            str sqlStatement = this.buildSQLDeleteStr(recordsToDeleteBatchSize);
+            while (deletedRows == recordsToDeleteBatchSize)
+            {
+                deletedRows = this.runSQLStatement(sqlStatement);
+                sumOfDeletedRows += deletedRows;
+            }
+
+            info(strFmt("@SCM:MessageDeletedNumberOfInventoryDimensions", sumOfDeletedRows));
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteUsedIdsFromCleanUpTable</Name>
+				<Source><![CDATA[
+    protected void deleteUsedIdsFromCleanUpTable(List _fieldList)
+    {
+        /* This method should remove all records from the InventDimCleanUp table, which are
+        currently used in any table field, which directly or indirectly use the InventDimId
+        extended data type, and which store data in the database. */
+
+        InventDimCleanUp    inventDimCleanUp;
+        int                 recordsToDelete = 0;
+
+        // Number of SQL deletions made after last check of remaining rows
+        #define.deletionsBeforeCheckFinished(10)
+        int                 deleted = 0;
+
+        // Prepare a new connection for the updates (it will be needed to create direct
+        // SQL statements in deleteInventDimCleanUp, and it will be reused between calls
+        Connection connection = new Connection();
+
+        // Define the max number of tables
+        recordsToDelete = _fieldList.elements();
+        this.progressInit(InventUnusedDimCleanUp::description(), recordsToDelete, #AviUpdate);
+
+        // Traverse through all tables
+        ListEnumerator listEnumerator = _fieldList.getEnumerator();
+        while (listEnumerator.moveNext())
+        {
+            container tableAndField = listEnumerator.current();
+            TableId tableId = conPeek(tableAndField, 1);
+            FieldId fieldId = conPeek(tableAndField, 2);
+
+            DictTable dictTable = new DictTable(tableId);
+            if (!dictTable || dictTable.name(DbBackend::Sql) == '' || dictTable.fieldName(fieldId, DbBackend::Sql) == '')
+            {
+                continue;
+            }
+
+            if (this.mustDeleteFromTable(tableId))
+            {
+                // Update progress bar
+                progress.incCount();
+                progress.setText( tableId2pname(tableId) );
+
+                // The InventDim is being used, remove it from the list of unused InventDims
+                this.deleteInventDimCleanUp(connection, tableId, fieldId);
+                deleted ++;
+
+                if (deleted >= #deletionsBeforeCheckFinished)
+                {
+                    // Get how many Invent Dims we are still remaining
+                    select firstonly RecId from inventDimCleanUp;
+
+                    // If all Invent Dims have been used, there is no point in continue scanning tables
+                    if (!inventDimCleanUp.RecId)
+                    {
+                        // Switch to 100% for a fraction of a second by forcing a visual update
+                        // because finishing at a 10% (for example) could be confusing
+                        progress.setCount( recordsToDelete );
+                        progress.update(true);
+                        break;
+                    }
+
+                    deleted = 0;
+                }
+            }
+        }
+
+        this.progressKill();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Returns a class that contains the methods that are described by the <c>RunBaseDialogable</c>
+    ///    interface.
+    /// </summary>
+    /// <returns>
+    ///    A class that contains the methods that are described by the <c>RunBaseDialogable</c> interface.
+    /// </returns>
+    /// <remarks>
+    ///    A dialog can be built by using the <c>Dialog</c> class or by using a class that is created in the
+    ///    Application Object Tree (AOT).
+    /// </remarks>
+    Object dialog()
+    {
+        #define.textWidth(60)
+        #define.textHeight(10)
+
+        dialog = super();
+
+        /* Show batch details and warnings
+        We have to create a fake invisible border control to retain the focus
+        on the first tab when starting the dialog */
+
+        DialogField dialogField = dialog.addFieldValue(extendedTypeStr(Notes), strFmt("@SCM:InventUnusedDimCleanUp_Description", InventUnusedDimCleanUp::DoNotDeleteNewInventDimDays));
+
+        dialogField.showLabel(false);
+        dialogField.border(1);
+        dialogField.allowEdit(false);
+        dialogField.displayHeight(#textHeight);
+        dialogField.displayLength(#textWidth);
+
+        if (isInventUnusedDimCleanupWithDateRangeEnabled)
+        {
+            dialogField.value("@SCM:InventUnusedDimCleanUp_DescriptionV2");
+
+            dialogDeleteInventDimFrom = dialog.addField(extendedTypeStr(ExecutionTime),"@SCM:InventUnusedDimCleanUpCreatedAfter");
+            dialogDeleteInventDimFrom.value(deleteInventDimCreatedAfter);
+ 
+            dialogDeleteInventDimFTo = dialog.addField(extendedTypeStr(ExecutionTime),"@SCM:InventUnusedDimCleanUpCreatedBefore");
+            dialogDeleteInventDimFTo.value(deleteInventDimCreatedBefore);
+        }
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findUsedInventDimIds</Name>
+				<Source><![CDATA[
+    protected List findUsedInventDimIds()
+    {
+        return this.InventDimIdFieldReferenceProvider().findInventDimIdFields();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InventDimIdFieldReferenceProvider</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the <c>InventDimIdFieldReferenceProvider</c> instance that is used to iterate the tables and fields.
+    /// </summary>
+    /// <returns>The <c>InventDimIdFieldReferenceProvider</c> instance that is used to iterate the tables and fields.</returns>
+    protected InventDimIdFieldReferenceProvider InventDimIdFieldReferenceProvider()
+    {
+        return InventDimIdFieldReferenceProvider::newExcludeSysDeletedObjects();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    boolean getFromDialog()
+    {
+        /*  If the database log has been configured to log deletes in the InventDim table or any
+        alerts have been setup based on deletes in the InventDim table, then inform the user that
+        alerts and database logs will not be created. */
+
+        if (this.isInventDimDeleteLogAlertActive() == true)
+        {
+            // Delete Logs/Alerts were defined. Warn the user and allow him to cancel
+            if (Box::okCancel("@SYS105062", DialogButton::Cancel) == DialogButton::Cancel)
+            {
+                return false;
+            }
+        }
+
+        if (isInventUnusedDimCleanupWithDateRangeEnabled)
+        {
+           deleteInventDimCreatedAfter = dialogDeleteInventDimFrom.value();
+           deleteInventDimCreatedBefore = dialogDeleteInventDimFTo.value();
+        }
+
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRecordsToDeleteBatchSize</Name>
+				<Source><![CDATA[
+    protected int getRecordsToDeleteBatchSize()
+    {
+        return 500000;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustDeleteFromTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if a table must be cleaned up.
+    /// </summary>
+    /// <param name = "_tableId">The id of the table.</param>
+    /// <returns>true if the table must be cleaned up; otherwise, false.</returns>
+    protected boolean mustDeleteFromTable(tableId _tableId)
+    {
+        boolean mustDeleteFromTable = true;
+        switch (_tableId)
+        {
+            case tableNum(InventDim):   //fall through
+            case tableNum(InventDimCleanUp):
+                mustDeleteFromTable = false;
+                break;
+            default:
+                mustDeleteFromTable = true;
+                break;
+        }
+
+        return mustDeleteFromTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isInventDimDeleteLogAlertActive</Name>
+				<Source><![CDATA[
+    protected boolean isInventDimDeleteLogAlertActive()
+    {
+        DatabaseLog         databaseLog;
+        boolean             deleteLogsEstablished = false;
+
+        /*  Check if the database log has been configured to log deletes in the InventDim table or any
+        alerts have been setup based on deletes in the InventDim table */
+
+        // Check if InventDim is logging/alerting delete operations (domains are inactive)
+        select firstonly RecId from databaseLog
+            where databaseLog.LogTable == tableNum(InventDim)
+              && (databaseLog.LogType == DatabaseLogType::Delete
+              ||  databaseLog.LogType == DatabaseLogType::EventDelete);
+        if (databaseLog.RecId)
+        {
+            deleteLogsEstablished = true;
+        }
+        return deleteLogsEstablished;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        locked = false;
+
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    container pack()
+    {
+        return [#CurrentVersion,#CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Contains the code that does the actual job of the class.
+    /// </summary>
+    void run()
+    {
+        lockingConnection = new UserConnection();
+
+        try
+        {
+            // Ensure that only one process per company executes this batch at any given moment
+            this.serialize();
+
+            // Start with an empty InventDimCleanUp table
+            this.deleteAllInventDimCleanUp();
+
+            // Fill it with all the contents of InventDim table
+            this.copyInventDimToCleanUpTable();
+
+            // Remove all used inventory dimensions from InventDimCleanUp
+            List fieldList = this.findUsedInventDimIds();
+            this.deleteUsedIdsFromCleanUpTable(fieldList);
+
+            // Delete all InventDim records where the InventDimId remains in InventDimCleanUp table
+            this.deleteUnusedInventDimIds();
+
+            // Delete the remaining records in InventDimCleanUp
+            this.deleteAllInventDimCleanUp();
+
+            // Free the lock established in serialize
+            this.abortSerialize();
+        }
+        finally
+        {
+            lockingConnection.finalize();
+        }
+	}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runsImpersonated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines whether the batch task is run on the server or on a client.
+    /// </summary>
+    /// <returns>
+    ///    true if the task is run on the server; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    Your classes that extend <c>RunBaseBatch</c> must override the <c>runsImpersonated</c> method and
+    ///    return false if you want those tasks to run on a client.
+    /// </remarks>
+    public boolean runsImpersonated()
+    {
+        // Job needs to run in server side impersonated session
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runSQLStatement</Name>
+				<Source><![CDATA[
+    private int runSQLStatement(str _sqlStatement)
+    {
+        int deletedRows;
+        Connection connection = new Connection();
+        Statement statement = connection.createStatement();
+
+        try
+        {
+            connection.ttsbegin();
+            deletedRows = statement.executeUpdateWithParameters(_sqlStatement, SqlParams::create());
+            connection.ttscommit();
+        }
+        catch
+        {
+            if (connection != null)
+            {
+                connection.ttsabort();
+            }
+
+            throw;
+        }
+        finally
+        {
+            statement.close();
+            connection.finalize();
+        }
+        return deletedRows;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>serialize</Name>
+				<Source><![CDATA[
+    protected void serialize()
+    {
+        SysLastValue sysLastValue;
+
+        /* Insert a dummy record that will be rolled back in abortSerialize when finishing
+        the batch job. This will prevent any other concurrent execution of this batch, as we
+        are locking the record by keeping the transaction open. */
+
+        if (locked == true)
+        {
+            throw Exception::UpdateConflict;
+        }
+
+        locked = true;
+
+        lockingConnection.ttsbegin();
+        sysLastValue.setConnection( lockingConnection );
+
+        sysLastValue.Company = curext();
+        sysLastValue.ElementName = this.name();
+        sysLastValue.RecordType = UtilElementType::Class;
+        sysLastValue.Value = [0];   // Dummy value
+
+        sysLastValue.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    boolean unpack(container _packedClass)
+    {
+        Integer     version      = RunBase::getVersion(_packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion :
+                [version,#CurrentList] = _packedClass;
+                break;
+            default :
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    public boolean validate(Object _calledFrom = null)  // The object/form which calls the method
+    {
+        /* Check if a virtual company is associated with the current company and the InventDim table
+        is part of a table collection associated with the virtual company. */
+        if (this.validateInventDimInVirtualCompany() == true )
+        {
+            if (_calledFrom != null )
+            {
+                throw error("@SYS105064");
+            }
+            return false;
+        }
+
+        /* Check if the aosValidateRead or aosValidateDelete method has been overridden, as this
+        can then not delete the records in the InventDim table. */
+        if (this.validateInventDimOverridenMethods() == false )
+        {
+            if (_calledFrom != null )
+            {
+                throw error("@SYS105063");
+            }
+            return false;
+        }
+
+        if (isInventUnusedDimCleanupWithDateRangeEnabled)
+        {
+            if (!deleteInventDimCreatedAfter)
+            {
+                return checkFailed("@SCM:InventUnusedDimCleanUpCreatedAfterDateCheck");
+            }
+            else if (!deleteInventDimCreatedBefore)
+            {
+                return checkFailed("@SCM:InventUnusedDimCleanUpCreatedBeforeDateCheck");
+            }
+            else if (DateTimeUtil::getDifference(deleteInventDimCreatedBefore, deleteInventDimCreatedAfter) <= 0)
+            {
+                return checkFailed("@SCM:InventUnusedDimCleanUpDateRangeCheck");
+            }
+            else if (intvNo(DateTimeUtil::date(deleteInventDimCreatedBefore), DateTimeUtil::date(deleteInventDimCreatedAfter), IntvScale::YearMonth) > YearMonthInterval)
+            {
+                if (Box::YesNo("@SCM:InventUnusedDimCleanUpDateRangeOverOneYear", DialogButton::No) == DialogButton::No)
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateInventDimInVirtualCompany</Name>
+				<Source><![CDATA[
+    protected boolean validateInventDimInVirtualCompany()
+    {
+        /* Check if a virtual company is associated with the current company and the InventDim table
+        is part of a table collection associated with the virtual company. */
+        TableCollectionList         tableCollectionList;
+        VirtualDataAreaList         virtualDataAreaList;
+
+        // Get all table collections which are part of the virtual companies the current company belongs
+        while select TableCollection from tableCollectionList
+            exists join virtualDataAreaList
+                where   tableCollectionList.VirtualDataArea == virtualDataAreaList.VirtualDataArea
+                     && virtualDataAreaList.Id              == curext()
+        {
+            // Traverse through all tables looking for InventDim
+            SysDictTableCollection sysDictTableCollection = new SysDictTableCollection(tableCollectionList.TableCollection);
+            TableName tableName = sysDictTableCollection.nextTable();
+            while (tableName)
+            {
+                if (tableName2id(tableName) == tableNum(InventDim) )
+                {
+                    return true;
+                }
+
+                tableName = sysDictTableCollection.nextTable();
+            }
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateInventDimOverridenMethods</Name>
+				<Source><![CDATA[
+    protected boolean validateInventDimOverridenMethods()
+    {
+        /* Check if the aosValidateRead or aosValidateDelete method has been overridden, as this
+        can then not delete the records in the InventDim table. */
+        UtilIdElements  utilIdElements;
+        int64           numOfRecs = 0;
+
+        // If they were overridden, we would find an entry in UtilIdElements
+        select firstonly RecId from utilIdElements
+                        where utilIdElements.ParentId   == tableNum(InventDim)
+                           && utilIdElements.RecordType == UtilElementType::TableInstanceMethod
+                           && (utilIdElements.Name      == methodStr(xRecord, aosValidateRead)  ||
+                               utilIdElements.Name      == methodStr(xRecord, aosValidateDelete));
+
+        // We will fail when there are records
+        if (utilIdElements.RecId)
+        {
+            return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static InventUnusedDimCleanUp construct()
+    {
+        return new InventUnusedDimCleanUp();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static ClassDescription description()
+    {
+        return "@SYS105060";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        InventUnusedDimCleanUp inventUnusedDimCleanUp = InventUnusedDimCleanUp::newStandard();
+
+        if (!inventUnusedDimCleanUp.prompt())
+        {
+            return;
+        }
+
+        inventUnusedDimCleanUp.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newStandard</Name>
+				<Source><![CDATA[
+    static InventUnusedDimCleanUp newStandard()
+    {
+        InventUnusedDimCleanUp inventUnusedDimCleanUp = InventUnusedDimCleanUp::construct();
+
+        inventUnusedDimCleanUp.getLast();   // Get last dialog values
+        inventUnusedDimCleanUp.init();
+
+        return inventUnusedDimCleanUp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    public boolean init()
+    {
+        if (isInventUnusedDimCleanupWithDateRangeEnabled)
+        {
+            if (!deleteInventDimCreatedAfter && !deleteInventDimCreatedBefore)
+            {
+                deleteInventDimCreatedBefore = DateTimeUtil::addDays(DateTimeUtil::utcNow(), -DoNotDeleteNewInventDimDays);
+                deleteInventDimCreatedAfter  = DateTimeUtil::addYears(deleteInventDimCreatedBefore, -1);
+            }
+        }
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

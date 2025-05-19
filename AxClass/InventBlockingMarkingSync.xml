@@ -1,0 +1,1480 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventBlockingMarkingSync</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>InventBlockingMarkingSync</c> class provides the methods to store and remove the marking
+///    between the original transactions and inventory blocking and their further restore.
+/// </summary>
+class InventBlockingMarkingSync
+{
+    InventBlocking          inventBlocking;
+    InventTransOriginId     originTransOriginId;                    // related movement
+    InventTransOriginId     originInventBlockingTransOriginId;      // blocking transactions being marked against related movement
+    InventTransOriginId     referredInventBlockingTransOriginId;    // blocking transactions with opposite sign.
+
+    PdsCWInventQty          cwInventBlockingQtyDelta;
+    InventQty               inventBlockingQtyDelta;                 // quantity being adjusted
+    Integer                 transRefSign;                           // positive if related movement is a receipt type movement (Purchase, Production)
+
+    InventTransMarkingMap   marking;
+    InventTransMarkingMap   originMarking;
+    boolean                 allowOriginalIssueReservPhys;
+    boolean                 unMark;
+    boolean                 receiptCanHaveOnlyDimensionsAboveLocation;
+    boolean                 canUnreserve;
+
+    private boolean isQualityOrdersValidateForPOWithWHSItemFlightEnabled = InventQualityOrdersValidateForPOWithWHSItemFlight::instance().isEnabled();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>inventDimBlocking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the dimension values from the corresponding inventory quality order if it exists, else it defaults to the inventory blocking dimension value.
+    /// </summary>
+    /// <returns><c>InventDim</c> buffer.</returns>
+    private InventDim inventDimBlocking()
+    {
+        if (InventBlockingRelatedTransactionInfoSingleton::instance().isCurrent())
+        {
+            return InventBlockingRelatedTransactionInfoSingleton::instance().inventDim();
+        }
+        else
+        {
+            return InventDim::find(InventBlocking.InventDimId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>collectAndUnmarkOriginalMarkings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Stores and removes markings for the specified inventory transactions.
+    /// </summary>
+    /// <param name="_inventTransOriginId">
+    ///    The transaction originator ID for which the markings should be stored.
+    /// </param>
+    protected void collectAndUnmarkOriginalMarkings(InventTransOriginId _inventTransOriginId)
+    {
+        InventQty               remainingQty            = inventBlockingQtyDelta;
+        PdsCWInventQty          cwRemainingQty          = cwInventBlockingQtyDelta;
+        InventTrans             inventTrans;
+
+        if (transRefSign == 0)
+        {
+            return; // blocking not linked to a process
+        }
+
+        select sum(Qty), sum(PdsCWQty) from inventTrans
+            where  inventTrans.ValueOpen                        == InventTransOpen::Yes
+               &&  inventTrans.InventTransOrigin                == _inventTransOriginId
+               &&  inventTrans.TransChildType                   == InventTransChildType::None
+               &&((inventTrans.StatusIssue                      == StatusIssue::None    && transRefSign > 0)
+               || (inventTrans.StatusReceipt                    == StatusReceipt::None  && transRefSign < 0))
+               &&  inventTrans.MarkingRefInventTransOrigin      == 0;
+
+        // No need to do unreserve if have inventory status blocking
+        if (inventTrans.Qty > 0 && !WHSInventStatus::isBlockingStatus(this.inventDimBlocking().InventStatusId))
+        {
+            canUnreserve = true;
+        }
+
+        if (abs(inventTrans.Qty)  >= inventBlockingQtyDelta
+            && abs(inventTrans.PdsCWQty) >= cwInventBlockingQtyDelta
+            )
+        {
+            return; // No need to unmark any origins as there are enough non-marked.
+        }
+
+        remainingQty -= abs(inventTrans.Qty);
+        cwRemainingQty -= abs(inventTrans.PdsCWQty);
+
+        if (transRefSign > 0)
+        {
+            this.collectOriginReceipts(_inventTransOriginId, remainingQty
+                                        , cwRemainingQty
+                                        );
+            const boolean RemoveReservationOnReservePhysicalTrans = true;
+            this.setContainerValueInCache(InventBlockingMarkingSync::transactionScopeCacheKey(_inventTransOriginId), [RemoveReservationOnReservePhysicalTrans]);
+        }
+        else
+        {
+            this.collectOriginIssues(_inventTransOriginId, remainingQty
+                                     , cwRemainingQty
+                                    );
+        }
+
+        this.deleteMarkings(_inventTransOriginId, originMarking);
+        if (transRefSign > 0)
+        {
+            this.removeContainerValueInCache(InventBlockingMarkingSync::transactionScopeCacheKey(_inventTransOriginId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>collectMarkings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Stores all the markings for the specified inventory transactions.
+    /// </summary>
+    /// <param name="_inventTransOriginId">
+    ///    The transaction originator ID for which the markings should be stored.
+    /// </param>
+    /// <param name="_remainingQty">
+    ///    The maximum quantity for which to restore the original markings.
+    /// </param>
+    /// <param name="_cwRemainingQty">
+    ///    The maximum catch weight quantity for which to restore the original markings.
+    /// </param>
+    protected void collectMarkings(
+        InventTransOriginId     _inventTransOriginId,
+        InventQty               _remainingQty
+        , PdsCWInventQty        _cwRemainingQty = 0
+        )
+    {
+        InventTrans     inventTrans;
+        InventQty       markingQty;
+        InventQty       remainingQty = _remainingQty;
+        PdsCWInventQty  cwMarkingQty;
+        PdsCWInventQty  cwRemainingQty = _cwRemainingQty;
+
+        // Store markings for _inventTransOriginId transaction against all other transactions
+        while select MarkingRefInventTransOrigin, InventDimId, Qty, PdsCWQty, ItemId from inventTrans
+            where inventTrans.ValueOpen                     == InventTransOpen::Yes
+               && inventTrans.InventTransOrigin             == _inventTransOriginId
+               && inventTrans.TransChildType                == InventTransChildType::None
+               && inventTrans.MarkingRefInventTransOrigin   != 0
+        {
+            // if current marking is less than requested marking, it should be taken completely, otherwise only requested part should be taken
+            if (remainingQty < abs(inventTrans.Qty))
+            {
+                markingQty = sign(inventTrans.Qty) * remainingQty;
+            }
+            else
+            {
+                markingQty = inventTrans.Qty;
+            }
+            if (cwRemainingQty < abs(inventTrans.PdsCWQty))
+            {
+                cwMarkingQty = sign(inventTrans.PdsCWQty) * cwRemainingQty;
+            }
+            else
+            {
+                cwMarkingQty = inventTrans.PdsCWQty;
+            }
+
+            // storing marking
+            marking.addMarking(inventTrans.MarkingRefInventTransOrigin, inventTrans.InventDimId, markingQty, cwMarkingQty);
+
+            // reduce requested marking quantity
+            remainingQty -= abs(markingQty);
+            cwRemainingQty -= abs(cwMarkingQty);
+
+            // finish if marking for whole requested quantity is collected
+            if (remainingQty == 0
+                || (PdsGlobal::pdsIsCWItem(inventTrans.ItemId) && cwRemainingQty == 0)
+                )
+            {
+                break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>collectOriginIssues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Stores markings for the specified receipt inventory transactions.
+    /// </summary>
+    /// <param name="_inventTransOriginId">
+    ///    The transaction originator ID for which the markings should be stored.
+    /// </param>
+    /// <param name="_unmarkQty">
+    ///    The quantity for which to find the marked transactions.
+    /// </param>
+    /// <param name="_cwUnmarkQty">
+    ///    The catch weight quantity for which to find the marked transactions; optional.
+    /// </param>
+    protected void collectOriginIssues(
+        InventTransOriginId     _inventTransOriginId,
+        InventQty               _unmarkQty
+        , PdsCWInventQty          _cwUnmarkQty = 0
+        ) // Positive number
+    {
+        InventQty               remainingQty            = _unmarkQty;  // positive number
+        InventQty               markingQty;                            // negative number
+        PdsCWInventQty          cwRemainingQty          = _cwUnmarkQty;
+        PdsCWInventQty          cwMarkingQty;
+        InventTrans             inventTransIssue;
+        InventDimParm           inventDimParmReserve;
+
+        // Store markings for _inventTransOriginId transaction against all other transactions, except for inventory blocking transactions.
+        while select forupdate inventTransIssue
+            order by StatusIssue
+            where inventTransIssue.ValueOpen                    == InventTransOpen::Yes
+               && inventTransIssue.InventTransOrigin            == _inventTransOriginId
+               && inventTransIssue.StatusIssue                  >= StatusIssue::ReservPhysical
+               && inventTransIssue.StatusReceipt                == StatusReceipt::None
+               && inventTransIssue.MarkingRefInventTransOrigin  != 0
+               && inventTransIssue.Qty                          < 0
+               &&!inventTransIssue.PackingSlipReturned
+        {
+            // if current marking is less than requested marking, it should be taken completely, otherwise only requested part should be taken
+            if (remainingQty < -inventTransIssue.Qty)
+            {
+                markingQty = -remainingQty;
+            }
+            else
+            {
+                markingQty = inventTransIssue.Qty;
+            }
+            if (cwRemainingQty < -inventTransIssue.PdsCWQty)
+            {
+                cwMarkingQty = -cwRemainingQty;
+            }
+            else
+            {
+                cwMarkingQty = inventTransIssue.PdsCWQty;
+            }
+
+            originMarking.addMarking(inventTransIssue.MarkingRefInventTransOrigin, inventTransIssue.InventDimId, markingQty, cwMarkingQty);
+
+            if (inventTransIssue.StatusIssue == StatusIssue::ReservPhysical)
+            {
+                // Remove reservation so blocking can make the physical reservation
+                inventDimParmReserve.setAllInventDim();
+                InventUpd_Reservation inventUpd_Reservation = InventUpd_Reservation::newInventDim(inventTransIssue.inventMovement(), inventTransIssue.inventDim(), markingQty
+                                                                      , false, cwMarkingQty
+                                                                      );
+                inventUpd_Reservation.parmInventDimParm(inventDimParmReserve);
+                inventUpd_Reservation.parmAllowAutoReserveDim(false); // don't reserve to something else.
+                inventUpd_Reservation.updateNow();
+            }
+
+            // reduce requested marking quantity
+            remainingQty -= -markingQty;
+            cwRemainingQty -= -cwMarkingQty;
+
+            // finish if marking for whole requested quantity is collected
+            if (remainingQty == 0
+                || (PdsGlobal::pdsIsCWItem(inventTransIssue.ItemId) && cwRemainingQty == 0)
+                )
+            {
+                break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>collectOriginReceipts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Stores the markings for the specified receipt inventory transactions.
+    /// </summary>
+    /// <param name="_inventTransOriginId">
+    ///    The transaction originator ID for which the markings should be stored.
+    /// </param>
+    /// <param name="_unmarkQty">
+    ///    The quantity for which to find the marked transactions.
+    /// </param>
+    /// <param name="_cwUnmarkQty">
+    ///    The catch weight quantity for which to find the marked transactions.
+    /// </param>
+    protected void collectOriginReceipts(
+        InventTransOriginId     _inventTransOriginId,
+        InventQty               _unmarkQty
+        , PdsCWInventQty          _cwUnmarkQty = 0
+        )
+    {
+        InventQty               remainingQty            = _unmarkQty;
+        InventQty               markingQty;
+        PdsCWInventQty          cwRemainingQty          = _cwUnmarkQty;
+        PdsCWInventQty          cwMarkingQty;
+        InventTrans             inventTransReceipt;
+        InventTrans             inventTransIssue;
+        InventDim               inventDimIssue;
+        InventDimParm           inventDimParm;
+        InventDimParm           inventDimParmReserve;
+        InventQty               unReserveQty;
+        PdsCWInventQty          cwUnReserveQty;
+        InventDim               inventDimReceiptExists;
+        InventDimParm           inventDimParmBlocking;
+        InventDim               inventDimInventTransReceipt;
+        boolean                 unreserveMinimumRequiredQty = WHSInventBlockingMarkingSyncCollectOriginReceiptsUnreserveMinimumFlight::instance().isEnabled();
+        boolean                 unreserveFullWeightIfNoCWQtyLeft = WHSInventBlockingMarkingSyncCollectOriginReceiptsCWItemFlight::instance().isEnabled();
+
+        InventDim inventDimBlocking = this.inventDimBlocking();
+        inventDimParmBlocking.initFromInventDim(inventDimBlocking);
+
+        // Store markings for _inventTransOriginId transaction against all other transactions, except for inventory blocking transactions.
+        while select MarkingRefInventTransOrigin, InventTransOrigin, InventDimId, Qty, StatusReceipt, StatusIssue, PdsCWQty, ItemId
+            from inventTransReceipt
+                    order by StatusReceipt
+            where inventTransReceipt.ValueOpen                      == InventTransOpen::Yes
+               && inventTransReceipt.InventTransOrigin              == _inventTransOriginId
+               && inventTransReceipt.TransChildType                 == InventTransChildType::None
+               && inventTransReceipt.StatusIssue                    == StatusIssue::None
+               && inventTransReceipt.MarkingRefInventTransOrigin    != originInventBlockingTransOriginId
+               && inventTransReceipt.MarkingRefInventTransOrigin    != 0
+            #InventDimExistsJoin(inventTransReceipt.inventDimId, inventDimReceiptExists, inventDimBlocking, inventDimParmBlocking)
+        {
+            boolean isCWItem = PdsGlobal::pdsIsCWItem(inventTransReceipt.ItemId);
+
+            // Skip transaction with zero CW quantity that might be left after partial receiving
+            if (unreserveFullWeightIfNoCWQtyLeft && isCWItem && !inventTransReceipt.PdsCWQty)
+            {
+                continue;
+            }
+
+            // if current marking is less than requested marking, it should be taken completely, otherwise only requested part should be taken
+            if (remainingQty < inventTransReceipt.Qty)
+            {
+                markingQty = remainingQty;
+            }
+            else
+            {
+                markingQty = inventTransReceipt.Qty;
+            }
+            if (cwRemainingQty < inventTransReceipt.PdsCWQty)
+            {
+                cwMarkingQty = cwRemainingQty;
+            }
+            else
+            {
+                cwMarkingQty = inventTransReceipt.PdsCWQty;
+            }
+
+            InventDimId inventDimId = inventTransReceipt.inventDimId;
+            InventDim inventDimReceipt = InventDim::find(inventTransReceipt.InventDimId);            
+
+            if (receiptCanHaveOnlyDimensionsAboveLocation)
+            {
+                // Clear location and below in advanced warehousing
+                inventDimInventTransReceipt.data(inventDimReceipt);
+                inventDimInventTransReceipt.clearLocationAndBelowDim(inventTransReceipt.ItemId);
+                inventDimInventTransReceipt = InventDim::findOrCreate(inventDimInventTransReceipt);
+                inventDimId = inventDimInventTransReceipt.InventDimId;
+
+                inventDimParm.initFromInventDim(inventDimInventTransReceipt);
+            }
+            else
+            {
+                inventDimParm.initFromInventDim(inventDimReceipt);
+            }
+
+            // storing marking
+            originMarking.addMarking(inventTransReceipt.MarkingRefInventTransOrigin, inventDimId, markingQty, cwMarkingQty);
+
+            // remove physical reservation if any so blocking can become the physical reservation.
+            if (inventTransReceipt.isUpdatedPhysical()
+            ||  inventTransReceipt.StatusReceipt  == StatusReceipt::Registered)
+            {
+                InventQty remainingUnReserveQty = markingQty;
+                PdsCWInventQty cwRemainingUnReserveQty = cwMarkingQty;
+
+                while select forupdate inventTransIssue
+                    where inventTransIssue.ValueOpen             == InventTransOpen::Yes
+                       && inventTransIssue.InventTransOrigin     == inventTransReceipt.MarkingRefInventTransOrigin
+                       && inventTransIssue.StatusIssue           == StatusIssue::ReservPhysical
+                       && inventTransIssue.StatusReceipt         == StatusReceipt::None
+                       && inventTransIssue.Qty                    < 0
+                       && !inventTransIssue.PackingSlipReturned
+                       && inventTransIssue.MarkingRefInventTransOrigin  == inventTransReceipt.InventTransOrigin
+                    #inventDimExistsJoin(inventTransIssue.inventDimId, inventDimIssue, inventDimReceipt, inventDimParm)
+                {
+                    if (unreserveMinimumRequiredQty)
+                    {
+                        if (-inventTransIssue.Qty > remainingUnReserveQty)
+                        {
+                            unReserveQty = -remainingUnReserveQty;
+                        }
+                        else
+                        {
+                            unReserveQty = inventTransIssue.Qty;
+                        }
+
+                        if (-inventTransIssue.PdsCWQty > cwRemainingUnReserveQty)
+                        {
+                            cwUnReserveQty = -cwRemainingUnReserveQty;
+                        }
+                        else
+                        {
+                            cwUnReserveQty = inventTransIssue.PdsCWQty;
+
+                            // Unreserve full weight in case we are unreserving full CW quantity
+                            if (unreserveFullWeightIfNoCWQtyLeft && isCWItem)
+                            {
+                                unReserveQty = inventTransIssue.Qty;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (-inventTransIssue.Qty < remainingUnReserveQty)
+                        {
+                            unReserveQty = -remainingUnReserveQty;
+                        }
+                        else
+                        {
+                            unReserveQty = inventTransIssue.Qty;
+                        }
+
+                        if (-inventTransIssue.PdsCWQty < cwRemainingUnReserveQty)
+                        {
+                            cwUnReserveQty = -cwRemainingUnReserveQty;
+                        }
+                        else
+                        {
+                            cwUnReserveQty = inventTransIssue.PdsCWQty;
+                        }
+                    }
+
+                    inventDimParmReserve.setAllInventDim();
+                    InventUpd_Reservation inventUpd_Reservation = InventUpd_Reservation::newInventDim(inventTransIssue.inventMovement(), inventTransIssue.inventDim(), -unReserveQty
+                                                                          , false, -cwUnReserveQty
+                                                                          );
+                    inventUpd_Reservation.parmInventDimParm(inventDimParmReserve);
+                    inventUpd_Reservation.parmAllowAutoReserveDim(false); // don't reserve to something else.
+                    inventUpd_Reservation.movement().inventdim(inventTransIssue.inventDim());
+
+                    if (InventBlockingFindMarkedOrderDescContext::current() && !inventTransIssue.inventMovement().pdsCWItem())
+                    {
+                        inventUpd_Reservation.parmOnlyUnReservePhysicalReserved(true);
+                    }
+
+                    inventUpd_Reservation.updateNow();
+
+                    remainingUnReserveQty += unReserveQty; // unReserveQty is negative
+                    cwRemainingUnReserveQty += cwUnReserveQty; // unReserveQty is negative
+                }
+            }
+
+            // reduce requested marking quantity
+            remainingQty -= markingQty;
+            cwRemainingQty -= cwMarkingQty;
+
+            // finish if marking for whole requested quantity is collected
+            if (remainingQty == 0
+                || (isCWItem && cwRemainingQty == 0)
+                )
+            {
+                break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createMarkings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Applies extra markings from the origin to the blocking.
+    /// </summary>
+    protected void createMarkings()
+    {
+        InventTransOriginId     inventTransMarkingIssue;
+        InventTransOriginId     inventTransMarkingReceipt;
+        InventTrans             inventTransReference;
+        InventQty               remainingQty = inventBlockingQtyDelta;
+        InventQty               markedQty;
+        PdsCWInventQty          cwMarkedQty;
+        PdsCWInventQty          cwRemainingQty = cwInventBlockingQtyDelta;
+        InventDim               inventDim;
+        InventDimParm           inventDimParm;
+
+        void adjustRemainingIfAlreadyMarked(InventTransOriginId _origin)
+        {
+            // Investigate if some (new) transactions have been automatically marked
+            InventTrans             inventTransMarked;
+
+            select sum(Qty), sum(PdsCWQty) from inventTransMarked  // Select already marked quantity
+                where inventTransMarked.InventTransOrigin           == _origin
+                   && inventTransMarked.MarkingRefInventTransOrigin != 0;
+
+            remainingQty = min(inventBlockingQtyDelta, inventBlocking.Qty - abs(inventTransMarked.Qty));
+            cwRemainingQty = min(cwInventBlockingQtyDelta, inventBlocking.PdsCWQty - abs(inventTransMarked.PdsCWQty));
+        }
+
+        if (!originTransOriginId)
+        {
+            return; // no originator so nothing to mark against.
+        }
+
+        if (transRefSign < 0)
+        {
+            inventTransMarkingIssue     = originTransOriginId;
+            inventTransMarkingReceipt   = originInventBlockingTransOriginId;
+        }
+        else
+        {
+            inventTransMarkingIssue     = originInventBlockingTransOriginId;
+            inventTransMarkingReceipt   = originTransOriginId;
+        }
+
+        // Investigate if some (new) transactions have been automatically marked
+        adjustRemainingIfAlreadyMarked(originTransOriginId);
+        if (remainingQty <= 0)
+        {
+            return;
+        }
+
+        inventDimParm.setAllInventDim();
+
+        while select Qty, PdsCWQty, ItemId from inventTransReference
+            where inventTransReference.InventTransOrigin            == originTransOriginId
+             &&   inventTransReference.MarkingRefInventTransOrigin  == 0
+             &&  !inventTransReference.PackingSlipReturned
+             && ((inventTransReference.Qty < 0 && transRefSign < 0)
+             ||  (inventTransReference.Qty > 0 && transRefSign >= 0))
+             join inventDim
+                where inventDim.InventDimId == inventTransReference.InventDimId
+        {
+            InventQty markQty = (transRefSign < 0) ? -inventTransReference.Qty : inventTransReference.Qty;
+            PdsCWInventQty cwMarkQty = (transRefSign < 0) ? -inventTransReference.PdsCWQty : inventTransReference.PdsCWQty;
+            if (markQty > remainingQty)
+            {
+                markQty = remainingQty;
+            }
+            if (cwMarkQty > cwRemainingQty)
+            {
+                cwMarkQty = cwRemainingQty;
+            }
+
+            [markedQty, cwMarkedQty] = this.updateMarking(inventTransMarkingReceipt, inventTransMarkingIssue, markQty, cwMarkQty, inventDim, inventDimParm);
+            remainingQty += markedQty;
+            cwRemainingQty += cwMarkedQty;
+            if (remainingQty == 0
+                || (PdsGlobal::pdsIsCWItem(inventTransReference.ItemId) && cwRemainingQty == 0)
+                )
+            {
+                break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteMarking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Removes markings from transactions with the specified inventory transaction originators.
+    /// </summary>
+    /// <param name="_inventTransOriginId">
+    ///    The ID of the inventory transaction originator for which a marking is removed.
+    /// </param>
+    /// <param name="_markingRefInventTransOrigin">
+    ///    The ID of the inventory transaction originator with which the transactions must be marked.
+    /// </param>
+    /// <param name="_markQty">
+    ///    The quantity on transactions for which a marking is removed.
+    /// </param>
+    /// <param name="_cwMarkQty">
+    ///    The catch weight quantity on transactions for which a marking is removed.
+    /// </param>
+    /// <param name="_inventDimCriteria">
+    ///    The inventory dimension values to match with when finding transactions.
+    /// </param>
+    /// <param name="_inventDimParm">
+    ///    The inventory dimensions to match with when finding transactions.
+    /// </param>
+    /// <returns>
+    ///    A container with the quantities for which marking was removed.
+    /// </returns>
+    protected container deleteMarking(
+        InventTransOriginId _inventTransOriginId,
+        InventTransOriginId _markingRefInventTransOrigin,
+        InventQty           _markQty,                      // sign as _inventTransOriginId
+        PdsCWInventQty      _cwMarkQty = 0,
+        InventDim           _inventDimCriteria = null,
+        InventDimParm       _inventDimParm = null
+    )
+    {
+        PmfQtyDataCarrier   outQuantities = new PmfQtyDataCarrier();
+
+        InventQty qtyMarkingRemoved = InventTransOrigin::deleteMarking(_inventTransOriginId, _markingRefInventTransOrigin,  _markQty, false,
+           _inventDimCriteria, _inventDimParm, false, false,
+           _cwMarkQty, outQuantities,
+           false, SortOrder::Ascending);
+        PdsCWInventQty cwQtyMarkingRemoved = outQuantities.parmCwQty();
+
+        if (InventBlockingFindMarkedOrderDescContext::current())
+        {
+            InventTransOrigin::deleteMarking(_markingRefInventTransOrigin, _inventTransOriginId, qtyMarkingRemoved, false,
+                _inventDimCriteria, _inventDimParm, false, false,
+                cwQtyMarkingRemoved, new PmfQtyDataCarrier(),
+                false, SortOrder::Descending);
+        }
+        else
+        {
+            InventTransOrigin::deleteMarking(_markingRefInventTransOrigin, _inventTransOriginId, qtyMarkingRemoved, false,
+                _inventDimCriteria, _inventDimParm, false, false,
+                cwQtyMarkingRemoved, new PmfQtyDataCarrier(),
+                false, SortOrder::Ascending);
+        }
+
+        return [qtyMarkingRemoved, cwQtyMarkingRemoved];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteMarkings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Deletes the stored markings for the specified transaction.
+    /// </summary>
+    /// <param name="_inventTransOriginId">
+    ///    The inventory transaction originator ID for which the markings are removed.
+    /// </param>
+    /// <param name="_markingMap">
+    ///    The map that holds the markings to remove.
+    /// </param>
+    protected void deleteMarkings(InventTransOriginId _inventTransOriginId, Map _markingMap)
+    {
+        InventQty               qty;
+        PdsCWInventQty          cwQty;
+
+        InventDimParm           inventDimParm;
+
+        // start iterating local marking storage from the beginning
+        MapEnumerator currentMarking = _markingMap.getEnumerator();
+
+        // process all stored markings
+        while (currentMarking.moveNext())
+        {
+            InventTransMarkingKey key = InventTransMarkingKey::newString(currentMarking.currentKey());
+
+            [qty, cwQty] = currentMarking.currentValue();
+
+            InventTransOriginId keyInventTransOriginId = key.getInventTransOriginId();
+            InventDim inventDim = InventDim::find(key.getInventDimId());
+            inventDimParm.initFromInventDim(inventDim);
+
+            // delete marking on the transactions
+            this.deleteMarking(_inventTransOriginId, keyInventTransOriginId, qty, cwQty, inventDim, inventDimParm);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the current <c>InventBlockingMarkingSync</c> instance from the parameters
+    /// </summary>
+    /// <remarks>
+    ///    Parameters have to be set with parm methods before initialization.
+    /// </remarks>
+    public void init()
+    {
+        if (transRefSign > 0)
+        {
+            originInventBlockingTransOriginId       = InventTransOriginBlockingIssue::findInventTransOriginId(inventBlocking.RecId);
+            referredInventBlockingTransOriginId     = InventTransOriginBlockingReceipt::findInventTransOriginId(inventBlocking.RecId);
+        }
+        else
+        {
+            originInventBlockingTransOriginId       = InventTransOriginBlockingReceipt::findInventTransOriginId(inventBlocking.RecId);
+            referredInventBlockingTransOriginId     = InventTransOriginBlockingIssue::findInventTransOriginId(inventBlocking.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mark</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Restores the marking for the original transaction.
+    /// </summary>
+    public void mark()
+    {
+        if (!originTransOriginId)
+        {
+            // No original transaction so nothing to mark
+            return;
+        }
+
+        if (inventBlockingQtyDelta == 0)
+        {
+            // No change in quantity so nothing to mark
+            return;
+        }
+
+        if (inventBlockingQtyDelta > 0)
+        {
+            // Inventory blocking marking quantity will be increased.
+            if (originInventBlockingTransOriginId && referredInventBlockingTransOriginId)
+            {
+                // Now marking origin with blocking.
+                this.createMarkings();
+            }
+
+            if (originMarking.elements() > 0)
+            {
+                // Mark referred transactions to the originally marked transactions
+                this.markRefferedToOriginalMarking();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markRefferedToOriginalMarking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Applies the stored original markings on the blocking transactions that are not pointing to the
+    ///    origin.
+    /// </summary>
+    protected void markRefferedToOriginalMarking()
+    {
+        InventQty               qty;
+        PdsCWInventQty          cwQty;
+
+        InventDimParm           inventDimParm;
+
+        InventTransOriginId referredOrigin = referredInventBlockingTransOriginId;
+        if (!referredOrigin)
+        {
+            // might not have been present at the time the sync started.
+            referredOrigin = InventTransOriginBlockingReceipt::findInventTransOriginId(inventBlocking.RecId);
+        }
+        if (!referredOrigin)
+        {
+            // nothing to mark against
+            throw error("@SYS8364");
+        }
+
+        // start iterating local marking storage from the beginning
+        MapEnumerator currentMarking = originMarking.getEnumerator();
+
+        // process all stored markings
+        while (currentMarking.moveNext())
+        {
+            InventTransMarkingKey key = InventTransMarkingKey::newString(currentMarking.currentKey());
+
+            [qty, cwQty] = currentMarking.currentValue();
+
+            InventTransOriginId keyInventTransOriginId = key.getInventTransOriginId();
+            InventDim inventDim = InventDim::find(key.getInventDimId());
+            inventDimParm.initFromInventDim(inventDim);
+
+            // push marking to referredOrigin transaction.
+            this.updateMarking(referredOrigin, keyInventTransOriginId, qty, cwQty, inventDim, inventDimParm);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        marking = InventTransMarkingMap::construct();
+        originMarking = InventTransMarkingMap::construct();
+        allowOriginalIssueReservPhys = true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCWInventBlockingQtyDelta</Name>
+				<Source><![CDATA[
+    public PdsCWInventQty parmCWInventBlockingQtyDelta(PdsCWInventQty _cwInventBlockingQtyDelta = cwInventBlockingQtyDelta)
+    {
+        cwInventBlockingQtyDelta = _cwInventBlockingQtyDelta;
+        return cwInventBlockingQtyDelta;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventBlocking</Name>
+				<Source><![CDATA[
+    public InventBlocking parmInventBlocking(InventBlocking _inventBlocking = inventBlocking)
+    {
+        inventBlocking = _inventBlocking;
+        return inventBlocking;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventBlockingQtyDelta</Name>
+				<Source><![CDATA[
+    public InventQty parmInventBlockingQtyDelta(InventQty _inventBlockingQtyDelta = inventBlockingQtyDelta)
+    {
+        inventBlockingQtyDelta = _inventBlockingQtyDelta;
+        return inventBlockingQtyDelta;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmOriginTransOriginId</Name>
+				<Source><![CDATA[
+    public InventTransOriginId parmOriginTransOriginId(InventTransOriginId _originTransOriginId = originTransOriginId)
+    {
+        originTransOriginId = _originTransOriginId;
+        return originTransOriginId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTransRefSign</Name>
+				<Source><![CDATA[
+    public Integer parmTransRefSign(Integer _transRefSign = transRefSign)
+    {
+        transRefSign = _transRefSign;
+        return transRefSign;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUnmark</Name>
+				<Source><![CDATA[
+    public boolean parmUnmark(boolean  _unMark)
+    {
+        unMark = _unMark;
+        return unMark;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restoreOriginMarkings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Restores the markings that are between the originator and what the originator was originally marked
+    ///    with.
+    /// </summary>
+    /// <param name="_remainingQty">
+    ///    The maximum quantity for which to restore original markings.
+    /// </param>
+    /// <param name="_cwRemainingQty">
+    ///    The maximum quantity for which to restore original markings.
+    /// </param>
+    /// <returns>
+    ///    The quantity that is yet to be handled by transactions that are not originally marked.
+    /// </returns>
+    protected container restoreOriginMarkings(InventQty _remainingQty, PdsCWInventQty _cwRemainingQty)
+    {
+        InventTrans             inventTransBlockingIssue;
+        InventTrans             inventTransBlockingReceipt;
+        InventTrans             inventTransOriginalIssue;
+        InventTrans             inventTransOriginalReceipt;
+        InventQty               remainingQty            = _remainingQty; // remainingQty is positive
+        PdsCWInventQty          cwRemainingQty          = _cwRemainingQty; // remainingQty is positive
+        InventTransOriginId     inventTransMarkingIssue;
+        InventTransOriginId     inventTransMarkingReceipt;
+        InventDim               inventDim;
+        InventDimParm           inventDimParm;
+        InventDim               inventDimReceipt;
+
+        boolean                 makeReservationPhysical;
+
+        boolean findChainOfTransactions()
+        {
+            // Find a chain of 4 transactions to remark
+            InventQty               markingQty;
+            PdsCWInventQty          cwMarkingQty;
+
+            inventTransOriginalReceipt = null;
+            inventTransOriginalIssue = null;
+            inventTransBlockingReceipt = null;
+            inventTransBlockingIssue = null;
+
+            // Find receipt transaction back to originator
+            select firstonly forupdate inventTransBlockingReceipt
+                order by Qty // ordering on Qty to avoid splitting when possible.
+                where   inventTransBlockingReceipt.InventTransOrigin                == inventTransMarkingReceipt
+                   &&   inventTransBlockingReceipt.MarkingRefInventTransOrigin      != inventTransMarkingIssue
+                   &&   inventTransBlockingReceipt.MarkingRefInventTransOrigin      != 0
+                   &&   inventTransBlockingReceipt.ValueOpen                        == InventTransOpen::Yes
+                   &&   inventTransBlockingReceipt.TransChildType                   == InventTransChildType::None
+                   &&   inventTransBlockingReceipt.StatusIssue                      == StatusIssue::None;
+            if (!inventTransBlockingReceipt)
+            {
+                // Nothing originally marked
+                return false;
+            }
+
+            // find related original issue transactions to unmark
+            select firstonly forupdate inventTransOriginalIssue
+                order by Qty desc
+                where   inventTransOriginalIssue.InventTransOrigin              == inventTransBlockingReceipt.MarkingRefInventTransOrigin
+                    &&  inventTransOriginalIssue.MarkingRefInventTransOrigin    == inventTransMarkingReceipt
+                    &&  inventTransOriginalIssue.ValueOpen                      == InventTransOpen::Yes
+                    &&  inventTransOriginalIssue.InventDimId                    == inventTransBlockingReceipt.InventDimId;
+            if (!inventTransOriginalIssue)
+            {
+                if (receiptCanHaveOnlyDimensionsAboveLocation
+                    && isQualityOrdersValidateForPOWithWHSItemFlightEnabled)
+                {
+                    InventDim inventDimIssue = inventTransBlockingReceipt.inventDim();
+                    InventDimParm inventDimParmIssue;
+                    inventDimParmIssue.initFromInventDim(inventDimIssue);
+                    inventDim = null;
+
+                    select firstonly forupdate inventTransOriginalIssue
+                        order by Qty desc
+                        where   inventTransOriginalIssue.InventTransOrigin              == inventTransBlockingReceipt.MarkingRefInventTransOrigin
+                           &&   inventTransOriginalIssue.MarkingRefInventTransOrigin    == inventTransMarkingReceipt
+                           &&   inventTransOriginalIssue.ValueOpen                      == InventTransOpen::Yes
+                        #inventDimExistsJoin(inventTransOriginalIssue.inventDimId, inventDim, inventDimIssue, inventDimParmIssue);
+
+                    inventDim = null;
+                }
+
+                if (!inventTransOriginalIssue)
+                {
+                    // Marking is wrong - only one direction or dimensions don't match
+                    return false;
+                }
+            }
+
+            // find related blocking issue transactions to unmark
+            select firstonly forupdate inventTransBlockingIssue
+                order by Qty desc
+                where   inventTransBlockingIssue.InventTransOrigin              == inventTransMarkingIssue
+                    &&  inventTransBlockingIssue.MarkingRefInventTransOrigin    != 0
+                    &&  inventTransBlockingIssue.ValueOpen                      == InventTransOpen::Yes
+                    &&  inventTransBlockingIssue.InventDimId                    == inventTransBlockingReceipt.InventDimId;
+            if (!inventTransBlockingIssue)
+            {
+                // Marking is wrong - only one direction or dimensions don't match
+                return false;
+            }
+
+            // find related origin transactions to remark with.
+            select firstonly forupdate inventTransOriginalReceipt
+                order by Qty
+                where   inventTransOriginalReceipt.InventTransOrigin            == inventTransBlockingIssue.MarkingRefInventTransOrigin
+                    &&  inventTransOriginalReceipt.MarkingRefInventTransOrigin  == inventTransBlockingIssue.InventTransOrigin
+                    &&  inventTransOriginalReceipt.ValueOpen                    == InventTransOpen::Yes
+                    &&  inventTransOriginalReceipt.InventDimId                  == inventTransBlockingReceipt.InventDimId;
+
+            if (!inventTransOriginalReceipt)
+            {
+                // Find again for warehouse enabled item because location and below inventory dimension are cleared from inventory blocking
+                if (receiptCanHaveOnlyDimensionsAboveLocation)
+                {
+                    inventDimReceipt = inventTransBlockingReceipt.InventDim();
+                    inventDimParm.initFromInventDim(inventDimReceipt);
+
+                    // find related origin transactions to remark with.
+                    select firstonly forupdate inventTransOriginalReceipt
+                        order by Qty
+                        where   inventTransOriginalReceipt.InventTransOrigin            == inventTransBlockingIssue.MarkingRefInventTransOrigin
+                            &&  inventTransOriginalReceipt.MarkingRefInventTransOrigin  == inventTransBlockingIssue.InventTransOrigin
+                            &&  inventTransOriginalReceipt.ValueOpen                    == InventTransOpen::Yes
+                        #inventDimExistsJoin(inventTransOriginalReceipt.inventDimId, inventDim, inventDimReceipt, inventDimParm);
+                }
+
+                if (!inventTransOriginalReceipt)
+                {
+                    // Marking is wrong - only one direction or dimensions don't match
+                    return false;
+                }
+            }
+
+            // find least quantity on the transactions.
+            markingQty = min(min(inventTransOriginalReceipt.Qty, inventTransBlockingReceipt.Qty), min(-inventTransOriginalIssue.Qty, -inventTransBlockingIssue.Qty));
+            markingQty = min(markingQty, remainingQty);
+
+            cwMarkingQty = min(min(inventTransOriginalReceipt.PdsCWQty, inventTransBlockingReceipt.PdsCWQty), min(-inventTransOriginalIssue.PdsCWQty, -inventTransBlockingIssue.PdsCWQty));
+            cwMarkingQty = min(cwMarkingQty, cwRemainingQty);
+
+            // split transactions if quantity doesn't match markingQty
+            if (inventTransOriginalReceipt.Qty > markingQty
+                || inventTransOriginalReceipt.PdsCWQty > cwMarkingQty
+                )
+            {
+                inventTransOriginalReceipt.updateSplit(markingQty, cwMarkingQty);
+            }
+
+            if (inventTransBlockingReceipt.Qty > markingQty
+                || inventTransBlockingReceipt.PdsCWQty > cwMarkingQty
+                )
+            {
+                inventTransBlockingReceipt.updateSplit(markingQty, cwMarkingQty);
+            }
+
+            if (-inventTransOriginalIssue.Qty > markingQty
+                || -inventTransOriginalIssue.PdsCWQty > cwMarkingQty
+                )
+            {
+                inventTransOriginalIssue.updateSplit(-markingQty, -cwMarkingQty);
+            }
+
+            if (-inventTransBlockingIssue.Qty > markingQty
+                || -inventTransBlockingIssue.PdsCWQty > cwMarkingQty
+                )
+            {
+                inventTransBlockingIssue.updateSplit(-markingQty, -cwMarkingQty);
+            }
+
+            return true;
+        }
+
+        if (transRefSign == 0 || !referredInventBlockingTransOriginId || !originTransOriginId)
+        {
+            return [remainingQty, cwRemainingQty];
+        }
+
+        if (transRefSign < 0)
+        {
+            inventTransMarkingIssue     = referredInventBlockingTransOriginId;
+            inventTransMarkingReceipt   = originInventBlockingTransOriginId;
+        }
+        else
+        {
+            inventTransMarkingIssue     = originInventBlockingTransOriginId;
+            inventTransMarkingReceipt   = referredInventBlockingTransOriginId;
+        }
+
+        while (findChainOfTransactions())
+        {
+            // update blocking issue
+            if (inventTransBlockingIssue.StatusIssue == StatusIssue::ReservPhysical && allowOriginalIssueReservPhys)
+            {
+                makeReservationPhysical = true;
+            }
+            inventTransBlockingIssue.StatusIssue = StatusIssue::OnOrder;
+            inventTransBlockingIssue.clearMarking();
+            inventTransBlockingIssue.update();
+
+            // update original receipt
+            if (unMark && inventTransOriginalReceipt.ProjId)
+            {
+                inventTransOriginalReceipt.clearMarking();
+            }
+            else
+            {
+                inventTransOriginalReceipt.setMarking(inventTransOriginalIssue.InventTransOrigin);
+            }
+            inventTransOriginalReceipt.update();
+
+            // update original issue
+            inventTransOriginalIssue.setMarking(inventTransOriginalReceipt.InventTransOrigin);
+
+            inventTransOriginalIssue.update();
+
+            boolean skipReservationStatusUpdating = false;
+            if (receiptCanHaveOnlyDimensionsAboveLocation)
+            {
+                StatusIssue origStatusIssue = inventTransOriginalIssue.StatusIssue;
+                InventDimId origInventDimId = inventTransOriginalIssue.InventDimId;
+                // Need to do reservation when restoring marking because inventory dimension of issue transaction may be changed
+                // when doing reservation with receipt transaction of inventory blocking
+                using (InventUpdateReserveRefTransIdFromBlockingMarkingSyncContext context = InventUpdateReserveRefTransIdFromBlockingMarkingSyncContext::construct())
+                {
+                    context.parmCheckDimDiffOnIssuesNonBlankDimensions(true);
+                    InventUpd_Reservation::updateReserveRefTransId(inventTransOriginalIssue.inventMovement());
+                }
+                inventTransOriginalIssue.reread();
+
+                if (inventTransOriginalIssue.RecId &&
+                    (origStatusIssue != inventTransOriginalIssue.StatusIssue || // Reservation is done for this record
+                     origInventDimId != inventTransOriginalIssue.inventDimId || // Reservation is done for this record
+                     makeReservationPhysical)) // Reservation may have done on other marked issue record, skip to change this record status to reserve physical
+                {
+                    skipReservationStatusUpdating = true;
+                }
+
+            }
+
+            // No need to update inventory status when it has been physical or financial updated.
+            if (!inventTransOriginalIssue.isUpdatedPhysical()  &&
+                !inventTransOriginalIssue.isUpdatedFinancial() &&
+                !skipReservationStatusUpdating)
+            {
+                if (makeReservationPhysical)
+                {
+                    inventTransOriginalIssue.StatusIssue = StatusIssue::ReservPhysical;
+                }
+                else
+                {
+                    inventTransOriginalIssue.StatusIssue = StatusIssue::ReservOrdered;
+                }
+
+                inventTransOriginalIssue.update();
+            }
+
+            // update blocking receipt
+            inventTransBlockingReceipt.clearMarking();
+            inventTransBlockingReceipt.update();
+
+            // reduce requested marking quantity
+            remainingQty -= inventTransOriginalReceipt.Qty;
+            cwRemainingQty -= inventTransOriginalReceipt.PdsCWQty;
+
+            // finish if marking for whole requested quantity is reverted
+            if (remainingQty == 0
+                && cwRemainingQty == 0
+            )
+            {
+                return [0,0];
+            }
+        }
+        return [remainingQty, cwRemainingQty];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unmark</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Stores and removes all the markings for the original transaction.
+    /// </summary>
+    public void unmark()
+    {
+        InventQty       originQty;
+        PdsCWInventQty  cwOriginQty;
+
+        if (!originTransOriginId)
+        {
+            // No original transaction so nothing to unmark
+            return;
+        }
+
+        if (inventBlockingQtyDelta == 0)
+        {
+            // No change in quantity so nothing to unmark
+            return;
+        }
+
+        if (inventBlockingQtyDelta > 0)
+        {
+            // More needs to be blocked
+            // Original marking quantity will be reduced, inventory blocking marking quantity will be increased,
+            // that means that origin marking should be removed.
+            this.collectAndUnmarkOriginalMarkings(originTransOriginId);
+        }
+        else
+        {
+            // inventBlockingQtyDelta < 0
+            // Less needs to be blocked
+            // Inventory blocking marking quantity will be reduced, original marking quantity will be increased,
+            // that means that inventory blocking marking should be removed.
+            InventQty remainingQty = -inventBlockingQtyDelta;
+            PdsCWInventQty cwRemainingQty = -cwInventBlockingQtyDelta;
+            [originQty, cwOriginQty] = this.restoreOriginMarkings(remainingQty, cwRemainingQty); // First restore the original markings if possible.
+            remainingQty    -= originQty;
+            cwRemainingQty  -= cwOriginQty;
+            if (remainingQty < 0)
+            {
+                this.collectMarkings(referredInventBlockingTransOriginId, remainingQty, cwRemainingQty);
+                this.deleteMarkings(referredInventBlockingTransOriginId, marking);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMarking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates a marking for the specified inventory transaction originator.
+    /// </summary>
+    /// <param name="_inventTransOriginId">
+    ///    The ID of the inventory transaction originator for which a marking is updated.
+    /// </param>
+    /// <param name="_markingRefInventTransOrigin">
+    ///    The ID of the inventory transaction originator that is being marked.
+    /// </param>
+    /// <param name="_markQty">
+    ///    The quantity to mark.
+    /// </param>
+    /// <param name="_cwMarkQty">
+    ///    The catch weight quantity to mark.
+    /// </param>
+    /// <param name="_inventDimCriteria">
+    ///    The inventory dimension values with which to match when finding transactions to mark.
+    /// </param>
+    /// <param name="_inventDimParm">
+    ///    The inventory dimensions with which to match when finding transactions to mark.
+    /// </param>
+    /// <returns>
+    ///    A container with the marked quantities
+    /// </returns>
+    protected container updateMarking(
+        InventTransOriginId     _inventTransOriginId,
+        InventTransOriginId     _markingRefInventTransOrigin,
+        InventQty               _markQty,           // sign as _inventTransOriginId
+        PdsCWInventQty          _cwMarkQty,
+        InventDim               _inventDimCriteria = null,
+        InventDimParm           _inventDimParm = null)
+    {
+        PmfQtyDataCarrier       outQuantities = new PmfQtyDataCarrier();
+        
+        // mark in one direction
+        InventQty markedQty = InventTransOrigin::updateMarking(_inventTransOriginId, _markingRefInventTransOrigin, _markQty, '', SortOrder::Descending, true, _inventDimCriteria, _inventDimParm
+        , _cwMarkQty, outQuantities
+        );
+
+        PdsCWInventQty cwMarkedQty = outQuantities.parmCwQty();
+
+        // mark in reverse direction
+        InventQty markedReverseQty = InventTransOrigin::updateMarking(_markingRefInventTransOrigin, _inventTransOriginId, markedQty, '', SortOrder::Descending, true, _inventDimCriteria, _inventDimParm, cwMarkedQty);
+        // if something is still not marked then find marking transaction with financial inventory dimension
+        if (!markedReverseQty)
+        {
+            InventDimParm financialInventDimParm;
+            InventDim financialInventDim;
+            InventTransOrigin inventTransOrgin = InventTransOrigin::find(_markingRefInventTransOrigin);
+            InventDimGroupSetup inventDimGroupSetup = InventDimGroupSetup::newItemId(inventTransOrgin.ItemId);
+            inventDimGroupSetup.inventDimParmActiveFinancialInventory(financialInventDimParm);
+            financialInventDim = _inventDimCriteria.data();
+            financialInventDim.clearNotSelectedDim(financialInventDimParm);
+
+            InventTransOrigin::updateMarking(_markingRefInventTransOrigin, _inventTransOriginId, markedQty, '', SortOrder::Descending, true, financialInventDim, financialInventDimParm, cwMarkedQty);
+        }
+
+        if (_markQty > 0)
+        {
+            this.updateMarkingReservation(_markingRefInventTransOrigin, _inventTransOriginId);
+        }
+        else
+        {
+            this.updateMarkingReservation(_inventTransOriginId, _markingRefInventTransOrigin);
+        }
+        return [markedQty, cwMarkedQty];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMarkingReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates a reservation for the specified inventory transaction originator.
+    /// </summary>
+    /// <param name="_inventTransOriginIdIssue">
+    ///    The ID of the inventory transaction originator for which a reservation is updated.
+    /// </param>
+    /// <param name="_inventTransOriginIdReceipt">
+    ///    The ID of the inventory transaction originator with which the transactions must be marked.
+    /// </param>
+    protected void updateMarkingReservation(
+        InventTransOriginId     _inventTransOriginIdIssue,
+        InventTransOriginId     _inventTransOriginIdReceipt)
+    {
+        InventTrans             inventTransIssue;
+
+        // update reservation for the issue.
+        select firstonly inventTransIssue
+            where   inventTransIssue.InventTransOrigin              == _inventTransOriginIdIssue
+                &&  inventTransIssue.StatusReceipt                  == StatusReceipt::None
+                &&  inventTransIssue.StatusIssue                    == StatusIssue::OnOrder
+                &&  inventTransIssue.MarkingRefInventTransOrigin    == _inventTransOriginIdReceipt;
+        if (inventTransIssue)
+        {
+            using (InventUpdateReserveRefTransIdFromBlockingMarkingSyncContext context = InventUpdateReserveRefTransIdFromBlockingMarkingSyncContext::construct())
+            {
+                context.parmIsUpdateMarkingReservationForOnOrderInventTransIssue(true);
+                InventUpd_Reservation::updateReserveRefTransId(inventTransIssue.inventMovement());
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static InventBlockingMarkingSync construct()
+    {
+        return new InventBlockingMarkingSync();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromInventBlocking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and initializes a new instance of the <c>InventBlockingMarkingSync</c> class from parameters.
+    /// </summary>
+    /// <param name="_inventBlocking">
+    /// An <c>InventBlocking</c> table record.
+    /// </param>
+    /// <param name="_inventBlockingQtyDelta">
+    /// The quantity change for the inventory blocking.
+    /// </param>
+    /// <param name="_originTransOriginId">
+    /// The original transaction originator ID; optional.
+    /// </param>
+    /// <param name="_transRefSign">
+    /// The value to use as transRefSign; optional.
+    /// </param>
+    /// <param name="_cwInventBlockingQtyDelta">
+    /// The catch weight quantity change for the inventory blocking.
+    /// </param>
+    /// <returns>
+    /// A new instance of the <c>InventBlockingMarkingSync</c> class.
+    /// </returns>
+    public static InventBlockingMarkingSync newFromInventBlocking(
+        InventBlocking      _inventBlocking,
+        InventQty           _inventBlockingQtyDelta,
+        InventTransOriginId _originTransOriginId        = InventTransOrigin::findByInventTransId(_inventBlocking.inventTransRefId()).RecId,
+        Integer             _transRefSign               = _inventBlocking.inventTransRefSign()
+        , PdsCWInventQty    _cwInventBlockingQtyDelta   = 0
+        )
+    {
+        InventBlockingMarkingSync inventBlockingMarkingSync = new InventBlockingMarkingSync();
+        inventBlockingMarkingSync.parmInventBlocking(_inventBlocking);
+        inventBlockingMarkingSync.parmInventBlockingQtyDelta(_inventBlockingQtyDelta);
+        inventBlockingMarkingSync.parmCWInventBlockingQtyDelta(_cwInventBlockingQtyDelta);
+        inventBlockingMarkingSync.parmOriginTransOriginId(_originTransOriginId);
+        inventBlockingMarkingSync.parmTransRefSign(_transRefSign);
+        inventBlockingMarkingSync.init();
+
+        return inventBlockingMarkingSync;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAllowOriginalIssueReservPhys</Name>
+				<Source><![CDATA[
+    public boolean parmAllowOriginalIssueReservPhys(boolean _allowOriginalIssueReservPhys  = allowOriginalIssueReservPhys)
+    {
+        allowOriginalIssueReservPhys  = _allowOriginalIssueReservPhys ;
+        return allowOriginalIssueReservPhys;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCanUnreserve</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines whether it's possible to unreserve existing issue transactions.
+    /// </summary>
+    /// <returns>
+    ///     True if it's possible to unreserve existing issue transactions; otherwise, false.
+    /// </returns>
+    public boolean parmCanUnreserve()
+    {
+        return canUnreserve;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReceiptCanHaveOnlyDimAboveLocation</Name>
+				<Source><![CDATA[
+    public boolean parmReceiptCanHaveOnlyDimAboveLocation(boolean _receiptCanHaveOnlyDimensionsAboveLocation = receiptCanHaveOnlyDimensionsAboveLocation)
+    {
+        receiptCanHaveOnlyDimensionsAboveLocation = _receiptCanHaveOnlyDimensionsAboveLocation;
+        return receiptCanHaveOnlyDimensionsAboveLocation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setContainerValueInCache</Name>
+				<Source><![CDATA[
+    private void setContainerValueInCache(str _transactionScopeCacheKey, container _cacheValue)
+    {
+        SysGlobalCache transactionCache = appl.transactionScope().parmTransactionScopeCache();
+        if (!transactionCache.isSet(InventBlockingMarkingSync::cacheOwner(), _transactionScopeCacheKey))
+        {
+            transactionCache.set(InventBlockingMarkingSync::cacheOwner(), _transactionScopeCacheKey, _cacheValue);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>needRemoveReservationOnReservePhysicalTrans</Name>
+				<Source><![CDATA[
+    internal static boolean needRemoveReservationOnReservePhysicalTrans(InventTransOriginId _inventTransOriginId)
+    {
+        container cacheValueCon = InventBlockingMarkingSync::getContainerValueFromCache(
+                InventBlockingMarkingSync::transactionScopeCacheKey(_inventTransOriginId));
+        if (cacheValueCon != conNull())
+        {
+            boolean needRemoveReservationOnReservePhysicalTrans;
+            [needRemoveReservationOnReservePhysicalTrans] = cacheValueCon;
+            return needRemoveReservationOnReservePhysicalTrans;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeContainerValueInCache</Name>
+				<Source><![CDATA[
+    private void removeContainerValueInCache(str _transactionScopeCacheKey)
+    {
+        SysGlobalCache transactionCache = appl.transactionScope().parmTransactionScopeCache();
+        if (transactionCache.isSet(InventBlockingMarkingSync::cacheOwner(), _transactionScopeCacheKey))
+        {
+            transactionCache.remove(InventBlockingMarkingSync::cacheOwner(), _transactionScopeCacheKey);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getContainerValueFromCache</Name>
+				<Source><![CDATA[
+    private static container getContainerValueFromCache(str _transactionScopeCacheKey)
+    {
+        SysTransactionScope transactionScope = appl.transactionScope();
+        SysGlobalCache transactionCache = transactionScope.parmTransactionScopeCache();
+                
+        return transactionCache.get(InventBlockingMarkingSync::cacheOwner(), _transactionScopeCacheKey, conNull());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cacheOwner</Name>
+				<Source><![CDATA[
+    internal static str cacheOwner()
+    {
+        return classStr(InventBlockingMarkingSync);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transactionScopeCacheKey</Name>
+				<Source><![CDATA[
+    internal static str transactionScopeCacheKey(RecId _inventTransOriginId)
+    {
+        return strFmt("%1#%2", int642Str(_inventTransOriginId),
+                int642str(InventUpdateOnhandGlobal::Instance().inventUpdateOnhand().ttsId()));
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

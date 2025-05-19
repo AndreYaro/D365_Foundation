@@ -1,0 +1,1066 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ForecastImportPlanningDataService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     The <c>ForecastDemandPlanImportService</c> is a service class for launching forecast import.
+/// </summary>
+internal final class ForecastImportPlanningDataService extends SysOperationServiceBase
+{
+    private const int MaximumItemCount = 100;
+    private ForecastImportPlanningDataTableReader reader;
+    private ReqDemPlanForecastParameters parameters;
+    private boolean isMainThread;
+    private ForecastImportPlanningDataBundleId bundleIds[];
+    private ForecastImportPlanningDataInstrumentationLogger instrumentationLogger;
+    private int retryAttemptNumber;
+    private BatchHeader batchHeader;
+    private boolean isScpDemandPlanningForecastTemplateFlightEnabled = ScpDemandPlanningForecastTemplateFlight::instance().isEnabled();
+
+    #OCCRetryCount
+    #ReqDemPlan
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>unitLabelForModule</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the released product unit field label for the specified <c>ModuleInventPurchSales</c> enum value.
+    /// </summary>
+    /// <param name = "_module">Module type</param>
+    /// <returns>Unit field label</returns>
+    protected str unitLabelForModule(ModuleInventPurchSales _module)
+    {
+        switch (_module)
+        {
+            case ModuleInventPurchSales::Sales:
+                return "@SYS14614"; // Sales unit
+
+            case ModuleInventPurchSales::Purch:
+                return "@SYS22997"; // Purchase unit
+
+            case ModuleInventPurchSales::Invent:
+            default:
+                return "@SYS16617"; // Inventory unit
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkFailedForItemUnitConversion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Displays a warning message when the forecast import cannot be completed for a specified product due to missing unit conversion details.
+    /// </summary>
+    /// <param name="_inventTable">
+    ///     The specified product that failed the import of forecast.
+    /// </param>
+    /// <param name="_module">
+    ///     The module that is missing a value specification.
+    /// </param>
+    protected void checkFailedForItemUnitConversion(InventTable _inventTable, ModuleInventPurchSales _module)
+    {
+        str unitLabel = this.unitLabelForModule(_module);
+
+        SysInfoAction_MenuFunction productDetailsForm = SysInfoAction_MenuFunction::newMenuItem(menuitemDisplayStr(EcoResProductDetailsExtended), MenuItemType::Display);
+        productDetailsForm.parmCallerBuffer(_inventTable);
+
+        setPrefix(strFmt("@SYS26921", _inventTable.ItemId));                                //processing item %1
+        checkFailed(strFmt("@SYS313291", unitLabel));                                       // A value is missing. Enter a value in the %1 field to be able to proceed.
+        checkFailed(strFmt("@SYS120745", "@SYS303714"), '', productDetailsForm);            // Open '%1' by double-clicking this message.
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanupPreviousForecastPerItemId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes the existing forecast records for a given item and date range.
+    /// </summary>
+    /// <param name="_forecastModelId">
+    /// The forecast model to clean up.
+    /// </param>
+    /// <param name="_itemId">
+    /// The item ID.
+    /// </param>
+    /// <param name="_forecastStart">
+    /// Start date of the interval to clean up.
+    /// </param>
+    /// <param name="_forecastEnd">
+    /// End date of the interval to clean up.
+    /// </param>
+    public void cleanupPreviousForecastPerItemId(
+        ForecastModelId _forecastModelId,
+        ItemId _itemId,
+        date _forecastStart,
+        date _forecastEnd)
+    {
+        using (var activity = this.instrumentationLogger().activities().cleanupPreviousForecastPerItemId())
+        {
+            ForecastSales forecastSales;
+            ForecastInvent forecastInvent;
+
+            if (!this.isExecutingInBatch() || retryAttemptNumber < 1)
+            {
+                delete_from forecastInvent
+                exists join forecastSales
+                where   forecastSales.ModelId        == _forecastModelId
+                    &&  forecastSales.ItemId         == _itemId
+                    &&  forecastSales.StartDate      >= _forecastStart
+                    &&  forecastSales.StartDate      <= _forecastEnd
+                    &&  forecastSales.TableId        == forecastInvent.TransTableId
+                    &&  forecastSales.RecId          == forecastInvent.TransRecId;
+
+                delete_from forecastSales
+                where   forecastSales.ModelId        == _forecastModelId
+                    &&  forecastSales.ItemId         == _itemId
+                    &&  forecastSales.StartDate      >= _forecastStart
+                    &&  forecastSales.StartDate      <= _forecastEnd;
+            }
+            // Set-based deletes may choose a poor query plan which will result in locking records for another product, consequently resulting in a deadlock
+            // We attempt the set-based strategy first (as it performs better)
+            // But if a deadlock was detected then we will fall back to record-by-record deletes
+            else
+            {
+                List inventRecIdList = new List(Types::Int64);
+                List salesRecIdList = new List(Types::Int64);
+
+                while select RecId from forecastInvent
+                exists join forecastSales
+                where   forecastSales.ModelId        == _forecastModelId
+                    &&  forecastSales.ItemId         == _itemId
+                    &&  forecastSales.StartDate      >= _forecastStart
+                    &&  forecastSales.StartDate      <= _forecastEnd
+                    &&  forecastSales.TableId        == forecastInvent.TransTableId
+                    &&  forecastSales.RecId          == forecastInvent.TransRecId
+                {
+                    inventRecIdList.addEnd(forecastInvent.RecId);
+                }
+
+                while select RecId from forecastSales
+                where   forecastSales.ModelId        == _forecastModelId
+                    &&  forecastSales.ItemId         == _itemId
+                    &&  forecastSales.StartDate      >= _forecastStart
+                    &&  forecastSales.StartDate      <= _forecastEnd
+                {
+                    salesRecIdList.addEnd(forecastSales.RecId);
+                }
+
+                ListEnumerator listEnumerator = inventRecIdList.getEnumerator();
+
+                while (listEnumerator.moveNext())
+                {
+                    delete_from forecastInvent where forecastInvent.RecId == listEnumerator.current();
+                }
+
+                listEnumerator = salesRecIdList.getEnumerator();
+
+                while (listEnumerator.moveNext())
+                {
+                    delete_from forecastSales where forecastSales.RecId == listEnumerator.current();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInventDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the InventDim record that matches the given dimension values and item dimension set-up.
+    /// </summary>
+    /// <param name="_inventDimSetup">
+    /// The item dimension set-up.
+    /// </param>
+    /// <param name="_forecast">
+    /// The forecast record.
+    /// </param>
+    /// <returns>
+    /// An InventDim record that contains a valid InventDimId found based on the given parameters.
+    /// </returns>
+    protected InventDim findInventDim(InventDimGroupSetup _inventDimSetup, ForecastStagedImportPlanningDataEntry _forecast)
+    {
+        InventDim inventDim = this.constructInventDim(_inventDimSetup, _forecast);
+
+        return InventDim::findOrCreate(inventDim);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importCompanyForecastFromCubeMultipleTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports the forecast from the Demand forecast cube into the Demand forecast tables of a given company.
+    /// The import is broken down in transactions each one of which includes the processing of MaximumItemCount items.
+    /// </summary>
+    /// <param name="_dataContract">
+    /// The data contract object.
+    /// </param>
+    /// <param name="_dataAreaId">
+    /// The data area ID of the company being processed.
+    /// </param>
+    /// <param name="_forecastModelId">
+    /// The forecast model into which demand should be imported.
+    /// </param>
+    private void importCompanyForecastFromCubeMultipleTransactions(
+        ForecastImportPlanningDataContract _dataContract,
+        DataAreaId _dataAreaId,
+        ForecastModelId _forecastModelId)
+    {
+        setPrefix("@DMP1084");
+
+        changecompany(Global::getCompany(tableNum(ForecastModel), _dataAreaId))
+        {
+            date forecastStart = _dataContract.parmForecastStart();
+            date forecastEnd = _dataContract.parmForecastEnd();
+            reader = this.executeReader(_dataContract, _dataAreaId);
+
+            int dateValueQueryPos        = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, ForecastStartDate));
+            int forecastQuantityQueryPos = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, ForecastedQuantity));
+            int deliveringSiteIdQueryPos  = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, DeliveringSiteId));
+            int deliveringWarehouseIdQueryPos = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, DeliveringWarehouseId));
+            int forecastModelIdQueryPos = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, ForecastModelId));
+
+            int customerAccountNumberQueryPos = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, CustomerAccountNumber));
+            int customerGroupIdQueryPos = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, CustomerGroupId));
+
+            int itemIdQueryPos = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, ItemId));
+            int productNumberQueryPos = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, ProductNumber));
+            int productVariantNumberQueryPos = reader.GetOrdinal(fieldStr(ForecastStagedImportPlanningDataEntry, ProductVariantNumber));
+
+            ItemId prevItemId;
+            EcoResProductDisplayProductNumber prevProductNumber;
+            EcoResProductDisplayProductNumber prevProductVariantNumber;
+            ItemId skipItemId;
+            InventDim prevInventDim;
+            InventDim prevVariantInventDim;
+            CustAccount prevCustAccount;
+            CustGroupId prevCustGroupId;
+            ForecastSales forecastSalesTemplate;
+            boolean forecastExists;
+            int itemCount;
+
+            InventTable inventTable;
+            InventDimGroupSetup inventDimSetup;
+            boolean isProductVariantConversionEnabledForItem;
+            UnitOfMeasure itemInventoryUnitOfMeasure;
+            UnitOfMeasure itemSalesUnitOfMeasure;
+            EcoResProductUnitConverter unitConverterInventToSales;
+            InventDim inventDim;
+            InventDim inventDimFromVariant;
+
+            boolean readerHasData = reader.Read();
+            while (readerHasData)
+            {
+                itemCount = 1;
+                int recordsProcessed = 0;
+                try
+                {
+                    ttsbegin;
+
+                    while (itemCount mod MaximumItemCount != 0 && readerHasData)
+                    {
+                        recordsProcessed++;
+                        
+                        ForecastStagedImportPlanningDataEntry forecast;
+
+                        forecast.DeliveringSiteId = reader.GetString(deliveringSiteIdQueryPos);
+                        forecast.DeliveringWarehouseId = reader.GetString(deliveringWarehouseIdQueryPos);
+                        forecast.ForecastModelId = reader.GetString(forecastModelIdQueryPos);
+                        
+                        forecast.CustomerAccountNumber = reader.GetString(customerAccountNumberQueryPos);
+                        forecast.CustomerGroupId = reader.GetString(customerGroupIdQueryPos);
+
+                        forecast.ItemId = reader.GetString(itemIdQueryPos);
+                        forecast.ProductNumber = reader.GetString(productNumberQueryPos);
+                        forecast.ProductVariantNumber = reader.GetString(productVariantNumberQueryPos);
+                        forecast.RecId = reader.GetRecId();
+
+                        if (forecast.ProductVariantNumber)
+                        {
+                            if (prevProductVariantNumber == forecast.ProductVariantNumber)
+                            {
+                                forecast.ItemId = prevItemId;
+                                prevVariantInventDim = inventDimFromVariant;
+                            }
+                            else
+                            {
+                                EcoResProduct ecoResProduct = EcoResProduct::findByDisplayProductNumber(forecast.ProductVariantNumber);
+                                EcoResDistinctProductVariant ecoResDistinctProductVariant = ecoResProduct as EcoResDistinctProductVariant;
+
+                                if (ecoResDistinctProductVariant)
+                                {
+                                    inventTable = InventTable::findByProduct(ecoResDistinctProductVariant.ProductMaster);
+                                    forecast.ItemId = inventTable.ItemId;
+
+                                    InventDimCombination inventDimCombination = InventDimCombination::findByDistinctProductVariant(ecoResDistinctProductVariant.RecId);
+                                    inventDimFromVariant = InventDim::find(inventDimCombination.InventDimId);
+                                    this.initializeNonProductDimensionsFromForecast(inventDimFromVariant, forecast);
+                                }
+                                else
+                                {
+                                    if (!ecoResProduct)
+                                    {
+                                        throw error(strFmt("@ParallelizedForecastImport:ErrorFindingProductVariant", forecast.ProductVariantNumber));
+                                    }
+                                    inventTable = InventTable::findByProduct(ecoResProduct.RecId);
+                                    forecast.ItemId = inventTable.ItemId;
+                                }
+                            }
+                        }
+                        else if (forecast.ItemId)
+                        {
+                            if (prevItemId == forecast.ItemId)
+                            {
+                                forecast.ProductNumber = prevProductNumber;
+                            }
+                            else
+                            {
+                                inventTable = InventTable::find(forecast.ItemId);
+                                forecast.ProductNumber = EcoResProduct::find(inventTable.Product).DisplayProductNumber;
+                            }
+                        }
+                        else if (forecast.ProductNumber)
+                        {
+                            if (prevProductNumber == forecast.ProductNumber)
+                            {
+                                forecast.ItemId = prevItemId;
+                            }
+                            else
+                            {
+                                EcoResProduct ecoResProduct = EcoResProduct::findByDisplayProductNumber(forecast.ProductNumber);
+                                EcoResDistinctProductVariant ecoResDistinctProductVariant = ecoResProduct as EcoResDistinctProductVariant;
+
+                                inventTable = ecoResDistinctProductVariant.ProductMaster
+                                    ? InventTable::findByProduct(ecoResDistinctProductVariant.ProductMaster)
+                                    : InventTable::findByProduct(ecoResProduct.RecId);
+
+                                forecast.ItemId = inventTable.ItemId;
+                            }
+                        }
+                        else
+                        {
+                            warning("@ParallelizedForecastImport:SpecifyItemOrProduct");
+                            readerHasData = reader.Read();
+                            continue;
+                        }
+                        
+                        if (skipItemId && (skipItemId == forecast.ItemId))
+                        {
+                            //do not process this item
+                            readerHasData = reader.Read();
+                            continue;
+                        }
+
+                        date dateValue = reader.GetDateTime(dateValueQueryPos);
+                        forecast.ForecastStartDate = dateValue;
+                        forecast.ForecastedQuantity = reader.GetDecimal(forecastQuantityQueryPos);
+
+                        if (forecast.ItemId != prevItemId)
+                        {
+                            retryAttemptNumber = 0;
+                            skipItemId  = '';
+
+                            inventTable = InventTable::find(forecast.ItemId);
+
+                            inventDimSetup = InventDimGroupSetup::newItemId(forecast.ItemId);
+                            itemInventoryUnitOfMeasure = UnitOfMeasure::findBySymbol(inventTable.inventTableModuleInvent().UnitId);
+                            itemSalesUnitOfMeasure = UnitOfMeasure::findBySymbol(inventTable.inventTableModuleSales().UnitId);
+
+                            isProductVariantConversionEnabledForItem = forecast.ItemId && EcoResProductUnitConverter::isProductMasterWithProductVariantConversionEnabled(forecast.ItemId);
+
+                            if (!itemInventoryUnitOfMeasure.RecId || !itemSalesUnitOfMeasure.RecId)
+                            {
+                                skipItemId = forecast.ItemId;
+
+                                ModuleInventPurchSales moduleInventPurchSales = !itemInventoryUnitOfMeasure.RecId ? ModuleInventPurchSales::Invent : ModuleInventPurchSales::Sales;
+
+                                this.checkFailedForItemUnitConversion(inventTable, moduleInventPurchSales);
+                                readerHasData = reader.Read();
+                                continue;
+                            }
+                        }
+
+                        if (forecast.ItemId != prevItemId || isProductVariantConversionEnabledForItem)
+                        {
+                            inventDim = inventDimFromVariant ? InventDim::findOrCreate(inventDimFromVariant) : this.findInventDim(inventDimSetup, forecast);
+
+                            unitConverterInventToSales = EcoResProductUnitConverter::newForReleasedProduct(
+                                inventTable.ItemId,
+                                inventDim.InventDimId,
+                                itemInventoryUnitOfMeasure.RecId,
+                                itemSalesUnitOfMeasure.RecId,
+                                NoYes::No,
+                                NoYes::Yes);
+                        }
+                
+                        if (forecast.ItemId != prevItemId)
+                        {
+                            this.cleanupPreviousForecastPerItemId(_forecastModelId, forecast.ItemId, forecastStart, forecastEnd);
+                            itemCount++;
+                        }
+
+                        if (isScpDemandPlanningForecastTemplateFlightEnabled 
+                            && (forecast.ItemId != prevItemId || !prevInventDim || !InventDim::isInventDimEqual(prevInventDim, inventDim)))
+                        {
+                            this.instrumentationLogger().logInformation(strFmt('Created forecast sales template for item %1', forecast.ItemId));
+
+                            // Create a new ForecastSales to be used a template in the following ForecastSales entries for the item
+                            forecastSalesTemplate = this.initializeDemandForecast(forecast.ItemId, inventDim);
+                        }
+
+                        if (forecast.ForecastStartDate >= forecastStart && forecast.ForecastStartDate <= forecastEnd)
+                        {
+                            // convert units and insert demand record
+                            // note: when units are the same no conversion will take place, but only rounding
+                            real qtyInventoryUnit = forecast.ForecastedQuantity;
+                            real qtySalesUnit = forecast.ItemId ? unitConverterInventToSales.convertValue(qtyInventoryUnit) : forecast.ForecastedQuantity;
+
+                            if (qtyInventoryUnit > 0 && qtySalesUnit > 0)
+                            {
+                                if (!inventDim)
+                                {
+                                    inventDim = inventDimFromVariant ? InventDim::findOrCreate(inventDimFromVariant) : this.findInventDim(inventDimSetup, forecast);
+                                }
+
+                                if (!isScpDemandPlanningForecastTemplateFlightEnabled
+                                    && (forecast.ItemId != prevItemId || !prevInventDim || !InventDim::isInventDimEqual(prevInventDim, inventDim)))
+                                {
+                                    // Create a new ForecastSales to be used a template in the following ForecastSales entries for the item
+                                    forecastSalesTemplate = this.initializeDemandForecast(forecast.ItemId, inventDim);
+                                }
+
+                                ForecastSales forecastSales = this.initializeForecastSalesFromTemplate(
+                                    forecastSalesTemplate,
+                                    _forecastModelId,
+                                    forecast,
+                                    qtyInventoryUnit,
+                                    qtySalesUnit,
+                                    itemSalesUnitOfMeasure.Symbol);
+
+                                forecastSales.insert();
+                            }
+                        }
+
+                        prevItemId = forecast.ItemId;
+                        prevProductNumber = forecast.ProductNumber;
+                        prevProductVariantNumber = forecast.ProductVariantNumber;
+                        prevInventDim = inventDim;
+                        prevVariantInventDim = inventDimFromVariant;
+                        forecastExists = true;
+                        
+                        // Update is processed so we do not process this item again
+                        ForecastStagedImportPlanningDataEntry forecastForUpdate;
+
+                        select forupdate firstonly forecastForUpdate
+                            where forecastForUpdate.RecId == forecast.RecId;
+
+                        forecastForUpdate.IsProcessed = NoYes::Yes;
+                        forecastForUpdate.update();
+
+                        readerHasData = reader.Read();
+                    }
+
+                    ttscommit;
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    this.instrumentationLogger().logInformation('Retrying Exception::UpdateConflict was caused by a SQL issue.');
+
+                    if (retryAttemptNumber < #RetryNum)
+                    {
+                        itemCount = 1;
+                        recordsProcessed = 0;
+                        retryAttemptNumber++;
+                        retry;
+                    }
+
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                catch (Exception::Deadlock)
+                {
+                    this.instrumentationLogger().logInformation('Retrying Exception::Deadlock was caused by a SQL issue.');
+
+                    if (retryAttemptNumber < #RetryNum)
+                    {
+                        itemCount = 1;
+                        recordsProcessed = 0;
+                        retryAttemptNumber++;
+                        retry;
+                    }
+
+                    throw Exception::Deadlock;
+                }
+                catch
+                {
+                    var currentRetryCount = xSession::currentRetryCount();
+                    if (currentRetryCount >= #RetryNum)
+                    {
+                        throw;
+                    }
+
+                    const int FiveSecondsInMilliseconds = 5 * 1000;
+                    const int OneMinuteInMilliseconds = 60 * 1000;
+
+                    var delay = FiveSecondsInMilliseconds * power(2, min(currentRetryCount, 4)); // no need for the exponent to be higher than 4 since with 4 maximum delay of 60 seconds is already exceeded
+                    sleep(min(OneMinuteInMilliseconds , delay));
+
+                    itemCount = 1;
+                    recordsProcessed = 0;
+                    retry;
+                }
+            }
+
+            reader.Dispose();
+            reader = null;
+
+            if (!forecastExists)
+            {
+                warning(strFmt("@DMP1192", _dataAreaId, _forecastModelId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    internal ForecastImportPlanningDataInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = ForecastImportPlanningDataInstrumentationLogger::createLogger(this.demandPlanInstrumentationLoggerClassName());
+        }
+        
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>demandPlanInstrumentationLoggerClassName</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal ClassName demandPlanInstrumentationLoggerClassName()
+    {
+        return classStr(ForecastImportPlanningDataService);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>importForecastFromCube</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Imports the forecast from the Demand forecast cube into the Demand forecast tables.
+    /// </summary>
+    /// <param name="_dataContract">
+    /// The data contract with runtime parameters.
+    /// </param>
+    /// <returns>
+    /// True in case forecast import was successful; otherwise, false.
+    /// </returns>
+    public boolean importForecastFromCube(ForecastImportPlanningDataContract _dataContract)
+    {
+        str exceptionText;
+
+        DataAreaId              dataAreaId = _dataContract.parmDataAreaId();
+        ForecastModelId         modelId = _dataContract.parmForecastModelId();
+
+        try
+        {
+            if (modelId != '')
+            {
+                using (var activity = this.instrumentationLogger().activities().importCompanyForecastFromCubeMultipleTransactions())
+                {
+                    this.importCompanyForecastFromCubeMultipleTransactions(_dataContract, dataAreaId, modelId);
+                }
+            }
+            else
+            {
+                warning(strFmt("@DMP1087", dataAreaId));
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            error("@DMP:AdjustedForecastPartiallyAuthorized");
+            exceptionText = ReqDemPlanExceptionHelper::getLastExceptionMessage();
+        }
+        catch
+        {
+            exceptionText = "@DMP:AdjustedForecastPartiallyAuthorized";
+        }
+
+        if (reader)
+        {
+            reader.dispose();
+        }
+
+        if (exceptionText)
+        {
+            error(exceptionText);
+            return false;
+        }
+        else
+        {
+            info("@DMP1081");
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startChildThreads</Name>
+				<Source><![CDATA[
+    private void startChildThreads(ForecastImportPlanningDataContract _dataContract)
+    {
+        ForecastImportProcessNumberOfThreads numberOfThreads = max(1, _dataContract.parmNumberOfThreads());
+
+        this.setBundleIds(numberOfThreads);
+
+        using (var activity = this.instrumentationLogger().activities().insertRecordsIntoExecutionList())
+        {
+            this.insertRecordsIntoExecutionList(_dataContract, numberOfThreads);
+        }
+
+        using (var activity = this.instrumentationLogger().activities().registerChildTreads())
+        {
+            this.registerChildTreads(_dataContract, numberOfThreads);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setBundleIds</Name>
+				<Source><![CDATA[
+    private void setBundleIds(ForecastImportProcessNumberOfThreads _numberOfThreads)
+    {
+        for (var i = 1; i <= _numberOfThreads; i++)
+        {
+            bundleIds[i] = System.Guid::NewGuid();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecordsIntoExecutionList</Name>
+				<Source><![CDATA[
+    private void insertRecordsIntoExecutionList(ForecastImportPlanningDataContract _dataContract, ForecastImportProcessNumberOfThreads _numberOfThreads)
+    {
+        int itemCount;
+
+        var recordInsertList = new RecordInsertList(tableNum(ForecastStagedImportPlanningDataExecutionItem));
+
+        DataAreaId dataAreaId = _dataContract.parmDataAreaId();
+        ForecastModelId modelId = _dataContract.parmForecastModelId();
+        ForecastImportId importId = _dataContract.parmForecastImportId();
+
+        ForecastStagedImportPlanningDataExecutionItem demandPlanForecastExecutionItem;
+        ForecastStagedImportPlanningDataEntry demandPlanForecast;
+        
+        ttsbegin;
+
+        while select crosscompany ItemId from demandPlanForecast
+            group by demandPlanForecast.ItemId, demandPlanForecast.ProductNumber
+            where  demandPlanForecast.DataAreaId == dataAreaId
+                && (!importId
+                    || (demandPlanForecast.ImportId == importId))
+        {
+            demandPlanForecastExecutionItem.clear();
+            demandPlanForecastExecutionItem.CompanyId = dataAreaId;
+            demandPlanForecastExecutionItem.ItemId = demandPlanForecast.ItemId;
+            demandPlanForecastExecutionItem.ProductNumber = demandPlanForecast.ProductNumber;
+            demandPlanForecastExecutionItem.ProductVariantNumber = demandPlanForecast.ProductVariantNumber;
+            demandPlanForecastExecutionItem.ProcessingBundleId = bundleIds[(itemCount mod _numberOfThreads) + 1];
+
+            recordInsertList.add(demandPlanForecastExecutionItem);
+            itemCount++;
+        }
+
+        recordInsertList.insertDatabase();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerChildTreads</Name>
+				<Source><![CDATA[
+    private void registerChildTreads(ForecastImportPlanningDataContract _dataContract, ForecastImportProcessNumberOfThreads _numberOfThreads)
+    {
+        batchHeader = BatchHeader::construct();
+        batchHeader.parmCaption("@ParallelizedForecastImport:ImportServiceBatchTitle");
+
+        for (int i = 1; i <= _numberOfThreads; i++)
+        {
+            SysOperationServiceController importCompanyForecastController = new SysOperationServiceController(
+                classStr(ForecastImportPlanningDataService),
+                methodStr(ForecastImportPlanningDataService, run));
+            ForecastImportPlanningDataContract importCompanyForecastContract = importCompanyForecastController.getDataContractObject();
+
+            importCompanyForecastContract.unpack(_dataContract.pack());
+            importCompanyForecastContract.parmIsBatch(false);
+            importCompanyForecastContract.parmBundleId(bundleIds[i]);
+            batchHeader.addTask(importCompanyForecastController);
+        }
+
+        batchHeader.save();
+
+        _dataContract.parmBatchId(batchHeader.parmBatchHeaderId());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeForecastSalesFromTemplate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Fill demand forecast record based on the given parameters.
+    /// </summary>
+    /// <param name = "_forecastSalesTemplate">ForecastSales entity to be filled.</param>
+    /// <param name = "_forecastModelId">The Id of the forecast model.</param>
+    /// <param name = "_forecast">The forecast record.</param>
+    /// <param name = "_inventQty">The quantity of the demand, in inventory unit of measure.</param>
+    /// <param name = "_salesQty">The quantity of the demand, in sales unit of measure.</param>
+    /// <param name = "_salesUnitId">The symbol of the sales unit of measure of the item.</param>
+    /// <returns>Instance of sales demand.</returns>
+    protected ForecastSales initializeForecastSalesFromTemplate(
+        ForecastSales _forecastSalesTemplate,
+        ForecastModelId _forecastModelId,
+        ForecastStagedImportPlanningDataEntry _forecast,
+        Qty _inventQty,
+        Qty _salesQty,
+        UnitOfMeasureSymbol _salesUnitId)
+    {
+        ForecastSales forecastSales;
+        forecastSales.data(_forecastSalesTemplate);
+
+        forecastSales.CustAccountId = _forecast.CustomerAccountNumber;
+        forecastSales.CustGroupId = _forecast.CustomerGroupId;
+        forecastSales.ModelId = _forecastModelId;
+        forecastSales.StartDate = _forecast.ForecastStartDate;
+        forecastSales.EndDate = _forecast.ForecastStartDate;
+        forecastSales.InventQty = _inventQty;
+        forecastSales.SalesQty = _salesQty;
+        forecastSales.SalesUnitId = _salesUnitId;
+
+        forecastSales.Amount = forecastSales.calcPrice2LineAmount(forecastSales.SalesQty, true);
+
+        return forecastSales;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeDemandForecast</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes demand forecast records based on the given parameters.
+    /// </summary>
+    /// <param name = "_itemId">The Id of the item.</param>
+    /// <param name = "_inventDim">The dimension values of the demand.</param>
+    /// <returns>Instance of sales demand.</returns>
+    protected ForecastSales initializeDemandForecast(
+        ItemId _itemId,
+        InventDim _inventDim)
+    {
+        ForecastSales forecastSales;
+
+        forecastSales.ItemId = _itemId;
+
+        forecastSales.initValue();
+
+        forecastSales.Active = NoYes::Yes;
+        forecastSales.setInventDimId(_inventDim.InventDimId);
+        
+        forecastSales.BudgetMap::initDefaultWarehouse();
+        forecastSales.BudgetMap::initDefaultInventoryStatus();
+
+        forecastSales.salesPurchLineInterface().setPriceAgreement(_inventDim, true);
+
+        return forecastSales;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Launches the forecast import process.
+    /// </summary>
+    /// <param name="_dataContract">
+    ///     The data contract with runtime parameters.
+    /// </param>
+    /// <returns>
+    ///     A RefRecId for the batch group if the provided contract has set batch to true.
+    /// </returns>
+    public RefRecId run(ForecastImportPlanningDataContract _dataContract)
+    {
+        if (!FeatureStateProvider::isFeatureEnabled(ScpDemandPlanningFeature::instance()))
+        {
+            throw error(strFmt("@ParallelizedForecastImport:ScpDemandPlanningFeatureError","@ParallelizedForecastImport:ScpDemandPlanningFeature"));
+        }
+        
+
+        RefRecId batchGroupId;
+        isMainThread = _dataContract.parmBundleId() ? false : true;
+        var demandPlanInstrumentationLogger = ForecastImportPlanningDataInstrumentationLogger::createLogger(classStr(ForecastImportPlanningDataService));
+        using (var activity = demandPlanInstrumentationLogger.activities().importForecast())
+        {
+            using (var lock = ReqReaderWriterLock::construct())
+            {
+                this.safeInit(_dataContract, demandPlanInstrumentationLogger);
+
+                _dataContract.throwIfNotValid();
+               
+                if (!_dataContract.parmBundleId() && !lock.tryEnterWriterLock(#DemPlanGlobalLockName))
+                {
+                    throw error("@DMP1216");
+                }
+                
+                try
+                {
+                    if ((_dataContract.parmIsBatch() || this.isExecutingInBatch()) && isMainThread)
+                    {
+                        this.cleanupPreviousForecaseSalesPeriod(_dataContract);
+
+                        this.startChildThreads(_dataContract);
+                        batchGroupId = batchHeader.parmBatchHeaderId();
+                    }
+                    else
+                    {
+                        this.importForecastFromCube(_dataContract);
+                    }
+                }
+                catch(Exception::CLRError)
+                {
+                    throw error("@DMP1088");
+                }
+                finally
+                {
+                    lock.releaseAllLocks();
+                }
+
+            }
+        }
+
+        return batchGroupId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructInventDim</Name>
+				<Source><![CDATA[
+    private InventDim constructInventDim(InventDimGroupSetup _inventDimSetup, ForecastStagedImportPlanningDataEntry _forecast)
+    {
+        InventDim inventDim = InventProductDimension::createInventDimFromTable(_forecast);
+        this.initializeNonProductDimensionsFromForecast(inventDim, _forecast);
+
+        inventDim.clearNotCovPrDim(_inventDimSetup);
+
+        return inventDim;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeNonProductDimensionsFromForecast</Name>
+				<Source><![CDATA[
+    private void initializeNonProductDimensionsFromForecast(InventDim _inventDim, ForecastStagedImportPlanningDataEntry _forecast)
+    {
+        #InventDimDevelop
+
+        _inventDim.InventLocationId = _forecast.DeliveringWarehouseId;
+        _inventDim.InventSiteId = _forecast.DeliveringSiteId ? _forecast.DeliveringSiteId : InventLocation::find(_inventDim.InventLocationId).InventSiteId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>safeInit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Performs exception-free initialization of the current instance.
+    /// </summary>
+    /// <param name="_dataContract">
+    ///     The data contract with runtime parameters.
+    /// </param>
+    /// <param name="_instrumentationLogger">
+    ///     The instrumentation logger.
+    /// </param>
+    private void safeInit(
+        ForecastImportPlanningDataContract _dataContract,
+        ForecastImportPlanningDataInstrumentationLogger _instrumentationLogger)
+    {
+        try
+        {
+            parameters = ReqDemPlanForecastParameters::find();
+        }
+        catch
+        {
+            exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>executeReader</Name>
+				<Source><![CDATA[
+    private ForecastImportPlanningDataTableReader executeReader(ForecastImportPlanningDataContract _dataContract, DataAreaId _dataAreaId)
+    {
+        using (var activity = this.instrumentationLogger().activities().queryForecastStagedImportPlanningDataEntry())
+        {
+            ForecastStagedImportPlanningDataEntry forecast;
+
+            var bundleId = _dataContract.parmBundleId();
+            var importId = _dataContract.parmForecastImportId();
+
+            if (bundleId)
+            {
+                ForecastStagedImportPlanningDataExecutionItem executionItem;
+
+                select forecast
+                order by forecast.ProductVariantNumber, forecast.ProductNumber, forecast.ItemId
+            exists join executionItem
+                where  executionItem.ItemId == forecast.ItemId
+                    && executionItem.ProcessingBundleId == bundleId
+                    && executionItem.ProductNumber == forecast.ProductNumber
+                    && executionItem.CompanyId == _dataAreaId
+                    && forecast.DataAreaId == _dataContract.parmDataAreaId()
+                    && forecast.ForecastStartDate >= _dataContract.parmForecastStart()
+                    && forecast.ForecastStartDate <= _dataContract.parmForecastEnd()
+                    && forecast.ForecastModelId == _dataContract.parmForecastModelId()
+                    && !forecast.IsProcessed
+                    && (forecast.ImportId == importId
+                         || !importId);
+            }
+            else
+            {
+                select forecast
+                order by forecast.ProductVariantNumber, forecast.ProductNumber, forecast.ItemId
+                where forecast.DataAreaId == _dataContract.parmDataAreaId()
+                   && forecast.ForecastStartDate >= _dataContract.parmForecastStart()
+                   && forecast.ForecastStartDate <= _dataContract.parmForecastEnd()
+                   && forecast.ForecastModelId == _dataContract.parmForecastModelId()
+                   && !forecast.IsProcessed
+                   && (forecast.ImportId == importId
+                        || !importId);
+            }
+
+            return new ForecastImportPlanningDataTableReader(forecast);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBatchStatus</Name>
+				<Source><![CDATA[
+    public BatchStatus getBatchStatus(RefRecId _batchId)
+    {
+        BatchJob batchJob;
+        select Status from batchJob
+            where batchJob.RecId == _batchId;
+
+        return batchJob.Status;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanupPreviousForecaseSalesPeriod</Name>
+				<Source><![CDATA[
+    private void cleanupPreviousForecaseSalesPeriod(ForecastImportPlanningDataContract _dataContract)
+    {
+        using (var activity = this.instrumentationLogger().activities().cleanupPreviousForecaseSalesPeriod())
+        {
+            ForecastStagedImportPlanningDataExecutionItem demandPlanForecastExecutionItem;
+
+            //The ForecastDemandPlanImportService main process can not be run concurently (the lock.tryEnterWriterLock(#DemPlanGlobalLockName) is used)
+            ttsbegin;
+            delete_from demandPlanForecastExecutionItem;
+            ttscommit;
+
+            ForecastSales forecastSales;
+            ForecastInvent forecastInvent;
+
+            if (!this.isExecutingInBatch() || !_dataContract.parmIsBatch() || retryAttemptNumber < 1)
+            {
+                delete_from forecastInvent
+                exists join forecastSales
+                where   forecastSales.ModelId        == _dataContract.parmForecastModelId()
+                    &&  forecastSales.StartDate      >= _dataContract.parmForecastStart()
+                    &&  forecastSales.StartDate      <= _dataContract.parmForecastEnd()
+                    &&  forecastSales.TableId        == forecastInvent.TransTableId
+                    &&  forecastSales.RecId          == forecastInvent.TransRecId;
+
+                delete_from forecastSales
+                where   forecastSales.ModelId        == _dataContract.parmForecastModelId()
+                    &&  forecastSales.StartDate      >= _dataContract.parmForecastStart()
+                    &&  forecastSales.StartDate      <= _dataContract.parmForecastEnd();
+            }
+            // Set-based deletes may choose a poor query plan which will result in locking records for another product, consequently resulting in a deadlock
+            // We attempt the set-based strategy first (as it performs better)
+            // But if a deadlock was detected then we will fall back to record-by-record deletes
+            else
+            {
+                List inventRecIdList = new List(Types::Int64);
+                List salesRecIdList = new List(Types::Int64);
+
+                while select RecId from forecastInvent
+                exists join forecastSales
+                where   forecastSales.ModelId        == _dataContract.parmForecastModelId()
+                    &&  forecastSales.StartDate      >= _dataContract.parmForecastStart()
+                    &&  forecastSales.StartDate      <= _dataContract.parmForecastEnd()
+                    &&  forecastSales.TableId        == forecastInvent.TransTableId
+                    &&  forecastSales.RecId          == forecastInvent.TransRecId
+                {
+                    inventRecIdList.addEnd(forecastInvent.RecId);
+                }
+
+                while select RecId from forecastSales
+                where   forecastSales.ModelId        == _dataContract.parmForecastModelId()
+                    &&  forecastSales.StartDate      >= _dataContract.parmForecastStart()
+                    &&  forecastSales.StartDate      <= _dataContract.parmForecastEnd()
+                {
+                    salesRecIdList.addEnd(forecastSales.RecId);
+                }
+
+                ListEnumerator listEnumerator = inventRecIdList.getEnumerator();
+
+                while (listEnumerator.moveNext())
+                {
+                    delete_from forecastInvent where forecastInvent.RecId == listEnumerator.current();
+                }
+
+                listEnumerator = salesRecIdList.getEnumerator();
+
+                while (listEnumerator.moveNext())
+                {
+                    delete_from forecastSales where forecastSales.RecId == listEnumerator.current();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

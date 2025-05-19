@@ -1,0 +1,436 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqBOMCreate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The class <c>ReqBOMCreate</c> implements the functionality of exploding a BOM in the requirements profile.
+/// </summary>
+class ReqBOMCreate
+{
+    BOMLineConsumption  bomLineConsumption;
+    ReqTrans            reqTrans;
+    ReqPO               reqPO;
+    ReqTrans            issue;
+
+    ReqSetup            setup;
+    ReqSetupDim         setupDim;
+    ReqPlanData         reqPlanData;
+    BOMCalcData         bomCalcData;
+
+    BOMDependencyManager bomDependencyManager;
+    boolean              dlvDateForBOMFlightIsEnabled;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates derived requirement transactions for each bill of materials line.
+    /// </summary>
+    /// <param name="_reqCalcRecordCacheInventDim">
+    ///    A <c>ReqCalcRecordCacheInventDim</c> object used to cache invententory dimension information.
+    /// </param>
+    /// <param name="_reqCalcRecordCacheUnitOfMeasure">
+    ///    A <c>ReqCalcRecordCacheUnitOfMeasure</c> object used to cache unit of measure information.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// The same item ID is wrongly used for the planned order and for a bill of materials line.
+    /// </exception>
+    public void createBOM(
+        ReqCalcRecordCacheInventDim     _reqCalcRecordCacheInventDim     = null,
+        ReqCalcRecordCacheUnitOfMeasure _reqCalcRecordCacheUnitOfMeasure = null)
+    {
+        if (!reqTrans.ItemBomId || !reqPO.RecId)
+        {
+            return;
+        }
+
+        BOMTable bomTable = BomTable::find(reqTrans.ItemBomId);
+
+        BOMSearch search;
+        if (reqPO.mustExpandPhantom())
+        {
+            search = BOMSearchPhantomExpand::newParameters(
+                reqPO.ItemId, 
+                reqPO.inventDim(), 
+                reqPO.Qty, 
+                reqPO.ItemBomId, 
+                dlvDateForBOMFlightIsEnabled ? reqPO.getBOMDate() : reqPO.ReqDate,
+                bomTable, 
+                bomDependencyManager);
+        }
+        else
+        {
+            search = BOMSearch::newReqCalculation(reqPO, setup, bomTable, bomDependencyManager);
+        }
+
+        ReqBOMInventDim reqBOMInventDim = ReqBOMInventDim::newStandard(reqPO, issue);
+
+        if (reqPlanData)
+        {
+            reqBOMInventDim.parmLeanLocationCache(reqPlanData.parmLeanLocationCache());
+        }
+
+        RecordInsertList recordInsertList;
+        ReqTraceLogger reqTraceLogger = reqPlanData.reqTraceLogger();
+
+        ReqRoute reqRoute;
+        OprNum prevOprNum;
+
+        while (search.next())
+        {
+            BOM bom = search.bom();
+
+            ReqSetup childSetup = reqPlanData.newReqSetup(bom.ItemId);
+            ReqTrans reqTransBOM;
+
+            reqTransBOM.initFromParentReqTrans(reqTrans);
+            reqTransBOM.initFromBOM(bom, bomTable);
+          
+            this.updateRequirementTransactionCovInventDimId(reqTransBOM, childSetup, bom, _reqCalcRecordCacheInventDim, reqBOMInventDim);
+            
+            if (#PmfEnabled)
+            {
+                reqTransBOM.PmfPlanPriorityCurrent = reqTrans.PmfPlanPriorityCurrent; //keep same as parent
+            }
+
+            ReqSetupDim childSetupDim = reqPlanData.newReqSetupDim(childSetup, reqTransBOM.CovInventDimId);
+
+            reqTransBOM.Level = childSetupDim.itemLevel();
+
+            if (!reqRoute || (reqRoute.PlanVersion != reqTransBOM.PlanVersion || 
+                reqRoute.RefId != reqTransBOM.RefId || prevOprNum != reqTransBOM.OprNum))
+            {
+                prevOprNum = reqTransBOM.OprNum;
+                reqRoute = ReqRoute::findReqTransBOM(reqTransBOM);
+            }
+
+            UnitOfMeasureSymbol unitOfMeasure = ReqTrans::getUnitOfMeasure(childSetup.inventTable(), _reqCalcRecordCacheUnitOfMeasure);
+
+            this.updateRequirementTransactionQuantity(reqTransBOM, bom, reqRoute, bomTable, unitOfMeasure);
+            this.updateRequirementTransactionDeliveryFields(reqTransBOM, bom, reqRoute, childSetupDim);
+
+            if (reqPlanData && reqPlanData.useInsertList())
+            {
+                if (!recordInsertList)
+                {
+                    recordInsertList = new RecordInsertList(tablenum(ReqTrans),true);
+                }
+
+                reqTransBOM.insertUsingInsertList(recordInsertList, reqPlanData);
+            }
+            else
+            {
+                reqTransBOM.insert(reqPlanData);
+            }
+
+            if (reqTraceLogger.loggingEnabled())
+            {
+                reqPlanData.reqTraceLogger().writeLog(ReqTraceLogMessageDetail::newDetail(
+                    ReqTraceMessageDetailType::AddBOMLine, 
+                    [reqTransBOM.ItemId, [enumNum(ReqRefType), enum2int(reqTransBOM.RefType)], ReqTraceLogMessage::packInventDim(childSetupDim.inventDim()), reqTransBOM.ReqDate, reqTransBOM.Qty]));
+            }
+        }
+
+        if (recordInsertList)
+        {
+            recordInsertList.insertDatabase();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRequirementTransactionCovInventDimId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates a requirement transaction coverage inventory dimension ID.
+    /// </summary>
+    /// <param name = "_reqTransBOM">A requirement transaction.</param>
+    /// <param name = "_childRequirementSetup">A child requirement setup.</param>
+    /// <param name = "_bom">A bill of material instance.</param>
+    /// <param name = "_reqCalcRecordCacheInventDim">A <c>ReqCalcRecordCacheInventDim</c> object used to cache invententory dimension information.</param>
+    /// <param name = "_reqBOMInventDim">An instance of the <c>ReqBOMInventDim</c>, determines the inventory dimension to be used by a BOM line requirement.</param>
+    private void updateRequirementTransactionCovInventDimId(ReqTrans _reqTransBOM, ReqSetup _childRequirementSetup, BOM _bom, ReqCalcRecordCacheInventDim _reqCalcRecordCacheInventDim, ReqBOMInventDim _reqBOMInventDim)
+    {
+        InventDim inventDim = _reqBOMInventDim.inventDim(_reqTransBOM,_childRequirementSetup.inventTable(), _bom, setupDim,_reqCalcRecordCacheInventDim);
+        str cacheKey = inventDim.InventDimId + '#' + _childRequirementSetup.itemId();
+        Map reqCovDimIdCache = reqPlanData.getReqCovDimIdCache();
+
+        if (!reqCovDimIdCache.exists(cacheKey))
+        {
+            _reqTransBOM.CovInventDimId      = inventDim.reqCovDimId(InventDimGroupSetup::newInventTable(_childRequirementSetup.inventTable()));
+            reqCovDimIdCache.insert(cacheKey, _reqTransBOM.CovInventDimId);
+        }
+        else
+        {
+            _reqTransBOM.CovInventDimId      = reqCovDimIdCache.lookup(cacheKey);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRequirementTransactionQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates a requirement transaction quantity.
+    /// </summary>
+    /// <param name = "_reqTransBOM">A requirement transaction.</param>
+    /// <param name = "_bom">A bill of material instance.</param>
+    /// <param name = "_reqRoute">A requirement route.</param>
+    /// <param name = "_bomTable">A bill of material table instance.</param>
+    /// <param name = "_unitOfMeasure">A unit of measure.</param>
+    private void updateRequirementTransactionQuantity(
+        ReqTrans _reqTransBOM, 
+        BOM _bom, 
+        ReqRoute _reqRoute, 
+        BOMTable _bomTable, 
+        UnitOfMeasureSymbol _unitOfMeasure)
+    {
+        _reqTransBOM.Qty = -bomLineConsumption.bomConsumptionInInventUnit(_bom,
+            bomCalcData,
+            _reqRoute.AccError ? _reqRoute.AccError : 1,
+            _unitOfMeasure,
+            reqPO.PmfYieldPct,
+            _bomTable.PmfBOMFormula == PmfBOMFormula::Formula,
+            _bomTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRequirementTransactionDeliveryFields</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates delivery related requirement transaction fields.
+    /// </summary>
+    /// <param name = "_reqTransBOM">A requirement transaction.</param>
+    /// <param name = "_bom">A bill of material instance.</param>
+    /// <param name = "_reqRoute">A requirement route.</param>
+    /// <param name = "_childSetupDim">A requirement dimensions setup.</param>
+    protected void updateRequirementTransactionDeliveryFields(
+        ReqTrans _reqTransBOM,
+        BOM _bom, 
+        ReqRoute _reqRoute,
+        ReqSetupDim _childSetupDim)
+    {
+        // Default requirement date
+        if (!_reqRoute.FromDate)
+        {
+            _reqTransBOM.ReqTime = 0;
+
+            if (_reqTransBOM.Qty > 0)
+            {
+                // Use the delivery date
+                _reqTransBOM.ReqDateDlvOrig  = reqPO.ReqDateDlv;
+                _reqTransBOM.ReqDate         = reqPlanData.schedReqDateReceipt(_reqTransBOM.ReqDateDlvOrig,_childSetupDim);
+            }
+            else
+            {
+                // Use the order date if no scheduling date is available (will be changed during scheduling)
+                _reqTransBOM.ReqDateDlvOrig  = reqPO.SchedFromDate ? reqPO.SchedFromDate: reqPO.ReqDateOrder;
+                _reqTransBOM.ReqDate         = reqPlanData.schedReqDateIssue(_reqTransBOM.ReqDateDlvOrig,_childSetupDim);
+            }
+        }
+        else
+        {
+            if (_reqTransBOM.Qty > 0)
+            {
+                _reqTransBOM.ReqDateDlvOrig = _reqRoute.ToDate;
+                _reqTransBOM.ReqDate        = reqPlanData.schedReqDateReceipt(_reqTransBOM.ReqDateDlvOrig,_childSetupDim);
+                _reqTransBOM.ReqTime        = _reqRoute.ToTime;
+            }
+            else
+            {
+                _reqTransBOM.ReqDateDlvOrig = _reqRoute.FromDate;
+                _reqTransBOM.ReqDate        = reqPlanData.schedReqDateIssue(_reqTransBOM.ReqDateDlvOrig,_childSetupDim);
+                _reqTransBOM.ReqTime        = _reqRoute.FromTime;
+            }
+        }
+
+        _reqTransBOM.IsDerivedDirectly = _childSetupDim.setup().mustBeDerivedDirectly(_bom.bomType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBOMCalcData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets the <c>BOMCalcData</c> instance that is used in the BOM explosion.
+    /// </summary>
+    /// <returns>
+    ///    The <c>BOMCalcData</c> instance that is used in the BOM explosion.
+    /// </returns>
+    public BOMCalcData getBOMCalcData()
+    {
+        return bomCalcData;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the structures used in the BOM explosion.
+    /// </summary>
+    protected void init()
+    {
+        if (!reqTrans.ItemBomId || !reqPO.RecId)
+        {
+            return;
+        }
+
+        if (!reqPlanData)
+        {
+            reqPlanData = ReqPlanData::newReqPlanVersion(reqTrans.PlanVersion);
+        }
+
+        setup    = reqPlanData.newReqSetup(reqTrans.ItemId);
+        setupDim = reqPlanData.newReqSetupDim(setup, reqTrans.CovInventDimId);
+
+        bomCalcData = BOMCalcData::newInventTable(reqTrans.Qty, setup.inventTable());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+        protected void new()
+    {
+        bomLineConsumption = BOMLineConsumption::construct();
+        dlvDateForBOMFlightIsEnabled = ReqTransPoMarkFirmUseDlvDateForBOMVersionFlight::instance().isEnabled();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBOMLineConsumption</Name>
+				<Source><![CDATA[
+        public BOMLineConsumption parmBOMLineConsumption(BOMLineConsumption _bomLineConsumption = bomLineConsumption)
+    {
+        bomLineConsumption = _bomLineConsumption;
+        return bomLineConsumption;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIssue</Name>
+				<Source><![CDATA[
+        protected ReqTrans parmIssue(ReqTrans _issue = issue)
+    {
+        issue = _issue;
+        return issue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReqPlanData</Name>
+				<Source><![CDATA[
+        protected ReqPlanData parmReqPlanData(ReqPlanData _reqPlanData = reqPlanData)
+    {
+        reqPlanData = _reqPlanData;
+        return reqPlanData;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReqPO</Name>
+				<Source><![CDATA[
+        protected ReqPO parmReqPO(ReqPO _reqPO = reqPO)
+    {
+        reqPO = _reqPO;
+        return reqPO;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReqTrans</Name>
+				<Source><![CDATA[
+        protected ReqTrans parmReqTrans(ReqTrans _reqTrans = reqTrans)
+    {
+        reqTrans = _reqTrans;
+        return reqTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+        private static ReqBOMCreate construct()
+    {
+        return new ReqBOMCreate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newReqTrans</Name>
+				<Source><![CDATA[
+/// <summary>
+    ///    Initializes a new instance of the <c>ReqBOMCreate</c> class.
+    /// </summary>
+    /// <param name="_reqTrans">
+    ///    A <c>ReqTrans</c> record that is the starting point for the BOM explode.
+    /// </param>
+    /// <param name="_reqPO">
+    ///    A <c>ReqPO</c> record that represents a planned order.
+    /// </param>
+    /// <param name="_reqPlanData">
+    ///    A <c>ReqPlanData</c> object that holds master scheduling settings; optional.
+    /// </param>
+    /// <param name="_issue">
+    ///    A <c>ReqTrans</c> record that that holds the related issue requirement; optional.
+    /// </param>
+    /// <param name="_bomDependencyManager">
+    ///    A <c>BOMDependencyManager</c> instance to use for circularity check; optional.
+    /// </param>
+    /// <returns>
+    ///   A new <c>ReqBOMCreate</c> instance.
+    /// </returns>
+    public static ReqBOMCreate newReqTrans(
+        ReqTrans        _reqTrans,
+        ReqPO           _reqPO,
+        ReqPlanData     _reqPlanData = null,
+        ReqTrans                _issue       = null,
+        BOMDependencyManager    _bomDependencyManager   = null)
+    {
+        ReqBOMCreate reqBOMCreate = ReqBOMCreate::construct();
+
+        reqBOMCreate.parmReqTrans(_reqTrans);
+        reqBOMCreate.parmReqPO(_reqPO);
+        reqBOMCreate.parmReqPlanData(_reqPlanData);
+        reqBOMCreate.parmIssue(_issue);
+        reqBOMCreate.parmBOMDependencyManager(_bomDependencyManager);
+        reqBOMCreate.init();
+
+        return reqBOMCreate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBOMDependencyManager</Name>
+				<Source><![CDATA[
+    public BOMDependencyManager parmBOMDependencyManager(BOMDependencyManager _bomDependencyManager = bomDependencyManager)
+    {
+        bomDependencyManager = _bomDependencyManager;
+        return bomDependencyManager;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

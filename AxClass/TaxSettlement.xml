@@ -1,0 +1,1068 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TaxSettlement</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>TaxSettlement</c> class calculates the tax upon settlement and reverse settlement of
+///    customer and vendor transactions.
+/// </summary>
+/// <remarks>
+///    This class derives from the <see cref="T:TaxReverse" /> and works as an extension of the main tax engine.
+/// </remarks>
+final class TaxSettlement extends TaxReverse
+{
+    Voucher         invoiceVoucher;
+    tableId         invoiceTableId;
+    recId           invoiceRecId;
+    TransDate       originalTaxTransDate;
+
+    tableId         paymentTableId;
+    recId           paymentRecId;
+
+    LedgerAccount   operationAccount;
+
+    // <GEERU>
+    // container of containers [TaxTransRecID, amount]
+    container       taxRecIDsAndAmounts;
+    // </GEERU>
+    Map             taxTransReversalRecIdList;
+    Map             taxTransRecIdList;
+    boolean         hasConditionalTaxTrans;
+
+    InvoiceId       rboInvoiceId;
+    // <GTH>
+    boolean         isTaxInvoiceInfoFilled;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>afterTaxTransInserted_RU</Name>
+				<Source><![CDATA[
+    void afterTaxTransInserted_RU(TaxTrans _taxTrans)
+    {
+        if (_taxTrans.TaxOrigin == TaxOrigin::Payment)
+        {
+            taxRecIDsAndAmounts += [[_taxTrans.recID, _taxTrans.SourceTaxAmountCur]];
+        }
+
+        TaxTrans_W taxTrans_W = TaxTrans_W::findByTaxTrans(_taxTrans.RecId, true);
+        taxTrans_W.CustVendTransPostingLogTaxOrigin_W = taxWorkTrans.OriginalTaxTrans;
+        if (taxTrans_W.RecId)
+        {
+            taxTrans_W.update();
+        }
+        else
+        {
+            taxTrans_W.TaxTrans = _taxTrans.RecId;
+            taxTrans_W.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allowPostingOfReversals</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Indicates whether the tax posting should post reversal records.
+    /// </summary>
+    /// <returns>
+    ///    true if a <c>TaxTrans</c> record with a <c>TaxOrigin</c> value of the <c>TaxReversed</c> class
+    ///    should be able to post; otherwise, false.
+    /// </returns>
+    protected boolean allowPostingOfReversals()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcAndInsertTaxes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Runs through the transactions in the <see cref="TaxTrans Table" /> in order to calculate the tax and inserts transactions in the <see cref="TmpTaxWorkTrans Table" />. The calculated tax amount is
+    ///    returned.
+    /// </summary>
+    /// <param name="_ledgerPostingController">
+    ///   The ledger posting controller to use for ledger posting.
+    /// </param>
+    /// <returns>
+    ///    The calculated tax amount.
+    /// </returns>
+    protected TaxAmount calcAndInsertTaxes(LedgerPostingController _ledgerPostingController)
+    {
+        TaxTrans                taxTrans;
+        // <GTH>
+        TaxTransExtensionTH     taxTransExtensionTH;
+        // </GTH>
+        TaxAmount               taxAmount;
+        TaxTable                taxTable;
+        TaxLedgerAccountGroup   taxLedgerAccountGroup;
+
+        LedgerDimensionDefaultAccount defaultLedgerDimension;
+
+        // <GTH>
+        boolean                         isAverageVATEnabled     = TaxThaiGovCertificationFeatureChecker::isAverageVATEnabled();
+        boolean                         isUnrealizedVATEnabled  = TaxThaiGovCertificationFeatureChecker::isUnrealizedVATEnabled();
+        TaxAverageVATAdjust             taxAverageVATAdjust;
+        LedgerJournalTrans              ledgerJournalTrans;
+        LedgerJournalTransExtensionTH   ledgerJournalTransExtensionTH;
+        VendTrans                       vendTrans;
+        AccountingDistribution          accountingDistribution;
+        // </GTH>
+
+        ttsbegin;
+
+        if (isConfigurationkeyEnabled(configurationKeyNum(Retail))
+            && RetailTaxKillSwitch::isUseLegacyLogicInSettlement())
+        {
+            taxAmount = this.retailCalcAndInsertTaxes(_ledgerPostingController);
+        }
+        else
+        {
+            while select *
+                from taxTrans
+                where taxTrans.Voucher             == invoiceVoucher &&
+                        taxTrans.TransDate           == originalTaxTransDate    &&
+                        (taxTrans.TaxOrigin           == TaxOrigin::Tax ||
+                         taxTrans.TaxOrigin           == TaxOrigin::Transfer) &&
+                        (taxTrans.TaxDirection       == TaxDirection::IncomingTax ||
+                         taxTrans.TaxDirection       == TaxDirection::OutgoingTax ||
+                         taxTrans.TaxDirection       == TaxDirection::TaxExemptPurchase ||
+                         taxTrans.TaxDirection       == TaxDirection::TaxExemptSales ||
+                         taxTrans.TaxDirection       == TaxDirection::UseTax)
+                join PaymentTaxCode from taxTable
+                where taxTable.TaxCode         == taxTrans.TaxCode           &&
+                            taxTable.PaymentTaxCode  != ''
+            {
+                // <GTH>
+                if (isUnrealizedVATEnabled)
+                {
+                    taxTransExtensionTH = taxTrans.taxTransExtensionTH();
+
+                    boolean skippedTaxDirections = TaxSkipToReverseUnrealizedVatInVendPayment_THFlight::instance().isEnabled() 
+                                ? (taxTrans.TaxDirection == TaxDirection::IncomingTax || taxTrans.TaxDirection == TaxDirection::OutgoingTax) 
+                                : (taxTrans.TaxDirection == TaxDirection::IncomingTax);
+
+                    if (skippedTaxDirections
+                        && !this.parmIsTaxInvoiceInfoFilled()
+                        && (!taxTransExtensionTH.TaxInvoiceId || !taxTransExtensionTH.TaxInvoiceDate || !taxTransExtensionTH.TaxInvoiceReceiptDate))
+                    {
+                        if (paymentTableId == tableNum(VendTrans))
+                        {
+                            vendTrans = VendTrans::find(paymentRecId);
+                            ledgerJournalTrans = LedgerJournalTrans::findJournalForVoucher(vendTrans.Voucher, vendTrans.TransDate);
+                            ledgerJournalTransExtensionTH = ledgerJournalTransExtensionTH::findByLedgerJournalTrans(ledgerJournalTrans.RecId);
+                            if (!ledgerJournalTrans.DocumentNum || !ledgerJournalTrans.DocumentDate || !ledgerJournalTransExtensionTH.TaxInvoiceReceiptDate)
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // </GTH>
+
+                taxWorkTrans.clear();
+                this.initTaxWorkTransLedgerDimensions(taxTrans);
+
+                if (this.checkBalancedTaxes(taxTrans, invoiceVoucher, originalTaxTransDate, taxWorkTrans.OperationLedgerDimension))
+                {
+                    taxWorkTrans.initFromTaxTrans(taxTrans);
+                    taxWorkTrans.HeadingTableId         = headingTableId;
+                    taxWorkTrans.HeadingRecId           = headingRecId;
+                    taxWorkTrans.SourceTableId          = this.sourceTableId();
+                    taxWorkTrans.SourceRecId            = this.sourceRecId();
+                    taxWorkTrans.InvoiceRecId           = invoiceRecId;
+                    taxWorkTrans.Source                 = taxModuleType;
+                    taxWorkTrans.Voucher                = voucher;
+                    taxWorkTrans.TransDate              = taxDate;
+                    taxWorkTrans.CalculationDate        = taxDate;
+                    taxWorkTrans.SourceCurrencyCode     = sourceCurrencyCode;
+                    taxWorkTrans.VatDueDate_W           = taxDate;
+
+                    // If 'Reverse sales tax on cash discount' is unmarked then the taxes should be settled
+                    // for original settling amount including cash discount during invoice settlement with conditional tax.
+                    // The query condition above where taxTable.paymentTaxCode != '' determines that the settlement is done for conditional tax,
+                    // therefore it is not part of the below if condition.
+                    boolean isSettlingInvoice = invoiceRecId && paymentRecId;
+                    TaxGroupHeading taxGroupHeading = TaxGroupHeading::find(taxTrans.TaxGroup);
+
+                    boolean shouldReverseTaxOnCashDisc = taxGroupHeading.TaxReverseOnCashDisc;
+                    boolean cashDiscVAT = VendParameters::find().CashDiscVAT;
+
+                    if (invoiceTableId == tableNum(CustInvoiceJour)
+                        || invoiceTableId == tableNum(VendInvoiceJour)
+                        || invoiceTableId == tableNum(ProjInvoiceJour))
+                    {
+                        TaxIntegrationTaxJurisdictionParameters taxIntegrationTaxJurisdictionParameters = TaxIntegrationFacade::getTaxJurisdictionParameters(invoiceTableId, invoiceRecId);
+
+                        if (taxIntegrationTaxJurisdictionParameters && !taxIntegrationTaxJurisdictionParameters.empty())
+                        {
+                            shouldReverseTaxOnCashDisc = taxIntegrationTaxJurisdictionParameters.shouldReverseTaxOnCashDisc();
+                            cashDiscVAT = taxIntegrationTaxJurisdictionParameters.isCashDiscCalculatedOnAmountInclTaxForVend();
+                        }
+                    }
+
+                    if (isSettlingInvoice && !shouldReverseTaxOnCashDisc &&
+                            (!SysCountryRegionCode::isLegalEntityInCountryRegion([#isoES]) || !(cashDiscVAT)))
+                    {
+                        this.adjustByPercentage(true, taxTrans.SourceCurrencyCode, percentIncludingCashDiscount);
+                    }
+                    else
+                    {
+                        this.adjustByPercentage(true, taxTrans.SourceCurrencyCode);
+                    }
+
+                    taxWorkTrans.TaxReports = NoYes::Yes;
+                    taxWorkTrans.ExemptTax  = NoYes::No;
+                    taxWorkTrans.TaxOrigin  = TaxOrigin::TaxReversed;
+                    taxWorkTrans.Txt        = enum2str(TaxOrigin::TaxReversed);
+                    // <GTH>
+                    if (isAverageVATEnabled)
+                    {
+                        taxWorkTrans.TaxUnrealizedRefRecId = taxTrans.RecId;
+
+                        if (taxTrans.SourceDocumentLine != 0
+                            && taxTrans.TaxOrigin       != TaxOrigin::Payment
+                            && taxTrans.TaxOrigin       != TaxOrigin::TaxReversed)
+                        {
+                            select firstOnly LedgerDimension
+                                from accountingDistribution
+                                    where accountingDistribution.SourceDocumentLine == taxTrans.SourceDocumentLine
+                                        && accountingDistribution.MonetaryAmount    == MonetaryAmount::Tax;
+
+                            if (accountingDistribution)
+                            {
+                                taxWorkTrans.LedgerDimension = accountingDistribution.LedgerDimension;
+                            }
+                        }
+                    }
+                    // </GTH>
+                    taxWorkTrans.insert();
+                    taxTransReversalRecIdList.insert(taxWorkTrans.RecId, taxTrans.RecId);
+
+                    // if there was a gain loss due to exchange rates then we need to
+                    // adjust TaxTrans to reflect that gain or loss.
+                    this.adjustTaxTransDueToExchangeRateGainLoss(taxTrans, _ledgerPostingController);
+                    taxTransReversalRecIdList.insert(taxWorkTrans.RecId, taxTrans.RecId);
+
+                    taxWorkTrans.TaxCode                = taxTable.PaymentTaxCode;
+                    taxWorkTrans.TaxBaseAmount          = -taxWorkTrans.TaxBaseAmount;
+                    taxWorkTrans.TaxAmount              = -taxWorkTrans.TaxAmount;
+                    taxWorkTrans.TaxInCostPrice         = -taxWorkTrans.TaxInCostPrice;
+                    taxWorkTrans.TaxInCostPriceMST      = -taxWorkTrans.TaxInCostPriceMST;
+                    taxWorkTrans.TaxBaseAmountCur       = -taxWorkTrans.TaxBaseAmountCur;
+                    taxWorkTrans.TaxBaseAmountRep       = -taxWorkTrans.TaxBaseAmountRep;
+                    taxWorkTrans.TaxAmountCur           = -taxWorkTrans.TaxAmountCur;
+                    taxWorkTrans.TaxAmountRep           = -taxWorkTrans.TaxAmountRep;
+                    taxWorkTrans.TaxInCostPriceCur      = -taxWorkTrans.TaxInCostPriceCur;
+                    taxWorkTrans.TaxInCostPriceRep      = -taxWorkTrans.TaxInCostPriceRep;
+                    taxWorkTrans.SourceBaseAmountCur    = -taxWorkTrans.SourceBaseAmountCur;
+                    taxWorkTrans.SourceTaxAmountCur     = -taxWorkTrans.SourceTaxAmountCur;
+
+                    taxLedgerAccountGroup = TaxLedgerAccountGroup::find(TaxTable::find(taxTable.PaymentTaxCode).TaxAccountGroup);
+                    defaultLedgerDimension = taxLedgerAccountGroup.taxLedgerDimension(taxTrans.TaxDirection);
+
+                    // Apply the default dimensions passed in.
+                    if (defaultLedgerDimension)
+                    {
+                        taxWorkTrans.LedgerDimension = LedgerDimensionFacade::serviceLedgerDimensionFromLedgerDims(defaultLedgerDimension, taxWorkTrans.LedgerDimension);
+                        if (taxTrans.TaxDirection == TaxDirection::UseTax)
+                        {
+                            taxWorkTrans.TaxOffsetUseTaxLedgerDimension = LedgerDimensionFacade::serviceLedgerDimensionFromLedgerDims(taxLedgerAccountGroup.TaxOffsetUseTaxLedgerDimension, taxWorkTrans.LedgerDimension);
+                        }
+                    }
+
+                    taxWorkTrans.TaxOrigin  = TaxOrigin::Payment;
+                    taxWorkTrans.Txt        = enum2str(TaxOrigin::Payment);
+                    // <GTH>
+                    if (isAverageVATEnabled)
+                    {
+                        taxWorkTrans.TaxUnrealizedRefRecId = taxTrans.RecId;
+
+                        taxAverageVATAdjust = TaxAverageVATAdjust::construct(taxTrans, taxWorkTrans, _ledgerPostingController);
+                        taxAverageVATAdjust.adjustNow();
+                    }
+                    // </GTH>
+
+                    taxWorkTrans.OriginalTaxTrans       = taxWorkTrans.OriginalTaxTrans;
+                    taxWorkTrans.TaxId                  = taxWorkTrans.TaxId;
+                    taxWorkTrans.insert();
+                    taxTransRecIdList.insert(taxWorkTrans.RecId, taxTrans.RecId);
+
+                    hasConditionalTaxTrans = true;
+                }
+            }
+        }
+        ttscommit;
+
+        return taxAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcAndPost</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calls the <c>calcAndInsertTaxes</c> method and then the <c>saveAndPost</c> method.
+    /// </summary>
+    /// <param name="_ledgerPostingController">
+    ///    The ledger posting controller to use for ledger posting.
+    /// </param>
+    /// <returns>
+    ///    The tax amount that is calculated in the <c>CalcAndInsertTaxes</c> method.
+    /// </returns>
+    public TaxAmount calcAndPost(LedgerPostingController _ledgerPostingController)
+    {
+        TaxAmount taxAmount = 0;
+
+        this.initLedgerPosting(_ledgerPostingController);
+
+        if (percent && invoiceRecId && paymentTableId && paymentRecId)
+        {
+            temporaryLedgerPostingJournal = _ledgerPostingController.getJournal();
+
+            taxAmount = this.calcAndInsertTaxes(_ledgerPostingController);
+
+            this.saveAndPost(_ledgerPostingController);
+        }
+
+        return taxAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canChargeBePostedByTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Indicates whether the sales tax charge can be posted by tax.
+    /// </summary>
+    /// <returns>
+    ///    true if tax should post the sales tax charge; otherwise, false if the transaction will post the
+    ///    sales tax charge.
+    /// </returns>
+    protected boolean canChargeBePostedByTax()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkBalancedTaxes</Name>
+				<Source><![CDATA[
+    protected boolean checkBalancedTaxes(TaxTrans _taxTrans, Voucher _voucher, TransDate _invoiceDate, LedgerDimensionAccount _transactionLineAccount)
+    {
+        TaxTrans taxTransOffset;
+        TaxTrans taxTransSettled;
+
+        TaxTransGeneralJournalAccountEntry taxTransGeneralJournalAccountEntry;
+
+        select firstonly Voucher, TransDate from taxTransOffset
+            where taxTransOffset.TaxOrigin        == TaxOrigin::TaxReversed     &&
+                  taxTransOffset.TransDate        == _invoiceDate               &&
+                  taxTransOffset.Voucher          == _voucher                   &&
+                  taxTransOffset.TaxCode          == _taxTrans.TaxCode
+            join RecId from taxTransGeneralJournalAccountEntry
+            where taxTransOffset.RecId == taxTransGeneralJournalAccountEntry.TaxTrans &&
+                  taxTransGeneralJournalAccountEntry.TaxTransRelationship == TaxTransRelationshipType::TransactionLineAccount &&
+                  taxTransGeneralJournalAccountEntry.LedgerDimension == _transactionLineAccount;
+            
+        if (!taxTransOffset)
+            return true;
+
+        select firstonly RecId from taxTransSettled
+            where taxTransSettled.Voucher   == taxTransOffset.Voucher    &&
+                  taxTransSettled.TransDate == taxTransOffset.TransDate  &&
+                  taxTransSettled.TaxOrigin == TaxOrigin::Payment;
+
+        return taxTransSettled.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkParameters</Name>
+				<Source><![CDATA[
+    boolean checkParameters(Voucher         _voucher        = '',
+                           TransDate        _transDate      = _transDate,
+                           recId            _invoiceRecId   = 0 ,
+                           tableId          _paymentTableId = 0,
+                           recId            _paymentRecId   = 0)
+    {
+        boolean ok      = true;
+
+        if (! _voucher || ! _transDate)
+        {
+            ok =  checkFailed(strFmt("@SYS27147", funcName()));
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>exchRate</Name>
+				<Source><![CDATA[
+    ExchRate exchRate(date _date = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+    {
+        return exchRate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getContainers_W</Name>
+				<Source><![CDATA[
+    container getContainers_W()
+    {
+        return taxRecIDsAndAmounts;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTaxTrans</Name>
+				<Source><![CDATA[
+    void initTaxTrans(TaxTrans _taxTrans, NumberSequenceCode _voucherSeriesCode)
+    {
+        TaxTable taxTable;
+
+        super(_taxTrans, _voucherSeriesCode);
+
+        if (_taxTrans.TaxOrigin == TaxOrigin::Payment)
+        {
+            select firstonly TaxCode from taxTable
+                where taxTable.PaymentTaxCode == _taxTrans.TaxCode;
+    /*
+            _taxTrans.TaxExcludeBasePct = TaxData::find( taxTable.TaxCode,
+                                                        _taxTrans.TransDate,
+                                                        _taxTrans.TaxBaseAmount).excludeBasePct;*/
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    void new(Voucher        _invoiceVoucher,
+             TransDate      _invoiceDate,
+             tableId        _invoiceTableId,
+             recId          _invoiceRecId,
+             CurrencyCode   _currencyCode,
+             tableId        _paymentTableId,
+             recId          _paymentRecId,
+             Percent        _percent,
+             ExchRate       _exchRate           = 0,
+             ExchRate       _exchRateSecond     = 0,
+             UnknownNoYes   _triangulation      = UnknownNoYes::Unknown)
+    {
+        super(_percent);
+
+        if (_percent != 0)
+        {
+            if (! this.checkParameters(_invoiceVoucher,
+                                       _invoiceDate,
+                                       _invoiceRecId,
+                                       _paymentTableId,
+                                       _paymentRecId))
+            {
+                throw error("@SYS18447");
+            }
+
+            invoiceVoucher  = _invoiceVoucher;
+            originalTaxTransDate = _invoiceDate;
+            invoiceTableId  = _invoiceTableId;
+            invoiceRecId    = _invoiceRecId;
+            paymentTableId  = _paymentTableId;
+            paymentRecId        = _paymentRecId;
+
+            headingTableId  = invoiceTableId;
+            headingRecId    = invoiceRecId;
+            taxModuleType   = TaxModuleType::Voucher;
+
+            this.setExchRates(_currencyCode, _exchRate, _exchRateSecond,_triangulation, taxDate);
+        }
+
+        taxTransReversalRecIdList = new Map(Types::Int64, Types::Int64);
+        taxTransRecIdList = new Map(Types::Int64, Types::Int64);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsTaxInvoiceInfoFilled</Name>
+				<Source><![CDATA[
+    public boolean parmIsTaxInvoiceInfoFilled(boolean _isTaxInvoiceInfoFilled = isTaxInvoiceInfoFilled)
+    {
+        isTaxInvoiceInfoFilled = _isTaxInvoiceInfoFilled;
+
+        return isTaxInvoiceInfoFilled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>post</Name>
+				<Source><![CDATA[
+    protected void post(LedgerPostingController _ledgerPostingController,
+                        TaxTrans                _taxTrans,
+                        TaxAmount               _taxAmount,
+                        TaxAmount               _chargeAmount,
+                        CurrencyExchangeHelper  _exchRateHelper,
+                        LedgerDimensionAccount  _ledgerDimension,
+                        LedgerDimensionAccount  _operationLedgerDimension,
+                        LedgerDimensionAccount  _taxOffsetUseTaxLedgerDimension,
+                        LedgerDetailLevel       _ledgerDetailLevel  = LedgerDetailLevel::AsDefault,
+                        ProjLedger              _projLedger = null
+                        ,LedgerDimensionAccount _offsetLedgerDimension = 0,
+                        AmountMSTSecondary      _amountMSTSecondary    = 0
+                        )
+    {
+        TaxTransGeneralJournalAccountEntryRecId taxLinkRecId;
+        TaxTransRecId                           originalInvoiceTaxTransRecId;
+        LedgerVoucherObject                     ledgerVoucherObject;
+        LedgerVoucherTransList                  list;
+        LedgerVoucherTransObject                transaction;
+        boolean                                 transactionFound, taxRelationFound;
+        TaxTrans                                taxTransLoc;
+
+        if (taxWorkTrans.RecId && taxTransReversalRecIdList.exists(taxWorkTrans.RecId))
+        {
+            originalInvoiceTaxTransRecId = taxTransReversalRecIdList.lookup(taxWorkTrans.RecId);
+            taxTransReversalRecIdList.insert(originalInvoiceTaxTransRecId, _taxTrans.RecId);
+            taxTransReversalRecIdList.remove(taxWorkTrans.RecId);
+        }
+        else if (taxWorkTrans.RecId && taxTransRecIdList.exists(taxWorkTrans.RecId))
+        {
+            originalInvoiceTaxTransRecId = taxTransRecIdList.lookup(taxWorkTrans.RecId);
+            taxTransRecIdList.insert(originalInvoiceTaxTransRecId, _taxTrans.RecId);
+            taxTransRecIdList.remove(taxWorkTrans.RecId);
+        }
+
+        if (originalInvoiceTaxTransRecId != 0)
+        {
+            taxLinkRecId = TaxTransGeneralJournalAccountEntry::getTaxLinkRecIdForTaxTrans(originalInvoiceTaxTransRecId, TaxTransRelationshipType::Tax);
+
+             // if the document being settled has not been posted, the tax links above will not return values.
+             // We will discover the records using the Ledger posting framework
+
+             if (!taxLinkRecId && relatedLedgerVoucher)
+             {
+                select firstonly Voucher, TransDate, SourceTableId, SourceRecId from taxTransLoc
+                where taxTransLoc.RecId == originalInvoiceTaxTransRecId;
+
+                ledgerVoucherObject = relatedLedgerVoucher.findReference(taxTransLoc.Voucher, taxTransLoc.TransDate, relatedLedgerVoucher.lastPostingLayer());
+                if (ledgerVoucherObject)
+                {
+                     list = ledgerVoucherObject.getInternalCollection();
+                     transactionFound = list.first();
+                     while (transactionFound)
+                    {
+                        transaction = list.item();
+                        if (transaction.parmTaxParentReferenceTableId() == taxTransLoc.SourceTableId
+                              && transaction.parmTaxParentReferenceRecId() == taxTransLoc.SourceRecId)
+                        {
+                            taxRelationFound = true;
+                            break;
+                        }
+                        transactionFound = list.next();
+                    }
+                }
+            }
+
+            if (taxLinkRecId != 0 || taxRelationFound || hasConditionalTaxTrans)
+            {
+                // If the original invoice tax trans has a tax link (ie. it's posted to GL), only then we should post the corresponding reversing and payment TaxTrans to GL
+                // by invoking super() otherwise don't post it to GL.
+                super(_ledgerPostingController,
+                  _taxTrans,
+                  _taxAmount,
+                  _chargeAmount,
+                  _exchRateHelper,
+                  _ledgerDimension,
+                  _operationLedgerDimension,
+                  _taxOffsetUseTaxLedgerDimension,
+                  _ledgerDetailLevel,
+                  _projLedger
+                  // <GEERU>
+                  ,_offsetLedgerDimension,
+                  _amountMSTSecondary
+                  // </GEERU>
+                  );
+            }
+        }
+        else
+        {
+            // Post to GL only if the current taxWorkTrans record doesn't have an associated original invoice tax trans that is being settled.
+            // Note: This can occur in case of Tax Settlement with foreign currency re-evaluation, where a different exchange rate is used during settlement than invoicing.
+            // In these cases, the tax transactions generated for "exchange rate gain/loss" needs to be posted to GL
+            super(_ledgerPostingController,
+                _taxTrans,
+                _taxAmount,
+                _chargeAmount,
+                _exchRateHelper,
+                _ledgerDimension,
+                _operationLedgerDimension,
+                _taxOffsetUseTaxLedgerDimension,
+                _ledgerDetailLevel,
+                _projLedger
+                // <GEERU>
+                ,_offsetLedgerDimension,
+                _amountMSTSecondary
+                // </GEERU>
+                );
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RBOSetInvoiceId</Name>
+				<Source><![CDATA[
+    [SysObsolete('This method is deprecated', false, 23\7\2022)]
+    void RBOSetInvoiceId(InvoiceId _invoiceId)
+    {
+        throw error(Error::wrongUseOfFunction(funcName()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retailCalcAndInsertTaxes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the tax and inserts records in the <c>TmpTaxWorkTrans</c> table based on records in the
+    /// <c>TaxTrans</c> table.
+    /// </summary>
+    /// <param name="_ledgerPostingController">
+    /// The ledger posting controller to use to post to the ledger.
+    /// </param>
+    /// <returns>
+    /// The calculated tax amount.
+    /// </returns>
+    protected TaxAmount retailCalcAndInsertTaxes(LedgerPostingController _ledgerPostingController)
+    {
+        TaxTrans                taxTrans;
+        // <GTH>
+        TaxTransExtensionTH     taxTransExtensionTH;
+        // </GTH>
+        TaxAmount               taxAmount;
+        TaxTable                taxTable;
+
+        // <GTH>
+        boolean                         isUnrealizedVATEnabled  = TaxThaiGovCertificationFeatureChecker::isUnrealizedVATEnabled();
+        LedgerJournalTrans              ledgerJournalTrans;
+        LedgerJournalTransExtensionTH   ledgerJournalTransExtensionTH;
+        VendTrans                       vendTrans;
+        // </GTH>
+
+        ttsbegin;
+
+        while select *
+            from taxTrans
+            where taxTrans.Voucher             == invoiceVoucher &&
+                taxTrans.TransDate           == originalTaxTransDate    &&
+                (taxTrans.TaxOrigin           == TaxOrigin::Tax ||
+                    taxTrans.TaxOrigin           == TaxOrigin::Transfer) &&
+                (taxTrans.TaxDirection       == TaxDirection::IncomingTax ||
+                    taxTrans.TaxDirection       == TaxDirection::OutgoingTax ||
+                    taxTrans.TaxDirection       == TaxDirection::TaxExemptPurchase ||
+                    taxTrans.TaxDirection       == TaxDirection::TaxExemptSales ||
+                    taxTrans.TaxDirection       == TaxDirection::UseTax)
+            join PaymentTaxCode from taxTable
+            where taxTable.TaxCode         == taxTrans.TaxCode           &&
+                        taxTable.PaymentTaxCode  != ''
+        {
+            // <GTH>
+            if (isUnrealizedVATEnabled)
+            {
+                taxTransExtensionTH = taxTrans.taxTransExtensionTH();
+
+                if (taxTrans.TaxDirection == TaxDirection::IncomingTax
+                    && !this.parmIsTaxInvoiceInfoFilled()
+                    && (!taxTransExtensionTH.TaxInvoiceId || !taxTransExtensionTH.TaxInvoiceDate || !taxTransExtensionTH.TaxInvoiceReceiptDate))
+                {
+                    if (paymentTableId == tableNum(VendTrans))
+                    {
+                        vendTrans = VendTrans::find(paymentRecId);
+                        ledgerJournalTrans = LedgerJournalTrans::findJournalForVoucher(vendTrans.Voucher, vendTrans.TransDate);
+                        ledgerJournalTransExtensionTH = ledgerJournalTransExtensionTH::findByLedgerJournalTrans(ledgerJournalTrans.RecId);
+                        if (!ledgerJournalTrans.DocumentNum || !ledgerJournalTrans.DocumentDate || !ledgerJournalTransExtensionTH.TaxInvoiceReceiptDate)
+                        {
+                            continue;
+                        }
+                    }
+                }
+            }
+            // </GTH>
+
+            taxWorkTrans.clear();
+            this.initTaxWorkTransLedgerDimensions(taxTrans);
+
+            if (this.checkBalancedTaxes(taxTrans, invoiceVoucher, originalTaxTransDate, taxWorkTrans.OperationLedgerDimension))
+            {
+                this.initTaxWorkTrans(taxTrans);
+                taxWorkTrans.insert();
+                taxTransReversalRecIdList.insert(taxWorkTrans.RecId, taxTrans.RecId);
+                hasConditionalTaxTrans = true;
+
+                // if there was a gain loss due to exchange rates then we need to
+                // adjust TaxTrans to reflect that gain or loss.
+                this.adjustTaxTransDueToExchangeRateGainLoss(taxTrans, _ledgerPostingController);
+                taxTransReversalRecIdList.insert(taxWorkTrans.RecId, taxTrans.RecId);
+
+                this.initPaymentTaxWorkTrans(taxTrans, _ledgerPostingController, taxTable);
+                taxWorkTrans.insert();
+                taxTransRecIdList.insert(taxWorkTrans.RecId, taxTrans.RecId);
+            }
+        }
+        ttscommit;
+
+        return taxAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reverseLinks</Name>
+				<Source><![CDATA[
+    public void reverseLinks(TaxTransRelationshipType _taxTransRelationshipType)
+    {
+        MapEnumerator mapEnumerator;
+
+        mapEnumerator = taxTransReversalRecIdList.getEnumerator();
+
+        while (mapEnumerator.moveNext())
+        {
+            TaxTransGeneralJournalAccountEntry::reversePostedByTaxTrans(mapEnumerator.currentKey(), _taxTransRelationshipType, taxTransReversalRecIdList);
+        }
+
+        mapEnumerator = taxTransRecIdList.getEnumerator();
+
+        while (mapEnumerator.moveNext())
+        {
+            TaxTransGeneralJournalAccountEntry::reversePostedByTaxTrans(mapEnumerator.currentKey(), _taxTransRelationshipType, taxTransRecIdList);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sourceRecId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the record ID of the transaction line to calculate.
+    /// </summary>
+    /// <returns>
+    /// The record ID of the transaction line to calculate.
+    /// </returns>
+    public recId sourceRecId()
+    {
+        return paymentRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sourceTableId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the table ID of the transaction to tax.
+    /// </summary>
+    /// <returns>
+    /// The ID of the transaction to tax.
+    /// </returns>
+    public RefTableId sourceTableId()
+    {
+        return paymentTableId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>conditionalVat</Name>
+				<Source><![CDATA[
+    static boolean conditionalVat(CustVendTrans custVendTrans, CompanyId _company = curext())
+    {
+        LedgerJournalTrans  ledgerJournalTrans;
+        TaxTable            taxTable;
+        TaxTrans            taxTrans;
+        TaxTrans            reversedTaxTrans;
+        LedgerJournalVoucherChanged ledgerJournalVoucherChanged;
+
+        TaxTransGeneralJournalAccountEntry taxTransGeneralJournalAccountEntry;
+        DimensionAttributeValueCombination dimensionAttributeValueCombination, reversedDimensionAttributeValueCombination;
+
+        changecompany(_company)
+        {
+            // If taxes have already been reveresed, then this settlement does not need to create a tax settlement.
+            while select RecId from ledgerJournalTrans
+            where   ledgerJournalTrans.VendTransId == custVendTrans.RecId
+            {
+                select RecId, Voucher, TaxAmount from taxTrans
+                    where   taxTrans.SourceTableId      == ledgerJournalTrans.TableId &&
+                        taxTrans.SourceRecId        == ledgerJournalTrans.RecId &&
+                        taxTrans.ExemptTax          == NoYes::No &&
+                        (taxTrans.TaxDirection      == TaxDirection::IncomingTax ||
+                        taxTrans.TaxDirection       == TaxDirection::OutgoingTax ||
+                        taxTrans.TaxDirection       == TaxDirection::UseTax)
+                join RecId from taxTable
+                where taxTable.TaxCode  == taxTrans.TaxCode &&
+                    taxTable.PaymentTaxCode != '' &&
+                    taxTable.TaxBase        != TaxBaseType::AmountByUnit
+                join RecId, TaxTransRelationship, LedgerDimension from taxTransGeneralJournalAccountEntry
+                where taxTrans.RecId == taxTransGeneralJournalAccountEntry.TaxTrans &&
+                    taxTransGeneralJournalAccountEntry.TaxTransRelationship == TaxTransRelationshipType::Tax
+                join  RecId, Hash from dimensionAttributeValueCombination
+                where dimensionAttributeValueCombination.RecId == taxTransGeneralJournalAccountEntry.LedgerDimension;
+
+                if (dimensionAttributeValueCombination.RecId)
+                {
+                    select RecId from reversedTaxTrans
+                    where   reversedTaxTrans.Voucher    == taxTrans.Voucher &&
+                            reversedTaxTrans.TaxOrigin  == TaxOrigin::TaxReversed &&
+                            reversedTaxTrans.TaxAmount  == -taxTrans.TaxAmount
+                    join RecId, TaxTransRelationship, LedgerDimension from taxTransGeneralJournalAccountEntry
+                    where taxTrans.RecId == taxTransGeneralJournalAccountEntry.TaxTrans &&
+                          taxTransGeneralJournalAccountEntry.TaxTransRelationship == TaxTransRelationshipType::Tax
+                    join RecId from reversedDimensionAttributeValueCombination
+                    where (reversedDimensionAttributeValueCombination.RecId == taxTransGeneralJournalAccountEntry.LedgerDimension  &&
+                             reversedDimensionAttributeValueCombination.Hash == dimensionAttributeValueCombination.Hash);
+
+                    if (reversedTaxTrans.RecId != 0)
+                    {
+                        return false;
+                    }
+                    else
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            if (custVendTrans.TableId == tablenum(VendTrans))
+            {
+                ledgerJournalVoucherChanged = LedgerJournalVoucherChanged::findFromVendTrans(custVendTrans);
+            }
+
+            select firstonly RecId from taxTrans
+                where taxTrans.Voucher             == (ledgerJournalVoucherChanged.RecId ? ledgerJournalVoucherChanged.ToVoucher : custVendTrans.Voucher) &&
+                      taxTrans.TransDate           == (ledgerJournalVoucherChanged.RecId ? ledgerJournalVoucherChanged.ToDate : custVendTrans.TransDate)    &&
+                      taxTrans.ExemptTax           == NoYes::No                  &&
+                      (taxTrans.TaxOrigin           == TaxOrigin::Tax            ||
+                       taxTrans.TaxOrigin           == TaxOrigin::Transfer)      &&
+                      (taxTrans.TaxDirection       == TaxDirection::IncomingTax  ||
+                       taxTrans.TaxDirection       == TaxDirection::OutgoingTax  ||
+                       taxTrans.TaxDirection       == TaxDirection::UseTax)
+                exists join RecId from taxTable
+                    where taxTable.TaxCode         == taxTrans.TaxCode           &&
+                          taxTable.PaymentTaxCode  != ''                         &&
+                          taxTable.TaxBase         != TaxBaseType::AmountByUnit;
+        }
+
+        return taxTrans.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTaxWorkTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>TmpTaxWorkTrans</c> table based on records in the <c>TaxTrans</c> table.
+    /// </summary>
+    /// <param name = "_taxTrans">
+    /// The buffer of <c>TaxTrans</c> records.
+    /// </param>
+    protected void initTaxWorkTrans(TaxTrans _taxTrans)
+    {
+        AccountingDistribution          accountingDistribution;
+        boolean                         isAverageVATEnabled     = TaxThaiGovCertificationFeatureChecker::isAverageVATEnabled();
+
+        taxWorkTrans.initFromTaxTrans(_taxTrans);
+        taxWorkTrans.HeadingTableId         = headingTableId;
+        taxWorkTrans.HeadingRecId           = headingRecId;
+        taxWorkTrans.SourceTableId          = this.sourceTableId();
+        taxWorkTrans.SourceRecId            = this.sourceRecId();
+        taxWorkTrans.InvoiceRecId           = invoiceRecId;
+        taxWorkTrans.Source                 = taxModuleType;
+        taxWorkTrans.Voucher                = voucher;
+        taxWorkTrans.TransDate              = taxDate;
+        taxWorkTrans.CalculationDate        = taxDate;
+        taxWorkTrans.SourceCurrencyCode     = sourceCurrencyCode;
+        taxWorkTrans.VatDueDate_W           = taxDate;
+
+        // If 'Reverse sales tax on cash discount' is unmarked then the taxes should be settled
+        // for original settling amount including cash discount during invoice settlement with conditional tax.
+        // The query condition above where taxTable.paymentTaxCode != '' determines that the settlement is done for conditional tax,
+        // therefore it is not part of the below if condition.
+        boolean isSettlingInvoice = invoiceRecId && paymentRecId;
+        TaxGroupHeading taxGroupHeading = TaxGroupHeading::find(_taxTrans.TaxGroup);
+
+        boolean shouldReverseTaxOnCashDisc = taxGroupHeading.TaxReverseOnCashDisc;
+        boolean cashDiscVAT = VendParameters::find().CashDiscVAT;
+
+        if (invoiceTableId == tableNum(CustInvoiceJour)
+            || invoiceTableId == tableNum(VendInvoiceJour))
+        {
+            TaxIntegrationTaxJurisdictionParameters taxIntegrationTaxJurisdictionParameters = TaxIntegrationFacade::getTaxJurisdictionParameters(invoiceTableId, invoiceRecId);
+
+            if (taxIntegrationTaxJurisdictionParameters && !taxIntegrationTaxJurisdictionParameters.empty())
+            {
+                shouldReverseTaxOnCashDisc = taxIntegrationTaxJurisdictionParameters.shouldReverseTaxOnCashDisc();
+                cashDiscVAT = taxIntegrationTaxJurisdictionParameters.isCashDiscCalculatedOnAmountInclTaxForVend();
+            }
+        }
+
+        if (isSettlingInvoice && !shouldReverseTaxOnCashDisc &&
+            (!SysCountryRegionCode::isLegalEntityInCountryRegion([#isoES]) || !(cashDiscVAT)))
+        {
+            this.adjustByPercentage(true, _taxTrans.SourceCurrencyCode, percentIncludingCashDiscount);
+        }
+        else
+        {
+            this.adjustByPercentage(true, _taxTrans.SourceCurrencyCode);
+        }
+
+        taxWorkTrans.TaxReports = NoYes::Yes;
+        taxWorkTrans.ExemptTax  = NoYes::No;
+        taxWorkTrans.TaxOrigin  = TaxOrigin::TaxReversed;
+        taxWorkTrans.Txt        = enum2str(TaxOrigin::TaxReversed);
+        // <GTH>
+        if (isAverageVATEnabled)
+        {
+            taxWorkTrans.TaxUnrealizedRefRecId = _taxTrans.RecId;
+
+            if (_taxTrans.SourceDocumentLine != 0
+                        && _taxTrans.TaxOrigin       != TaxOrigin::Payment
+                        && _taxTrans.TaxOrigin       != TaxOrigin::TaxReversed)
+            {
+                select firstOnly LedgerDimension
+                            from accountingDistribution
+                                where accountingDistribution.SourceDocumentLine == _taxTrans.SourceDocumentLine
+                                    && accountingDistribution.MonetaryAmount    == MonetaryAmount::Tax;
+
+                if (accountingDistribution)
+                {
+                    taxWorkTrans.LedgerDimension = accountingDistribution.LedgerDimension;
+                }
+            }
+        }
+        // </GTH>
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initPaymentTaxWorkTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes <c>TmpTaxWorkTrans</c> record for payment sales tax code.
+    /// </summary>
+    /// <param name = "_taxTrans">
+    /// The buffer of <c>TaxTrans</c> records.
+    /// </param>
+    /// <param name = "_ledgerPostingController">
+    /// The ledger posting controller to use for ledger posting.
+    /// </param>
+    /// <param name = "taxTable">
+    /// The buffer of <c>TaxTable</c> records.
+    /// </param>
+    protected void initPaymentTaxWorkTrans(TaxTrans _taxTrans, LedgerPostingController _ledgerPostingController, TaxTable taxTable)
+    {
+        TaxLedgerAccountGroup           taxLedgerAccountGroup;
+        LedgerDimensionDefaultAccount   defaultLedgerDimension;
+        TaxAverageVATAdjust             taxAverageVATAdjust;
+        CustInvoiceTable                custInvoiceTable;
+        CustRelatedInvoice              custRelatedInvoice;
+        // <GTH>
+        TaxTransExtensionTH             taxTransExtensionTH;
+        // </GTH>
+
+        boolean                         isAverageVATEnabled     = TaxThaiGovCertificationFeatureChecker::isAverageVATEnabled();
+        boolean                         isUnrealizedVATEnabled  = TaxThaiGovCertificationFeatureChecker::isUnrealizedVATEnabled();
+
+        // <GTH>
+        if (isUnrealizedVATEnabled)
+        {
+            custInvoiceTable = CustInvoiceTable::findPostedInvoice(CustTrans::findVoucherDate(_taxTrans.Voucher, _taxTrans.TransDate).AccountNum,
+                                                                        taxTransExtensionTH.TaxInvoiceId,
+                                                                        taxTransExtensionTH.TaxInvoiceDate);
+
+            select firstonly InvoiceAssociationType from custRelatedInvoice
+                        where (custRelatedInvoice.OriginalCustInvoice == custinvoiceTable.RecId  &&
+                                custRelatedInvoice.ParentCustInvoice   == custinvoiceTable.RecId) ||
+                                (custRelatedInvoice.CustInvoice         == custinvoiceTable.RecId  &&
+                                custRelatedInvoice.ParentCustInvoice   != 0);
+
+            taxWorkTrans.TaxCode                = taxTable.PaymentTaxCode;
+            if (custRelatedInvoice.InvoiceAssociationType    == InvoiceAssociationType ::CorrectedInvoice
+                            || custRelatedInvoice.InvoiceAssociationType == InvoiceAssociationType ::AdjustingInvoice)
+            {
+                taxWorkTrans.TaxCode            = _taxTrans.TaxCode;
+            }
+            else
+            {
+                taxWorkTrans.TaxCode            = taxTable.PaymentTaxCode;
+            }
+        }
+        else
+        {
+            // </GTH>
+            taxWorkTrans.TaxCode            = taxTable.PaymentTaxCode;
+            // <GTH>
+        }
+        // </GTH>
+
+        taxWorkTrans.TaxBaseAmount          = -taxWorkTrans.TaxBaseAmount;
+        taxWorkTrans.TaxAmount              = -taxWorkTrans.TaxAmount;
+        taxWorkTrans.TaxInCostPrice         = -taxWorkTrans.TaxInCostPrice;
+        taxWorkTrans.TaxInCostPriceMST      = -taxWorkTrans.TaxInCostPriceMST;
+        taxWorkTrans.TaxBaseAmountCur       = -taxWorkTrans.TaxBaseAmountCur;
+        taxWorkTrans.TaxAmountCur           = -taxWorkTrans.TaxAmountCur;
+        taxWorkTrans.TaxInCostPriceCur      = -taxWorkTrans.TaxInCostPriceCur;
+        taxWorkTrans.SourceBaseAmountCur    = -taxWorkTrans.SourceBaseAmountCur;
+        taxWorkTrans.SourceTaxAmountCur     = -taxWorkTrans.SourceTaxAmountCur;
+        taxWorkTrans.TaxBaseAmountRep       = -taxWorkTrans.TaxBaseAmountRep;
+        taxWorkTrans.TaxAmountRep           = -taxWorkTrans.TaxAmountRep;
+        taxWorkTrans.TaxInCostPriceRep      = -taxWorkTrans.TaxInCostPriceRep;
+
+        taxLedgerAccountGroup = TaxLedgerAccountGroup::find(TaxTable::find(taxTable.PaymentTaxCode).TaxAccountGroup);
+        defaultLedgerDimension = taxLedgerAccountGroup.taxLedgerDimension(_taxTrans.TaxDirection);
+
+        // Apply the default dimensions passed in.
+        if (defaultLedgerDimension)
+        {
+            taxWorkTrans.LedgerDimension = LedgerDimensionFacade::serviceLedgerDimensionFromLedgerDims(defaultLedgerDimension, taxWorkTrans.LedgerDimension);
+            if (_taxTrans.TaxDirection == TaxDirection::UseTax)
+            {
+                taxWorkTrans.TaxOffsetUseTaxLedgerDimension = LedgerDimensionFacade::serviceLedgerDimensionFromLedgerDims(taxLedgerAccountGroup.TaxOffsetUseTaxLedgerDimension, taxWorkTrans.LedgerDimension);
+            }
+        }
+
+        taxWorkTrans.TaxOrigin  = TaxOrigin::Payment;
+        taxWorkTrans.Txt        = enum2str(TaxOrigin::Payment);
+        // <GTH>
+        if (isAverageVATEnabled)
+        {
+            taxWorkTrans.TaxUnrealizedRefRecId = _taxTrans.RecId;
+
+            taxAverageVATAdjust = TaxAverageVATAdjust::construct(_taxTrans, taxWorkTrans, _ledgerPostingController);
+            taxAverageVATAdjust.adjustNow();
+        }
+        // </GTH>
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,672 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ServiceTaxSetOffRule_IN</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>ServiceTaxSetOffRule_IN</c> class handles the service tax set off rule.
+/// </summary>
+class ServiceTaxSetOffRule_IN
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>clearUnpostedTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete unposted ServiceTaxAdjustment_IN and ServiceTaxAdjustmentsTransactions_IN records
+    /// </summary>
+    public void clearUnpostedTransactions()
+    {
+        ServiceTaxAdjustments_IN  serviceTaxAdjustments;
+        ServiceTaxAdjustmentsTransactions_IN serviceTaxAdjustmentsTransactions;
+
+        // Even before posting 'ServiceTaxAdjustments_IN' can have data. Eg. if you click 'Adjustment' button on 'SalesTaxPayment' dialog.
+        // So for any intermediate operation, its mandatory to clear the 'ServiceTaxAdjustments_IN' and child records.
+
+        // Delete action on ServiceTaxAdjustments_IN will automatically clear ServiceTaxAdjustmentsTransactions_IN.
+        ttsbegin;
+        delete_from serviceTaxAdjustments
+            exists join serviceTaxAdjustmentsTransactions
+                where serviceTaxAdjustmentsTransactions.Posted == NoYes::No
+                   && serviceTaxAdjustmentsTransactions.ServiceTaxAdjustments == serviceTaxAdjustments.RecId;
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertServiceTaxAdjustments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert ServiceTaxAdjustments and ServiceTaxAdjustmentsTransactions_IN records
+    /// </summary>
+    public void insertServiceTaxAdjustments()
+    {
+        ComponentTransactions_IN   componentTransaction;
+        ComponentTransactions_IN   componentTransactionLoc;
+        ServiceTaxAdjustments_IN   serviceTaxAdjustments;
+        ServiceTaxAdjustmentsTransactions_IN serviceTaxAdjustmentsTransactions;
+
+        this.clearUnpostedTransactions();
+        // Balance will be updated during SetOff.
+        // Parent
+        insert_recordset serviceTaxAdjustments
+        (
+            RecoverableAmountMST,
+            PayableAmountMST,
+            TaxComponentTable,
+            ServiceCodeTable,
+            TaxType
+        )
+        select sum(RecoverableAmount),
+               sum(PayableAmount),
+               TaxComponentTable,
+               ServiceCodeTable,
+               TaxType
+               from componentTransaction
+        group by componentTransaction.TaxComponentTable, componentTransaction.ServiceCodeTable, componentTransaction.TaxType
+            where componentTransaction.Mark    == NoYes::Yes
+                && componentTransaction.Posted == NoYes::No
+            notExists join componentTransactionLoc
+                where componentTransactionLoc.LedgerVoucher == componentTransaction.Voucher;
+        // Child
+        insert_recordset serviceTaxAdjustmentsTransactions
+        (
+            TaxTrans,
+            RecoverableAmountMST,
+            PayableAmountMST
+        )
+        select TransRecId,
+               RecoverableAmount,
+               PayableAmount
+               from componentTransaction
+            where componentTransaction.Mark    == NoYes::Yes
+                && componentTransaction.Posted == NoYes::No
+            notExists join componentTransactionLoc
+                where componentTransactionLoc.LedgerVoucher == componentTransaction.Voucher;
+        // Set relation.
+        update_recordset serviceTaxAdjustmentsTransactions
+            setting ServiceTaxAdjustments = serviceTaxAdjustments.RecId
+            where serviceTaxAdjustmentsTransactions.Posted == NoYes::No
+        join componentTransaction
+            where componentTransaction.TransRecid == serviceTaxAdjustmentsTransactions.TaxTrans
+        join serviceTaxAdjustments
+            where serviceTaxAdjustments.TaxComponentTable == componentTransaction.TaxComponentTable
+               && serviceTaxAdjustments.ServiceCodeTable  == componentTransaction.ServiceCodeTable
+               && serviceTaxAdjustments.TaxPaymentVoucher == '';
+
+        update_recordset serviceTaxAdjustments
+            setting BalanceAmtMST = serviceTaxAdjustments.RecoverableAmountMST + serviceTaxAdjustments.PayableAmountMST
+            where serviceTaxAdjustments.TaxPaymentVoucher == '';
+
+        this.serviceTaxAdjustmentsFrmCarryFrwrd();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the legacy tables with correct data, during excise setoff.
+    /// </summary>
+    /// <param name="_taxSetOffRule">
+    /// The taxSetOffRule
+    /// </param>
+    /// <param name="_adjustedExciseRec">
+    /// The excise recoverable amount
+    /// </param>
+    /// <remarks>
+    /// Excise does not obey the common legacy setoff rule, after the implementation of ServiceAccounting code feature.
+    /// </remarks>
+    public void postUpdate(
+        TaxSetOffRule_IN _taxSetOffRule,
+        Amount _adjustedExciseRec)
+    {
+        TaxAdjustments_IN   taxAdjustments;
+
+        select forupdate taxAdjustments
+            where taxAdjustments.Posted == NoYes::No
+               && taxAdjustments.TaxComponentTable == _taxSetOffRule.TaxComponentTable;
+        if (taxAdjustments.RecId)
+        {
+            taxAdjustments.Adjustment -= abs(_adjustedExciseRec);
+            taxAdjustments.Balance     = taxAdjustments.PayableAmount + taxAdjustments.RecoverableAmount + taxAdjustments.Adjustment;
+            taxAdjustments.update ();
+        }
+        select forupdate taxAdjustments
+            where taxAdjustments.Posted == NoYes::No
+               && taxAdjustments.TaxComponentTable == _taxSetOffRule.TaxComponentTableSetOff;
+        if (taxAdjustments.RecId)
+        {
+            taxAdjustments.Adjustment += abs(_adjustedExciseRec);
+            taxAdjustments.Balance     = taxAdjustments.PayableAmount + taxAdjustments.RecoverableAmount + taxAdjustments.Adjustment;
+            taxAdjustments.update ();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>serviceTaxAdjustmentsFrmCarryFrwrd</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find the existing ServiceTaxAdjustments_IN record for carry forward scenario
+    /// Update the existing ServiceTaxAdjustments_IN record and insert adjustment transaction records
+    /// </summary>
+    void serviceTaxAdjustmentsFrmCarryFrwrd()
+    {
+        ComponentTransactions_IN   componentTransactions;
+        ComponentTransactions_IN   componentTransactionsLoc;
+        ServiceTaxAdjustments_IN   serviceTaxAdjustmentsExists;
+        ServiceTaxAdjustments_IN   serviceTaxAdjustments;
+        ServiceTaxAdjustmentsTransactions_IN serviceTaxAdjustmentsTransactions;
+
+        while select Voucher, TaxComponentTable, TransRecid from componentTransactions
+            where componentTransactions.Mark   == NoYes::Yes
+               && componentTransactions.Posted == NoYes::No
+            exists join componentTransactionsLoc
+                where componentTransactionsLoc.LedgerVoucher == componentTransactions.Voucher
+        {
+            while select serviceTaxAdjustments
+                where serviceTaxAdjustments.TaxPaymentVoucher == componentTransactions.Voucher
+                   && serviceTaxAdjustments.TaxComponentTable      == componentTransactions.TaxComponentTable
+                   && serviceTaxAdjustments.BalanceAmtMST > 0
+            {
+                select forUpdate serviceTaxAdjustmentsExists
+                    where serviceTaxAdjustmentsExists.TaxPaymentVoucher == ''
+                       && serviceTaxAdjustmentsExists.TaxComponentTable      == serviceTaxAdjustments.TaxComponentTable
+                       && serviceTaxAdjustmentsExists.ServiceCodeTable       == serviceTaxAdjustments.ServiceCodeTable
+                       && serviceTaxAdjustmentsExists.TaxType           == serviceTaxAdjustments.TaxType;
+                if (serviceTaxAdjustmentsExists.RecId != 0)
+                {
+                    serviceTaxAdjustmentsExists.RecoverableAmountMST += serviceTaxAdjustments.BalanceAmtMST;
+                    serviceTaxAdjustmentsExists.BalanceAmtMST        += serviceTaxAdjustments.BalanceAmtMST;
+                    serviceTaxAdjustmentsExists.update();
+                }
+                else
+                {
+                    serviceTaxAdjustmentsExists.TaxComponentTable         = serviceTaxAdjustments.TaxComponentTable;
+                    serviceTaxAdjustmentsExists.ServiceCodeTable          = serviceTaxAdjustments.ServiceCodeTable;
+                    serviceTaxAdjustmentsExists.TaxType              = serviceTaxAdjustments.TaxType;
+                    serviceTaxAdjustmentsExists.RecoverableAmountMST += serviceTaxAdjustments.BalanceAmtMST;
+                    serviceTaxAdjustmentsExists.BalanceAmtMST        += serviceTaxAdjustments.BalanceAmtMST;
+                    serviceTaxAdjustmentsExists.insert();
+                }
+                serviceTaxAdjustmentsTransactions.RecoverableAmountMST  = serviceTaxAdjustments.BalanceAmtMST;
+                serviceTaxAdjustmentsTransactions.ServiceTaxAdjustments = serviceTaxAdjustmentsExists.RecId;
+                serviceTaxAdjustmentsTransactions.TaxTrans              = componentTransactions.TransRecid;
+                serviceTaxAdjustmentsTransactions.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOffDiffComponents</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set off by different component
+    /// </summary>
+    public void setOffDiffComponents()
+    {
+        ServiceTaxAdjustmentsTransactions_IN   serviceTaxAdjustmentsTransactions;
+        ServiceTaxAdjustmentsTransactions_IN   serviceTaxAdjustmentsTransactionsLoc;
+        ServiceTaxAdjustments_IN               serviceTaxAdjustments;
+        ServiceTaxAdjustments_IN               serviceTaxAdjustmentsLoc;
+        TaxSetOffRule_IN                       taxSetOffRule;
+        Map                                    recoverableMap;
+        Amount                                 recoverableAmount;
+        Amount                                 payableAmount;
+        TaxServiceCodeSetOffExcise_IN          taxServiceCodeSetOffExcise;
+        TaxComponentTable_IN                   taxComponentTable;
+        Container                              cons;
+
+        while select taxSetOffRule
+            order by Column
+            where taxSetOffRule.TaxComponentTable != taxSetOffRule.TaxComponentTableSetOff
+            exists join taxComponentTable
+                where taxComponentTable.RecId == taxSetOffRule.TaxComponentTableSetOff
+                &&    taxComponentTable.TaxType == TaxType_IN::ServiceTax
+        {
+            select firstonly taxServiceCodeSetOffExcise
+              where taxServiceCodeSetOffExcise.TaxSetoffRule == taxSetOffRule.RecId;
+            if (taxServiceCodeSetOffExcise)
+            {
+                this.setOffUsingExciseComponents(taxSetOffRule);
+                continue;
+            }
+            while select forupdate serviceTaxAdjustmentsTransactions
+                where serviceTaxAdjustmentsTransactions.PayableAmountMST < 0
+                   && serviceTaxAdjustmentsTransactions.Posted           == NoYes::No
+                   && serviceTaxAdjustmentsTransactions.PayableAmountMST != serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST
+                join forupdate  serviceTaxAdjustments
+                order by serviceTaxAdjustments.BalanceAmtMST
+                    where serviceTaxAdjustmentsTransactions.ServiceTaxAdjustments == serviceTaxAdjustments.RecId
+                       && taxSetOffRule.TaxComponentTableSetOff                   == serviceTaxAdjustments.TaxComponentTable
+                       && serviceTaxAdjustments.BalanceAmtMST < 0
+            {
+                recoverableMap = new Map(Types::Int64, Types::Real);
+
+                payableAmount = (serviceTaxAdjustmentsTransactions.PayableAmountMST - serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST);
+
+                payableAmount = payableAmount > serviceTaxAdjustments.BalanceAmtMST ? serviceTaxAdjustments.BalanceAmtMST : payableAmount;
+
+                cons = serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions;
+                if (conlen(cons))
+                {
+                    recoverableMap = Map::create(cons);
+                }
+                while select forupdate serviceTaxAdjustmentsTransactionsLOC
+                    where serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST  > 0
+                       && serviceTaxAdjustmentsTransactionsLOC.Posted                == NoYes::No
+                       && serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST  != serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST
+                       && serviceTaxAdjustmentsTransactionsLOC.ServiceTaxAdjustments != serviceTaxAdjustments.RecId
+                    join forupdate serviceTaxAdjustmentsLoc
+                        where serviceTaxAdjustmentsTransactionsLOC.ServiceTaxAdjustments == serviceTaxAdjustmentsLoc.RecId
+                           && serviceTaxAdjustmentsLoc.TaxComponentTable                 == taxSetOffRule.TaxComponentTable
+                           && serviceTaxAdjustmentsLoc.BalanceAmtMST > 0
+                {
+                    recoverableAmount = serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST - serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST;
+
+                    recoverableAmount = recoverableAmount > serviceTaxAdjustmentsLoc.BalanceAmtMST ? serviceTaxAdjustmentsLoc.BalanceAmtMST : recoverableAmount;
+
+                    //if recoverable is more fetch another payable
+                    //if Payable is more fetch another Recoverable record to balance the present payable.
+                    if (abs(recoverableAmount) > abs(payableAmount))
+                    {
+                        recoverableMap.insert(serviceTaxAdjustmentsTransactionsLOC.TaxTrans,abs(payableAmount));
+
+                        serviceTaxAdjustmentsTransactionsLOC.reread();
+                        serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST   +=  abs(payableAmount);
+                        serviceTaxAdjustmentsTransactionsLOC.update();
+
+                        serviceTaxAdjustmentsTransactions.reread();
+                        serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST          -=  abs(payableAmount);
+                        serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions =  recoverableMap.pack();
+                        serviceTaxAdjustmentsTransactions.update();
+
+                        serviceTaxAdjustments.reread();
+                        if (TaxComponentTable_IN::find(taxSetOffRule.TaxComponentTable).TaxType
+                            == TaxComponentTable_IN::find(taxSetOffRule.TaxComponentTableSetOff).TaxType )  //  Update the Parent records also
+                        {
+                            serviceTaxAdjustments.RecoverableAmountMST                      += abs(payableAmount);
+                        }
+                        else
+                        {
+                            serviceTaxAdjustments.AmtAdjustedFrmOtherTaxMST                 += abs(payableAmount);
+                        }
+                        serviceTaxAdjustments.BalanceAmtMST                                 += abs(payableAmount);
+                        serviceTaxAdjustments.update();
+
+                        serviceTaxAdjustmentsLoc.reread();
+                        serviceTaxAdjustmentsLoc.RecoverableAmountMST                       -= abs(payableAmount);
+                        serviceTaxAdjustmentsLoc.BalanceAmtMST                              -= abs(payableAmount);
+                        serviceTaxAdjustmentsLoc.update();
+                        break;
+                    }
+                    else
+                    {
+                        recoverableMap.insert(serviceTaxAdjustmentsTransactionsLOC.TaxTrans,recoverableAmount);
+
+                        serviceTaxAdjustmentsTransactionsLOC.reread();
+                        serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST +=  abs(recoverableAmount);
+                        serviceTaxAdjustmentsTransactionsLOC.update();
+
+                        serviceTaxAdjustmentsTransactions.reread();
+                        serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST        -=  abs(recoverableAmount);
+                        serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions =  recoverableMap.pack();
+                        serviceTaxAdjustmentsTransactions.update();
+
+                        payableAmount = abs(payableAmount) - abs(recoverableAmount);
+
+                        serviceTaxAdjustments.reread();
+                        if (TaxComponentTable_IN::find(taxSetOffRule.TaxComponentTable).TaxType
+                            == TaxComponentTable_IN::find(taxSetOffRule.TaxComponentTableSetOff).TaxType)
+                        {
+                            serviceTaxAdjustments.RecoverableAmountMST                      += abs(recoverableAmount);
+                        }
+                        else
+                        {
+                            serviceTaxAdjustments.AmtAdjustedFrmOtherTaxMST                 += abs(recoverableAmount);
+                        }
+                        serviceTaxAdjustments.BalanceAmtMST                                 += abs(recoverableAmount);
+                        serviceTaxAdjustments.update();
+
+                        serviceTaxAdjustmentsLoc.reread();
+                        serviceTaxAdjustmentsLoc.RecoverableAmountMST                      -= abs(recoverableAmount);
+                        serviceTaxAdjustmentsLoc.BalanceAmtMST                             -= abs(recoverableAmount);
+                        serviceTaxAdjustmentsLoc.update();
+
+                        if (payableAmount == 0)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOffSameComponentDiffServiceCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set off by the same component with different service code
+    /// </summary>
+    public void setOffSameComponentDiffServiceCode()
+    {
+        ServiceTaxAdjustmentsTransactions_IN   serviceTaxAdjustmentsTransactions;
+        ServiceTaxAdjustmentsTransactions_IN   serviceTaxAdjustmentsTransactionsLoc;
+        ServiceTaxAdjustments_IN               serviceTaxAdjustmentsPayable;
+        ServiceTaxAdjustments_IN               serviceTaxAdjustmentsRecov;
+        TaxSetOffRule_IN                       taxSetOffRule;
+        Map                                    recoverableMap;
+        Amount                                 recoverableAmount;
+        Amount                                 payableAmount;
+        container                              cons;
+
+        while select forupdate serviceTaxAdjustmentsTransactions
+            where serviceTaxAdjustmentsTransactions.PayableAmountMST < 0
+                && serviceTaxAdjustmentsTransactions.Posted           == NoYes::No
+                && serviceTaxAdjustmentsTransactions.PayableAmountMST != serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST
+            join forupdate serviceTaxAdjustmentsPayable
+                order by serviceTaxAdjustmentsPayable.BalanceAmtMST
+                where serviceTaxAdjustmentsTransactions.ServiceTaxAdjustments == serviceTaxAdjustmentsPayable.RecId
+                    && serviceTaxAdjustmentsPayable.BalanceAmtMST <0
+            join TaxComponentTable from taxSetOffRule
+                where taxSetOffRule.TaxComponentTable == taxSetOffRule.TaxComponentTableSetOff
+                   && taxSetOffRule.TaxComponentTable == serviceTaxAdjustmentsPayable.TaxComponentTable
+        {
+            recoverableMap = new Map(Types::Int64, Types::Real);
+            payableAmount = (serviceTaxAdjustmentsTransactions.PayableAmountMST - serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST);
+            payableAmount = payableAmount > serviceTaxAdjustmentsPayable.BalanceAmtMST ? serviceTaxAdjustmentsPayable.BalanceAmtMST : payableAmount;
+
+            cons              = serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions;
+            if (conlen(cons))
+            {
+                recoverableMap    = Map::create(cons);
+            }
+                // Settoff between the records which have same TaxComponent diff ServiceCodes
+            while select forupdate serviceTaxAdjustmentsTransactionsLOC
+                where serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST > 0
+                    && serviceTaxAdjustmentsTransactionsLOC.Posted                == NoYes::No
+                    && serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST != serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST
+                    && serviceTaxAdjustmentsTransactionsLOC.ServiceTaxAdjustments != serviceTaxAdjustmentsPayable.RecId
+                join forupdate serviceTaxAdjustmentsRecov
+                    where serviceTaxAdjustmentsTransactionsLOC.ServiceTaxAdjustments == serviceTaxAdjustmentsRecov.RecId
+                        && serviceTaxAdjustmentsRecov.TaxComponentTable              == taxSetOffRule.TaxComponentTable
+                        && serviceTaxAdjustmentsRecov.BalanceAmtMST > 0
+            {
+                recoverableAmount = (serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST - serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST);
+                recoverableAmount = recoverableAmount > serviceTaxAdjustmentsRecov.BalanceAmtMST ? serviceTaxAdjustmentsRecov.BalanceAmtMST : recoverableAmount;
+                // if recoverable is more fetch another payable
+                // if Payable is more fetch another Recoverable record to balance the present payable.
+                if (abs(recoverableAmount) > abs(payableAmount))
+                {
+                    recoverableMap.insert(serviceTaxAdjustmentsTransactionsLOC.TaxTrans, abs(payableAmount));
+
+                    serviceTaxAdjustmentsTransactionsLOC.reread();
+                    serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST   +=  abs(payableAmount);
+                    serviceTaxAdjustmentsTransactionsLOC.update();
+
+                    serviceTaxAdjustmentsTransactions.reread();
+                    serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST          -=  abs(payableAmount);
+                    serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions =  recoverableMap.pack();
+                    serviceTaxAdjustmentsTransactions.update();
+
+                        //  Update the Parent records also
+                    serviceTaxAdjustmentsPayable.reread();
+                    serviceTaxAdjustmentsPayable.RecoverableAmountMST += abs(payableAmount);
+                    serviceTaxAdjustmentsPayable.BalanceAmtMST        += abs(payableAmount);
+                    serviceTaxAdjustmentsPayable.update();
+
+                    serviceTaxAdjustmentsRecov.reread();
+                    serviceTaxAdjustmentsRecov.RecoverableAmountMST -= abs(payableAmount);
+                    serviceTaxAdjustmentsRecov.BalanceAmtMST        -= abs(payableAmount);
+                    serviceTaxAdjustmentsRecov.update();
+                    break;
+                }
+                else
+                {
+                    recoverableMap.insert(serviceTaxAdjustmentsTransactionsLOC.TaxTrans,recoverableAmount);
+
+                    serviceTaxAdjustmentsTransactionsLOC.reread();
+                    serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST +=  abs(recoverableAmount);
+                    serviceTaxAdjustmentsTransactionsLOC.update();
+
+                    serviceTaxAdjustmentsTransactions.reread();
+                    serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST        -=  abs(recoverableAmount);
+                    serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions  =  recoverableMap.pack();
+                    serviceTaxAdjustmentsTransactions.update();
+
+                    payableAmount = abs(payableAmount) - abs(recoverableAmount);
+
+                    serviceTaxAdjustmentsPayable.reread();
+                    serviceTaxAdjustmentsPayable.RecoverableAmountMST                         += abs(recoverableAmount);
+                    serviceTaxAdjustmentsPayable.BalanceAmtMST                                += abs(recoverableAmount);
+                    serviceTaxAdjustmentsPayable.update();
+
+                    serviceTaxAdjustmentsRecov.reread();
+                    serviceTaxAdjustmentsRecov.RecoverableAmountMST                      -= abs(recoverableAmount);
+                    serviceTaxAdjustmentsRecov.BalanceAmtMST                             -= abs(recoverableAmount);
+                    serviceTaxAdjustmentsRecov.update();
+
+                    if (payableAmount == 0)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOffSameComponentSameServiceCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set off by the same component with the same service code
+    /// </summary>
+    public void setOffSameComponentSameServiceCode()
+    {
+        ServiceTaxAdjustmentsTransactions_IN serviceTaxAdjustmentsTransactions;
+        ServiceTaxAdjustmentsTransactions_IN serviceTaxAdjustmentsTransactionsLoc;
+        ServiceTaxAdjustments_IN             serviceTaxAdjustments;
+        TaxSetOffRule_IN                     taxSetOffRule;
+        AmountMST                            recoverableAmount;
+        AmountMST                            payableAmount;
+
+        while select forupdate serviceTaxAdjustmentsTransactions
+            where serviceTaxAdjustmentsTransactions.PayableAmountMST < 0
+                && serviceTaxAdjustmentsTransactions.Posted           == NoYes::No
+                && serviceTaxAdjustmentsTransactions.PayableAmountMST != serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST
+            join serviceTaxAdjustments
+                where serviceTaxAdjustments.RecId        ==  serviceTaxAdjustmentsTransactions.ServiceTaxAdjustments
+            exists join taxSetOffRule
+                where taxSetOffRule.TaxComponentTable == taxSetOffRule.TaxComponentTableSetOff
+                   && taxSetOffRule.TaxComponentTable == serviceTaxAdjustments.TaxComponentTable
+        {
+            payableAmount = (serviceTaxAdjustmentsTransactions.PayableAmountMST - serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST);
+            // Settoff between the records which have same ServiceCode and TaxComponent
+            while select forupdate serviceTaxAdjustmentsTransactionsLoc
+                where serviceTaxAdjustmentsTransactionsLoc.RecoverableAmountMST > 0
+                    && serviceTaxAdjustmentsTransactionsLoc.Posted               == NoYes::No
+                    && serviceTaxAdjustmentsTransactionsLoc.RecoverableAmountMST != serviceTaxAdjustmentsTransactionsLoc.UtilizedRecoverableAmountMST
+                    && serviceTaxAdjustmentsTransactionsLoc.ServiceTaxAdjustments == serviceTaxAdjustmentsTransactions.ServiceTaxAdjustments
+            {
+                recoverableAmount = (serviceTaxAdjustmentsTransactionsLoc.RecoverableAmountMST - serviceTaxAdjustmentsTransactionsLoc.UtilizedRecoverableAmountMST);
+                if (abs(recoverableAmount) > abs(payableAmount))
+                {
+                    serviceTaxAdjustmentsTransactionsLOC.reread();
+                    serviceTaxAdjustmentsTransactionsLoc.UtilizedRecoverableAmountMST +=  abs(payableAmount);
+                    serviceTaxAdjustmentsTransactionsLoc.update();
+
+                    serviceTaxAdjustmentsTransactions.reread();
+                    serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST        -=  abs(payableAmount);
+                    serviceTaxAdjustmentsTransactions.update();
+                    break;
+                }
+                else
+                {
+                    serviceTaxAdjustmentsTransactionsLOC.reread();
+                    serviceTaxAdjustmentsTransactionsLoc.UtilizedRecoverableAmountMST +=  abs(recoverableAmount);
+                    serviceTaxAdjustmentsTransactionsLoc.update();
+
+                    serviceTaxAdjustmentsTransactions.reread();
+                    serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST        -=  abs(recoverableAmount);
+                    serviceTaxAdjustmentsTransactions.update();
+
+                    payableAmount = abs(payableAmount) - abs(recoverableAmount);
+                    if (payableAmount == 0)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOffUsingExciseComponents</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set off by Excise component based on Service code set off rule
+    /// </summary>
+    /// <param name="_taxSetOffRule">
+    /// The taxSetOffRule of Excise(The taxComponent Type of this rule should be ServiceTax)
+    /// </param>
+    public void setOffUsingExciseComponents(TaxSetOffRule_IN _taxSetOffRule)
+    {
+        ServiceTaxAdjustmentsTransactions_IN   serviceTaxAdjustmentsTransactions;
+        ServiceTaxAdjustmentsTransactions_IN   serviceTaxAdjustmentsTransactionsLoc;
+        ServiceTaxAdjustments_IN               serviceTaxAdjustments;
+        ServiceTaxAdjustments_IN               serviceTaxAdjustmentsLoc;
+        Map                                    recoverableMap;
+        Amount                                 recoverableAmount;
+        Amount                                 payableAmount;
+        TaxServiceCodeSetOffExcise_IN          taxServiceCodeSetOffRuleLoc;
+        Container                              cons;
+        Amount                                 exciseRecoverableAmount;
+
+        while select forupdate serviceTaxAdjustmentsTransactions
+            where serviceTaxAdjustmentsTransactions.PayableAmountMST < 0
+               && serviceTaxAdjustmentsTransactions.Posted           == NoYes::No
+               && serviceTaxAdjustmentsTransactions.PayableAmountMST != serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST
+            join forupdate serviceTaxAdjustments
+                where serviceTaxAdjustmentsTransactions.ServiceTaxAdjustments == serviceTaxAdjustments.RecId
+            join taxServiceCodeSetOffRuleLoc
+                order by taxServiceCodeSetOffRuleLoc.Column// Priority will be in the order of ServiceCodes  in the table
+                where taxServiceCodeSetOffRuleLoc.ServiceCodeTable   == serviceTaxAdjustments.ServiceCodeTable
+                   && taxServiceCodeSetOffRuleLoc.TaxSetoffRule == _taxSetOffRule.RecId
+                   && serviceTaxAdjustments.TaxComponentTable == _taxSetOffRule.TaxComponentTableSetOff
+                   && serviceTaxAdjustments.BalanceAmtMST < 0
+        {
+            recoverableMap = new Map(Types::Int64, Types::Real);
+            payableAmount     = serviceTaxAdjustmentsTransactions.PayableAmountMST        - serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST;
+            payableAmount = payableAmount > serviceTaxAdjustments.BalanceAmtMST ? serviceTaxAdjustments.BalanceAmtMST : payableAmount;
+            cons              = serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions;
+            if (conlen(cons))
+            {
+                recoverableMap    = Map::create(cons);
+            }
+            while select forupdate serviceTaxAdjustmentsTransactionsLOC
+                where serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST > 0
+                   && serviceTaxAdjustmentsTransactionsLOC.Posted                == NoYes::No
+                   && serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST != serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST
+                   && serviceTaxAdjustmentsTransactionsLOC.ServiceTaxAdjustments != serviceTaxAdjustments.RecId
+                join forupdate serviceTaxAdjustmentsLoc
+                    where serviceTaxAdjustmentsTransactionsLOC.ServiceTaxAdjustments == serviceTaxAdjustmentsLoc.RecId
+                       && serviceTaxAdjustmentsLoc.TaxComponentTable                      == _taxSetOffRule.TaxComponentTable
+                       && serviceTaxAdjustmentsLoc.BalanceAmtMST >0
+            {
+                recoverableAmount = serviceTaxAdjustmentsTransactionsLOC.RecoverableAmountMST - serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST;
+                recoverableAmount = recoverableAmount > serviceTaxAdjustmentsLoc.BalanceAmtMST ? serviceTaxAdjustmentsLoc.BalanceAmtMST : recoverableAmount;
+                if (abs(recoverableAmount) > abs(payableAmount))
+                {
+                    recoverableMap.insert(serviceTaxAdjustmentsTransactionsLOC.TaxTrans,abs(payableAmount));
+
+                    serviceTaxAdjustmentsTransactionsLOC.reread();
+                    serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST  +=  abs(payableAmount);
+                    serviceTaxAdjustmentsTransactionsLOC.update();
+
+                    serviceTaxAdjustmentsTransactions.reread();
+                    serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST         -=  abs(payableAmount);
+                    serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions =  recoverableMap.pack();
+                    serviceTaxAdjustmentsTransactions.update();
+
+                    serviceTaxAdjustments.reread();
+                    serviceTaxAdjustments.AmtAdjustedFrmOtherTaxMST                     += abs(payableAmount);
+                    serviceTaxAdjustments.BalanceAmtMST                                 += abs(payableAmount);
+                    serviceTaxAdjustments.update();
+
+                    serviceTaxAdjustmentsLoc.reread();
+                    serviceTaxAdjustmentsLoc.RecoverableAmountMST                       -= abs(payableAmount);
+                    serviceTaxAdjustmentsLoc.BalanceAmtMST                              -= abs(payableAmount);
+                    serviceTaxAdjustmentsLoc.update();
+
+                    exciseRecoverableAmount += abs(payableAmount);
+                    break;
+                }
+                else
+                {
+                    recoverableMap.insert(serviceTaxAdjustmentsTransactionsLOC.TaxTrans,recoverableAmount);
+
+                    serviceTaxAdjustmentsTransactionsLOC.reread();
+                    serviceTaxAdjustmentsTransactionsLOC.UtilizedRecoverableAmountMST +=  abs(recoverableAmount);
+                    serviceTaxAdjustmentsTransactionsLOC.update();
+
+                    serviceTaxAdjustmentsTransactions.reread();
+                    serviceTaxAdjustmentsTransactions.UtilizedPayableAmountMST          -=  abs(recoverableAmount);
+                    serviceTaxAdjustmentsTransactions.ServiceTaxAdjustmentsTransactions =  recoverableMap.pack();
+                    serviceTaxAdjustmentsTransactions.update();
+
+                    payableAmount = abs(payableAmount) - abs(recoverableAmount);
+
+                    serviceTaxAdjustments.reread();
+                    serviceTaxAdjustments.AmtAdjustedFrmOtherTaxMST                   += abs(recoverableAmount);
+                    serviceTaxAdjustments.BalanceAmtMST                               += abs(recoverableAmount);
+                    serviceTaxAdjustments.update();
+
+                    serviceTaxAdjustmentsLoc.reread();
+                    serviceTaxAdjustmentsLoc.RecoverableAmountMST                     -= abs(recoverableAmount);
+                    serviceTaxAdjustmentsLoc.BalanceAmtMST                            -= abs(recoverableAmount);
+                    serviceTaxAdjustmentsLoc.update();
+
+                    exciseRecoverableAmount += abs(recoverableAmount);
+                    if (payableAmount == 0)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        if (exciseRecoverableAmount)
+        {
+            this.postUpdate(_taxSetOffRule, exciseRecoverableAmount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+        public static ServiceTaxSetOffRule_IN construct()
+    {
+        return new ServiceTaxSetOffRule_IN();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

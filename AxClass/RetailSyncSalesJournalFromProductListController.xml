@@ -1,0 +1,400 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailSyncSalesJournalFromProductListController</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// The Retail Controller that syncs sales order journal type from product list updates.
+/// </summary>
+internal final class RetailSyncSalesJournalFromProductListController
+{
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>syncOrderTemplatesToSalesJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Synchronizes sales order journal type from product list updates.
+    /// </summary>
+    public static void syncOrderTemplatesToSalesJournal()
+    {
+        using(var telemetry = RetailInstrumentationSegment::construct('RetailSyncSalesJournalFromProductListController', funcName()))
+        {
+            FromTime startTime = timeNow();
+
+            // Delete historical lines from product list and line updates tables
+            // including previous (if any) and repeated (if any) records.
+            // Keeping most recent record from updates only.
+            RetailSyncSalesJournalFromProductListController::removeHistoricalRecords();
+
+            // Create or update the orders and lines of already synced product list
+            int countTemplatesSynced = RetailSyncSalesJournalFromProductListController::syncOrderTemplateHeaders();
+            int countLinesSynced = RetailSyncSalesJournalFromProductListController::syncOrderTemplateLines();
+            int secondsRun = timeNow() - startTime;
+            eventSource.EventWriteOrderTemplateSyncEvent(funcName(), countTemplatesSynced, countLinesSynced, secondsRun);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeHistoricalRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes historical records from incoming updates on header and line level.
+    /// </summary>
+    internal static void removeHistoricalRecords()
+    {
+        RetailProductListLineUpdate productListLineUpdateLookUp;
+        
+        // remove old (if any at all) and repeated lines from their updates (narrowing the scope to updates only)
+        while select maxof(LastUpdated), LineId from productListLineUpdateLookUp
+            group by LineId
+            where productListLineUpdateLookUp.SyncDateTime == DateTimeUtil::minValue() // this is indication of unsynced (dirty) record
+            {
+                RetailProductListLineUpdate productListLineUpdateDelete;
+                ttsbegin;
+                delete_from productListLineUpdateDelete
+                   where productListLineUpdateLookUp.LineId == productListLineUpdateDelete.LineId
+                    && productListLineUpdateLookUp.LastUpdated > productListLineUpdateDelete.LastUpdated;
+                ttscommit;
+            }
+
+        // repeat the same for the product list header
+        RetailProductListUpdate productListUpdateLookUp;
+        while select maxof(LastUpdated), ProductListId from productListUpdateLookUp
+            group by ProductListId
+            where productListUpdateLookUp.SyncDateTime == DateTimeUtil::minValue()
+            {
+                RetailProductListUpdate productListUpdateDelete;
+                ttsbegin;
+                delete_from productListUpdateDelete
+                    where productListUpdateLookUp.ProductListId == productListUpdateDelete.ProductListId
+                     && productListUpdateLookUp.LastUpdated > productListUpdateDelete.LastUpdated;
+                ttscommit;
+            }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>syncOrderTemplateHeaders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Syncs sales order journal type on a header level.
+    /// </summary>
+    /// <returns> Returns the number of templates synced.</returns>
+    internal static int syncOrderTemplateHeaders()
+    {
+        RetailProductListUpdate templateUpdate;
+        int totalSynced = 0;
+
+        // find the all modified headers and their lines to sync with Sales Journal
+        while select forupdate templateUpdate
+            where templateUpdate.Type == RetailProductListType::OrderTemplate
+            && templateUpdate.SyncDateTime == DateTimeUtil::minValue()
+        {
+            try
+            {
+                ttsbegin; // begin header update transaction scope
+                RetailProductListId productListId = templateUpdate.ProductListId;
+
+                // validate if order template already exists
+                RetailSalesTable retailSalesTableLocal;
+                select firstonly forupdate retailSalesTableLocal
+                    where retailSalesTableLocal.RetailProductListUpdateId == productListId;
+            
+                if (retailSalesTableLocal.RecId == 0)
+                {
+                    // create new, since sales journal doesn't exist for this order template, lines will be added later, if any added
+                    RetailSyncSalesJournalFromProductListController::createSalesJournalFromProductList(templateUpdate);
+                    totalSynced++;
+                }
+                else if (templateUpdate.DeletedDateTime > DateTimeUtil::minValue())
+                {
+                    // handle template removal - this will indicate line removal as well
+                    SalesTable salesOrderToDelete;
+                    select firstonly salesOrderToDelete
+                        where retailSalesTableLocal.SalesTable == salesOrderToDelete.RecId;
+                    if (salesOrderToDelete.RecId == 0)
+                    {
+                        // attempting to delete non-existing sales order journal type, skip it
+                        eventSource.EventWriteOrderTemplateDeleteNonExistingJournal(funcName(), templateUpdate.RecId, templateUpdate.ProductListId);
+                    }
+                    else
+                    {
+                        RetailSyncSalesJournalFromProductListController::deleteSalesOrder(salesOrderToDelete.SalesId);
+                    }
+
+                    // clean up RetailProductListLineUpdate and RetailProductListUpdate
+                    RetailProductListLineUpdate listLinesToBeDeleted;
+                    delete_from listLinesToBeDeleted
+                        where listLinesToBeDeleted.ProductListid == productListId;
+
+                    RetailProductListUpdate listToBeDeleted;
+                    delete_from listToBeDeleted
+                        where listToBeDeleted.ProductListId == productListId;
+
+                    totalSynced++;
+                    ttscommit;
+                    continue;
+                }
+                else
+                {
+                    // insert and delete handled, update the title of existing template now
+                    retailSalesTableLocal.RetailProductListUpdateName = templateUpdate.Name;
+                    retailSalesTableLocal.update();
+                    totalSynced++;
+                }
+
+                templateUpdate.SyncDateTime = DateTimeUtil::utcNow();
+                templateUpdate.update();
+
+                ttscommit; // complete header update transaction scope
+            }
+            catch
+            {
+                eventSource.EventWriteOrderTemplateHeaderSyncFailed(funcName(), templateUpdate.RecId, templateUpdate.ProductListId);
+            }
+        }
+
+        return totalSynced;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>syncOrderTemplateLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Syncs sales order journal type on a lines level.
+    /// </summary
+    /// <returns> Returns the number of templates synced.</returns>
+    internal static int syncOrderTemplateLines()
+    {
+        int totalSynced = 0;
+        RetailProductListUpdate retailProductListUpdated;
+        RetailProductListLineUpdate retailProductListLineUpdated;
+
+        while select forupdate retailProductListLineUpdated
+            join retailProductListUpdated
+            where retailProductListLineUpdated.ProductListId == retailProductListUpdated.ProductListId
+            && retailProductListUpdated.Type == RetailProductListType::OrderTemplate
+            && retailProductListLineUpdated.SyncDateTime == DateTimeUtil::minValue() // some of new lines were already created during Header sync up.
+        {
+            try
+            {
+                ttsbegin; // begin line update transaction scope
+
+                // update Qty on existing retailSalesLine and salesLine
+                RetailSalesLine retailSalesLineLocal;
+                SalesLine salesLineLocal;
+                select firstonly forupdate retailSalesLineLocal
+                    where retailSalesLineLocal.RetailProductListLineUpdateId == retailProductListLineUpdated.LineId
+                    join forupdate salesLineLocal 
+                    where retailSalesLineLocal.SalesLine == salesLineLocal.RecId;
+
+                if (salesLineLocal.RecId != 0)
+                {
+                    if (salesLineLocal.validateDelete())
+                    {
+                        salesLineLocal.delete();
+                    }
+                    if (retailProductListLineUpdated.DeletedDateTime > DateTimeUtil::minValue())
+                    {
+                        // clean up RetailProductListLineUpdate - this is a final update
+                        retailProductListLineUpdated.delete();
+                    }
+                    else
+                    {
+                        // update the old retail sales line qty
+                        SalesTable headerTable = SalesTable::find(salesLineLocal.SalesId);
+                        RetailSyncSalesJournalFromProductListController::createSalesJournalLinesFromProductListLine(retailProductListLineUpdated, headerTable);
+                        retailProductListLineUpdated.SyncDateTime = DateTimeUtil::utcNow();
+                        retailProductListLineUpdated.update();
+                    }
+
+                    totalSynced++;
+                    ttscommit;
+                    continue; // go to next line update
+                }
+
+                // the line updates left that has no previous appearance - new rows
+                if (retailProductListLineUpdated.DeletedDateTime > DateTimeUtil::minValue())
+                {
+                    // this is nonsense, let's just clean up RetailProductListLineUpdate and log this issue                
+                    eventSource.EventWriteOrderTemplateOrphanedDeleteLineUpdateAppeared(funcName(), retailProductListLineUpdated.LineId);
+                    retailProductListLineUpdated.delete();
+                }
+                else
+                {
+                    // create new lines for previously created templates
+                    RetailSalesTable retailSalesTable;
+                    SalesTable salesTable;
+                
+                    select firstonly1 salesTable
+                        join retailSalesTable
+                        where retailSalesTable.RetailProductListUpdateId == retailProductListUpdated.ProductListId
+                        && salesTable.RecId == retailSalesTable.SalesTable;
+
+                    if (salesTable.RecId != 0)
+                    {
+                        RetailSyncSalesJournalFromProductListController::createSalesJournalLinesFromProductListLine(retailProductListLineUpdated, salesTable);
+                        retailProductListLineUpdated.SyncDateTime = DateTimeUtil::utcNow();
+                        retailProductListLineUpdated.update();
+                        totalSynced++;
+                    }
+                    else
+                    {
+                        // handling the case when line updates came for missing order template on HQ
+                        // don't delete update - it might be caused by failed sales order journal creation
+                        eventSource.EventWriteOrderTemplateLineSyncFailedMissingHeader(funcName(), retailProductListLineUpdated.RecId, retailProductListLineUpdated.LineId);
+                    }
+                }            
+
+                ttscommit; // end line update transaction scope
+            }
+            catch
+            {
+                eventSource.EventWriteOrderTemplateLineSyncFailed(funcName(), retailProductListLineUpdated.RecId, retailProductListLineUpdated.LineId);
+            }
+        }
+
+        return totalSynced;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete sales order and its related artifacts
+    /// </summary>
+    /// <param name = "_salesId">Sales order id.</param>
+    private static void deleteSalesOrder(SalesId _salesId)
+    {
+        SalesTable salesTable = SalesTable::find(_salesId, true);
+
+        // First validate that the order can be deleted
+        // This should execute both header and line level validations
+        if (salesTable.validateDelete())
+        {
+            // Then execution the deletion.
+            // This will cascade the delete to lines as well.
+            salesTable.delete();
+            
+            // Sanity check: making sure that no line is left behind
+            SalesLine countOfLines;
+            select count(RecId) from countOfLines where countOfLines.SalesId == _salesId;
+
+            if (countOfLines.RecId > 0)
+            {
+                // Not all lines were deleted by SalesTable.delete() - will attempt deletion next time
+                throw error("@Retail:OrderTemplateDeleteSalesOrderFailed");
+            }
+        }
+        else
+        {
+            // Error messages have already been appended by SalesTable.validateDelete()
+            throw error("@Retail:OrderTemplateDeleteSalesOrderLinesFailed");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSalesJournalFromProductList</Name>
+				<Source><![CDATA[
+    private static void createSalesJournalFromProductList(RetailProductListUpdate retailProductListUpdated)
+    {
+        ttsbegin;
+        SalesTable salesTable;
+
+        NumberSequenceReference salesOrderNumberSeqRef = RetailParameters::numRefSalesOrderId();
+        if (!salesOrderNumberSeqRef.NumberSequenceId)
+        {
+            salesOrderNumberSeqRef = SalesParameters::numRefSalesId();
+        }
+
+        NumberSeq numberSeq = NumberSeq::newGetNum(salesOrderNumberSeqRef);
+        numberSeq.used();
+        salesTable.SalesId = numberSeq.num();
+        salesTable.initValue(SalesType::Journal);
+        salesTable.CustAccount = retailProductListUpdated.CustomerId;
+        salesTable.initFromCustTable();
+        salesTable.initInvoiceAccount();
+        salesTable.insert();
+
+        RetailSalesTable retailSalesTable = RetailSalesTable::findSalesTable(salesTable, true);
+        if (retailSalesTable)
+        {
+            retailSalesTable.RetailProductListUpdateName = retailProductListUpdated.Name;
+            retailSalesTable.RetailProductListUpdateId = retailProductListUpdated.ProductListId;
+            retailSalesTable.RetailChannel = retailProductListUpdated.ChannelId;
+            retailSalesTable.update();
+        }
+        else
+        {
+            retailSalesTable.SalesTable = SalesTable.RecId;
+            retailSalesTable.RetailProductListUpdateName = retailProductListUpdated.Name;
+            retailSalesTable.RetailProductListUpdateId = retailProductListUpdated.ProductListId;
+            retailSalesTable.RetailChannel = retailProductListUpdated.ChannelId;
+            retailSalesTable.insert();
+        }
+
+        RetailProductListLineUpdate retailProductListLineUpdated;
+
+        while select forupdate retailProductListLineUpdated
+            where retailProductListLineUpdated.ProductListId == retailProductListUpdated.ProductListId
+        {
+            // the line updates left that has no previous appearance - new rows
+            if (retailProductListLineUpdated.DeletedDateTime > DateTimeUtil::minValue())
+            {
+                // this is first and last time row appeared: just clean up RetailProductListLineUpdate
+                retailProductListLineUpdated.delete();
+            }
+            else
+            {
+                RetailSyncSalesJournalFromProductListController::createSalesJournalLinesFromProductListLine(retailProductListLineUpdated, salesTable);
+                retailProductListLineUpdated.SyncDateTime = DateTimeUtil::utcNow();
+                retailProductListLineUpdated.update();
+            }
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSalesJournalLinesFromProductListLine</Name>
+				<Source><![CDATA[
+    private static void createSalesJournalLinesFromProductListLine(RetailProductListLineUpdate retailProductListLineUpdated, SalesTable salesTable)
+    {
+        ttsbegin;
+        SalesLine salesLine;
+        salesLine.initFromSalesTable(salesTable);
+        salesLine.ItemId = EcoResProduct::find(retailProductListLineUpdated.ProductId).DisplayProductNumber;
+        salesLine.SalesQty = retailProductListLineUpdated.Quantity;
+        salesLine.QtyOrdered = retailProductListLineUpdated.Quantity;
+        salesLine.SalesUnit = retailProductListLineUpdated.UnitOfMeasure;
+        salesLine.insert();
+
+        RetailSalesLine retailSalesLine = salesLine.retailSalesLine();
+        retailSalesLine.RetailProductListLineUpdateId = retailProductListLineUpdated.LineId;
+        retailSalesLine.Catalog = retailProductListLineUpdated.CatalogId;
+        retailSalesLine.update();
+        RetailTransactionServiceFulfillment::updateFulfillmentStatus(salesLine.RecId);
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

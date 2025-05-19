@@ -1,0 +1,1020 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventCostClosingCancel_Init</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>InventCostClosingCancel_Init</c> class initializes the cancellation process.
+/// </summary>
+/// <remarks>
+///    If running in batch, for each item and production order that will be processed, a separate batch
+///    task will be created.
+/// </remarks>
+class InventCostClosingCancel_Init extends InventCostClosingCancel implements BatchRetryable
+{
+    boolean             cancelRecalculationsFromDate;
+
+    DialogField         dialogDateCancel;
+    DialogField         dialogVoucherCancel;
+    DialogField         dialogNotes;
+    DialogField         dialogNotes2;
+    DialogField         dialogCancelFromDate;
+    DialogGroup         dlgGroupCancelOneVoucher;
+    DialogGroup         dlgGroupCancelRecalcs;
+
+    Voucher             voucherCancel;
+    TransDate           dateCancel;
+    FreeTxt             freeTxt;
+
+    TransDate           cancelFromDate;
+
+    NumberSeq           numberSeq;
+
+    private int maxBatchTasks = 1000;
+
+    #DEFINE.CurrentVersion(2)
+    #LOCALMACRO.CurrentList
+        cancelRecalculationsFromDate,
+        DateCancel,
+        VoucherCancel,
+        FreeTxt,
+        cancelFromDate
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createInventClosing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates an inventory cancellation record that will be used to cancel an inventory closing.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void createInventClosing()
+    {
+        // First of all, check if the cancelation record already has been created
+        select forupdate firstonly inventClosing
+        where inventClosing.CancelClosingRefRecId  == cancelClosing.RecId &&
+                  inventClosing.InventTransCurrency_RU == inventTransCurrency;
+
+        if (!inventClosing)
+        {
+            inventClosing.Executed          = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            inventClosing.Start             = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+
+            inventClosing.initFromCancelClosing(cancelClosing);
+            inventClosing.Cancellation      = NoYes::Yes;
+
+            inventClosing.Voucher           = numberSeq.num();
+            inventClosing.Notes             = freeTxt;
+
+            // set the status to calculation
+            inventClosing.InventCostStatus  = InventCostStatus::Calculation;
+
+            if (LedgerVoucherObject::validateVoucher(inventClosing.Voucher,
+                                                         numberSeq.parmNumberSequenceCode(),
+                                                         inventClosing.TransDate))
+            {
+                inventClosing.insert();
+            }
+        }
+        else if (CostClosingReverseCheckDuplicateV2Flight::instance().isEnabled())
+        {
+            if (inventClosing.StopRunning == NoYes::No)
+            {
+                throw error(strFmt("@SCM:InventClosingDuplicateReverseNotAllowed", cancelClosing.AdjustmentType, cancelClosing.Voucher));
+            }
+            else
+            {
+                inventClosing.setStopRunning(NoYes::No);
+                inventClosing.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancels the items.
+    /// </summary>
+    /// <param name = "_batchHeader">The batch header.</param>
+    /// <param name = "_inventCostClosingCancel_End">The end task.</param>
+    protected void cancelItems(BatchHeader _batchHeader, InventCostClosingCancel_End _inventCostClosingCancel_End)
+    {
+        InventSettlement inventSettlement;
+
+        if (FeatureStateProvider::isFeatureEnabled(InventCostClosingCancelBundleItemsFeature::instance()))
+        {
+            InventCostClosingCancelItemsTmp cancelItemsTmp;
+
+            insert_recordset cancelItemsTmp (ItemId, RecCount)
+                select ItemId, count(RecId)
+                    from inventSettlement
+                    group by ItemId
+                    where inventSettlement.Voucher   == cancelClosing.Voucher
+                        && inventSettlement.TransDate == cancelClosing.TransDate
+                        && inventSettlement.Cancelled == NoYes::No
+                        && inventSettlement.InventTransCurrency_RU == inventTransCurrency;
+
+            select count(RecId) from cancelItemsTmp;
+            int numOfCancelItem = cancelItemsTmp.RecId;
+            int maxItemTaskCount = max(1, InventParameters::find().CloseBatchHelpers);
+
+            if (maxItemTaskCount < numOfCancelItem)
+            {
+                Array allItemIds = new Array(Types::String);
+                while select ItemId from cancelItemsTmp
+                    order by cancelItemsTmp.RecCount
+                {
+                    allItemIds.value(allItemIds.lastIndex() + 1, cancelItemsTmp.ItemId);
+                }
+
+                for (int taskCounter = 1; taskCounter <= maxItemTaskCount; taskCounter++)
+                {
+                    List itemIdListPerTask = new List(Types::String);
+
+                    int indexOfallItemIds = taskCounter;
+                    do
+                    {
+                        itemIdListPerTask.addEnd(allItemIds.value(indexOfallItemIds));
+                        indexOfallItemIds = indexOfallItemIds + maxItemTaskCount;
+                    }
+                    while (indexOfallItemIds <= numOfCancelItem);
+
+                    this.createCancelItemTask(_batchHeader,  _inventCostClosingCancel_End, null, itemIdListPerTask);
+                }
+
+                return;
+            }
+        }
+
+        // Add all the items that needs to be canceled
+        while select ItemId from inventSettlement
+            group by ItemId
+            where inventSettlement.Voucher   == cancelClosing.Voucher
+                && inventSettlement.TransDate == cancelClosing.TransDate
+                && inventSettlement.Cancelled == NoYes::No
+                && inventSettlement.InventTransCurrency_RU == inventTransCurrency
+        {
+            this.createCancelItemTask(_batchHeader,  _inventCostClosingCancel_End, inventSettlement.ItemId, null);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCancelItemTask</Name>
+				<Source><![CDATA[
+    private void createCancelItemTask(BatchHeader _batchHeader, InventCostClosingCancel_End _inventCostClosingCancel_End, ItemId _itemId, List _itemIdList)
+    {
+        // For each record add a new Batch Task
+        InventCostClosingCancel_WorkInvent inventCostClosingCancel_WorkInvent = InventCostClosingCancel::construct(InventCostWorkType::WorkInvent);
+        inventCostClosingCancel_WorkInvent.parmCancelClosingRecId(cancelClosing.RecId);
+        inventCostClosingCancel_WorkInvent.parmInventClosingRecId(inventClosing.RecId);
+        if (_itemId)
+        {
+            inventCostClosingCancel_WorkInvent.parmItemId(_itemId);
+        }
+        if (_itemIdList)
+        {
+            inventCostClosingCancel_WorkInvent.parmItemIdList(_itemIdList);
+        }
+        inventCostClosingCancel_WorkInvent.parmInventTransCurrency_RU(inventTransCurrency);
+
+        // Add the tasks and make the end class depend on them
+        if (this.isInBatch())
+        {
+            inventCostClosingCancel_WorkInvent.batchInfo().parmGroupId(this.parmCurrentBatch().GroupId);
+
+            _batchHeader.addRuntimeTask(inventCostClosingCancel_WorkInvent, this.parmCurrentBatch().RecId);
+            _batchHeader.addDependency(_inventCostClosingCancel_End, inventCostClosingCancel_WorkInvent, BatchDependencyStatus::Finished);
+        }
+        else
+        {
+            progress.setText(strFmt("@SYS14077", _itemId? _itemId : _itemIdList.toString()));
+            progress.incCount();
+            inventCostClosingCancel_WorkInvent.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the worker tasks.
+    /// </summary>
+    /// <remarks>
+    ///    If the class is running in batch, the worker tasks will be put into batch. Otherwise the outer TTS
+    ///    scope will be committed and the worker tasks will be triggered. This is done that in both cases,
+    ///    the cancellation will run in several small TTS scopes.
+    /// </remarks>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void createTasks()
+    {
+        BatchHeader batchHeader;
+
+        //persist infolog
+        this.writeInfoLog();
+
+        // For the closing that needs to be cancelled, the following tasks needs to be created
+        // Cancel of all items
+        // Cancel of production indirect costs
+        // Posting into ledger
+
+        // Initialize the default values of the end class
+        InventCostClosingCancel_End inventCostClosingCancel_End = InventCostClosingCancel::construct(InventCostWorkType::End);
+        inventCostClosingCancel_End.parmCancelClosingRecId(cancelClosing.RecId);
+        inventCostClosingCancel_End.parmInventClosingRecId(inventClosing.RecId);
+        inventCostClosingCancel_End.parmInventTransCurrency_RU(inventTransCurrency);
+
+        if (this.isInBatch())
+        {
+            // Initialize the batch header using the recId that this class
+            // currently holds to add the tasks to the same job
+            batchHeader = BatchHeader::construct(this.parmCurrentBatch().BatchJobId);
+
+            inventCostClosingCancel_End.batchInfo().parmGroupId(this.parmCurrentBatch().GroupId);
+
+            // Add the ending task
+            batchHeader.addTask(inventCostClosingCancel_End);
+        }
+        else
+        {
+            progress.setText("@SYS8516");
+            progress.update(true);
+
+            // Commit the outer transaction
+            // Now the cancelClosing record has been written to the database
+            // Application Level should be zero after wards
+            ttscommit;
+        }
+
+        // Now add all the production orders that needs to be cancelled
+        this.createTasksProd(InventTransType::Production, InventTransType::ProdLine, batchHeader, inventCostClosingCancel_End);
+        this.createTasksProd(InventTransType::BOMMain,    InventTransType::BOMLine, batchHeader, inventCostClosingCancel_End);
+        this.createTasksProd(InventTransType::Production, InventTransType::PmfProdCoBy, batchHeader, inventCostClosingCancel_End);
+
+        // Add all the items that needs to be cancelled
+        this.cancelItems(batchHeader, inventCostClosingCancel_End);
+
+        // Save
+        if (this.isInBatch())
+        {
+            batchHeader.save();
+        }
+        else
+        {
+            progress.setText("@SYS17508");
+            progress.update(true);
+
+            inventCostClosingCancel_End.runOperation();
+
+            // Now open a transaction again, to
+            // process the cancellation of the next closing
+            ttsbegin;
+        }
+
+        //tasks may write to the log before ending; reset start point
+        logPointBegin = infologLine();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelRecalculations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Cancel recalculations.
+    /// </summary>
+    /// <param name="_inventClosing">
+    ///  An inventory closing that should be canceled.
+    /// </param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void cancelRecalculations(InventClosing _inventClosing)
+    {
+        InventCostClosingCancel_Init inventCostClosingCancel_Init = InventCostClosingCancel_Init::newFromInventClosing(_inventClosing);
+        inventCostClosingCancel_Init.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMaxBatchTasks</Name>
+				<Source><![CDATA[
+    protected int getMaxBatchTasks()
+    {
+        return maxBatchTasks;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTasksProd</Name>
+				<Source><![CDATA[
+    private void createTasksProd(InventTransType _parentTransType,
+                                        InventTransType _childTransType,
+                                        BatchHeader _batchHeader,
+                                        InventCostClosingCancel_End _inventCostClosingCancel_End
+                                        )
+    {
+        InventTransOrigin assemblyInventTransOrigin;
+        InventTransOrigin componentInventTransOrigin;
+        InventTrans componentInventTrans;
+        InventTransOriginAssemblyComponent inventTransOriginAssemblyComponent;
+        InventSettlement inventSettlement;
+        InventClosing cancelClosingLocal;
+
+        InventCostClosingCancelProdIdsTmp cancelProdIdsTemp;
+
+        insert_recordset cancelProdIdsTemp (ProdId)
+            select forceLiterals ReferenceId from assemblyInventTransOrigin
+                group by ReferenceId
+                where assemblyInventTransOrigin.ReferenceCategory == _parentTransType
+                exists join componentInventTransOrigin
+                    where componentInventTransOrigin.ReferenceCategory == _childTransType
+                        && componentInventTransOrigin.ReferenceId == assemblyInventTransOrigin.ReferenceId
+                    exists join componentInventTrans
+                        where componentInventTrans.InventTransOrigin == componentInventTransOrigin.RecId
+                    exists join inventTransOriginAssemblyComponent
+                        where inventTransOriginAssemblyComponent.ComponentInventTransOrigin == componentInventTransOrigin.RecId
+                            && inventTransOriginAssemblyComponent.AssemblyInventTransOrigin == assemblyInventTransOrigin.RecId
+                        exists join inventSettlement
+                            where inventSettlement.TransRecId == componentInventTrans.RecId
+                                && inventSettlement.Cancelled == NoYes::No
+                                && inventSettlement.InventTransCurrency_RU == inventTransCurrency
+                            exists join cancelClosingLocal
+                                where cancelClosingLocal.RecId == cancelClosing.RecId
+                                    && cancelClosingLocal.Voucher == inventSettlement.Voucher
+                                    && cancelClosingLocal.TransDate == inventSettlement.TransDate;
+
+        select count(RecId) from cancelProdIdsTemp;
+        int numOfCancelProdIds = cancelProdIdsTemp.RecId;
+        int maxTasks = this.getMaxBatchTasks();
+
+        if (numOfCancelProdIds > maxTasks && InventCostClosingCancelBundleProdFlight::instance().isEnabled())
+        {           
+            Array allProdIds = new Array(Types::String);
+            while select ProdId from cancelProdIdsTemp
+            {
+                allProdIds.value(allProdIds.lastIndex() + 1, cancelProdIdsTemp.ProdId);
+            }
+
+            for (int taskCounter = 1; taskCounter <= maxTasks; taskCounter++)
+            {
+                List prodIdListPerTask = new List(Types::String);
+
+                int indexOfAllProdIds = taskCounter;
+                do
+                {
+                    prodIdListPerTask.addEnd(allProdIds.value(indexOfAllProdIds));
+                    indexOfAllProdIds = indexOfAllProdIds + maxTasks;
+                }
+                while (indexOfAllProdIds <= numOfCancelProdIds);
+
+                this.createCancelProdTasks(_batchHeader, _inventCostClosingCancel_End, '', prodIdListPerTask);
+            }
+        }
+        else
+        {
+            while select ProdId from cancelProdIdsTemp
+            {
+                this.createCancelProdTasks(_batchHeader, _inventCostClosingCancel_End, cancelProdIdsTemp.ProdId, null);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCancelProdTasks</Name>
+				<Source><![CDATA[
+    private void createCancelProdTasks(BatchHeader _batchHeader, InventCostClosingCancel_End _inventCostClosingCancel_End, ProdId _prodId, List _prodIdList)
+    {
+        InventCostClosingCancel_WorkProd inventCostClosingCancel_WorkProd = InventCostClosingCancel::construct(InventCostWorkType::WorkProd);
+        inventCostClosingCancel_WorkProd.parmCancelClosingRecId(cancelClosing.RecId);
+        inventCostClosingCancel_WorkProd.parmInventClosingRecId(inventClosing.RecId);
+
+        if (_prodId)
+        {
+            inventCostClosingCancel_WorkProd.parmProdId(_prodId);
+        }
+
+        if (_prodIdList)
+        {
+            inventCostClosingCancel_WorkProd.parmProdIdList(_prodIdList);
+        }
+
+        inventCostClosingCancel_WorkProd.parmInventTransCurrency_RU(inventTransCurrency);
+
+        // Add the tasks and make the end class depend on them
+        if (this.isInBatch())
+        {
+            inventCostClosingCancel_WorkProd.batchInfo().parmGroupId(this.parmCurrentBatch().GroupId);
+
+            _batchHeader.addRuntimeTask(inventCostClosingCancel_WorkProd, this.parmCurrentBatch().RecId);
+            _batchHeader.addDependency(_inventCostClosingCancel_End, inventCostClosingCancel_WorkProd, BatchDependencyStatus::Finished);
+        }
+        else
+        {
+            progress.setText(strFmt("@SYS26199", _prodId));
+            progress.incCount();
+            inventCostClosingCancel_WorkProd.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteRelatedRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Deletes the <see cref="T:InventCostList" /> and <see cref="T:InventCostListTrans" /> records.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void deleteRelatedRecords()
+    {
+        InventCostList          inventCostList;
+        InventCostListTrans     inventCostListTrans;
+
+        // Clean up in the inventCostList and inventCostListTrans
+        delete_from inventCostList      where inventCostList.Voucher        == cancelClosing.Voucher;
+        delete_from inventCostListTrans where inventCostListTrans.Voucher   == cancelClosing.Voucher;
+
+        if (cancelClosing.AdjustmentType         == InventAdjustmentType::Closing &&
+            cancelClosing.InventTransCurrency_RU == InventTransCurrency_RU::PrimaryCur)
+        {
+            InventSumDateFinancialTrans_RU::deleteTransDate(cancelClosing.TransDate);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Builds the dialog to provide to the user interface to allow modification of parameters for the
+    ///    cancellation.
+    /// </summary>
+    /// <returns>
+    ///    An initialized dialog.
+    /// </returns>
+    public Object dialog()
+    {
+        DialogRunbase dialog = super();
+
+        dialog.caption(InventCostClosingCancel_Init::description(inventTransCurrency));
+
+        dlgGroupCancelOneVoucher = dialog.addGroup("@SCM:InventClosingCancellationDialogReverseOneVoucher");
+        dlgGroupCancelOneVoucher.optionValue(!cancelRecalculationsFromDate);
+        dlgGroupCancelOneVoucher.frameOptionButton(FormFrameOptionButton::Radio);
+
+        dialogDateCancel          = dialog.addField(extendedTypeStr(TransDate), "@SYS3961");
+        dialogDateCancel.value(dateCancel);
+        dialogDateCancel.active(false);
+
+        dialogVoucherCancel      = dialog.addField(extendedTypeStr(Voucher), "@SYS7290");
+        dialogVoucherCancel.value(voucherCancel);
+        dialogVoucherCancel.active(false);
+
+        dialogNotes             = dialog.addField(extendedTypeStr(FreeTxt), "@SYS13887");
+        dialogNotes.value(freeTxt);
+
+        dlgGroupCancelRecalcs = dialog.addGroup("@SCM:InventClosingCancellationDialogReverseRecalculations");
+        dlgGroupCancelRecalcs.optionValue(cancelRecalculationsFromDate);
+        dlgGroupCancelRecalcs.frameOptionButton(FormFrameOptionButton::Radio);
+
+        dialogCancelFromDate = dialog.addField(extendedTypeStr(TransDate), "@SCM:InventClosingCancellationDialogReverseAllRecalculationsFrom");
+        dialogCancelFromDate.value(cancelFromDate);
+
+        dialogNotes2 = dialog.addField(extendedTypeStr(FreeTxt), "@SYS13887");
+        dialogNotes2.value(freeTxt);
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the cancellation process.
+    /// </summary>
+    /// <remarks>
+    ///    The records that should be canceled and then the cancellation record is be created. For this pair,
+    ///    the worker tasks will be initialized.
+    /// </remarks>
+    /// <exception cref="M:Exception::Error">
+    ///    When the inventory closing record has already been canceled, the update will be aborted.
+    /// </exception>
+    /// <exception cref="M:Exception::Error">
+    ///    When no records to be canceled exist, the update will be aborted.
+    /// </exception>
+    protected void execute()
+    {
+        setprefix(InventCostClosingCancel::description(inventTransCurrency));
+
+        if (!cancelRecalculationsFromDate)
+        {
+            setPrefix(strFmt("@SYS25865", dateCancel) + ', ' + strFmt("@SYS25866", voucherCancel));
+        }
+        else
+        {
+            setPrefix(strFmt("@SYS25865", dateCancel));
+        }
+
+        if (! this.validate())
+        {
+            throw error("@SYS18447");
+        }
+
+        if (this.isInBatch() == false)
+        {
+            if (!cancelRecalculationsFromDate)
+            {
+                this.progressInit(InventCostClosingCancel::description(inventTransCurrency), InventSettlement::numOfSettlementVoucher(dateCancel,voucherCancel)*2, #AviUpdate);
+            }
+            else
+            {
+                this.progressInit(InventCostClosingCancel::description(inventTransCurrency), 0, #AviUpdate);
+            }
+        }
+
+        // Cancel later inventory recalculations if cancel one voucher is selected
+        InventClosing closingCancel = InventClosing::find(voucherCancel, dateCancel);
+        if (!cancelRecalculationsFromDate && closingCancel.CancelRecalculation)
+        {
+            this.cancelRecalculations(closingCancel);
+        }
+
+        Query query = new Query();
+        QueryBuildDataSource inventClosingDataSource = query.addDataSource(tableNum(InventClosing));
+        inventClosingDataSource.update(true);
+        inventClosingDataSource.addSortIndex(indexNum(InventClosing, VoucherDateIdx));
+        inventClosingDataSource.indexIsHint(true);
+        if (!cancelRecalculationsFromDate)
+        {
+            inventClosingDataSource.addRange(fieldNum(InventClosing, Voucher)).value(queryValue(voucherCancel));
+            inventClosingDataSource.addRange(fieldNum(InventClosing, TransDate)).value(queryValue(dateCancel));
+        }
+        else
+        {
+            inventClosingDataSource.addRange(fieldNum(InventClosing, TransDate)).value(queryRange(cancelFromDate,''));
+            inventClosingDataSource.addRange(fieldNum(InventClosing, Active)).value(queryValue(NoYes::Yes));
+            inventClosingDataSource.addRange(fieldNum(InventClosing, AdjustmentType)).value(queryValue(InventAdjustmentType::Recalculation));
+            inventClosingDataSource.addSortField(fieldNum(InventClosing, TransDate), SortOrder::Descending);
+        }
+
+        inventClosingDataSource.addRange(fieldnum(InventClosing, InventTransCurrency_RU)).value(queryValue(inventTransCurrency));
+
+        Set processedClosings = new Set(Types::Int64);
+
+        QueryRun queryRun = new QueryRun(query);
+        while (queryRun.next())
+        {
+            cancelClosing = queryRun.get(tableNum(InventClosing));
+
+            if (!processedClosings.in(cancelClosing.RecId))
+            {
+                // For each of the closings that needs to be cancelled,
+                // create a new inventClosing record
+                this.createInventClosing();
+
+                if (! cancelClosing.RecId ||
+                    ! inventClosing.RecId)
+                {
+                    throw error(strFmt("@SYS19306",funcName()));
+                }
+
+                this.updateCancelClosing();
+
+                // Check if I am allowed to proceed
+                if (this.checkStatus())
+                {
+                    // First of all, remove the left over records in the inventCostList to prevent a user to start computing on this
+                    this.deleteRelatedRecords();
+
+                    // For this closing I need to create the tasks
+                    this.createTasks();
+                }
+
+                // Add to set, so that it is not processed a second time
+                processedClosings.add(cancelClosing.RecId);
+            }
+        }
+
+        this.writeInfoLog();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the user input from the cancellation dialog.
+    /// </summary>
+    /// <returns>
+    ///    true if the user input was valid; otherwise, false.
+    /// </returns>
+    public boolean getFromDialog()
+    {
+        cancelRecalculationsFromDate = dlgGroupCancelRecalcs.optionValue();
+
+        if (!cancelRecalculationsFromDate)
+        {
+            dateCancel     = dialogDateCancel.value();
+            voucherCancel  = dialogVoucherCancel.value();
+            freeTxt        = dialogNotes.value();
+        }
+
+        if (cancelRecalculationsFromDate)
+        {
+            cancelFromDate      = dialogCancelFromDate.value();
+            freeTxt = dialogNotes2.value();
+        }
+        
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the parameters for the inventory closing cancellation.
+    /// </summary>
+    /// <returns>
+    ///    true if the parameters were successfully initialized; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    The super call is not necessary in this case because there are no records to reread.
+    /// </remarks>
+    public boolean init()
+    {
+        // Do not execute super here, because it does not make sense trying to reread records that
+        // I have not created yet
+
+        logPointBegin = infologLine();
+        numberSeq = NumberSeq::newGetNum(InventClosing::numberSequenceReference(cancelClosing.AdjustmentType, inventTransCurrency));
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets the caption for a batch record.
+    /// </summary>
+    /// <param name="batch">
+    ///    The batch record where the caption should be set.
+    /// </param>
+    public void initBatch(Batch batch)
+    {
+        super(batch);
+
+        batch.Caption = InventCostClosingCancel_Init::description(inventTransCurrency);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the default values for the cancellation parameters.
+    /// </summary>
+    public void initParmDefault()
+    {
+        cancelRecalculationsFromDate = false;
+
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container  pack()
+    {
+        return [#CurrentVersion, #CurrentList] + [super()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCancelFromDate</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public TransDate parmCancelFromDate(TransDate _cancelFromDate = cancelFromDate)
+    {
+        cancelFromDate = _cancelFromDate;
+        return cancelFromDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCancelRecalculationsFromDate</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public boolean parmCancelRecalculationsFromDate(boolean _cancelRecalculationsFromDate = cancelRecalculationsFromDate)
+    {
+        cancelRecalculationsFromDate = _cancelRecalculationsFromDate;
+        return cancelRecalculationsFromDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmFreeTxt</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public FreeTxt parmFreeTxt(FreeTxt _freeTxt = freeTxt)
+    {
+        freeTxt    = _freeTxt;
+        return freeTxt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTransDate</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public TransDate parmTransDate(TransDate _dateCancel = dateCancel)
+    {
+        dateCancel = _dateCancel;
+        return dateCancel;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmVoucherCancel</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public Voucher parmVoucherCancel(Voucher       _voucherCancel = voucherCancel)
+    {
+        voucherCancel = _voucherCancel;
+        return voucherCancel;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean  unpack(container  packedClass)
+    {
+        Integer  version = conPeek(packedClass,1);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                container base;
+                [version, #CurrentList, base] = packedClass;
+                return super(base);
+
+            default:
+                return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCancelClosing</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateCancelClosing()
+    {
+        if (cancelClosing && cancelClosing.RecId)
+        {
+            // If closing is running, stop it
+            cancelClosing.setStopRunning(NoYes::Yes);
+            cancelClosing.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates if the closing records have already been canceled.
+    /// </summary>
+    /// <param name="_calledFrom">
+    ///    Identifies the object from which this method is called. Default value is null.
+    /// </param>
+    /// <returns>
+    ///    true if the cancellation can proceed; otherwise, false.
+    /// </returns>
+    public boolean validate(Object _calledFrom = null)
+    {
+        if (cancelRecalculationsFromDate)
+        {
+            if (! InventClosing::checkClosing(cancelFromDate, inventTransCurrency))
+            {
+                return false;
+            }
+
+            InventClosing inventClosingRecalculation;
+            boolean ret = true;
+            while select inventClosingRecalculation
+                order by inventClosingRecalculation.TransDate desc
+                where inventClosingRecalculation.Active
+                   && inventClosingRecalculation.TransDate >= cancelFromDate
+                   && inventClosingRecalculation.AdjustmentType == InventAdjustmentType::Recalculation
+                   && inventClosingRecalculation.InventTransCurrency_RU == inventTransCurrency
+            {
+                ret = InventTransArchiveProcessHistoryTable::checkArchivingInvolvedInClosingCancel(inventClosingRecalculation) && ret;
+            }
+
+            return ret;
+        }
+
+        if (!cancelRecalculationsFromDate && ! InventClosing::checkCancel(dateCancel, voucherCancel, inventTransCurrency))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static InventCostClosingCancel_Init construct()
+    {
+        return new InventCostClosingCancel_Init();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static ClassDescription description(InventTransCurrency_RU _inventTransCurrency = InventTransCurrency_RU::PrimaryCur)
+    {
+        return _inventTransCurrency == InventTransCurrency_RU::PrimaryCur ? "@SCM:InventClosingCancellationDialogName"
+                                                                          : "@GLS112125";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static public void main(Args args)
+    {
+        InventClosing                    cancelClosing;
+        InventTransCurrency_RU           inventTransCurrency;
+
+        if (args && args.caller() && args.dataset() == tablenum(InventClosing))
+            cancelClosing= args.record();
+
+        if (cancelClosing)
+        {
+            inventTransCurrency = cancelClosing.InventTransCurrency_RU;
+        }
+        else
+        {
+            inventTransCurrency = InventCostClosing::callerInventTransCurrency_RU(args);
+        }
+
+        InventCostClosingCancel_Init inventCostClosingCancel_Init = InventCostClosingCancel_Init::newFromParameters(cancelClosing.Voucher, cancelClosing.TransDate, "", inventTransCurrency);
+
+        if ( ! inventCostClosingCancel_Init.prompt())
+            return;
+
+        inventCostClosingCancel_Init.runOperation();
+
+        if (cancelClosing.RecId)
+        {
+            if (FormDataUtil::isFormDataSource(cancelClosing))
+                FormDataUtil::getFormDataSource(cancelClosing).research();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromInventClosing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of this class.
+    /// </summary>
+    /// <param name="_inventClosing">
+    ///    The inventory closing that should be canceled.
+    /// </param>
+    /// <returns>
+    ///    An initialized instance of the <see cref="T:InventCostClosingCancel_Init" />.
+    /// </returns>
+
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static InventCostClosingCancel_Init newFromInventClosing(InventClosing _inventClosing)
+    {
+        InventCostClosingCancel_Init    inventCostClosingCancel = InventCostClosingCancel::construct(InventCostWorkType::Init);
+
+        inventCostClosingCancel.initParmDefault();
+        inventCostClosingCancel.parmCancelRecalculationsFromDate(true);
+        inventCostClosingCancel.parmCancelFromDate(_inventClosing.TransDate + 1);
+        inventCostClosingCancel.parmFreeTxt(_inventClosing.Notes);
+        inventCostClosingCancel.parmInventTransCurrency_RU(_inventClosing.InventTransCurrency_RU);
+
+        return inventCostClosingCancel;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of this class.
+    /// </summary>
+    /// <param name="_voucherCancel">
+    ///    The voucher that should be canceled.
+    /// </param>
+    /// <param name="_dateCancel">
+    ///    The transaction date that should be canceled.
+    /// </param>
+    /// <param name="_freeTxt">
+    ///    The transaction text that should be used for the cancellation.
+    /// </param>
+    /// <param name="_inventTransCurrency">
+    /// The transaction currency: primary (default) or secondary - used for Dual Warehousing
+    /// </param>
+    /// <returns>
+    ///    An initialized instance of the <see cref="T:InventCostClosingCancel_Init" />.
+    /// </returns>
+
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static InventCostClosingCancel_Init newFromParameters(Voucher    _voucherCancel,
+                                                                        TransDate  _dateCancel,
+                                                                        FreeTxt                _freeTxt,
+                                                                        InventTransCurrency_RU _inventTransCurrency = InventTransCurrency_RU::PrimaryCur
+                                                                        )
+    {
+        InventCostClosingCancel_Init    inventCostClosingCancel = InventCostClosingCancel_Init::construct();
+
+        inventCostClosingCancel.getLast();
+        inventCostClosingCancel.parmVoucherCancel(_voucherCancel);
+        inventCostClosingCancel.parmTransDate(_dateCancel);
+        inventCostClosingCancel.parmFreeTxt(_freeTxt);
+        inventCostClosingCancel.parmCancelFromDate(_dateCancel);
+        inventCostClosingCancel.parmInventTransCurrency_RU(_inventTransCurrency);
+
+        return inventCostClosingCancel;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

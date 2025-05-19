@@ -1,0 +1,1629 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>LedgerJournalCheckPostAssets</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Helper class for the <c>LedgerJournalCheckPost</c> class.
+/// </summary>
+public class LedgerJournalCheckPostAssets
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>assetUpdateForNetBookValueErrors</Name>
+				<Source><![CDATA[
+    //
+    // Add transaction for a journal, asset and book to the errorLog and if
+    // posting to the voucherErrorList.
+    // This method is called called when an error is found in the assetValidateNetBookValues
+    //
+    private static void assetUpdateForNetBookValueErrors(
+        LedgerJournalCheckPost _caller,
+        JournalId _journalNum,
+        AssetId _assetId,
+        AssetBookId _assetBook,
+        SysInfoLogStr _errorText,
+        SelectableDataArea _assetCompanyId)
+    {
+        LedgerJournalTrans                  ledgerJournalTrans;
+        LedgerJournalTrans_Asset            ledgerJournalTrans_Asset;
+        DimensionAttributeValueCombination  dimAttrValueCombo;
+
+        // check if asset and book id exist as primary account and mark these as errors
+        while select ledgerJournalTrans
+            where ledgerJournalTrans.JournalNum == _journalNum
+            join RecId from ledgerJournalTrans_Asset
+                where ledgerJournalTrans.RecId == ledgerJournalTrans_Asset.RefRecId
+                    && ledgerJournalTrans_Asset.BookId == _assetBook
+                    && ledgerJournalTrans.Company == _assetCompanyId
+            join RecId from dimAttrValueCombo where
+                dimAttrValueCombo.RecId == ledgerJournalTrans.LedgerDimension &&
+                dimAttrValueCombo.DisplayValue == _assetId
+
+        {
+            if (!_caller.parmBeQuiet())
+            {
+                warning(_errorText);
+            }
+
+            _caller.updateTransInfoLog(ledgerJournalTrans);
+            if (_caller.parmPost())
+            {
+                _caller.insertInVoucherErrorList(ledgerJournalTrans.Voucher);
+            }
+        }
+
+        // check if asset and book id exist as offset account and mark these as errors
+        while select ledgerJournalTrans
+            where ledgerJournalTrans.JournalNum == _journalNum
+            join RecId from ledgerJournalTrans_Asset
+                where ledgerJournalTrans.RecId == ledgerJournalTrans_Asset.RefRecId
+                    && ledgerJournalTrans_Asset.BookId  == _assetBook
+                    && ledgerJournalTrans.Company == _assetCompanyId
+            join RecId from dimAttrValueCombo where
+                dimAttrValueCombo.RecId == ledgerJournalTrans.OffsetLedgerDimension &&
+                dimAttrValueCombo.DisplayValue == _assetId
+        {
+            if (!_caller.parmBeQuiet())
+            {
+                warning(_errorText);
+            }
+
+            _caller.updateTransInfoLog(ledgerJournalTrans);
+            if (_caller.parmPost())
+            {
+                _caller.insertInVoucherErrorList(ledgerJournalTrans.Voucher);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assetValidateNetBookValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate all the lines on the journal to check if the net book value is negative
+    /// or if the net book value is greater than the acquistion cost.
+    /// </summary>
+    /// <param name = "_caller">
+    /// The calling <c>LedgerJournalCheckPost</c> class.
+    /// </param>
+    /// <param name = "_journalNum">
+    /// The journal number.
+    /// </param>
+    /// <returns>
+    /// True if the net book value is negative or the net book value is greater than the acquision cost.
+    /// </returns>
+    /// <remarks>
+    /// This method will only work with asset journal type, since it does not
+    /// consider tax or discount in calculation of the amount of the journal
+    /// (able to make performance better because of this).
+    /// For non asset journal types should use assetValidateNetBookValuesNonFA method.
+    /// </remarks>
+    public static boolean assetValidateNetBookValues(LedgerJournalCheckPost _caller, JournalId _journalNum)
+    {
+        boolean                     ok = true;
+        LedgerJournalTrans          ledgerJournalTrans;
+        LedgerJournalTrans          ledgerJournalTransOffset;
+        LedgerJournalTrans_Asset    ledgerJournalTrans_Asset;
+        LedgerJournalTrans_Asset    ledgerJournalTrans_AssetOffset;
+        AmountMST                   journalAmount = 0.0;
+        AmountMST                   journalAmountAcquistion = 0.0;
+        AssetBook                   assetBook;
+        Map                         journalMap;
+        container                   containerAmount;
+        MapEnumerator               mapEnum;
+        str                         mapKey;
+        str                         origMapKey = '';
+        AssetId                     assetId;
+        RecId                       assetRecId;
+        AssetBookId                 assetBookId;
+        AmountMST                   baseAmount = 0.0;
+        AmountMST                   baseAmountAcquistion = 0.0;
+        boolean                     negativeNetBookValue;
+        boolean                     exceedingNetBookValue;
+        SelectableDataArea          assetCompanyId;
+        TransDate                   assetTransDate;
+        boolean                     assetNetBookNegativeNotFound = true;
+        boolean                     assetNetBookExceedNotFound = true;
+
+        // <GJP>
+        boolean                     isAssetDocumentEnabled = AssetDocumentUtility_JP::isAssetDocumentEnabled();
+        // </GJP>
+
+        #define.OffsetFlag('O')
+        #define.NormalFlag('N')
+
+        journalMap = new Map(Types::String, Types::Container);
+
+        // Are allowed to have fixed asset as an offset account, so need to check this.
+        // Having fixed asset as an offset account will not happen very often, but it does
+        // need to accumulate the amounts primary and offset amounts for an asset and book.
+        // This accumulation is done using a map to store the amount.  If no offset accounts
+        // for fixed assets are found, will not need maps to do the work.
+        // Read lines on journal and sum journal amount by Book and asset id for offset account
+        // but only read lines that need to check the negative book value and
+        // exceed net book value on the asset book record (this is what the join is doing.)
+        // <GJP>
+        if (isAssetDocumentEnabled)
+        {
+            select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTransOffset
+                group by OffsetCompany
+                where ledgerJournalTransOffset.JournalNum        == _journalNum  &&
+                      ledgerJournalTransOffset.OffsetAccountType == LedgerJournalACType::FixedAssets
+            join AssetId, BookId, TransType, DocumentType_JP from ledgerJournalTrans_AssetOffset
+                group by AssetId, BookId, TransType, DocumentType_JP
+                where ledgerJournalTransOffset.RecId == ledgerJournalTrans_AssetOffset.RefRecId         &&
+                      (ledgerJournalTrans_AssetOffset.TransType  != AssetTransTypeJournal::DisposalSale &&
+                       ledgerJournalTrans_AssetOffset.TransType  != AssetTransTypeJournal::DisposalScrap);
+        }
+        else
+        {
+            // </GJP>
+            select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTransOffset
+                group by OffsetCompany
+                where ledgerJournalTransOffset.JournalNum        == _journalNum
+                    && ledgerJournalTransOffset.OffsetAccountType == LedgerJournalACType::FixedAssets
+            join AssetId, BookId, TransType from ledgerJournalTrans_AssetOffset
+                group by AssetId, BookId, TransType
+                where ledgerJournalTransOffset.RecId == ledgerJournalTrans_AssetOffset.RefRecId
+                    && ledgerJournalTrans_AssetOffset.TransType  != AssetTransTypeJournal::DisposalSale
+                    && ledgerJournalTrans_AssetOffset.TransType  != AssetTransTypeJournal::DisposalScrap;
+            // <GJP>
+        }
+        // </GJP>
+
+        while (ledgerJournalTrans_AssetOffset.AssetId)
+        {
+            changecompany(_caller.validateCompany(ledgerJournalTransOffset.OffsetCompany))
+            {
+                assetBook = null;
+
+                if (Ledger::reportingCurrency() != ''
+                    && Ledger::accountingCurrency() != Ledger::reportingCurrency()
+                    && ledgerJournalTrans_AssetOffset.AssetId && ledgerJournalTrans_AssetOffset.BookId)
+                {
+                    LedgerJournalCheckPostAssets::depreciationTransactionWithZeroAmountInReportingCurrency(
+                        _journalNum,
+                        ledgerJournalTrans_AssetOffset.AssetId,
+                        ledgerJournalTrans_AssetOffset.BookId);
+                }
+
+                select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                where assetBook.AssetId == ledgerJournalTrans_AssetOffset.AssetId
+                    && assetBook.BookId  == ledgerJournalTrans_AssetOffset.BookId
+                    && (assetBook.NegativeNetBookValue  == NoYes::No
+                    || assetBook.ExceedingNetBookValue == NoYes::No);
+
+                if (assetBook)
+                {
+                    // asset or book id has changed, do checking and initialize values
+                    if (ledgerJournalTrans_AssetOffset.AssetId != assetId
+                        || ledgerJournalTrans_AssetOffset.BookId != assetBookId
+                        || ledgerJournalTransOffset.OffsetCompany != assetCompanyId)
+                    {
+                        if (assetId != '')
+                        {
+                            containerAmount =
+                                [assetId,
+                                assetBookId,
+                                journalAmount, journalAmountAcquistion,
+                                negativeNetBookValue, exceedingNetBookValue,
+                                assetCompanyId];
+
+                            journalMap.insert(int642str(assetRecId) + #OffsetFlag, containerAmount);
+                        }
+
+                        // initialize values
+                        assetCompanyId = ledgerJournalTransOffset.OffsetCompany;
+                        assetId = ledgerJournalTrans_AssetOffset.AssetId;
+                        assetBookId = ledgerJournalTrans_AssetOffset.BookId;
+                        journalAmount = 0.0;
+                        journalAmountAcquistion = 0.0;
+                        negativeNetBookValue = assetBook.NegativeNetBookValue;
+                        exceedingNetBookValue = assetBook.ExceedingNetBookValue;
+                        assetRecId = assetBook.RecId;
+                    }
+
+                    // sum up amounts - Need to reverse sign for offset account
+                    baseAmount = -(ledgerJournalTransOffset.AmountCurDebit - ledgerJournalTransOffset.AmountCurCredit);
+
+                    // <GEEU>
+                    if (ledgerJournalTrans_AssetOffset.TransType != AssetTransTypeJournal::Preacquisition_CZ
+                        // <GJP>
+                        && (!isAssetDocumentEnabled || ledgerJournalTrans_AssetOffset.doesAffectNetBookValue_JP())
+                        // </GJP>
+                        )
+                    {
+                        // </GEEU>
+                        journalAmount += baseAmount;
+                        // <GEEU>
+                    }
+                    // </GEEU>
+
+                    if (AssetSumCalc_Trans::isTransactionAffectingAcquisitionCosts(ledgerJournalTrans_AssetOffset.TransType)
+                        // <GJP>
+                        && (!isAssetDocumentEnabled || ledgerJournalTrans_AssetOffset.doesAffectAcquisitionCost_JP())
+                        // </GJP>
+                        )
+                    {
+                        journalAmountAcquistion += baseAmount;
+                    }
+                }
+            }
+
+            next ledgerJournalTransOffset;
+        }
+
+        // asset or book id has changed, do checking for last record
+        if (assetId != '')
+        {
+            containerAmount =
+                [assetId,
+                assetBookId,
+                journalAmount, journalAmountAcquistion,
+                negativeNetBookValue, exceedingNetBookValue,
+                assetCompanyId];
+
+            journalMap.insert(int642str(assetRecId) + #OffsetFlag, containerAmount);
+        }
+
+        // Now need to check for fixed asset as normal account
+        // initalize variables
+        assetId = '';
+        assetBookId = '';
+        journalAmount = 0.0;
+        journalAmountAcquistion = 0.0;
+
+        // if no offset records exist that are type of fixed asset, can just sum the amounts
+        // and do checking based on the amounts returned.  This should have the best performance
+        if (journalMap.empty() == true)
+        {
+            // read lines on journal and sum journal amount by Book and asset id for normal account
+            // but only read lines that need to check the negative book value and
+            // exceed net book value on the asset book record (this is what the join is doing.
+            // <GJP>
+            if (isAssetDocumentEnabled)
+            {
+                select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTrans
+                    group by Company
+                        where ledgerJournalTrans.JournalNum  == _journalNum  &&
+                              ledgerJournalTrans.AccountType == LedgerJournalACType::FixedAssets
+                    join AssetId, BookId, TransType, DocumentType_JP from ledgerJournalTrans_Asset
+                        group by AssetId, BookId, TransType, DocumentType_JP
+                        where ledgerJournalTrans.RecId            == ledgerJournalTrans_Asset.RefRecId   &&
+                              (ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalSale &&
+                               ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalScrap);
+            }
+            else
+            {
+                // </GJP>
+                select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTrans
+                    group by Company
+                        where ledgerJournalTrans.JournalNum  == _journalNum
+                            && ledgerJournalTrans.AccountType == LedgerJournalACType::FixedAssets
+                    join AssetId, BookId, TransType from ledgerJournalTrans_Asset
+                        group by AssetId, BookId, TransType
+                        where ledgerJournalTrans.RecId            == ledgerJournalTrans_Asset.RefRecId
+                            && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalSale
+                            && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalScrap;
+                // <GJP>
+            }
+            // </GJP>
+
+            while (ledgerJournalTrans_Asset.AssetId)
+            {
+                changecompany(_caller.validateCompany(ledgerJournalTrans.Company))
+                {
+                    assetBook = null;
+
+                    if (Ledger::reportingCurrency() != ''
+                        && Ledger::accountingCurrency() != Ledger::reportingCurrency()
+                        && ledgerJournalTrans_Asset.AssetId && ledgerJournalTrans_Asset.BookId)
+                    {
+                        LedgerJournalCheckPostAssets::depreciationTransactionWithZeroAmountInReportingCurrency(
+                            _journalNum,
+                            ledgerJournalTrans_Asset.AssetId,
+                            ledgerJournalTrans_Asset.BookId);
+                    }
+
+                    select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                    where assetBook.AssetId == ledgerJournalTrans_Asset.AssetId
+                        && assetBook.BookId  == ledgerJournalTrans_Asset.BookId
+                        && (assetBook.NegativeNetBookValue  == NoYes::No
+                        || assetBook.ExceedingNetBookValue == NoYes::No);
+
+                    if (assetBook)
+                    {
+                        assetNetBookNegativeNotFound = true;
+                        assetNetBookExceedNotFound = true;
+
+                        // asset or book id has changed, do checking and initialize values
+                        if (ledgerJournalTrans_Asset.AssetId != assetId
+                            || ledgerJournalTrans_Asset.BookId != assetBookId
+                            || ledgerJournalTrans.Company!= assetCompanyId)
+                        {
+                            if (assetId != '')
+                            {
+                                // The company needs to be reselected as it is possible that previous company
+                                // was different then the current assigned to the record.
+                                changecompany(_caller.validateCompany(assetCompanyId))
+                                {
+                                    ok = ok && LedgerJournalCheckPostAssets::validateNegativeAndExceedingNetBookValue(
+                                        assetId, 
+                                        assetBookId,
+                                        journalAmount,
+                                        journalAmountAcquistion,
+                                        _caller,
+                                        _journalNum,
+                                        assetCompanyId,
+                                        assetTransDate);
+                                }
+                            }
+
+                            // initialize values
+                            assetCompanyId = ledgerJournalTrans.Company;
+                            assetId = ledgerJournalTrans_Asset.AssetId;
+                            assetBookId = ledgerJournalTrans_Asset.BookId;
+                            journalAmount = 0.0;
+                            journalAmountAcquistion = 0.0;
+                            negativeNetBookValue = assetBook.NegativeNetBookValue;
+                            exceedingNetBookValue = assetBook.ExceedingNetBookValue;
+                            assetRecId = assetBook.RecId;
+                        }
+
+                        // sum up amounts - This is the primary account so do not reverse the sign.
+                        baseAmount = (ledgerJournalTrans.AmountCurDebit - ledgerJournalTrans.AmountCurCredit);
+
+                        // <GEEU>
+                        if (ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::Preacquisition_CZ
+                            && (!isAssetDocumentEnabled || ledgerJournalTrans_Asset.doesAffectNetBookValue_JP())
+                            && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DerogatoryDecrease
+                            && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DerogatoryIncrease)
+                        {
+                            // </GEEU>
+                            journalAmount += baseAmount;
+                            // <GEEU>
+                        }
+                        // </GEEU>
+
+                        if (AssetSumCalc_Trans::isTransactionAffectingAcquisitionCosts(ledgerJournalTrans_Asset.TransType)
+                            // <GJP>
+                            && (!isAssetDocumentEnabled || ledgerJournalTrans_Asset.doesAffectAcquisitionCost_JP())
+                            // </GJP>
+                            )
+                        {
+                            journalAmountAcquistion += baseAmount;
+                        }
+                    }
+                }
+
+                next ledgerJournalTrans;
+            }
+
+            // asset or book id has changed, do checking for last record
+            if (assetId != '')
+            {
+                changecompany(_caller.validateCompany(assetCompanyId))
+                {
+                    ok = ok && LedgerJournalCheckPostAssets::validateNegativeAndExceedingNetBookValue(
+                        assetId,
+                        assetBookId,
+                        journalAmount,
+                        journalAmountAcquistion,
+                        _caller,
+                        _journalNum,
+                        assetCompanyId,
+                        assetTransDate);
+                }
+            }
+        }
+        // found some offset account so now need to check for fixed asset as normal accounts
+        // these need to be summed with the values in the map
+        else if (journalMap.empty() == false)
+        {
+            // read lines on journal and sum journal amount by Book and asset id for normal account
+            // but only read lines that need to check the negative book value and
+            // exceed net book value on the asset book record (this is what the join is doing).
+            // <GJP>
+            if (isAssetDocumentEnabled)
+            {
+                select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTrans
+                    group by Company
+                    where ledgerJournalTrans.JournalNum  == _journalNum  &&
+                          ledgerJournalTrans.AccountType == LedgerJournalACType::FixedAssets
+                join AssetId, BookId, TransType, DocumentType_JP from ledgerJournalTrans_Asset
+                    group by AssetId, BookId, TransType, DocumentType_JP
+                    where ledgerJournalTrans.RecId            == ledgerJournalTrans_Asset.RefRecId   &&
+                          (ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalSale &&
+                           ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalScrap);
+            }
+            else
+            {
+                // </GJP>
+                select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTrans
+                    group by Company
+                    where ledgerJournalTrans.JournalNum  == _journalNum
+                        && ledgerJournalTrans.AccountType == LedgerJournalACType::FixedAssets
+                join AssetId, BookId, TransType from ledgerJournalTrans_Asset
+                    group by AssetId, BookId, TransType
+                    where ledgerJournalTrans.RecId            == ledgerJournalTrans_Asset.RefRecId
+                        && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalSale
+                        && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalScrap;
+                // <GJP>
+            }
+            // </GJP>
+
+            while (ledgerJournalTrans_Asset.AssetId)
+            {
+                changecompany(_caller.validateCompany(ledgerJournalTrans.Company))
+                {
+                    assetBook = null;
+
+                    select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                        group by NegativeNetBookValue, ExceedingNetBookValue
+                        where assetBook.AssetId == ledgerJournalTrans_Asset.AssetId
+                            && assetBook.BookId  == ledgerJournalTrans_Asset.BookId
+                            && (assetBook.NegativeNetBookValue == NoYes::No
+                            || assetBook.ExceedingNetBookValue == NoYes::No);
+
+                    if (assetBook)
+                    {
+                        // asset or book id has changed, do checking and initialize values
+                        if (ledgerJournalTrans_Asset.AssetId != assetId
+                            || ledgerJournalTrans_Asset.BookId != assetBookId
+                            || ledgerJournalTrans.Company!= assetCompanyId)
+                        {
+                            if (assetId != '')
+                            {
+                                containerAmount =
+                                    [assetId,
+                                    assetBookId,
+                                    journalAmount, journalAmountAcquistion,
+                                    negativeNetBookValue, exceedingNetBookValue,
+                                    assetCompanyId];
+
+                                journalMap.insert(int642str(assetRecId) + #NormalFlag, containerAmount);
+                            }
+
+                            // initialize values
+                            assetCompanyId = ledgerJournalTrans.Company;
+                            assetId = ledgerJournalTrans_Asset.AssetId;
+                            assetBookId = ledgerJournalTrans_Asset.BookId;
+                            journalAmount = 0.0;
+                            journalAmountAcquistion = 0.0;
+                            negativeNetBookValue = assetBook.NegativeNetBookValue;
+                            exceedingNetBookValue = assetBook.ExceedingNetBookValue;
+                            assetRecId = assetBook.RecId;
+                        }
+
+                        // sum up amounts - This is the primary account so do not reverse the sign.
+                        baseAmount = (ledgerJournalTrans.AmountCurDebit - ledgerJournalTrans.AmountCurCredit);
+
+                        // <GEEU>
+                        if (ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::Preacquisition_CZ
+                            // <GJP>
+                            && (!isAssetDocumentEnabled || ledgerJournalTrans_Asset.doesAffectNetBookValue_JP())
+                            // </GJP>
+                            && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DerogatoryDecrease
+                            && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DerogatoryIncrease)
+                        {
+                            // </GEEU>
+                            journalAmount += baseAmount;
+                            // <GEEU>
+                        }
+                        // </GEEU>
+
+                        if (AssetSumCalc_Trans::isTransactionAffectingAcquisitionCosts(ledgerJournalTrans_Asset.TransType)
+                            // <GJP>
+                            && (!isAssetDocumentEnabled || ledgerJournalTrans_Asset.doesAffectAcquisitionCost_JP())
+                            // </GJP>
+                            )
+                        {
+                            journalAmountAcquistion += baseAmount;
+                        }
+                    }
+                }
+                next ledgerJournalTrans;
+            }
+
+            // asset or book id has changed, do checking for last record
+            if (assetId != '')
+            {
+                containerAmount =
+                    [assetId,
+                    assetBookId,
+                    journalAmount, journalAmountAcquistion,
+                    negativeNetBookValue, exceedingNetBookValue,
+                    assetCompanyId];
+
+                journalMap.insert(int642str(assetRecId) + #NormalFlag, containerAmount);
+            }
+
+            // All records are now in the map, so process the map
+            origMapKey = '';
+            mapEnum = journalMap.getEnumerator();
+            while (mapEnum.moveNext())
+            {
+                // get the values from the map
+                mapKey = mapEnum.currentKey();
+                containerAmount = mapEnum.currentValue();
+                // strip the offset of normal flag off of the key value
+                if (strLen(mapKey) > 1)
+                {
+                    mapKey = subStr(mapKey, 1, strLen(mapKey) - 1);
+                }
+
+                // if map key doesn't match the original key do checking
+                if (mapKey != origMapKey)
+                {
+                    if (origMapKey != '')
+                    {
+                        changecompany(_caller.validateCompany(assetCompanyId))
+                        {
+                            ok = ok && LedgerJournalCheckPostAssets::validateNegativeAndExceedingNetBookValue(
+                                assetId,
+                                assetBookId,
+                                journalAmount,
+                                journalAmountAcquistion,
+                                _caller,
+                                _journalNum,
+                                assetCompanyId,
+                                assetTransDate);
+                        }
+                    }
+
+                    // initalize values
+                    origMapKey = mapKey;
+                    journalAmount = 0;
+                    journalAmountAcquistion = 0;
+                }
+
+                // accumulate amounts from map
+                [assetId, assetBookId, baseAmount, baseAmountAcquistion, negativeNetBookValue, exceedingNetBookValue, assetCompanyId] = containerAmount;
+                journalAmount += baseAmount;
+                journalAmountAcquistion += baseAmountAcquistion;
+            }
+
+            // check last record
+            // if map key doesn't match the original key do checking
+            if (origMapKey != '')
+            {
+                changecompany(_caller.validateCompany(assetCompanyId))
+                {
+                    ok = ok && LedgerJournalCheckPostAssets::validateNegativeAndExceedingNetBookValue(
+                        assetId,
+                        assetBookId,
+                        journalAmount,
+                        journalAmountAcquistion,
+                        _caller,
+                        _journalNum,
+                        assetCompanyId,
+                        assetTransDate);
+                }
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateNegativeAndExceedingNetBookValue</Name>
+				<Source><![CDATA[
+    private static boolean validateNegativeAndExceedingNetBookValue(
+        AssetId _assetId,
+        AssetBookId _bookId,
+        Amount _journalAmount,
+        Amount _journalAmountAcquistion,
+        LedgerJournalCheckPost _caller,
+        JournalId _journalNum,
+        CompanyId _companyId,
+        TransDate _transDate)
+    {
+        AssetSumCalc_Trans sumCalcTrans = AssetSumCalc_Trans::newAssetYear(_assetId, _bookId);
+        AssetSumCalc_Trans_IN sumCalc_Trans_IN = AssetSumCalc_Trans_IN::newAssetYear(_assetId, _bookId, _transDate);
+
+        AssetBook assetBook = AssetBook::find(_assetId, _bookId);
+
+        boolean isNegativeNBV = false;
+        boolean isExceedingNBV = false;
+
+        if (assetBook.NegativeNetBookValue == NoYes::No)
+        {            
+            isNegativeNBV = LedgerJournalCheckPostAssets::isNegativeNetBookValue(
+                assetBook,
+                _journalAmount,
+                _transDate,
+                sumCalcTrans,
+                sumCalc_Trans_IN);
+
+            if (isNegativeNBV)
+            {
+                LedgerJournalCheckPostAssets::assetUpdateForNetBookValueErrors(
+                _caller,
+                _journalNum,
+                _assetId,
+                _bookId,
+                strFmt("@FixedAssets:FA_MessageError_PostedNetBookValueWillBeNegative", _assetId, _bookId),
+                _companyId);
+            }
+        }
+
+        if (assetBook.ExceedingNetBookValue == NoYes::No)
+        {
+            isExceedingNBV = sumCalcTrans.isNetBookValueHigherThanAcquisition(_journalAmount - _journalAmountAcquistion);
+        
+            if (isExceedingNBV)
+            {
+                LedgerJournalCheckPostAssets::assetUpdateForNetBookValueErrors(
+                _caller,
+                _journalNum,
+                _assetId,
+                _bookId,
+                strFmt("@FixedAssets:FA_MessageError_NetBookValueHigherThanAcquisition", _assetId, _bookId),
+                _companyId);
+            }
+        }
+        
+        return !isNegativeNBV && !isExceedingNBV;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isNegativeNetBookValue</Name>
+				<Source><![CDATA[
+    private static boolean isNegativeNetBookValue(
+        AssetBook _assetBook,
+        Amount _journalAmount,
+        TransDate _transDate,
+        AssetSumCalc_Trans _sumCalcTrans,
+        AssetSumCalc_Trans_IN _sumCalc_Trans_IN)
+    {
+        boolean isNegativeNBV = false;
+
+        if (!_assetBook.AssetGroupDepreciation_IN)
+        {
+            _sumCalcTrans = AssetSumCalc_Trans::newAssetYear(_assetBook.AssetId, _assetBook.BookId);
+            isNegativeNBV = _sumCalcTrans.isNegativeNetBookValue(_journalAmount);
+        }
+        else
+        {
+            _sumCalc_Trans_IN = AssetSumCalc_Trans_IN::newAssetYear(_assetBook.AssetGroup, _assetBook.BookId, _transDate);
+            isNegativeNBV = _sumCalc_Trans_IN.isNegativeNetBookValue(_journalAmount);
+        }
+
+        return isNegativeNBV;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assetValidateNetBookValues_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check whether the netbook value of the posted asset doesnt leads to an imbalance in the journals.
+    /// </summary>
+    /// <param name="_caller">
+    /// The calling <c>LedgerJournalCheckPost</c> class.
+    /// </param>
+    /// <param name="_journalNum">
+    /// The journal number of the journal
+    /// </param>
+    /// <returns>
+    /// Returns true if no imbalance occurs.
+    /// </returns>
+    public static boolean assetValidateNetBookValues_IN(LedgerJournalCheckPost _caller, JournalId _journalNum)
+    {
+        boolean                             ok = true;
+        LedgerJournalTrans                  ledgerJournalTrans;
+        LedgerJournalTrans                  ledgerJournalTransOffset;
+        LedgerJournalTrans_Asset            ledgerJournalTrans_Asset;
+        LedgerJournalTrans_Asset            ledgerJournalTrans_AssetOffset;
+        DimensionAttributeValueCombination  dimensionAttribute;
+        AmountMST                           journalAmount = 0;
+        AmountMST                           journalAmountAcquistion = 0;
+        AmountMST                           baseAmount = 0;
+        AmountMST                           baseAmountAcquistion;
+        AssetBook                           assetBook;
+        AssetSumCalc_Trans_IN               assetSumCalc_Trans;
+        AssetId                             assetId = '';
+        AssetBookId                         assetBookId = '';
+        NoYes                               negativeNetBookValue;
+        NoYes                               exceedingNetBookValue;
+        Map                                 journalMap;
+        container                           containerAmount;
+        MapEnumerator                       mapEnum;
+        str                                 mapKey;
+        str                                 origMapKey = '';
+        RecId                               assetRecId;
+        SelectableDataArea                  assetCompanyId;
+        boolean                             assetNetBookNegativeNotFound = true;
+        boolean                             assetNetBookExceedNotFound = true;
+        #define.OffsetFlag('O')
+        #define.NormalFlag('N')
+
+        journalMap = new Map(Types::String, Types::Container);
+        while select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTransOffset
+                group by LedgerDimension, OffsetCompany
+                where ledgerJournalTransOffset.JournalNum == _journalNum
+                    && ledgerJournalTransOffset.OffsetAccountType == LedgerJournalACType::FixedAssets
+            join ledgerJournalTrans_AssetOffset
+                group by BookId, TransType
+                where ledgerJournalTransOffset.RecId == ledgerJournalTrans_AssetOffset.RefRecId
+                    && (ledgerJournalTrans_AssetOffset.TransType != AssetTransTypeJournal::DisposalSale
+                    && ledgerJournalTrans_AssetOffset.TransType != AssetTransTypeJournal::DisposalScrap)
+            join dimensionAttribute
+                where dimensionAttribute.RecId == ledgerJournalTransOffset.LedgerDimension
+
+        {
+            changecompany(_caller.validateCompany(ledgerJournalTransOffset.OffsetCompany))
+            {
+                assetBook = null;
+
+                select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                    group by NegativeNetBookValue, ExceedingNetBookValue
+                    where assetBook.AssetId                     == dimensionAttribute.DisplayValue
+                        && assetBook.BookId                     == ledgerJournalTrans_AssetOffset.BookId
+                        && (assetBook.NegativeNetBookValue      == NoYes::No
+                        || assetBook.ExceedingNetBookValue      == NoYes::No);
+
+                if (assetBook)
+                {
+                    if (ledgerJournalTransOffset.parmOffsetAccount() != assetId
+                        || ledgerJournalTrans_AssetOffset.BookId != assetBookId
+                        || ledgerJournalTransOffset.OffsetCompany != assetCompanyId)
+                    {
+                        if (assetId || assetBookId)
+                        {
+                            containerAmount =
+                                [assetId,
+                                assetBookId,
+                                journalAmount, journalAmountAcquistion,
+                                negativeNetBookValue, exceedingNetBookValue,
+                                assetCompanyId];
+
+                            journalMap.insert(int642str(assetRecId) + #OffsetFlag, containerAmount);
+                        }
+
+                        assetCompanyId          = ledgerJournalTransOffset.OffsetCompany;
+                        assetId                 = ledgerJournalTransOffset.parmOffsetAccount();
+                        assetBookId             = ledgerJournalTrans_AssetOffset.BookId;
+                        journalAmount           = 0;
+                        journalAmountAcquistion = 0;
+                        negativeNetBookValue    = assetBook.NegativeNetBookValue;
+                        exceedingNetBookValue   = assetBook.ExceedingNetBookValue;
+                        assetRecId              = assetBook.RecId;
+                    }
+
+                    baseAmount      = -(ledgerJournalTransOffset.AmountCurDebit - ledgerJournalTransOffset.AmountCurCredit);
+                    journalAmount   += baseAmount;
+                    if (ledgerJournalTrans_AssetOffset.TransType == AssetTransTypeJournal::Acquisition ||
+                        ledgerJournalTrans_AssetOffset.TransType == AssetTransTypeJournal::AcquisitionAdj)
+                    {
+                        journalAmountAcquistion += baseAmount;
+                    }
+                }
+            }
+        }
+
+        if (assetId || assetBookId)
+        {
+            containerAmount =
+                [assetId,
+                assetBookId,
+                journalAmount, journalAmountAcquistion,
+                negativeNetBookValue, exceedingNetBookValue,
+                assetCompanyId];
+
+            journalMap.insert(int642str(assetRecId) + #OffsetFlag, containerAmount);
+        }
+
+        assetId                 = '';
+        assetBookId             = '';
+        journalAmount           = 0;
+        journalAmountAcquistion = 0;
+        if (journalMap.empty() == true)
+        {
+            while select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTrans
+                    group by LedgerDimension, Company
+                    where ledgerJournalTrans.JournalNum == _journalNum
+                        && ledgerJournalTrans.AccountType == LedgerJournalACType::FixedAssets
+                join ledgerJournalTrans_Asset
+                    group by BookId, TransType
+                    where ledgerJournalTrans.RecId == ledgerJournalTrans_Asset.RefRecId
+                        && ledgerJournalTrans_Asset.TransType   != AssetTransTypeJournal::DisposalSale
+                        && ledgerJournalTrans_Asset.TransType   != AssetTransTypeJournal::DisposalScrap
+                join dimensionAttribute
+                    where dimensionAttribute.RecId == ledgerJournalTrans.LedgerDimension
+            {
+                assetNetBookNegativeNotFound = true;
+                changecompany(_caller.validateCompany(ledgerJournalTrans.Company))
+                {
+                    assetBook = null;
+
+                    select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                        group by NegativeNetBookValue, ExceedingNetBookValue
+                        where assetBook.AssetId                     == dimensionAttribute.DisplayValue
+                            && assetBook.BookId                     == ledgerJournalTrans_Asset.BookId
+                            && (assetBook.NegativeNetBookValue      == NoYes::No
+                            || assetBook.ExceedingNetBookValue      == NoYes::No);
+
+                    if (assetBook)
+                    {
+                        if (ledgerJournalTrans.parmAccount() != assetId
+                            || ledgerJournalTrans_AssetOffset.BookId != assetBookId
+                            || ledgerJournalTrans.Company != assetCompanyId)
+                        {
+                            if (assetId || assetBookId)
+                            {
+                                assetSumCalc_Trans = AssetSumCalc_Trans_IN::newAssetYear(assetId, assetBookId);
+
+                                journalAmount = 0;
+                                while select AmountCurDebit, AmountCurCredit from ledgerJournalTrans
+                                    where ledgerJournalTrans.JournalNum  == _journalNum
+                                join RefRecId from ledgerJournalTrans_Asset
+                                    where ledgerJournalTrans.RecId == ledgerJournalTrans_Asset.RefRecId
+                                {
+                                    journalAmount += ledgerJournalTrans.AmountCurDebit - ledgerJournalTrans.AmountCurCredit;
+                                }
+
+                                if (negativeNetBookValue == NoYes::No)
+                                {
+                                    if (assetSumCalc_Trans.netBookValue() + journalAmount < 0)
+                                    {
+                                        assetNetBookNegativeNotFound = false;
+                                    }
+                                }
+                            }
+
+                            assetCompanyId          = ledgerJournalTrans.Company;
+                            assetId                 = ledgerJournalTrans.parmAccount();
+                            assetBookId             = ledgerJournalTrans_AssetOffset.BookId;
+                            journalAmount           = 0;
+                            journalAmountAcquistion = 0;
+                            negativeNetBookValue    = assetBook.NegativeNetBookValue;
+                            exceedingNetBookValue   = assetBook.ExceedingNetBookValue;
+                        }
+
+                        baseAmount      = ledgerJournalTrans.AmountCurDebit - ledgerJournalTrans.AmountCurCredit;
+                        journalAmount   += baseAmount;
+
+                        if (ledgerJournalTrans_AssetOffset.TransType == AssetTransTypeJournal::Acquisition     ||
+                            ledgerJournalTrans_AssetOffset.TransType == AssetTransTypeJournal::AcquisitionAdj)
+                        {
+                            journalAmountAcquistion += baseAmount;
+                        }
+                    }
+                }
+
+                ok = ok && assetNetBookNegativeNotFound;
+                if (!ok)
+                {
+                    LedgerJournalCheckPostAssets::createAssetNetBookValueErrors(_caller, _journalNum, assetId, assetBookId, assetNetBookNegativeNotFound, false, assetCompanyId);
+                }
+            }
+
+            if (assetId || assetBookId)
+            {
+                journalAmount = 0;
+                while select AmountCurDebit, AmountCurCredit, Company from ledgerJournalTrans
+                    where ledgerJournalTrans_AssetOffset.BookId == assetBookId  &&
+                          ledgerJournalTrans.JournalNum         == _journalNum
+                {
+                    journalAmount += ledgerJournalTrans.AmountCurDebit - ledgerJournalTrans.AmountCurCredit;
+                }
+
+                if (negativeNetBookValue == NoYes::No)
+                {
+                    assetCompanyId = ledgerJournalTrans.Company;
+                    changecompany(_caller.validateCompany(assetCompanyId))
+                    {
+                        assetSumCalc_Trans = AssetSumCalc_Trans_IN::newAssetYear(assetId, assetBookId);
+                        if (assetSumCalc_Trans.netBookValue() + journalAmount < 0)
+                        {
+                            assetNetBookNegativeNotFound = false;
+                        }
+                    }
+                    ok = ok && assetNetBookNegativeNotFound;
+                    if (!ok)
+                    {
+                        LedgerJournalCheckPostAssets::createAssetNetBookValueErrors(_caller, _journalNum, assetId, assetBookId, assetNetBookNegativeNotFound, false, assetCompanyId);
+                    }
+                }
+            }
+        }
+        else if (journalMap.empty() == false)
+        {
+            while select sum(AmountCurDebit), sum(AmountCurCredit) from ledgerJournalTrans
+                    group by LedgerDimension, Company
+                    where ledgerJournalTrans.JournalNum == _journalNum
+                        && ledgerJournalTrans.AccountType == LedgerJournalACType::FixedAssets
+                join ledgerJournalTrans_Asset
+                    group by BookId, TransType
+                    where ledgerJournalTrans.RecId == ledgerJournalTrans_Asset.RefRecId
+                        && ledgerJournalTrans_Asset.TransType   != AssetTransTypeJournal::DisposalSale
+                        && ledgerJournalTrans_Asset.TransType   != AssetTransTypeJournal::DisposalScrap
+                join dimensionAttribute
+                    where dimensionAttribute.RecId == ledgerJournalTrans.LedgerDimension
+            {
+                changecompany(_caller.validateCompany(ledgerJournalTrans.Company))
+                {
+                    assetBook = null;
+
+                    select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                        group by NegativeNetBookValue, ExceedingNetBookValue
+                        where assetBook.AssetId                     == dimensionAttribute.DisplayValue
+                            && assetBook.BookId                     == ledgerJournalTrans_Asset.BookId
+                            && (assetBook.NegativeNetBookValue      == NoYes::No
+                            || assetBook.ExceedingNetBookValue      == NoYes::No);
+
+                    if (assetBook)
+                    {
+                        if (ledgerJournalTrans.parmAccount() != assetId
+                            || ledgerJournalTrans_Asset.BookId != assetBookId
+                            || ledgerJournalTrans.Company != assetCompanyId)
+                        {
+                            if (assetId || assetBookId)
+                            {
+                                containerAmount =
+                                    [assetId,
+                                    assetBookId,
+                                    journalAmount, journalAmountAcquistion,
+                                    negativeNetBookValue, exceedingNetBookValue,
+                                    assetCompanyId];
+
+                                journalMap.insert(int642str(assetRecId) + #NormalFlag, containerAmount);
+                            }
+
+                            assetCompanyId          = ledgerJournalTrans.Company;
+                            assetId                 = ledgerJournalTrans.parmAccount();
+                            assetBookId             = ledgerJournalTrans_Asset.BookId;
+                            journalAmount           = 0;
+                            journalAmountAcquistion = 0;
+                            assetRecId              = assetBook.RecId;
+                            negativeNetBookValue    = assetBook.NegativeNetBookValue;
+                            exceedingNetBookValue   = assetBook.ExceedingNetBookValue;
+                        }
+
+                        baseAmount      = ledgerJournalTrans.AmountCurDebit - ledgerJournalTrans.AmountCurCredit;
+                        journalAmount   += baseAmount;
+
+                        if (ledgerJournalTrans_Asset.TransType == AssetTransTypeJournal::Acquisition     ||
+                            ledgerJournalTrans_Asset.TransType == AssetTransTypeJournal::AcquisitionAdj)
+                        {
+                            journalAmountAcquistion += baseAmount;
+                        }
+                    }
+                }
+            }
+
+            if (assetId || assetBookId)
+            {
+                containerAmount =
+                    [assetId,
+                    assetBookId,
+                    journalAmount, journalAmountAcquistion,
+                    negativeNetBookValue, exceedingNetBookValue,
+                    assetCompanyId];
+
+                journalMap.insert(int642str(assetRecId) + #NormalFlag, containerAmount);
+            }
+
+            origMapKey = '';
+            mapEnum = journalMap.getEnumerator();
+            while (mapEnum.moveNext())
+            {
+                assetNetBookNegativeNotFound = true;
+                assetNetBookExceedNotFound = true;
+                mapKey = mapEnum.currentKey();
+                containerAmount = mapEnum.currentValue();
+                if (strLen(mapKey) > 1)
+                {
+                    mapKey = subStr(mapKey, 1, strLen(mapKey) - 1);
+                }
+
+                if (mapKey != origMapKey)
+                {
+                    if (origMapKey != '')
+                    {
+                        changecompany(_caller.validateCompany(assetCompanyId))
+                        {
+                            assetSumCalc_Trans = AssetSumCalc_Trans_IN::newAssetYear(assetId, assetBookId);
+
+                            if (negativeNetBookValue == NoYes::No)
+                            {
+                                if (assetSumCalc_Trans.netBookValue() + journalAmount < 0)
+                                {
+                                    assetNetBookNegativeNotFound = false;
+                                }
+                            }
+                            if (exceedingNetBookValue == NoYes::No)
+                            {
+                                if (assetSumCalc_Trans.netBookValue() + journalAmount >
+                                    assetSumCalc_Trans.acquisitionValue() +
+                                    assetSumCalc_Trans.acquisitionAdjValue() + journalAmountAcquistion)
+                                {
+                                    assetNetBookExceedNotFound = false;
+                                }
+                            }
+                        }
+
+                        ok = ok && assetNetBookNegativeNotFound && assetNetBookExceedNotFound;
+                        if (!ok)
+                        {
+                            LedgerJournalCheckPostAssets::createAssetNetBookValueErrors(_caller, _journalNum, assetId, assetBookId, assetNetBookNegativeNotFound, assetNetBookExceedNotFound, assetCompanyId);
+                        }
+                    }
+
+                    origMapKey              = mapKey;
+                    journalAmount           = 0;
+                    journalAmountAcquistion = 0;
+                }
+                [assetId, assetBookId, baseAmount, baseAmountAcquistion, negativeNetBookValue, exceedingNetBookValue, assetCompanyId] = containerAmount;
+                journalAmount += baseAmount;
+                journalAmountAcquistion += baseAmountAcquistion;
+            }
+
+            if (origMapKey)
+            {
+                changecompany(_caller.validateCompany(assetCompanyId))
+                {
+                    assetSumCalc_Trans = AssetSumCalc_Trans_IN::newAssetYear(assetId, assetBookId);
+                    if (negativeNetBookValue == NoYes::No)
+                    {
+                        if (assetSumCalc_Trans.netBookValue() + journalAmount < 0)
+                        {
+                            assetNetBookNegativeNotFound = false;
+                        }
+                    }
+
+                    if (exceedingNetBookValue == NoYes::No)
+                    {
+                        if (assetSumCalc_Trans.netBookValue() + journalAmount > assetSumCalc_Trans.acquisitionValue() + assetSumCalc_Trans.acquisitionAdjValue() + journalAmountAcquistion)
+                        {
+                            assetNetBookExceedNotFound = false;
+                        }
+                    }
+                }
+
+                ok = ok & assetNetBookNegativeNotFound & assetNetBookExceedNotFound;
+                if (!ok)
+                {
+                    LedgerJournalCheckPostAssets::createAssetNetBookValueErrors(_caller, _journalNum, assetId, assetBookId, assetNetBookNegativeNotFound, assetNetBookExceedNotFound, assetCompanyId);
+                }
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assetValidateNetBookValuesNonFA</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates all the lines on the journal to check if the net book value is negative
+    /// or if the net book value is greater than the acquistion cost.
+    /// </summary>
+    /// <param name = "_caller">The calling <c>LedgerJournalCheckPost</c> class.</param>
+    /// <param name = "_journalNum">The journal number.</param>
+    /// <returns>
+    /// true if the net book value is negative or the net book value is greater
+    /// than the acquision cost; otherwise, false.
+    /// </returns>
+    public static boolean assetValidateNetBookValuesNonFA(LedgerJournalCheckPost _caller, JournalId _journalNum)
+    {
+        boolean                             ok = true;
+        LedgerJournalTrans                  ledgerJournalTrans;
+        LedgerJournalTrans                  ledgerJournalTransOffset;
+        LedgerJournalTrans_Asset            ledgerJournalTrans_Asset;
+        LedgerJournalTrans_Asset            ledgerJournalTrans_AssetOffset;
+        AmountMST                           journalAmount = 0.0;
+        AmountMST                           journalAmountAcquistion = 0.0;
+        AmountMST                           baseAmount = 0.0;
+        AmountMST                           baseAmountAcquistion = 0.0;
+        AssetBook                           assetBook;
+        AssetId                             assetId = '';
+        AssetBookId                         assetBookId = '';
+        NoYes                               negativeNetBookValue;
+        NoYes                               exceedingNetBookValue;
+        Map                                 journalMap;
+        container                           containerAmount;
+        MapEnumerator                       mapEnum;
+        str                                 mapKey;
+        str                                 origMapKey = '';
+        RecId                               assetRecId;
+        SelectableDataArea                  assetCompanyId;
+        TransDate                           assetTransDate;
+        boolean                             assetNetBookNegativeNotFound = true;
+        boolean                             assetNetBookExceedNotFound = true;
+        #define.OffsetFlag('O')
+        #define.NormalFlag('N')
+
+        journalMap = new Map(Types::String, Types::Container);
+
+        // Are allowed to have fixed asset as an offset account, so need to check this.
+        // Having fixed asset as an offset account will not happen very often, but it does
+        // need to accumulate the amounts primary and offset amounts for an asset and book.
+        // This accumulation is done using a map to store the amount.  If no offset accounts
+        // for fixed assets are found, will not need maps to do the work.
+        // Read lines on journal and sum journal amount by Book and asset id for offset account
+        // but only read lines that need to check the negative book value and
+        // exceed net book value on the asset book record (this is what the join is doing.)
+        while select ledgerJournalTransOffset
+            where ledgerJournalTransOffset.JournalNum == _journalNum
+                && ledgerJournalTransOffset.OffsetAccountType == LedgerJournalACType::FixedAssets
+            join AssetId, BookId, TransType from ledgerJournalTrans_AssetOffset
+                order by AssetId, BookId, TransType
+                where ledgerJournalTransOffset.RecId            == ledgerJournalTrans_AssetOffset.RefRecId
+                    && ledgerJournalTrans_AssetOffset.TransType != AssetTransTypeJournal::DisposalSale
+                    && ledgerJournalTrans_AssetOffset.TransType != AssetTransTypeJournal::DisposalScrap
+        {
+            changecompany(_caller.validateCompany(ledgerJournalTransOffset.OffsetCompany))
+            {
+                assetBook = null;
+
+                select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                    where assetBook.AssetId == ledgerJournalTrans_AssetOffset.AssetId
+                        && assetBook.BookId  == ledgerJournalTrans_AssetOffset.BookId
+                        && (assetBook.NegativeNetBookValue == NoYes::No
+                        || assetBook.ExceedingNetBookValue == NoYes::No);
+
+                if (assetBook)
+                {
+                    // asset or book id has changed, do checking and initialize values
+                    if (ledgerJournalTrans_AssetOffset.AssetId != assetId
+                        || ledgerJournalTrans_AssetOffset.BookId != assetBookId
+                        || ledgerJournalTransOffset.OffsetCompany != assetCompanyId)
+                    {
+                        if (assetId != '')
+                        {
+                            containerAmount =
+                                [assetId,
+                                assetBookId,
+                                journalAmount, journalAmountAcquistion,
+                                negativeNetBookValue, exceedingNetBookValue,
+                                assetCompanyId];
+
+                            journalMap.insert(int642str(assetRecId) + #OffsetFlag, containerAmount);
+                        }
+
+                        // initialize values
+                        assetCompanyId = ledgerJournalTransOffset.OffsetCompany;
+                        assetId = ledgerJournalTrans_AssetOffset.AssetId;
+                        assetBookId = ledgerJournalTrans_AssetOffset.BookId;
+                        journalAmount = 0;
+                        journalAmountAcquistion = 0;
+                        negativeNetBookValue = assetBook.NegativeNetBookValue;
+                        exceedingNetBookValue = assetBook.ExceedingNetBookValue;
+                        assetRecId = assetBook.RecId;
+                    }
+
+                    // sum up amounts - Need to reverse sign for offset account
+                    ledgerJournalTransOffset.swapAccountOffsetAccount();
+                    baseAmount = ledgerJournalTransOffset.calcBaseAmountMSTIncTaxInCostPrice(_caller.parmTaxVoucherService());
+
+                    // <GEEU>
+                    if (ledgerJournalTrans_AssetOffset.TransType != AssetTransTypeJournal::Preacquisition_CZ)
+                    {
+                        // </GEEU>
+                        journalAmount += baseAmount;
+                        // <GEEU>
+                    }
+                    // </GEEU>
+
+                    if (AssetSumCalc_Trans::isTransactionAffectingAcquisitionCosts(ledgerJournalTrans_AssetOffset.TransType))
+                    {
+                        journalAmountAcquistion += baseAmount;
+                    }
+                }
+            }
+        }
+
+        // asset or book id has changed, do checking for last record
+        if (assetId != '')
+        {
+            containerAmount =
+                [assetId,
+                assetBookId,
+                journalAmount, journalAmountAcquistion,
+                negativeNetBookValue, exceedingNetBookValue,
+                assetCompanyId];
+
+            journalMap.insert(int642str(assetRecId) + #OffsetFlag, containerAmount);
+        }
+
+        // initalize variables
+        assetId = '';
+        assetBookId = '';
+        journalAmount = 0.0;
+        journalAmountAcquistion = 0.0;
+
+        // if no offset records exist that are type of fixed asset, can just sum the amounts
+        // and do checking based on the amounts returned.  This should have the best performance
+        if (journalMap.empty() == true)
+        {
+            // read lines on journal and sum journal amount by Book and asset id for normal account
+            // but only read lines that need to check the negative book value and
+            // exceed net book value on the asset book record (this is what the join is doing.
+            while select ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum  == _journalNum
+                    && ledgerJournalTrans.AccountType == LedgerJournalACType::FixedAssets
+                join AssetId, BookId, TransType from ledgerJournalTrans_Asset
+                    order by AssetId, BookId, TransType
+                    where ledgerJournalTrans.RecId == ledgerJournalTrans_Asset.RefRecId
+                        && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalSale
+                        && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalScrap
+            {
+                changecompany(_caller.validateCompany(ledgerJournalTrans.Company))
+                {
+                    assetBook = null;
+
+                    select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                        where assetBook.AssetId == ledgerJournalTrans_Asset.AssetId
+                            && assetBook.BookId  == ledgerJournalTrans_Asset.BookId
+                            && (assetBook.NegativeNetBookValue  == NoYes::No
+                            || assetBook.ExceedingNetBookValue == NoYes::No);
+
+                    if (assetBook)
+                    {
+                        // asset or book id has changed, do checking and initialize values
+                        if (ledgerJournalTrans_Asset.AssetId != assetId
+                            || ledgerJournalTrans_Asset.BookId != assetBookId
+                            || ledgerJournalTrans.Company!= assetCompanyId)
+                        {
+                            if (assetId != '')
+                            {
+                                changecompany(assetCompanyId)
+                                {
+                                    ok = ok && LedgerJournalCheckPostAssets::validateNegativeAndExceedingNetBookValue(
+                                        assetId,
+                                        assetBookId,
+                                        journalAmount,
+                                        journalAmountAcquistion,
+                                        _caller,
+                                        _journalNum,
+                                        assetCompanyId,
+                                        assetTransDate);
+                                }
+                            }
+
+                            // initialize values
+                            assetCompanyId = ledgerJournalTrans.Company;
+                            assetTransDate = ledgerJournalTrans.TransDate;
+                            assetId = ledgerJournalTrans_Asset.AssetId;
+                            assetBookId = ledgerJournalTrans_Asset.BookId;
+                            journalAmount = 0.0;
+                            journalAmountAcquistion = 0.0;
+                            negativeNetBookValue = assetBook.NegativeNetBookValue;
+                            exceedingNetBookValue = assetBook.ExceedingNetBookValue;
+                        }
+
+                        // sum up amounts
+                        baseAmount = ledgerJournalTrans.calcBaseAmountMSTIncTaxInCostPrice(_caller.parmTaxVoucherService());
+                        // <GEEU>
+                        if (ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::Preacquisition_CZ)
+                        {
+                            // </GEEU>
+                            journalAmount += baseAmount;
+                            // <GEEU>
+                        }
+                        // </GEEU>
+
+                        if (AssetSumCalc_Trans::isTransactionAffectingAcquisitionCosts(ledgerJournalTrans_Asset.TransType))
+                        {
+                            journalAmountAcquistion += baseAmount;
+                        }
+                    }
+                }
+            }
+
+            // update for last record
+            if (assetId != '')
+            {
+                changecompany(_caller.validateCompany(assetCompanyId))
+                {
+                    ok = ok && LedgerJournalCheckPostAssets::validateNegativeAndExceedingNetBookValue(
+                        assetId,
+                        assetBookId,
+                        journalAmount,
+                        journalAmountAcquistion,
+                        _caller,
+                        _journalNum,
+                        assetCompanyId,
+                        assetTransDate);
+                }
+            }
+        }
+        // found some offset account so now need to check for fixed asset as normal accounts
+        // these need to be summed with the values in the map
+        else if (journalMap.empty() == false)
+        {
+            // read lines on journal and sum journal amount by Book and asset id for normal account
+            // but only read lines that need to check the negative book value and
+            // exceed net book value on the asset book record (this is what the join is doing.
+            while select ledgerJournalTrans
+                where ledgerJournalTrans.JournalNum  == _journalNum
+                    && ledgerJournalTrans.AccountType == LedgerJournalACType::FixedAssets
+                join AssetId, BookId, TransType from ledgerJournalTrans_Asset
+                    order by AssetId, BookId, TransType
+                    where ledgerJournalTrans.RecId == ledgerJournalTrans_Asset.RefRecId
+                        && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalSale
+                        && ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::DisposalScrap
+            {
+                changecompany(_caller.validateCompany(ledgerJournalTrans.Company))
+                {
+                    assetBook = null;
+
+                    select firstonly NegativeNetBookValue, ExceedingNetBookValue from assetBook
+                        where assetBook.AssetId == ledgerJournalTrans_Asset.AssetId &&
+                              assetBook.BookId  == ledgerJournalTrans_Asset.BookId &&
+                              (assetBook.NegativeNetBookValue  == NoYes::No ||
+                               assetBook.ExceedingNetBookValue == NoYes::No);
+                    if (assetBook)
+                    {
+                        // asset or book id has changed, do checking and initialize values
+                        if (ledgerJournalTrans_Asset.AssetId != assetId
+                            || ledgerJournalTrans_Asset.BookId != assetBookId
+                            || ledgerJournalTrans.Company!= assetCompanyId)
+                        {
+                            if (assetId != '')
+                            {
+                                containerAmount =
+                                    [assetId,
+                                    assetBookId,
+                                    journalAmount, journalAmountAcquistion,
+                                    negativeNetBookValue, exceedingNetBookValue,
+                                    assetCompanyId];
+
+                                journalMap.insert(int642str(assetRecId) + #NormalFlag, containerAmount);
+                            }
+
+                            // initialize values
+                            assetCompanyId = ledgerJournalTrans.Company;
+                            assetId = ledgerJournalTrans_Asset.AssetId;
+                            assetBookId = ledgerJournalTrans_Asset.BookId;
+                            journalAmount = 0.0;
+                            journalAmountAcquistion = 0.0;
+                            assetRecId = assetBook.RecId;
+                            negativeNetBookValue = assetBook.NegativeNetBookValue;
+                            exceedingNetBookValue = assetBook.ExceedingNetBookValue;
+                        }
+
+                        // sum up amounts
+                        baseAmount = ledgerJournalTrans.calcBaseAmountMSTIncTaxInCostPrice(_caller.parmTaxVoucherService());
+                        // <GEEU>
+                        if (ledgerJournalTrans_Asset.TransType != AssetTransTypeJournal::Preacquisition_CZ)
+                        {
+                            // </GEEU>
+                            journalAmount += baseAmount;
+                            // <GEEU>
+                        }
+                        // </GEEU>
+
+                        if (AssetSumCalc_Trans::isTransactionAffectingAcquisitionCosts(ledgerJournalTrans_Asset.TransType))
+                        {
+                            journalAmountAcquistion += baseAmount;
+                        }
+                    }
+                }
+            }
+
+            // asset or book id has changed, process last record
+            if (assetId != '')
+            {
+                containerAmount =
+                    [assetId,
+                    assetBookId,
+                    journalAmount, journalAmountAcquistion,
+                    negativeNetBookValue, exceedingNetBookValue,
+                    assetCompanyId];
+
+                journalMap.insert(int642str(assetRecId) + #NormalFlag, containerAmount);
+            }
+
+            // All records are now in the map, so process the map
+            origMapKey = '';
+            mapEnum = journalMap.getEnumerator();
+            while (mapEnum.moveNext())
+            {
+                // get the values from the map
+                mapKey = mapEnum.currentKey();
+                containerAmount = mapEnum.currentValue();
+                // strip the offset of normal flag off of the key value
+                if (strLen(mapKey) > 1)
+                {
+                    mapKey = subStr(mapKey, 1, strLen(mapKey) - 1);
+                }
+
+                // if map key doesn't match the original key do checking
+                if (mapKey != origMapKey)
+                {
+                    if (origMapKey != '')
+                    {
+                        changecompany(_caller.validateCompany(assetCompanyId))
+                        {
+                            ok = ok && LedgerJournalCheckPostAssets::validateNegativeAndExceedingNetBookValue(
+                                assetId,
+                                assetBookId,
+                                journalAmount,
+                                journalAmountAcquistion,
+                                _caller,
+                                _journalNum,
+                                assetCompanyId,
+                                assetTransDate);
+                        }
+                    }
+
+                    // initalize values
+                    origMapKey = mapKey;
+                    journalAmount = 0.0;
+                    journalAmountAcquistion = 0.0;
+                }
+
+                // accumulate amounts from map
+                [assetId, assetBookId, baseAmount, baseAmountAcquistion, negativeNetBookValue, exceedingNetBookValue, assetCompanyId] = containerAmount;
+                journalAmount += baseAmount;
+                journalAmountAcquistion += baseAmountAcquistion;
+            }
+
+            // check last record
+            // if map key doesn't match the original key do checking
+            if (origMapKey != '')
+            {
+                changecompany(_caller.validateCompany(assetCompanyId))
+                {
+                    ok = ok && LedgerJournalCheckPostAssets::validateNegativeAndExceedingNetBookValue(
+                        assetId,
+                        assetBookId,
+                        journalAmount,
+                        journalAmountAcquistion,
+                        _caller,
+                        _journalNum,
+                        assetCompanyId,
+                        assetTransDate);
+                }
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAssetNetBookValueErrors</Name>
+				<Source><![CDATA[
+    private static void createAssetNetBookValueErrors(
+        LedgerJournalCheckPost _caller,
+        JournalId       _journalNum,
+        AssetId         _assetId,
+        AssetBookId     _assetBook,
+        boolean         _isAssetNetBookNegative,
+        boolean         _isAssetNetBookExceed,
+        SelectableDataArea _assetCompanyId)
+    {
+        if (!_isAssetNetBookNegative)
+        {
+            LedgerJournalCheckPostAssets::assetUpdateForNetBookValueErrors(
+                _caller, 
+                _journalNum, 
+                _assetId, 
+                _assetBook, 
+                strFmt("@FixedAssets:FA_MessageError_PostedNetBookValueWillBeNegative", _assetId, _assetBook), 
+                _assetCompanyId);
+        }
+
+        if (!_isAssetNetBookExceed)
+        {
+            LedgerJournalCheckPostAssets::assetUpdateForNetBookValueErrors(
+                _caller, 
+                _journalNum, 
+                _assetId, 
+                _assetBook, 
+                strFmt("@FixedAssets:FA_MessageError_NetBookValueHigherThanAcquisition", _assetId, _assetBook), 
+                _assetCompanyId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateTransForFixedAssets</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates the transaction for fixed assets.
+    /// </summary>
+    /// <param name="_ledgerJournalTrans">
+    ///    The transaction to validate.
+    /// </param>
+    /// <param name="_ledgerPostingMessageCollection">
+    ///    The posting messages collection; optional.
+    /// </param>
+    /// <returns>
+    ///    true if the transaction is valid; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    This is called from both the <c>checkJournal</c> and <c>postJournal</c> methods when it loops
+    ///    through and verifies the transactions in the journal to be checked or posted.
+    /// </remarks>
+    public boolean validateTransForFixedAssets(
+        LedgerJournalTrans _ledgerJournalTrans,
+        LedgerPostingMessageLog _ledgerPostingMessageCollection = null)
+    {
+        boolean isValid = true;
+
+        if (_ledgerJournalTrans.AccountType         == LedgerJournalACType::FixedAssets  &&
+            _ledgerJournalTrans.OffsetAccountType   == LedgerJournalACType::FixedAssets  &&
+            _ledgerJournalTrans.LedgerDimension                                          &&
+            _ledgerJournalTrans.OffsetLedgerDimension                                    &&
+            _ledgerJournalTrans.Company             != _ledgerJournalTrans.OffsetCompany &&
+            isConfigurationkeyEnabled(configurationKeyNum(LedgerAdvIntercompanyAccounting)))
+        {
+            // The primary and offset companies must be the same if both account types are of type fixed assets.
+            if (_ledgerPostingMessageCollection)
+            {
+                isValid =  _ledgerPostingMessageCollection.logCheckFailed("@SYS112198");
+            }
+            else
+            {
+                isValid =  checkFailed("@SYS112198");
+            }
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>depreciationTransactionWithZeroAmountInReportingCurrency</Name>
+				<Source><![CDATA[
+    private static void depreciationTransactionWithZeroAmountInReportingCurrency(JournalId _journalNum, AssetId _assetId, AssetBookId _bookId)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+        LedgerJournalTrans_Asset ledgerJournalTrans_Asset;
+
+        select firstonly RecId, JournalNum, AmountCurCredit from ledgerJournalTrans
+            where ledgerJournalTrans.JournalNum == _journalNum
+                join AssetId, BookId, TransType, AmountCreditReportingCurrency from ledgerJournalTrans_Asset
+                    where ledgerJournalTrans_Asset.RefRecId == ledgerJournalTrans.RecId
+                        && ledgerJournalTrans_Asset.AssetId == _assetId
+                        && ledgerJournalTrans_Asset.BookId == _bookId
+                        && ledgerJournalTrans.AmountCurCredit != 0
+                        && ledgerJournalTrans_Asset.AmountCreditReportingCurrency == 0
+                        && (ledgerJournalTrans_Asset.TransType == AssetTransTypeJournal::Depreciation
+                        || ledgerJournalTrans_Asset.TransType == AssetTransTypeJournal::DepreciationAdj
+                        || ledgerJournalTrans_Asset.TransType == AssetTransTypeJournal::ExtraordinaryDepreciation
+                        || ledgerJournalTrans_Asset.TransType == AssetTransTypeJournal::BonusDepreciation);
+
+        if (ledgerJournalTrans.RecId != 0
+            && ledgerJournalTrans_Asset.RecId != 0
+            && AssetPost::isFixedAssetReportingCurrencyAmountShouldBeUsed(ledgerJournalTrans, ledgerJournalTrans_Asset))
+        {
+            AssetSumCalc_Trans assetSumTransReportingCurrency = AssetSumCalc_Trans::newAssetYearByCurrency(
+                ledgerJournalTrans_Asset.AssetId,
+                ledgerJournalTrans_Asset.BookId,
+                DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
+                AssetYear::All,
+                AssetSumCalcType::Reporting);
+
+            if (assetSumTransReportingCurrency.netBookValue() != 0)
+            {
+                throw error(strFmt("@FixedAssets:FA_DepreciationTransactionWithZeroAmountInReportingCurrencyError", ledgerJournalTrans_Asset.AssetId, ledgerJournalTrans_Asset.BookId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

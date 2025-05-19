@@ -1,0 +1,659 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>MCRReleaseAndAuthFutureOrders</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+///     The <c>MCRReleaseAndAuthFutureOrders</c> class that extends the <c>RunBaseBatch</c> class. implements BatchRetryable
+/// </summary>
+/// <remarks>
+///     This class that extends the run base batch will go over future sales orders in the system
+///     that have a credit card payment associated with them. If the release date is met and the
+///     payment has not yet been submitted and if the user has indicated that the payment
+///     be submitted for online authorization, then the payment is sent for online authorization.
+///     Otherwise, the payment record is moved to a status of pending where by the Authorization
+///     transaction batch will pick up the pending records during batch creation.
+/// </remarks>
+class MCRReleaseAndAuthFutureOrders extends RunBaseBatch implements BatchRetryable
+{
+    // Dialog fields
+    DialogField     dlgReleaseAndAuthFutureOrders;
+    DialogField     dlgRetryDeclinedCreditCards;
+    DialogField     dlgRetryStaleCreditCards;
+    DialogField     dlgNumOfDays;
+    DialogField     dlgCheckAvailability;
+    DialogField     dlgVoidPriorToExpire;
+
+    boolean         releaseAndAuthFutureOrders;
+    boolean         retryDeclinedCreditCards;
+    // ReAuthorize stale entries.
+    boolean         retryStaleCreditCards;
+    boolean         checkAvailability;
+    boolean         voidPriorToExpire;
+    int             numOfDays;
+
+    int maxRetryAttempts = 3;
+    int backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+
+    private static CommerceHQEventSource eventWriter = CommerceHQEventSource::Log;
+
+    // Macro for the pack / unpack.
+    #define.CurrentVersion(3)
+    #localmacro.CurrentList
+        releaseAndAuthFutureOrders,
+        retryDeclinedCreditCards,
+        retryStaleCreditCards,
+        checkAvailability,
+        voidPriorToExpire,
+        numOfDays
+    #endmacro
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>canProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines whether or not the passed in sales order can be shipped.
+    /// </summary>
+    /// <param name="_salesTable">
+    ///     A record in the table <c>SalesTable</c>.
+    /// </param>
+    /// <param name="_showErrors">
+    ///     A <c>Boolean</c> used in determining if errors are to be displayed back to the screen; optional.
+    /// </param>
+    /// <returns>
+    ///     A <c>Boolean</c> letting the calling object know that the sales order can be shipped.
+    /// </returns>
+    /// <remarks>
+    ///     Determines whether or not the passed in sales order can be shipped within the window and if it has quantity available.
+    ///     If so, true is returned, otherwise false is returned.
+    /// </remarks>
+    private boolean canProcess(
+        SalesTable  _salesTable,
+        boolean     _showErrors = true)
+    {
+        MCROrderParameters  mcrOrderParameters = MCROrderParameters::find();
+        boolean             retVal = false;
+        boolean             noInvent = true;
+        boolean             inFuture = true;
+        date                todaysDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        SalesLine           salesLine;
+
+        while select SalesId, ConfirmedDlv, ItemId, InventDimId
+            from  salesLine
+            order by ConfirmedDlv asc
+            where salesLine.SalesId == _salesTable.SalesId
+               && (!mcrOrderParameters.MCRFutureOrder
+               || (salesLine.ConfirmedDlv <= (todaysDate + numOfDays)))
+        {
+            inFuture = false;
+            retVal = true;
+            noInvent = false;
+            break;
+        }
+
+        // If this line cannot be processed and we're displaying the errors, display the error.
+        if (!retVal && _showErrors)
+        {
+            // If no line was determined to be shipped soon, display an error.
+            if (inFuture)
+            {
+                error(strFmt("@MCR35753", _salesTable.SalesId, numOfDays));
+            }
+            // If everything is to be shipped, but there is no quantity available, display an error.
+            else if (checkAvailability && noInvent)
+            {
+                error(strFmt("@MCR35754", _salesTable.SalesId));
+            }
+        }
+        return retVal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Sets the class description to 'Authorization resubmit'.
+    /// </summary>
+    /// <returns>
+    ///     A class description is returned.
+    /// </returns>
+    public ClassDescription caption()
+    {
+        ClassDescription ret;
+
+        ret = super();
+
+        if (!ret)
+        {
+            ret = "@MCR25365";
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Presents a dialog form for user entry.
+    /// </summary>
+    /// <returns>
+    ///     A <c>DialogRunbase</c> dialog.
+    /// </returns>
+    /// <remarks>
+    ///     This method adds the check box online authorization to the dialog box.
+    ///     1. If the box is checked and if a future order meets the release date, the order is
+    ///     moved to in processing and the payments are submitted for online authorization.
+    ///     2. If the box is not checked then the future orders that meet the release date are
+    ///     moved to in processing and the payments are moved to a status of pending. The
+    ///     transaction batch when created will pick up these orders and submit them for authorization.
+    /// </remarks>
+    public Object dialog()
+    {
+        DialogGroup                 dialogGrp1;
+        DialogGroup                 dialogGrp2;
+        DialogRunbase               dialog;
+
+        // Setup the dialog layout.
+        dialog = new DialogRunbase("@MCR25365", this);
+        dialogGrp1 = dialog.addGroup('');
+        dialogGrp1.frameType(FormFrameType::None);
+        dialogGrp1.columns(1);
+        // Add the group for the criteria to the layout.
+        dialogGrp2 = dialog.addGroup("@SYS13128", dialogGrp1);
+        dialogGrp2.frameType(FormFrameType::Auto);
+
+        // Prompt for "online authorization". If set to yes, then credit cards will
+        // be submitted online for authorization. If else they will be submitted in
+        // batch mode and will be picked up during the run of an auth batch.
+
+        dlgNumOfDays = dialog.addField(extendedTypeStr(DaysAfter), "@MCR12650");
+        dlgNumOfDays.value(numOfDays);
+
+        dlgCheckAvailability = dialog.addField(enumStr(NoYes), "@MCR35755");
+        dlgCheckAvailability.value(checkAvailability);
+
+        dlgReleaseAndAuthFutureOrders = dialog.addField(enumStr(NoYes), "@MCR30955");
+        dlgReleaseAndAuthFutureOrders.value(releaseAndAuthFutureOrders);
+
+        dlgRetryDeclinedCreditCards = dialog.addField(enumStr(NoYes), "@MCR30957");
+        dlgRetryDeclinedCreditCards.value(retryDeclinedCreditCards);
+        // Disable check box if retry on submit is checked.
+        dlgRetryDeclinedCreditCards.enabled(!MCROrderParameters::find().MCRRetryOnSubmit);
+
+        dlgRetryStaleCreditCards = dialog.addField(enumStr(NoYes), "@MCR35756");
+        dlgRetryStaleCreditCards.value(retryStaleCreditCards);
+        
+        dlgVoidPriorToExpire = dialog.addField(enumStr(NoYes), "@MCR:VoidPriorToExpire");
+        dlgVoidPriorToExpire.value(voidPriorToExpire);
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Assigns class variables based on the values entered by the user on the dialog form.
+    /// </summary>
+    /// <returns>
+    ///     A <c>super()</c> following class variable assignments.
+    /// </returns>
+    public boolean getFromDialog()
+    {
+        releaseAndAuthFutureOrders  = dlgReleaseAndAuthFutureOrders.value();
+        retryDeclinedCreditCards    = dlgRetryDeclinedCreditCards.value();
+        retryStaleCreditCards       = dlgRetryStaleCreditCards.value();
+        numOfDays                   = dlgNumOfDays.value();
+        checkAvailability           = dlgCheckAvailability.value();
+        voidPriorToExpire           = dlgVoidPriorToExpire.value();
+
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDeclinedPayments</Name>
+				<Source><![CDATA[
+    private void processDeclinedPayments(MCRCCNumAuthRetries _numAuthRetries)
+    {
+        SalesTable              salesTable;
+        MCRCustPaymTable        mcrCustPaymTable;
+        CreditCardAuthTrans     creditCardAuthTrans;
+
+        MCRCustPaymTotals       mcrCustPaymTotals;
+        boolean                 callProcessPayments, valid;
+
+        date todaysDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        setPrefix("@MCR35757");
+        while select forupdate mcrCustPaymTable
+            where mcrCustPaymTable.Status        == MCRCustPaymStatus::Declined
+                && mcrCustPaymTable.CustPaymType == MCRCustPaymType::CreditCard
+                && mcrCustPaymTable.Amount       >  0
+                && mcrCustPaymTable.PostedAmount <  mcrCustPaymTable.Amount
+            join  salesTable
+            where salesTable.RecId               == mcrCustPaymTable.RefRecId
+                && salesTable.TableId            == mcrCustPaymTable.RefTableId
+                && salesTable.MCROrderStopped    == NoYes::Yes
+        {
+            mcrCustPaymTotals = MCRCustPaymTotals::construct(salesTable.TableId, salesTable.RecId);
+            if (this.canProcess(salesTable) && !mcrCustPaymTotals.allPaymentsApproved())
+            {
+                callProcessPayments = false;
+
+                if (CreditCardCust::find(mcrCustPaymTable.PaymInfoRecId))
+                {
+                    valid = true;
+                }
+                if (valid)
+                {
+                    creditCardAuthTrans = CreditCardAuthTrans::mcrFindLatest(mcrCustPaymTable.RecId);
+
+                    if (creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Declined
+                        && mcrCustPaymTable.NumAuthRetry < _numAuthRetries)
+                    {
+                        mcrCustPaymTable.Status = MCRCustPaymStatus::NotSubmitted;
+
+                        ttsBegin;
+
+                        if (mcrCustPaymTable.validateWrite())
+                        {
+                            mcrCustPaymTable.update();
+                        }
+                        else
+                        {
+                            throw error("@SYS104318");
+                        }
+
+                        ttsCommit;
+
+                        mcrCustPaymTotals = MCRCustPaymTotals::construct(salesTable.TableId, salesTable.RecId);
+                        // Performance - do not need to re-validate and recalculate payments since
+                        // already performed above in the validate() method.
+                        eventWriter.EventWriteProcessDeclinedPayment(salesTable.RecId, mcrCustPaymTable.RecId, creditCardAuthTrans.RecId);
+                        mcrCustPaymTotals.processPayments(MCRProcessPaymAction::PostOnlyPrepays, false, false, mcrCustPaymTable.RecId);
+                        info(strFmt("@MCR35758", salesTable.SalesId));
+                    }
+                }
+                else
+                {
+                    error(strFmt("@MCR35759", salesTable.SalesId));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processFutureOrders</Name>
+				<Source><![CDATA[
+    private void processFutureOrders()
+    {
+        SalesTable          salesTable;
+        MCRCustPaymTable    mcrCustPaymTable;
+        MCRCustPaymTotals   mcrCustPaymTotals;
+        MCRSalesOrderTotals mcrSalesOrderTotals;
+        CreditCardAuthTrans creditCardAuthTrans;
+        date                todaysDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+
+        boolean valid;
+
+        setPrefix("@MCR35760");
+        while select salesTable
+            where salesTable.MCROrderStopped == NoYes::Yes
+                join  RefRecId, RefTableId, Status, CustPaymType, Amount, PostedAmount, RecId, PaymInfoRecId
+                    from  mcrCustPaymTable
+                        where mcrCustPaymTable.RefRecId     == salesTable.RecId
+                           && mcrCustPaymTable.RefTableId   == salesTable.TableId
+                           && mcrCustPaymTable.Status       == MCRCustPaymStatus::NotSubmitted
+                           && mcrCustPaymTable.CustPaymType == MCRCustPaymType::CreditCard
+                           && mcrCustPaymTable.Amount       >  0
+                           && mcrCustPaymTable.PostedAmount <  mcrCustPaymTable.Amount
+            notexists join creditCardAuthTrans
+                where creditCardAuthTrans.MCRPaymRecId  == mcrCustPaymTable.RecId
+        {
+            mcrCustPaymTotals     = MCRCustPaymTotals::construct(salesTable.TableId, salesTable.RecId);
+            // Future orders will not have an auth record, cannot do as part of the query
+            //  slows it down too much.
+            if (this.canProcess(salesTable) && !mcrCustPaymTotals.allPaymentsApproved())
+            {
+                if (CreditCardCust::find(mcrCustPaymTable.PaymInfoRecId))
+                {
+                    valid = true;
+                }
+                if (valid)
+                {
+                    mcrSalesOrderTotals   = new mcrSalesOrderTotals(salesTable);
+                    mcrCustPaymTotals     = MCRCustPaymTotals::construct(salesTable.TableId,
+                                                                        salesTable.RecId,
+                                                                        mcrSalesOrderTotals);
+
+                    // Performance - do not need to re-validate and recalculate payments since
+                    // already performed above in the validate() method.
+                    eventWriter.EventWriteProcessFutureOrderPayment(salesTable.RecId);
+                    mcrCustPaymTotals.processPayments(MCRProcessPaymAction::PostOnlyPrepays, false, false, mcrCustPaymTable.RecId);
+                    info(strFmt("@MCR35758", salesTable.SalesId));
+                }
+                else
+                {
+                    error(strFmt("@MCR35759", salesTable.SalesId));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processStalePayments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Checks for stale sales orders that were paid by authorized credit cards or check.
+    /// </summary>
+    /// <remarks>
+    ///     Loop over all Open, Delivered, or In process sales orders that are paid
+    ///     by authorized credit cards and check if anything is stale.
+    /// </remarks>
+    private void processStalePayments()
+    {
+        SalesTable                          salesTable;
+        MCRCustPaymTable                    mcrCustPaymTable;
+        CreditCardAuthTrans                 creditCardAuthTrans;
+        CreditCardAuthTrans                 futureCreditCardAuthTrans;
+        boolean                             successful = false;
+        MCRCustPaymTotals                   mcrCustPaymTotals;
+        CreditCardProcess                   regularAuthProcess;
+        setPrefix("@MCR35761");
+
+        // Process Credit Card Re-Auth
+        // Call Center Orders have the following relationship to get CC authorizations:
+        // SalesTable ---< MCRCustPaymTable ---< CreditCardAuthTrans
+        // Online Orders, Customer Orders and Regular Sales Orders have the following relationship to get CC authorizations:
+        // SalesTable ---< CreditCardAuthTrans
+        while select forupdate creditCardAuthTrans
+            where creditCardAuthTrans.ApprovalType == CreditCardOperation::Authorize
+                  && creditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved
+            join salesTable
+            where salesTable.SalesId                == creditCardAuthTrans.SalesId
+                && (salesTable.SalesStatus          == SalesStatus::None
+                    || salesTable.SalesStatus       == SalesStatus::Backorder
+                    || salesTable.SalesStatus       == SalesStatus::Delivered)
+            outer join forUpdate RecId, Status from mcrCustPaymTable
+            where mcrCustPaymTable.RefRecId         == salesTable.RecId
+                && mcrCustPaymTable.RefTableId      == salesTable.TableId
+                && (mcrCustPaymTable.Status         == MCRCustPaymStatus::Authorized ||
+                    mcrCustPaymTable.Status         == MCRCustPaymStatus::Paid)
+                && mcrCustPaymTable.CustPaymType    == MCRCustPaymType::CreditCard
+                && mcrCustPaymTable.Amount          >  0
+                && mcrCustPaymTable.PostedAmount    <  mcrCustPaymTable.Amount
+            notexists join futureCreditCardAuthTrans
+            where futureCreditCardAuthTrans.SalesId == creditCardAuthTrans.SalesId
+                && futureCreditCardAuthTrans.ApprovalType == CreditCardOperation::Authorize
+                && futureCreditCardAuthTrans.ProcessorStatus == CreditCardProcessorStatus::Approved
+                && futureCreditCardAuthTrans.ApprovedDateTime > creditCardAuthTrans.ApprovedDateTime
+        {
+            // Do not process orders in case the Credit card authorization process is not older then the threshold
+            CreditCardPreapprovalLastNoOfDays days = creditCardAuthTrans.getPreapprovalDurationDays();
+            if (!creditCardAuthTrans.ApprovalExpired 
+                && !((DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()) - DateTimeUtil::date(creditCardAuthTrans.ApprovedDateTime))  >  days))
+            {
+                continue;
+            }
+
+            Microsoft.Dynamics.Ax.Xpp.DeadlockException deadlockException;
+            System.Exception exception;
+
+            try
+            {
+                ttsbegin;
+
+                if (voidPriorToExpire)
+                {
+                    // Try to Void pre-auth with processor
+                    CreditCardProcess::doVoidAuth(creditCardAuthTrans);
+                }
+
+                // Update the card to expired, even if no re-auth is going to be triggered, as we really want
+                CreditCardAuthTrans::setAuthorizationExpired(creditCardAuthTrans.RecId);
+                
+                ttscommit;
+            }
+            catch(exception)
+            {
+                eventWriter.EventWritePaymentReauthorizationJobTaskException(deadLockException.GetType().ToString(), deadLockException.StackTrace);
+            }
+
+            if (this.canProcess(salesTable))
+            {
+                if (creditCardAuthTrans.MCRPaymRecId != 0
+                    && mcrCustPaymTable.RecId != 0)
+                {
+                    // Process Re-auth for Call center orders
+                    ttsBegin;
+                    mcrCustPaymTable.Status = MCRCustPaymStatus::NotSubmitted;
+                    mcrCustPaymTable.update();
+                    ttsCommit;
+
+                    mcrCustPaymTotals = MCRCustPaymTotals::construct(salesTable.TableId, salesTable.RecId);
+
+                    if (mcrCustPaymTotals)
+                    {
+                        eventWriter.EventWriteProcessStalePaymentLine(salesTable.RecId, mcrCustPaymTable.RecId, creditCardAuthTrans.RecId );
+
+                        // Do not recalc or allow user input.
+                        successful = mcrCustPaymTotals.processPayments(MCRProcessPaymAction::PostOnlyPrepays,
+                                                                        false,
+                                                                        false,
+                                                                        mcrCustPaymTable.RecId);
+                    }
+                }
+                else
+                {
+                    // Process Re-auth for Online Orders, Customer Orders and A/R Regular Sales Orders
+                    eventWriter.EventWriteProcessStalePayment(salesTable.RecId, creditCardAuthTrans.RecId);
+                    regularAuthProcess = CreditCardProcess::construct(CreditCardOperation::Authorize, creditCardAuthTrans);
+                    regularAuthProcess.setAmountFromSales(creditCardAuthTrans.ApprovalAmountCur, creditCardAuthTrans.CurrencyCode);
+                    successful = regularAuthProcess.process();
+                }
+                    
+                if (successful)
+                {
+                    info(strFmt("@MCR35762", salesTable.SalesId));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Runs the instantiated class <c>McrReleaseAndAuthFutureOrders</c>.
+    /// </summary>
+    /// <remarks>
+    ///     The run method processes future orders, processes declined payments, and submits stale payments.
+    ///     The user can choose to have the payments authorized online.
+    /// </remarks>
+    public void run()
+    {
+        MCROrderParameters   mcrOrderParameters = MCROrderParameters::find();
+        MCRCCNumAuthRetries  numAuthRetries     = mcrOrderParameters.MCRNumCCAuthRetry;
+        super ();
+
+        // set prefix to indicate batch run has started.
+        setPrefix("@MCR35586");
+
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadlockException;
+        System.Exception exception;
+
+        try
+        {
+            eventWriter.EventWritePaymentReauthorizationJobStage('Start');
+            if (releaseAndAuthFutureOrders && MCROrderParameters::find().MCRFutureOrder)
+            {
+                eventWriter.EventWritePaymentReauthorizationJobStage('ProcessFutureOrders');
+                this.processFutureOrders();
+            }
+            if (retryDeclinedCreditCards
+                && !mcrOrderParameters.MCRRetryOnSubmit
+                && numAuthRetries >= 0)
+            {
+                eventWriter.EventWritePaymentReauthorizationJobStage('ProcessDeclinedPayments');
+                this.processDeclinedPayments(numAuthRetries);
+            }
+            // Resubmit stale authorizations.
+            if (retryStaleCreditCards)
+            {
+                eventWriter.EventWritePaymentReauthorizationJobStage('ProcessStalePayments');
+                this.processStalePayments();
+            }
+            eventWriter.EventWritePaymentReauthorizationJobStage('End');
+        }
+        catch(deadlockException)
+        {
+            eventWriter.EventWritePaymentReauthorizationJobDBException(deadLockException.GetType().ToString(), deadLockException.StackTrace, xSession::currentRetryCount(), maxRetryAttempts);
+            if (xSession::currentRetryCount() <= maxRetryAttempts)
+            {
+                sleep(xSession::currentRetryCount() * backOffWait);
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+        catch(exception)
+        {
+            eventWriter.EventWritePaymentReauthorizationJobException(deadLockException.GetType().ToString(), deadLockException.StackTrace);
+            throw;
+        }
+
+        // set info to indicate that the batch has completed.
+        info("@MCR35750");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = RunBase::getVersion(packedClass);
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Constructs an instance of the <c>McrReleaseAndAuthFutureOrders</c> class.
+    /// </summary>
+    /// <returns>
+    ///     An instance of the <c>McrReleaseAndAuthFutureOrders</c> class.
+    /// </returns>
+    public static MCRReleaseAndAuthFutureOrders construct()
+    {
+        return new mcrReleaseAndAuthFutureOrders();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Constructs an instance of the class <c>MCRReleaseAndAuthFutureOrders</c>.
+    /// </summary>
+    /// <param name="args">
+    ///     A passed set of arguements.
+    /// </param>
+    /// <remarks>
+    ///     Constructs an instance of the class <c>MCRReleaseAndAuthFutureOrders</c> and
+    ///     invokes the run method of the batch.
+    /// </remarks>
+    public static void main(Args args)
+    {
+        MCRReleaseAndAuthFutureOrders   mcrReleaseAndAuthFutureOrders;
+
+        mcrReleaseAndAuthFutureOrders   = MCRReleaseAndAuthFutureOrders::construct();
+
+        if (mcrReleaseAndAuthFutureOrders.prompt())
+        {
+            mcrReleaseAndAuthFutureOrders.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Describes whether the class is designed for execution in a new session.
+    /// </summary>
+    /// <returns>
+    /// false.
+    /// </returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public final boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

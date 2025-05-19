@@ -1,0 +1,2616 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProdUpdCostEstimation</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>ProdUpdCostEstimation</c> class is used for calculating the estimation for a production
+/// order.
+/// </summary>
+/// <remarks>
+/// By using this class, you can make the estimation for a single production order or for a whole chain
+/// of production orders which are related to each other by references. When the <paramref
+/// name="References" /> parameter is set to the <c>NoYes::Yes</c> enumeration value, all production
+/// orders which are related to the same main production will be estimated.When the <paramref
+/// name="References" /> parameter is set to the <c>NoYes::No</c> enumeration value, only the selected
+/// production order will be estimated.
+/// </remarks>
+public class ProdUpdCostEstimation extends ProdUpd
+{
+    #ISOCountryRegionCodes
+    #Define.lineNumAdd(0.00001)
+
+    ProdParmCostEstimation              prodParmCostEstimation;
+    ProdPurch                           prodPurch;
+    Set                                 circularityCheckItemSet;
+    Set                                 phantomRouteExpanded;
+    private Set                         purchaseOrdersToBeSubmittedToWorkflow;
+    private PurchInstrumentationLogger  instrumentationLogger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>costEstimate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Makes the estimation for a specific production order.
+    /// </summary>
+    /// <param name="_prodTable">
+    ///    A specific production order.
+    /// </param>
+    /// <remarks>
+    ///    The estimation will be done for bill of materials (BOM) lines and route operations.
+    /// </remarks>
+    protected void costEstimate(ProdTable _prodTable)
+    {
+        this.costEstimateItems(_prodTable);
+
+        if (_prodTable.ProdType == ProdType::Process)
+        {
+            this.pmfCostEstimateCoBys(_prodTable);
+        }
+
+        this.costEstimateOperations(_prodTable);
+
+        this.endUpdateProduction(_prodTable);
+
+        if (phantomRouteExpanded.in(_prodTable.ProdId) && _prodTable.status().isBefore(ProdStatus::Released))
+        {
+            ProdRoute::updateReNumberOprNum(_prodTable.ProdId);
+        }
+
+        if (_prodTable.ProdId != prodParmCostEstimation.ProdId)
+        {
+            this.createReferenceProdParmCostEstmatation(_prodTable.ProdId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createReferenceProdParmCostEstmatation</Name>
+				<Source><![CDATA[
+    private void createReferenceProdParmCostEstmatation(ProdId _prodId)
+    {
+        ProdParmCostEstimation prodParmCostEstimationLocal = prodParmCostEstimation.data();
+        prodParmCostEstimationLocal.ProdId = _prodId;
+        prodParmCostEstimationLocal.LineNum = 1;
+        prodParmCostEstimationLocal.AutoUpdate = NoYes::Yes;
+        prodParmCostEstimationLocal.ParmId = NumberSeq::newGetNum(CompanyInfo::numRefParmId()).num();
+        prodParmCostEstimationLocal.ExecutedDateTime = DateTimeUtil::getSystemDateTime();
+        prodParmCostEstimationLocal.JobStatus = ParmJobStatus::Executed;
+        prodParmCostEstimationLocal.doInsert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>costEstimateItems</Name>
+				<Source><![CDATA[
+    protected void costEstimateItems(ProdTable _prodTable)
+    {
+        ProdBOM             prodBOM;
+        ProdRoute           prodRoute;
+        ProdRoute           prodRouteFirst  = ProdRoute::findFirst(_prodTable.ProdId);
+
+        purchaseOrdersToBeSubmittedToWorkflow = new Set(Types::Int64);
+
+        setPrefix("@SYS28536");
+        
+        while select forupdate prodBOM
+            where prodBOM.ProdId     == _prodTable.ProdId &&
+                  prodBOM.EndConsump == NoYes::No
+        {
+            using (var m = ProdInstrumentationSegmentFactory::create(ProdInstrumentationActivities::UpdateCostEstimationOfItems, prodBOM.RecId))
+            {
+                setPrefix(#PreFixField(prodBOM,ItemId));
+
+                InventTable inventTable = prodBOM.inventTable();
+                if (! inventTable.RecId)
+                {
+                    throw error(strFmt(InventTable::txtNotExist(),prodBOM.ItemId));
+                }
+
+                prodRoute.clear();
+
+                if (prodBOM.OprNum)
+                {
+                    prodRoute = ProdRoute::find(_prodTable.ProdId,prodBOM.OprNum,RouteOprPriority::Primary);
+                }
+
+                if (prodBOM.ProdLineType == BOMType::Phantom)
+                {
+                    this.expandBOMRoute(_prodTable,prodBOM.LineNum,ProdRoute::highestOprNum(_prodTable.ProdId),prodRoute.RecId ? prodRoute : prodRouteFirst,prodBOM);
+                    prodBOM.delete();
+                }
+                else
+                {
+                    this.costEstimateNonPhantomItems( _prodTable,  prodBOM,  prodRoute,  inventTable, prodRouteFirst);
+                }
+            }
+        }
+
+        if (purchaseOrdersToBeSubmittedToWorkflow)
+        {
+            ProdMultiPurchLateSubmissionToWorkflow::submitPurchaseOrdersToWorkflow(purchaseOrdersToBeSubmittedToWorkflow);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>costEstimateNonPhantomItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Estimates cost for non phantom items.
+    /// </summary>
+    /// <param name = "_prodTable">Production order for cost estimation.</param>
+    /// <param name = "_prodBOM">Production BOM for cost estimation.</param>
+    /// <param name = "_prodRoute">Production route for cost estimation.</param>
+    /// <param name = "_inventTable">Inventory item for cost estimation.</param>
+    /// <param name = "_prodRouteFirst">First production route.</param>
+    protected void costEstimateNonPhantomItems(ProdTable _prodTable, ProdBOM _prodBOM, ProdRoute _prodRoute, InventTable _inventTable, ProdRoute _prodRouteFirst)
+    {
+        BOMCalcData calcBOMData = BOMCalcData::newProdTable(_prodTable.QtySched,_prodTable);
+        this.setItemConsumption(calcBOMData, _prodTable, _prodBOM, _prodRoute.RecId ? _prodRoute : _prodRouteFirst);
+        _prodBOM.type().setReservation();
+        ProdBOM::updateExclBackStatus(_prodBOM);
+
+        if (_prodBOM.InventRefTransId)
+        {
+            this.updateSub(_prodTable,_prodBOM);
+        }
+        else
+        {
+            this.createSub(_prodTable,_prodBOM, _inventTable);
+        }
+    
+        if (_prodBOM.Reservation == ProdReservation::Estimation)
+        {
+            InventMovement::construct(_prodBOM).updateReservation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>costEstimateOperations</Name>
+				<Source><![CDATA[
+    protected void costEstimateOperations(ProdTable _prodTable)
+    {
+        BOMCalcData             calcBOMData = BOMCalcData::newProdTable(_prodTable.QtySched,_prodTable);
+        ProdRoute               prodRoute;
+
+        setPrefix("@SYS28537");
+
+        this.updateProductionRoutes(_prodTable, calcBOMData);
+
+        // Calculate overlap
+        while select forupdate prodRoute
+            where prodRoute.ProdId      == _prodTable.ProdId         &&
+                  prodRoute.OprPriority == RouteOprPriority::Primary &&
+                  prodRoute.TransferBatch
+        {
+            ProdRouteOverlapCalc prodRouteOverlapCalc = ProdRouteOverlapCalc::newProdRouteBOMData(prodRoute,
+                                                                                                  calcBOMData,
+                                                                                                  true,      // update ProdRoute
+                                                                                                  false,     // show the calculated overlap quantity
+                                                                                                  true);     // inform when the overlap quantity is changed
+            prodRouteOverlapCalc.run();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateProductionRoutes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the production routes related to the specified <c>ProdTable</c>.
+    /// </summary>
+    /// <param name = "_prodTable">The production order that the estimation is being calculated for.</param>
+    /// <param name = "_calcBOMData">The BOM calculation data for the production order.</param>
+    protected void updateProductionRoutes(ProdTable _prodTable, BOMCalcData _calcBOMData)
+    {
+        ProdRoute           prodRoute;
+        ProdJobTypeSearch   prodJobTypeSearch = new ProdJobTypeSearch();
+
+        while select forupdate prodRoute
+            where prodRoute.ProdId == _prodTable.ProdId
+        {
+            setPrefix(#PreFixField(ProdRoute, OprId));
+
+            this.updateProductionRoute(prodRoute, _calcBOMData, prodJobTypeSearch);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateProductionRoute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the specified production route with the cost estimations.
+    /// </summary>
+    /// <param name = "_prodRoute">The <c>ProdRoute</c> to update.</param>
+    /// <param name = "_calcBOMData">The BOM calculation data for the production order.</param>
+    /// <param name = "_prodJobTypeSearch">An instance of <c>ProdJobTypeSearch</c> that is used to update the <c>ProdRoute</c>.</param>
+    protected void updateProductionRoute(ProdRoute _prodRoute, BOMCalcData _calcBOMData, ProdJobTypeSearch _prodJobTypeSearch)
+    {
+        if (_prodJobTypeSearch.first())
+        {
+            do
+            {
+                ProdJobType prodJobType = _prodJobTypeSearch.prodJobType();
+                prodJobType.setCalcConsumptionProdRoute(_prodRoute, _calcBOMData);
+            }
+            while (_prodJobTypeSearch.next());
+        }
+
+        _prodRoute.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createKanban</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates one or more Kanban's for a pegged supply BOM line, if the applicable Kanban rule exists.
+    /// </summary>
+    /// <param name="_prodBOM">
+    ///    The <c>ProdBOM</c> record for which to create Kanban's.
+    /// </param>
+    /// <returns>
+    ///    true if the BOM line was handled; otherwise, false.
+    /// </returns>
+    protected boolean createKanban(ProdBOM _prodBOM)
+    {
+        boolean                 result = _prodBOM.ProdLineType == BOMType::PeggedSupply;
+
+        if (result)
+        {
+            //create event Kanban's as appropriate
+            ReqEventProcessKanban reqEventProcessKanban = ReqEventProcessKanban::newStandard(_prodBOM);
+            reqEventProcessKanban.parmMustBeAutoReserved(true);
+            reqEventProcessKanban.runOperation();
+
+            result = reqEventProcessKanban.isEventHandled();
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createProdBOM</Name>
+				<Source><![CDATA[
+    protected container createProdBOM(
+        ProdTable   _prodTable,
+        LineNum     _lineNumOffset,
+        OprNum      _oprNumOffset,
+        OprNum      _oprNumFirst,
+        OprNum      _oprNumNext,
+        OprNum      _oprNumPhantom,
+        BOMMap      _phantomBOM,
+        Factor      _phantomUnitFactor = 1)
+    {
+        ProdBOM             prodBOM;
+
+        LineNum             lineNumNext = _lineNumOffset;
+        OprNum              oprNumNext  = _oprNumNext;
+
+        ProdRoute           phantomProdRoute;
+
+        BOMCalcData         calcBOMData     = BOMCalcData::newProdTable(_prodTable.QtySched,_prodTable);
+
+        Qty                 searchQty   = _phantomBOM.BOMMap::searchQty(_prodTable.ItemId,_prodTable.QtySched);
+
+        setPrefix("@SYS28535");
+
+        BOMId bomId = _phantomBOM.BOMMap::itemBOMId(_prodTable.bomDate, searchQty, InventDim::find(_phantomBOM.InventDimId));
+
+        if (!bomId)
+        {
+            throw error(strFmt("@SYS112833", _prodTable.ItemId, _phantomBOM.ItemId, _prodTable.inventDim().InventSiteId));
+        }
+
+        BOMSearch search = BOMSearch::newBOMCalc(bomId, _prodTable.bomDate, _phantomBOM.ItemId, _phantomBOM.configId());
+
+        while (search.next())
+        {
+            BOM bom = search.bom();
+            setPrefix(#PreFixField(BOM,ItemId));
+
+            InventTable inventTable = InventTable::find(bom.ItemId);
+            if (!inventTable.RecId)
+            {
+                throw error(strFmt(InventTable::txtNotExist(),bom.ItemId));
+            }
+
+            InventTableModule inventTableModuleInvent = InventTableModule::find(bom.ItemId,ModuleInventPurchSales::Invent);
+            if (!inventTableModuleInvent.RecId)
+            {
+                throw error(strFmt("@SYS5700",bom.ItemId,ModuleInventPurchSales::Invent));
+            }
+
+            if (_phantomBOM.RecId || (_phantomBOM.BOMType == BOMType::Phantom && _phantomBOM.TableId == tableNum(ProdBOM)))
+            {
+                bom.BOMMap::initializePhantomBOMMap(_phantomBOM, _phantomUnitFactor, _prodTable);
+            }
+
+            if (bom.bomType == BOMType::Phantom)
+            {
+                OprNumBOM oprNumBOM = this.initializePhantomBOMOperationNumber(bom, _prodTable, _oprNumOffset, _oprNumFirst, _oprNumNext, _oprNumPhantom, _phantomBOM);
+
+                phantomProdRoute = ProdRoute::findPhantomBOMFirst(_prodTable.ProdId, _oprNumPhantom, oprNumBOM, _oprNumFirst, phantomProdRoute);
+                
+                // expand phantom
+                [lineNumNext,oprNumNext] = this.expandBOMRoute(_prodTable, lineNumNext, oprNumNext, phantomProdRoute, bom);
+            }
+            else
+            {
+                lineNumNext = lineNumNext + #lineNumAdd;
+
+                // Initialize and create prodBOM
+                prodBOM = this.initializeProductionBOM(_prodTable, bom, _oprNumOffset, _oprNumFirst, _oprNumNext, _oprNumPhantom, _phantomBOM);
+                prodBOM.LineNum = lineNumNext;
+                prodBOM.insert();
+
+                phantomProdRoute = ProdRoute::findPhantomBOMFirst(_prodTable.ProdId, 0, prodBOM.OprNum, _oprNumFirst, phantomProdRoute);
+
+                this.setItemConsumption(calcBOMData, _prodTable, prodBOM, phantomProdRoute, inventTableModuleInvent);
+
+                if (_prodTable.isProjMethodConsumed())
+                {
+                    ProjInventJournalTransMapForm::construct(prodBOM).initProdBOM();
+                }
+
+                prodBOM.update();
+                _prodTable.reread();
+
+                this.createSub(_prodTable,prodBOM,inventTable);
+
+                if (prodBOM.Reservation == ProdReservation::Estimation)
+                {
+                    InventMovement::construct(prodBOM).updateReservation();
+                }
+            }
+        }
+
+        return [lineNumNext,oprNumNext];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializePhantomBOMOperationNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the phantom bill of materials line operation number.
+    /// </summary>
+    /// <param name = "_bom">The bill of material lines record.</param>
+    /// <param name = "_prodTable">The production order record.</param>
+    /// <param name = "_oprNumOffset">The operation number off set.</param>
+    /// <param name = "_oprNumFirst">The first operation number.</param>
+    /// <param name = "_oprNumNext">The next operation number.</param>
+    /// <param name = "_oprNumPhantom">The phantom operation number.</param>
+    /// <param name = "_phantomBOM">The phantom bill of material lines record.</param>
+    /// <returns>The initialized bill of materials line operation number.</returns>
+    protected OprNumBOM initializePhantomBOMOperationNumber(
+        BOM         _bom,
+        ProdTable   _prodTable,
+        OprNum      _oprNumOffset,
+        OprNum      _oprNumFirst,
+        OprNum      _oprNumNext,
+        OprNum      _oprNumPhantom,
+        BOMMap      _phantomBOM)
+    {
+        OprNumBOM oprNumBOM;
+        if (_bom.OprNum)
+        {
+            oprNumBOM = _bom.OprNum + _oprNumOffset;
+        }
+        else
+        {
+            RouteId phantomRouteId;
+
+            if (_bom.ItemRouteId)
+            {
+                phantomRouteId = _bom.ItemRouteId;
+            }
+            else
+            {
+                phantomRouteId = _phantomBOM.inventTable().routeId(
+                    _prodTable.bomDate,
+                    _prodTable.QtySched,
+                    InventDim::find(_phantomBOM.InventDimId));
+            }
+
+            oprNumBOM = Route::findFirst(phantomRouteId).OprNum + _oprNumOffset;
+        }
+        return oprNumBOM;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeProductionBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the production bill of materials.
+    /// </summary>
+    /// <param name = "_prodTable">The production order record.</param>
+    /// <param name = "_bom">The bill of material lines record.</param>
+    /// <param name = "_oprNumOffset">The operation number off set.</param>
+    /// <param name = "_oprNumFirst">The first operation number.</param>
+    /// <param name = "_oprNumNext">The next operation number.</param>
+    /// <param name = "_oprNumPhantom">The phantom operation number.</param>
+    /// <param name = "_phantomBOM">The phantom bill of material lines record.</param>
+    /// <returns>An initialized production bill of materials record.</returns>
+    protected ProdBOM initializeProductionBOM(
+        ProdTable   _prodTable,
+        BOM         _bom,
+        OprNum      _oprNumOffset,
+        OprNum      _oprNumFirst,
+        OprNum      _oprNumNext,
+        OprNum      _oprNumPhantom,
+        BOMMap      _phantomBOM)
+    {
+        ProdBOM prodBOM;
+        prodBOM.InventTransId           = NumberSeq::newGetNum(InventParameters::numRefInventTransId()).num();
+        prodBOM.initFromProdTable(_prodTable);
+        prodBOM.initFromBOM(_bom);
+        
+        if (prodBOM.OprNum)
+        {
+            prodBOM.OprNum += _oprNumOffset;
+        }
+        else
+        {
+            prodBOM.OprNum = _oprNumFirst;
+        }
+
+        InventTable inventTable = InventTable::find(_bom.ItemId);
+        prodBOM.DefaultDimension    = prodBOM.mergeDimension(_prodTable.DefaultDimension, inventTable.DefaultDimension);
+
+        prodBOM.setInventDimId(
+            prodBOM.BOMMap::inventDimFinal(
+                _prodTable.ItemId,
+                _prodTable.inventDim(),
+                _prodTable.RouteId).InventDimId);
+
+        return prodBOM;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createProdRoute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Explodes the operations that are made on the phantom BOM onto the production route.
+    /// </summary>
+    /// <param name="_prodTable">
+    ///    The production order for which to create route records.
+    /// </param>
+    /// <param name="_oprNumOffset">
+    ///    The offset from which the operation number should be generated.
+    /// </param>
+    /// <param name="_phantomProdRoute">
+    ///    The production operation where the phantom lines should be inserted.
+    /// </param>
+    /// <param name="_phantomBOM">
+    ///    The phantom BOM.
+    /// </param>
+    /// <param name="_phantomUnitFactor">
+    ///    The unit conversion factor to use when creating the new operations.
+    /// </param>
+    /// <param name="_inventTable">
+    ///    The phantom BOM item.
+    /// </param>
+    /// <returns>
+    ///    A container that has the first and the last operation numbers inserted.
+    /// </returns>
+    protected container createProdRoute(
+        ProdTable   _prodTable,
+        OprNum      _oprNumOffset,
+        ProdRoute   _phantomProdRoute,
+        BOMMap      _phantomBOM,
+        Factor      _phantomUnitFactor  = 1,
+        InventTable _inventTable        = InventTable::find(_phantomBOM.ItemId))
+    {
+        ProdRoute           prodRoute;
+
+        OprNum              oprNumLast          = _oprNumOffset;
+        OprNum              oprNumFirst;
+        Level               levelFirst;
+
+        RouteId             routeId;
+        InventSiteId        siteId = _prodTable.inventDim().InventSiteId;
+
+        if (_phantomBOM.ItemRouteId)
+        {
+            routeId = _phantomBOM.ItemRouteId;
+        }
+        else
+        {
+            var bomCalcData         = BOMCalcData::newInventTable(_prodTable.QtySched, _phantomBOM.inventTable());
+            var bomCalcConsumption  = BOMCalcConsumption::construct(_phantomBOM.Formula, bomCalcData);
+            var calcAccError        = _phantomProdRoute.AccError ? _phantomProdRoute.AccError : 1;
+            var consumptionBOMQty   = bomCalcConsumption.calcConsumption(_phantomBOM, calcAccError);
+
+            InventDim dimToSearch = InventDim::find(_phantomBOM.InventDimId);
+
+            if (dimToSearch && dimToSearch.InventSiteId == '')
+            {
+                dimToSearch.InventSiteId = siteId;
+                dimToSearch = InventDim::findDim(dimToSearch);
+            }
+
+            routeId = _inventTable.routeId(_prodTable.bomDate, consumptionBOMQty, InventDim::find(dimToSearch.InventDimId));
+        }
+
+        RouteSearch routeSearch = RouteSearch::newRouteId(routeId);
+        while (routeSearch.next())
+        {
+            Route route = routeSearch.route();
+            RouteOpr routeOpr = route.routeOpr(_phantomBOM.ItemId, _phantomBOM.configId(), siteId, null);
+
+            setPrefix(#PreFixField(Route,OprNum));
+
+            prodRoute.clear();
+
+            prodRoute.initFromProdTable(_prodTable);
+            prodRoute.initFromRouteRouteOpr(route,routeOpr);
+            prodRoute.initFromPhantom(_phantomBOM,_phantomProdRoute,route.OprNum,route.OprNumNext,route.Level,_oprNumOffset,_phantomUnitFactor);
+            prodRoute.insert();
+
+            Docu::copy(routeOpr,prodRoute);
+            WrkCtrActivityRequirementSet::copyRequirements(routeOpr.activity(), prodRoute.activity());
+            prodRoute.initDimensionWrkCtrTable();
+            prodRoute.update();
+
+            if (prodRoute.Level > levelFirst || (prodRoute.Level == levelFirst && prodRoute.OprNum < oprNumFirst))
+            {
+                oprNumFirst = prodRoute.OprNum;
+                levelFirst  = prodRoute.Level;
+            }
+
+            oprNumLast  = prodRoute.OprNum;
+
+            if (_oprNumOffset && phantomRouteExpanded)
+            {
+                phantomRouteExpanded.add(_prodTable.ProdId);
+            }
+        }
+
+        return [oprNumFirst,oprNumLast];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createProdTable</Name>
+				<Source><![CDATA[
+    protected void createProdTable(
+        ProdTable       _prodTable,
+        ProdBOM         _prodBOM,
+        InventTable     _inventTable,
+        ProdType        _prodType = ProdType::Standard)
+    {
+        ProdTable  prodTableSub;
+
+        if (_prodBOM.RemainInventPhysical > 0 && _prodBOM.RemainInventPhysical == _prodBOM.QtyInventCalc)
+        {
+            setPrefix("@SYS28447");
+            setPrefix(#PreFixField(_prodBOM,ItemId));
+
+            this.registerItemAndDimensionForCircularityCheck(_prodBOM.ItemId, _prodBOM.InventDimId);
+
+            // create production
+
+            prodTableSub.initValue();
+            prodTableSub.initFromInventTable(_inventTable, _prodBOM.inventDim());
+
+            prodTableSub.bomDate    = _prodTable.bomDate;
+            prodTableSub.initFromProdBOM(_prodBOM);
+
+            if (_prodTable.isProjMethodConsumed() && _prodBOM.ProjSetSubProdToConsumed == NoYes::Yes)
+            {
+                prodTableSub.ProjId = _prodTable.ProjId;
+                prodTableSub.ActivityNumber = _prodTable.ActivityNumber;
+                prodTableSub.ProjPostingType = _prodTable.ProjPostingType;
+                prodTableSub.DefaultDimension = prodTableSub.copyDimension(_prodTable.DefaultDimension);
+            }
+
+            if (ProdTableType::isInhouseProduction(_prodType)
+                && prodTableSub.inventTable().isFormulaAllowed())
+            {
+                prodTableSub.ProdType   = ProdType::Process;
+                prodTableSub.ProdId     = this.retrieveProdIdForInhouseFormulaItems();
+            }
+            else
+            {
+                prodTableSub.ProdId     = this.retrieveProdId();
+                prodTableSub.ProdType   = _prodType;
+            }
+
+            prodTableSub.setInventStorageDim(prodTableSub.inventDim(), _inventTable);
+
+            if (prodTableSub.isProjMethodConsumed() && !prodTableSub.validateWrite())
+            {
+                throw error("@SYS21628");
+            }
+
+            this.writeSubProdTable(prodTableSub, _prodTable, _prodBOM);
+
+            if (!#PmfEnabled
+                || ((_prodTable.inventTable().isBOMAllowed()
+                        && !prodTableSub.inventTable().isFormulaAllowed())
+                    || (_prodTable.inventTable().isFormulaAllowed()
+                        && !prodTableSub.inventTable().isBOMAllowed())))
+            {
+                this.addCreatedRec(prodTableSub);
+            }
+
+            this.costEstimate(prodTableSub);
+
+            this.deRegisterItemAndDimensionForCircularityCheck(_prodBOM.ItemId, _prodBOM.InventDimId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>writeSubProdTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Writes the sub production order.
+    /// </summary>
+    /// <param name = "_prodTableSub">The sub production order to be inserted/updated.</param>
+    /// <param name = "_prodTable">A production order.</param>
+    /// <param name = "_prodBOM">A production bill of materials record.</param>
+    [Replaceable]
+    protected void writeSubProdTable(ProdTable _prodTableSub, ProdTable _prodTable, ProdBOM _prodBOM)
+    {
+        _prodTableSub.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveProdIdForInhouseFormulaItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the production order id for in-house items that can have formula.
+    /// </summary>
+    /// <returns>A production order id.</returns>
+    [Replaceable]
+    protected ProdId retrieveProdIdForInhouseFormulaItems()
+    {
+        return ProdTable::pmfNumberSeqBatchId(false).num();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveProdId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the production order id.
+    /// </summary>
+    /// <returns>A production order id.</returns>
+    [Replaceable]
+    protected ProdId retrieveProdId()
+    {
+        return ProdTable::numberSeqProdId(false).num();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPurchLineQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the purchase order line quantity based on the unit on the production BOM line.
+    /// </summary>
+    /// <param name = "_prodBOM">The production BOM line for which to get the unit.</param>
+    /// <param name = "_purchTable">The purchase order.</param>
+    /// <param name = "_purchLine">The purchase order line.</param>
+    /// <param name = "_itemId">The product item.</param>
+    /// <returns>The purchase order line with the updated quantity.</returns>
+    protected PurchLine setPurchLineQty(
+        ProdBOM	    _prodBOM,
+        PurchTable  _purchTable,
+        PurchLine   _purchLine,
+        Itemid      _itemId)
+    {
+        InventTableModule inventTableModuleInvent = InventTableModule::find(_prodBOM.ItemId,ModuleInventPurchSales::Invent);
+        InventTableModule inventTableModulePurch  = InventTableModule::find(_prodBOM.ItemId,ModuleInventPurchSales::Purch);
+  
+        _purchLine.PurchUnit = inventTableModulePurch.UnitId;
+
+        //It is necessary to round up and split the inventory transactions to ensure consistency through the intercompany chain
+        boolean roundUpNeeded			  = (inventTableModuleInvent.UnitId != inventTableModulePurch.UnitId) && (_purchTable.vendTable_OrderAccount().interCompanyTradingRelationActive());
+        UnitOfMeasureRecId purchUOMRecId  = UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableModulePurch.UnitId);
+        UnitOfMeasureRecId inventUOMRecId = UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableModuleInvent.UnitId);
+        
+        EcoResProductUnitConverter ecoResProductUnitConverter = EcoResProductUnitConverter::newForReleasedProduct(_itemId,
+                                                                                                                  _purchLine.InventDimId,
+                                                                                                                  inventUOMRecId,
+                                                                                                                  purchUOMRecId,
+                                                                                                                  NoYes::Yes,
+                                                                                                                  NoYes::No);
+
+        if (roundUpNeeded)
+        {
+            _purchLine.PurchQty              = ecoResProductUnitConverter.convertValue(_purchLine.QtyOrdered);
+            _purchLine.PurchQty              = roundUpDec(_purchLine.PurchQty, UnitOfMeasure::unitOfMeasureDecimalPrecision(purchUOMRecId));
+            _purchLine.RemainPurchPhysical   = _purchLine.PurchQty;
+            _purchLine.QtyOrdered            = _purchLine.salesPurchLineInterface().calcQtyOrdered();
+            _purchLine.RemainInventPhysical  = _purchLine.QtyOrdered;
+        }
+        else
+        {
+            ecoResProductUnitConverter.parmApplyRounding(NoYes::Yes);
+            _purchLine.PurchQty              = ecoResProductUnitConverter.convertValue(_purchLine.QtyOrdered);
+            _purchLine.RemainPurchPhysical   = _purchLine.PurchQty;
+        }
+
+        return _purchLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPurchLine</Name>
+				<Source><![CDATA[
+    protected void createPurchLine(ProdBOM _prodBOM)
+    {
+        PurchId                 purchId;
+
+        PurchTable              purchTable;
+        PurchLine               purchLine;
+        PurchLine               rollbackPurchLine;
+
+        InventTable             inventTable;
+
+        InventItemInventSetup   inventItemInventSetup;
+        InventItemPurchSetup    inventItemPurchSetup;
+
+        PurchAgreementId        purchAgreementId;
+        AgreementLine           localAgreementLine;
+        boolean                 isLineInitializedFromBOM;
+        boolean                 isNewPurchTable;
+        InventDim               inventDim;
+        PriceDiscPolicyCheckPolicy  checkPolicy;
+        VendTable               vendTable;
+
+        if (_prodBOM.RemainInventPhysical > 0 && _prodBOM.RemainInventPhysical == _prodBOM.QtyInventCalc)
+        {
+            _prodBOM.setVendId();
+            vendTable = VendTable::find(_prodBOM.VendId);
+
+            if (this.prodPurch().parmSearchPurchAgreement())
+            {
+                // Need to initialize here to get proper inventDim
+                purchLine.initFromProdBOM(_prodBOM);
+                isLineInitializedFromBOM = true;
+
+                // Set the PurchQty to find the right agreement.
+                inventTable = InventTable::find(_prodBOM.ItemId);
+                purchLine = this.setPurchLineQty(_prodBOM, purchTable, purchLine, inventTable.ItemId);
+
+                purchLine.VendAccount = _prodBOM.VendId;
+                // purchLine.DeliveryDate is set by initFormProdBOM as _prodBOM.RawMaterialDate
+                purchLine.CurrencyCode = vendTable.Currency;
+
+                // Try to search for agreement line...
+                // ... before do this set "final" deliveryDate to avoid changes in agreement search conditions later...
+                inventDim = purchLine.inventDim();
+                inventDim.initFromInventTable(inventTable, InventItemOrderSetupType::Purch, inventDim);
+                checkPolicy = PriceDiscPolicyCheckPolicy::newFromParm(purchLine);
+                purchLine.setPriceAgreement(inventDim, false, checkPolicy, true);
+
+                //initialize the dimension field explicitly so the dimensions take precedence to the ones on the lines.
+                purchLine.DefaultDimension  = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(purchLine.DefaultDimension, inventTable.DefaultDimension);
+
+                purchLine.DeliveryDate = max(purchLine.DeliveryDate,_prodBOM.RawMaterialDate);
+
+                localAgreementLine = AgreementLine::findLineForAutoMatch(purchLine,0,true);
+
+                purchAgreementId = localAgreementLine ? localAgreementLine.getPurchAgreementId() : '';
+            }
+
+            [purchId,isNewPurchTable] = this.createPurchTable(_prodBOM, purchAgreementId);
+
+            if (!purchId)
+            {
+                throw error("@SYS70020");
+            }
+
+            purchTable              = PurchTable::find(purchId,true);
+            
+            if (!inventTable)
+            {
+                inventTable         = InventTable::find(_prodBOM.ItemId);
+            }
+
+            if (!ProdPurch::checkCreatePurchLine(purchId,_prodBOM.ItemId,purchTable,inventTable, null, null, false))
+            {
+                throw Exception::Error;
+            }
+
+            using (var activityContext = instrumentationLogger.purchOrderLineCreationActivities().createPurchLineFromProductionOrder())
+            {
+                purchLine.initValue(purchTable.PurchaseType);
+                purchLine.initFromPurchTable(purchTable,isLineInitializedFromBOM);
+                purchLine.initFromInventTable(inventTable);
+
+                // initialize from prodBOM, even if already called earlier for agreement
+                // some values get overwritten by other initialization and need to be restored now
+                purchLine.initFromProdBOM(_prodBOM);
+
+                // Set the PurchQty again as it was either not set or can have been overwritten by other initialization.
+                purchLine = this.setPurchLineQty(_prodBOM, purchTable, purchLine, inventTable.ItemId);
+
+                ProdPurch::setInventStorageDim(purchLine,
+                                           InventDim::find(purchLine.InventDimId),
+                                           inventTable,
+                                           InventItemOrderSetupType::Purch,
+                                           purchTable.InventLocationId);
+
+                inventItemInventSetup   = InventItemInventSetup::find(_prodBOM.ItemId, _prodBOM.InventDimId);
+                inventItemPurchSetup    = InventItemPurchSetup::find(_prodBOM.ItemId, _prodBOM.InventDimId);
+
+                if (!ProdPurch::checkCreatePurchLine(purchId,_prodBOM.ItemId,purchTable,inventTable, inventItemInventSetup, inventItemPurchSetup))
+                {
+                    throw Exception::Error;
+                }
+
+                purchLine.initFromVendTable(purchLine.vendTable_OrderAccount());
+                purchLine.setPriceDisc(InventDim::find(purchLine.InventDimId));
+
+                if (_prodBOM.RawMaterialDate != datenull())
+                {
+                    purchLine.DeliveryDate  = _prodBOM.RawMaterialDate;
+                }
+                else
+                {
+                    purchLine.DeliveryDate  = max(purchLine.DeliveryDate, _prodBOM.RawMaterialDate);
+                }
+
+                purchLine.calculateRequestedShipAndReceiptDate(dateNull(), purchLine.DeliveryDate, SchedDirection::Backward);
+                purchLine.SkipShipReceiptDateCalculation = true;
+                purchLine.insert();
+
+                // row version might have changed by purchLine->PurchTable status update => sync the buffer
+                if (ProdBomSubcontractingNoUpdateConflictFlight::instance().isEnabled())
+                {
+                    purchTable.reread();
+                }
+            }
+
+            // set the earliest delivery date on the header
+            if ((purchTable.DeliveryDate > purchLine.DeliveryDate) || isNewPurchTable)
+            {
+                purchTable.DeliveryDate = purchLine.DeliveryDate;
+                purchTable.calculateRequestedShipAndReceiptDate(dateNull(), purchTable.DeliveryDate, SchedDirection::Backward);
+                purchLine.SkipShipReceiptDateCalculation = true;
+            }
+
+            List listRecordList = new List(Types::Record);
+            listRecordList.addEnd(purchLine);
+            ListEnumerator listEnumerator = listRecordList.getEnumerator();
+            purchTable.updateFromPurchReqLineMap(listEnumerator);
+
+            purchTable.update();
+
+            // update internal maps
+            this.prodPurch().mapKey2PurchId().insert(this.prodPurch().prodBOMPurchIdKey(_prodBOM, purchAgreementId),purchId);
+
+            // Update prodBOm
+            _prodBOM.RawMaterialDate  = purchLine.DeliveryDate;
+            _prodBOM.InventRefType    = InventRefType::Purch;
+            _prodBOM.InventRefId      = purchLine.PurchId;
+            _prodBOM.InventRefTransId = purchLine.InventTransId;
+            _prodBOM.updateInventDimFromRefInventDim(purchLine.inventDim());
+            _prodBOM.update();
+
+            if (   _prodBOM.InventRefTransId
+                && InventDim::isInventDimEqualConsistent(InventDimGroupSetup::newInventTable(inventTable), _prodBOM.inventDim(), purchLine.inventDim()))
+            {
+                InventUpd_Reservation::updateReserveRefTransId(InventMovement::construct(_prodBOM));
+            }
+
+            // Do association of the new line with Agreement line...
+            if (this.prodPurch().parmSearchPurchAgreement() && localAgreementLine && purchLine.RecId)
+            {
+                // Cache line data for possible roll-back
+                rollbackPurchLine.data(purchLine);
+
+                ttsbegin;
+
+                // Verify association with Agreement still could be done...
+                purchLine.initFromAgreementLine(localAgreementLine);
+                if (purchLine.isAgreementLinkValid(false))
+                {
+                    // Still can associate - do it now!
+                    purchLine.update();
+                }
+                else
+                {
+                    // Association is not possible anymore - restore line data by rolling back Agreement specific changes...
+                    purchLine.data(rollbackPurchLine);
+                }
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPurchTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new <c>PurchTable</c> record or retrieves the purchase ID of an existing one.
+    /// </summary>
+    /// <param name="_prodBOM">
+    /// A <c>ProdBOM</c> record used during the initialization of the purchase order.
+    /// </param>
+    /// <param name="_purchAgreementId">
+    /// A purchase agreement ID used during the initialization of the purchase order.
+    /// </param>
+    /// <returns>
+    /// A container that holds the purchase ID and a Boolean value that indicates if a new purchase order
+    /// was created.
+    /// </returns>
+    /// <exception cref="M:Exception::Error">
+    /// A vendor was not specified.
+    /// </exception>
+    /// <exception cref="M:Exception::Error">
+    /// A purchase order could not be created, because change management is enabled and required for the
+    /// vendor.
+    /// </exception>
+    protected container createPurchTable(
+        ProdBOM          _prodBOM,
+        PurchAgreementId _purchAgreementId)
+    {
+        PurchId         purchId;
+        boolean         isNewPurchTable;
+
+        if (!_prodBOM.VendId)
+        {
+            throw error("@SYS23532");
+        }
+
+        [purchId,isNewPurchTable] = this.retrievePurchId(_prodBOM, _purchAgreementId);
+        
+        if (!purchId)
+        {
+            ProdPurchCreateParameters prodPurchCreateParameters = this.instantiateProdPurchCreateParameters(_prodBOM.VendId,_prodBOM.purchType(),_prodBOM.RawMaterialDate, _purchAgreementId);
+            ProdPurchCreate prodPurchCreate                     = this.instantiateProdPurchCreate(prodPurchCreateParameters);
+            purchId                                             = prodPurchCreate.createPurchTable();
+
+            isNewPurchTable = purchId != '';
+        }
+
+        return [purchId,isNewPurchTable];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrievePurchId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the purchase ID of an existing <c>PurchTable</c> record.
+    /// </summary>
+    /// <param name="_prodBOM">
+    /// A <c>ProdBOM</c> record used during the initialization of the purchase order.
+    /// </param>
+    /// <param name="_purchAgreementId">
+    /// A purchase agreement ID used during the initialization of the purchase order.
+    /// </param>
+    /// <returns>
+    /// A container that holds the purchase ID and a Boolean value that indicates if a new purchase order was created.
+    /// </returns>
+    protected container retrievePurchId(ProdBOM          _prodBOM,
+                                        PurchAgreementId _purchAgreementId)
+    {
+        PurchId         purchId;
+        boolean         isNewPurchTable;
+
+        if (this.prodPurch().mapKey2PurchId().exists(this.prodPurch().prodBOMPurchIdKey(_prodBOM, _purchAgreementId)))
+        {
+            purchId         = prodPurch.mapKey2PurchId().lookup(this.prodPurch().prodBOMPurchIdKey(_prodBOM, _purchAgreementId));
+            isNewPurchTable = false;
+        }
+
+        return [purchId,isNewPurchTable];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSub</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates Kanban, production, or purchase orders for the given BOM line if required.
+    /// </summary>
+    /// <param name="_prodTable">
+    /// A <c>ProdTable</c> record.
+    /// </param>
+    /// <param name="_prodBOM">
+    /// The <c>ProdBOM</c> record for which the orders are created.
+    /// </param>
+    /// <param name="_inventTable">
+    /// An <c>InventTable</c> record.
+    /// </param>
+    protected void createSub(
+        ProdTable       _prodTable,
+        ProdBOM         _prodBOM,
+        InventTable     _inventTable)
+    {
+        ProdBOMType     prodBOMType = _prodBOM.type();
+
+        if (prodBOMType.isPeggedSupply())
+        {
+            if (!this.createKanban(_prodBOM))
+            {
+                ReqSetupDim     reqSetupDim = ReqSetupDim::newInventTable(_inventTable, _prodBOM.inventDimId);
+                ReqRefType      reqRefType = reqSetupDim.plannedOrderTypeReq(true);
+
+                if (reqRefType == ReqRefType::BOMPlannedOrder || reqRefType == ReqRefType::PmfPlannedProdBatch)
+                {
+                    this.createProdTable(_prodTable,_prodBOM,_inventTable,prodBOMType.prodType());
+                }
+                else if (reqRefType == ReqRefType::ItemPlannedOrder)
+                {
+                    this.createPurchLine(_prodBOM);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endUpdateProduction</Name>
+				<Source><![CDATA[
+    protected void endUpdateProduction(ProdTable _prodTable)
+    {
+        if (prodParmCostEstimation.EndJob && _prodTable.status().isBefore(ProdStatus::CostEstimated))
+        {
+            _prodTable.ProdStatus= ProdStatus::CostEstimated;
+        }
+
+        if (_prodTable.QtySched != _prodTable.QtyCalc)
+        {
+            _prodTable.QtyCalc  =  _prodTable.QtySched;
+        }
+
+        if (_prodTable.PdsCWBatchSched != _prodTable.PdsCWBatchEst)
+        {
+            _prodTable.PdsCWBatchEst = _prodTable.PdsCWBatchSched;
+        }
+        if (_prodTable.ProfitSet != prodParmCostEstimation.ProfitSet)
+        {
+            _prodTable.ProfitSet =  prodParmCostEstimation.ProfitSet;
+        }
+
+        if (_prodTable.CalcDate < DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+        {
+            _prodTable.CalcDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        }
+
+        _prodTable.update();
+
+        this.addUpdateRec(_prodTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>expandBOMRoute</Name>
+				<Source><![CDATA[
+    public container expandBOMRoute(
+        ProdTable   _prodTable,
+        LineNum     _lineNumOffset,
+        OprNum      _oprNumOffset,
+        ProdRoute   _phantomProdRoute,
+        BOMMap      _phantomBOM)
+    {
+        LineNum             lineNumNext;
+        OprNum              oprNumfirst;
+        OprNum              oprNumNext;
+        OprNum              oprNumPhantom;
+        this.registerItemAndDimensionForCircularityCheck(_phantomBOM.ItemId, _phantomBOM.InventDimId);
+
+        Factor phantomUnitFactor = _phantomBOM.RecId ? _phantomBOM.BOMMap::phantomUnitFactor(_prodTable.QtySched) : 1;
+
+        if (this.canExpandPhantomProductionRoute())
+        {
+            // Create prodRoute
+            [oprNumfirst,oprNumNext] = this.createProdRoute(_prodTable,_oprNumOffset,_phantomProdRoute,_phantomBOM,phantomUnitFactor);
+        }
+
+        // Create prodBOM
+        if (!oprNumfirst)
+        {
+            if (_phantomProdRoute.RecId)
+            {
+                oprNumPhantom   = _phantomProdRoute.OprNum;
+                oprNumfirst     = _phantomProdRoute.OprNum;
+            }
+            else
+            {
+                oprNumPhantom = 0;
+            }
+        }
+
+        [lineNumNext,oprNumNext] = this.createProdBOM(_prodTable,_lineNumOffset,_oprNumOffset,oprNumfirst,oprNumNext,oprNumPhantom,_phantomBOM,phantomUnitFactor);
+
+        this.deRegisterItemAndDimensionForCircularityCheck(_phantomBOM.ItemId, _phantomBOM.InventDimId);
+
+        return [lineNumNext,oprNumNext];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canExpandPhantomProductionRoute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if phantom BOM route should be expanded as part of parent BOM route.
+    /// </summary>
+    /// <returns>True if phantom BOM route should expand; otherwise false.</returns>
+    protected boolean canExpandPhantomProductionRoute()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerItemAndDimensionForCircularityCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers an item and inventory dimension to be able to detect circularities.
+    /// </summary>
+    /// <param name = "_itemId">An item id to register.</param>
+    /// <param name = "_inventDimId">An inventory dimensions id to register.</param>
+    /// <remarks>
+    /// Note, that callers of this method pass an inventory dimension id of the "full" inventory dimensions, not only product dimensions.
+    /// This behavior is by intent since circularity will be detected anyway when storage and tracking dimensions will start to repeat.
+    /// </remarks>
+    private void registerItemAndDimensionForCircularityCheck(ItemId _itemId, InventDimId _inventDimId)
+    {
+        if (!circularityCheckItemSet)
+        {
+            circularityCheckItemSet = new Set(Types::Container);
+        }
+        else if (circularityCheckItemSet.in([_itemId, _inventDimId]))
+        {
+            throw error(strFmt("@SYS18964", _itemId));
+        }
+
+        circularityCheckItemSet.add([_itemId, _inventDimId]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deRegisterItemAndDimensionForCircularityCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// De-registers an item and inventory dimension from circularity detection.
+    /// </summary>
+    /// <param name = "_itemId">An item id to de-register.</param>
+    /// <param name = "_inventDimId">An inventory dimensions id to de-register.</param>
+    private void deRegisterItemAndDimensionForCircularityCheck(ItemId _itemId, InventDimId _inventDimId)
+    {
+        if (circularityCheckItemSet.in([_itemId, _inventDimId]))
+        {
+            circularityCheckItemSet.remove([_itemId, _inventDimId]);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmParmBuffer</Name>
+				<Source><![CDATA[
+    ParmBuffer parmParmBuffer(ParmBuffer _prodParmCostEstimation = prodParmCostEstimation)
+    {
+        if (!_prodParmCostEstimation.RecId)
+        {
+            throw error("@SYS25332");
+        }
+
+        prodParmCostEstimation = _prodParmCostEstimation;
+
+        return prodParmCostEstimation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmProdPurch</Name>
+				<Source><![CDATA[
+    ProdPurch parmProdPurch(ProdPurch _prodPurch = prodPurch)
+    {
+        prodPurch = _prodPurch;
+        return prodPurch;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPhantomRouteExpanded</Name>
+				<Source><![CDATA[
+    public Set parmPhantomRouteExpanded(Set _phantomRouteExpanded = phantomRouteExpanded)
+    {
+        phantomRouteExpanded = _phantomRouteExpanded;
+        return phantomRouteExpanded;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pdsCheckApprovedVendorList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method calls PdsApprovedVendorList class and returns if the vendor set in item master is valid if production order is of type
+    /// Vendor.
+    /// </summary>
+    /// <returns>
+    /// Returns Boolean
+    /// </returns>
+    private boolean pdsCheckApprovedVendorList()
+    {
+        boolean                     ret = true;
+
+        ProdTable tmpProdTable = prodParmCostEstimation.prodTable();
+        PdsApprovedVendorListCheck avlCheck = PdsApprovedVendorListCheck::newFromTable(tmpProdTable);
+        ret = avlCheck.validateCheck();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfCostEstimateCoBys</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Estimation of batch order related co/by products.
+    /// </summary>
+    /// <param name="_prodTable">
+    /// Production/batch record.
+    /// </param>
+    protected void pmfCostEstimateCoBys(ProdTable   _prodTable)
+    {
+        PmfProdCoBy         prodCoBy;
+
+        setPrefix("@PRO2282");
+
+        while select forupdate prodCoBy
+            where prodCoBy.ProdId == _prodTable.ProdId
+                && prodCoBy.EndConsump == NoYes::No
+        {
+            setPrefix(#PreFixField(prodCoBy,ItemId));
+
+            InventTable inventTable = prodCoBy.inventTable();
+
+            if (! inventTable.RecId)
+            {
+                throw error(strFmt(
+                            InventTable::txtNotExist(),
+                            prodCoBy.ItemId));
+            }
+
+            prodCoBy.type().runCostEstimation();
+
+            if (prodCoBy.InventRefTransId)
+            {
+                this.pmfUpdateCoBySub(_prodTable,prodCoBy);
+            }
+            else
+            {
+                this.pmfCreateCoBySub(_prodTable,prodCoBy,inventTable);
+            }
+
+            this.addUpdateRec(prodCoBy);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfCreateCoBySub</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Launches creation of batch order co/by product sub orders.
+    /// </summary>
+    /// <param name="_prodTable">
+    /// Production/batch record.
+    /// </param>
+    /// <param name="_pmfProdCoBy">
+    /// Coby record.
+    /// </param>
+    /// <param name="_inventTable">
+    /// Sub order item.
+    /// </param>
+    protected void pmfCreateCoBySub(
+        ProdTable           _prodTable,
+        PmfProdCoBy         _pmfProdCoBy,
+        InventTable         _inventTable)
+    {
+        if (_inventTable.isFormulaProducedByDefault())
+        {
+            this.pmfCreateSubProdTable(
+                _prodTable,
+                _pmfProdCoBy,
+                _inventTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeSubProductionOrderFromProductionOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the sub production order from the production order.
+    /// </summary>
+    /// <param name = "_prodTableSub">The sub production order to initialize.</param>
+    /// <param name = "_prodTable">A production order.</param>
+    protected void initializeSubProductionOrderFromProductionOrder(ProdTable _prodTableSub, ProdTable _prodTable)
+    {
+        _prodTableSub.bomDate = _prodTable.bomDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfCreateSubProdTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a batch order co/by product sub orders.
+    /// </summary>
+    /// <param name="_prodTable">
+    /// A <c>ProdTable</c> record.
+    /// </param>
+    /// <param name="_pmfProdCoBy">
+    /// A <c>PmfProdCoby</c> record.
+    /// </param>
+    /// <param name="_inventTable">
+    /// A sub order item.
+    /// </param>
+    /// <param name="_prodType">
+    /// A suborder production type.
+    /// </param>
+    protected void pmfCreateSubProdTable(
+        ProdTable           _prodTable,
+        PmfProdCoBy         _pmfProdCoBy,
+        InventTable         _inventTable,
+        ProdType            _prodType = ProdType::Standard)
+    {
+        ProdTable  prodTableSub;
+
+        if (_pmfProdCoBy.RemainCoByPhysical > 0
+            && _pmfProdCoBy.RemainCoByPhysical == _pmfProdCoBy.QtyCoByCalc)
+        {
+            setPrefix("@SYS28447");
+            setPrefix(#PreFixField(_pmfProdCoBy,ItemId));
+
+            prodTableSub.initValue();
+            prodTableSub.initFromInventTable(_inventTable);
+
+            this.initializeSubProductionOrderFromProductionOrder(prodTableSub, _prodTable);
+
+            prodTableSub.initFromPmfProdCoBy(_pmfProdCoBy);
+
+            if (prodTableSub.inventTable().isFormulaAllowed())
+            {
+                prodTableSub.ProdType = ProdType::Process;
+                prodTableSub.ProdId = ProdTable::pmfNumberSeqBatchId(false).num();
+            }
+            else
+            {
+                prodTableSub.ProdId = ProdTable::numberSeqProdId(false).num();
+
+                if (#PmfEnabled)
+                {
+                    prodTableSub.ProdType = ProdType::Standard;
+                }
+            }
+
+            if (!#PmfEnabled
+                || !prmisDefault(_prodType))
+            {
+                prodTableSub.ProdType   = _prodType;
+            }
+
+            prodTableSub.setInventStorageDim(
+                prodTableSub.inventDim(),
+                _inventTable);
+
+            prodTableSub.insert();
+
+            if (!#PmfEnabled
+                || ((_prodTable.inventTable().isBOMAllowed()
+                        && !prodTableSub.inventTable().isFormulaAllowed())
+                    || (_prodTable.inventTable().isFormulaAllowed()
+                        && !prodTableSub.inventTable().isBOMAllowed())))
+            {
+                this.addCreatedRec(prodTableSub);
+            }
+
+            this.costEstimate(prodTableSub);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatingCoBySub</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updating batch orders.
+    /// </summary>
+    /// <param name="_prodTable">Production/batch record.</param>
+    /// <param name="_pmfProdCoBy">The co- or by- product record.</param>
+    /// <param name="_currentInstance">The instance of the <c>ProdUpdCostEstimation</c> for which this delegate is called.</param>
+    delegate void updatingCoBySub(ProdTable _prodTable, PmfProdCoBy _pmfProdCoBy, ProdUpdCostEstimation _currentInstance)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatingCoBySubEventHandler</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Subscriber for updating batch orders.
+    /// </summary>
+    /// <param name="_prodTable">Production/batch record.</param>
+    /// <param name="_pmfProdCoBy">The co- or by- product record.</param>
+    /// <param name="_currentInstance">The instance of the <c>ProdUpdCostEstimation</c> for which this delegate is called.</param>
+    [SubscribesTo(classStr(ProdUpdCostEstimation), delegateStr(ProdUpdCostEstimation, updatingCoBySub))]
+    public static void updatingCoBySubEventHandler(ProdTable _prodTable, PmfProdCoBy _pmfProdCoBy, ProdUpdCostEstimation _currentInstance)
+    {
+        switch (_pmfProdCoBy.InventRefType)
+        {
+            case InventRefType::Production:
+                _currentInstance.pmfUpdateCoBySubProdTable(_prodTable,_pmfProdCoBy);
+                break;
+
+            case InventRefType::Purch:
+                _currentInstance.pmfUpdateCoBySubPurchLine(_prodTable,_pmfProdCoBy);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfUpdateCoBySub</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates batch order co/by product suborders.
+    /// </summary>
+    /// <param name="_prodTable">
+    /// Production/batch record.
+    /// </param>
+    /// <param name="_pmfProdCoBy">
+    /// Coby record.
+    /// </param>
+    protected void pmfUpdateCoBySub(
+        ProdTable           _prodTable,
+        PmfProdCoBy         _pmfProdCoBy)
+    {
+        this.updatingCoBySub(_prodTable, _pmfProdCoBy, this);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfUpdateCoBySubProdTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates batch order co/by product production/batch suborders.
+    /// </summary>
+    /// <param name="_prodTable">
+    /// Production/batch record.
+    /// </param>
+    /// <param name="_pmfProdCoBy">
+    /// Coby record.
+    /// </param>
+    protected void pmfUpdateCoBySubProdTable(
+        ProdTable           _prodTable,
+        PmfProdCoBy         _pmfProdCoBy)
+    {
+        setPrefix("@SYS28540");
+
+        ProdTable prodTableSub = ProdTable::find(_pmfProdCoBy.InventRefId,true);
+
+        if (prodTableSub.RecId
+            && prodTableSub.status().isBefore(ProdStatus::Completed))
+        {
+            if (prodTableSub.InventRefType == InventRefType::ProdLine
+                && prodTableSub.InventRefTransId == _pmfProdCoBy.InventTransId)
+            {
+                if (!_pmfProdCoBy.checkSubProduction(prodTableSub))
+                {
+                    throw error(strFmt("@SYS22552",_prodTable.ProdId));
+                }
+
+                if (prodParmCostEstimation.References
+                    && _pmfProdCoBy.QtyCoByCalc != prodTableSub.QtySched)
+                {
+                    prodTableSub.status()
+                        .setQtySched(_pmfProdCoBy.QtyCoByCalc);
+
+                    if (_pmfProdCoBy.QtyCoByCalc != prodTableSub.QtySched)
+                    {
+                        checkFailed(
+                            strFmt(
+                                "@SYS22128",
+                                prodTableSub.ProdStatus,
+                                prodTableSub.ProdId));
+                    }
+                    else
+                    {
+                        prodTableSub.update();
+                        this.addUpdateRec(prodTableSub);
+                    }
+                }
+            }
+
+            if (prodParmCostEstimation.References)
+            {
+                this.costEstimate(prodTableSub);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfUpdateCoBySubPurchLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the batch order's co/by product purchase orders when estimating.
+    /// </summary>
+    /// <param name="_prodTable">
+    /// The batch order record related to co/by record.
+    /// </param>
+    /// <param name="_pmfProdCoBy">
+    /// The co/by product record for which co/by purchase orders will be updated.
+    /// </param>
+    protected void pmfUpdateCoBySubPurchLine(
+        ProdTable           _prodTable,
+        PmfProdCoBy         _pmfProdCoBy)
+    {
+        setPrefix("@SYS28539");
+
+        PurchLine purchLine = PurchLine::findInventTransId(
+            _pmfProdCoBy.InventRefTransId,
+            true);
+
+        if (purchLine.RecId
+            && purchLine.ItemRefType == InventRefType::ProdLine
+            && purchLine.InventRefTransId == _pmfProdCoBy.InventTransId)
+        {
+            if (!_pmfProdCoBy.checkSubPurch(purchLine))
+            {
+                throw error(strFmt("@SYS22552",_pmfProdCoBy.ProdId));
+            }
+
+            if (prodParmCostEstimation.References)
+            {
+                Qty consumptionPurch = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(_pmfProdCoBy.ItemId,
+                                                                                                             _pmfProdCoBy.InventDimId,
+                                                                                                             _pmfProdCoBy.QtyCoByCalc,
+                                                                                                             _pmfProdCoBy.inventUnit(),
+                                                                                                             purchLine.PurchUnit,
+                                                                                                             NoYes::Yes);
+
+                consumptionPurch = consumptionPurch - purchLine.PurchQty;
+
+                Qty consumptionInvent
+                    = _pmfProdCoBy.QtyCoByCalc
+                        - purchLine.QtyOrdered;
+
+                purchLine.PurchQty              += consumptionPurch;
+                purchLine.QtyOrdered            += consumptionInvent;
+                purchLine.RemainPurchPhysical   += consumptionPurch;
+                purchLine.RemainInventPhysical  += consumptionInvent;
+
+                if (!purchLine.checkPurchQty())
+                {
+                    throw error(strFmt("@SYS22552",_pmfProdCoBy.ProdId));
+                }
+
+                purchLine.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>prodPurch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves or initializes the <c>ProdPurch</c> class variable.
+    /// </summary>
+    /// <returns>
+    ///    A <c>ProdPurch</c> object.
+    /// </returns>
+    protected ProdPurch prodPurch()
+    {
+        if (!prodPurch)
+        {
+            prodPurch = ProdPurch::newProd();
+        }
+
+        return prodPurch;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>projCostControlUpdate</Name>
+				<Source><![CDATA[
+    public void projCostControlUpdate(ProdTable _prodTable)
+    {
+        ProdBOM                             prodBOM;
+        ProdRoute                           prodRoute;
+        ProdRouteProj                       prodRouteProj;
+
+        if (_prodTable.isProjMethodFinished())
+        {
+            InventMov_Prod movement = InventMovement::construct(_prodTable);
+            InventMov_Virtuel movement_Virtuel = InventMov_Virtuel::construct();
+            movement_Virtuel.parmInventMovReference(movement);
+
+            if (movement_Virtuel.mustBeCostControlled()  && movement_Virtuel.canCommittedCostBeReversed())
+            {
+                CostControlPostingItemProduction costControlPostingItemProduction = CostControlPosting::newCostControlPostingItem(movement_Virtuel);
+                costControlPostingItemProduction.run(ProjCommittedCostUpdateAction::UpdateOnly);
+            }
+        }
+        if (_prodTable.isProjMethodConsumed())
+        {
+            while select prodBOM where prodBOM.ProdId == _prodTable.ProdId
+            {
+                if (prodBOM.prodTableRef().isProjMethodConsumed())
+                {
+                    this.projCostControlUpdate(prodBOM.prodTableRef());
+                }
+                else
+                {
+                    if (prodBOM.validateProject())
+                    {
+                        CostControlPostingItemProdLine costControlPostingItemProdLine = CostControlPosting::newCostControlPostingItem(InventMovement::construct(prodBOM));
+                        costControlPostingItemProdLine.run(ProjCommittedCostUpdateAction::UpdateOnly);
+                    }
+                }
+            }
+            while select prodRoute
+                where prodRoute.ProdId == _prodTable.ProdId
+            {
+                if (prodRoute.validateProject())
+                {
+                    while select prodRouteProj
+                        where prodRouteProj.ProdId == prodRoute.ProdId
+                        &&    prodRouteProj.OprNum == prodRoute.OprNum
+                        &&    prodRouteProj.OprPriority == prodRoute.OprPriority
+                    {
+                        CostControlPostingHourProdLine costControlPostingHourProdLine = CostControlPosting::newCostControlPostingHour(prodRoute,prodRouteProj);
+                        costControlPostingHourProdLine.run(ProjCommittedCostUpdateAction::Unknown);
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Runs the estimation.
+    /// </summary>
+    /// <remarks>
+    ///    Before the method is run, you should set up estimation parameters by using one of the following
+    ///    methods:
+    ///    <list type="bullet">
+    ///       <item>
+    ///          <description>
+    ///             The <c>newProdId</c> method.
+    ///          </description>
+    ///       </item>
+    ///       <item>
+    ///          <description>
+    ///             The <c>newParmBuffer</c> method.
+    ///          </description>
+    ///       </item>
+    ///       <item>
+    ///          <description>
+    ///             The <c>initParmBufferFromSched</c> method.
+    ///          </description>
+    ///       </item>
+    ///    </list>
+    /// </remarks>
+    public void run()
+    {
+        #OCCRetryCount
+
+        setPrefix(ProdMultiCostEstimation::description());
+        setPrefix(#PreFixField(ProdParmCostEstimation,ProdId));
+
+        try
+        {
+            this.setParameters();
+            var parameters = this.addInstrumentationAdditionalParameters();
+
+            using (var m = ProdInstrumentationSegmentFactory::create(ProdInstrumentationActivities::UpdateCostEstimationRun, prodParmCostEstimation.RecId, parameters))
+            {
+                ttsbegin;
+
+                if (!this.validate())
+                {
+                    throw Exception::Error;
+                }                
+
+                if (prodTable.RecId && prodTable.QtySched <= 0)
+                {
+                    throw error("@SYS50502");
+                }
+
+                using (RecordViewCache viewCacheProdBom = new RecordViewCache(ProdBOM::viewCacheBufferFromProdId(prodTable.ProdId, true)))
+                {
+                    using (RecordViewCache viewCacheProdRoute = new RecordViewCache(ProdRoute::viewCacheBufferFromProdId(prodTable.ProdId, true)))
+                    {
+                        this.costEstimate(prodTable);
+
+                        if (prodTable.inventTable().isFormulaAllowed())
+                        {
+                            PmfTCAUpdate::construct(prodTable).updateTCA();
+                        }
+
+                        if (prodTable.prodParametersDim().SpecifyCalc == NoYes::Yes)
+                        {
+                            ProdUpdBOMCalc::newProdTable(prodTable,prodParmCostEstimation.ProfitSet,prodTable.DlvDate,prodParmCostEstimation.References).run();
+                            // The BOM price/quantity got changed, the committed cost for this project will change accordingly
+                            if (prodTable.ProjId)
+                            {
+                                this.projCostControlUpdate(prodTable);
+                            }
+                        }
+
+                        this.updateJobJournal(ParmJobStatus::Executed);
+
+                        if (!this.validateVendId())
+                        {
+                            throw Exception::Error;
+                        }
+                    }
+                }
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            this.updateJobJournal(ParmJobStatus::ContainErrors);
+            throw error("@SYS18447");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setBOMRawMaterialDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Sets the scheduled dates and times for the raw materials as estimated during production.
+    /// </summary>
+    /// <param name="_prodTable">
+    ///     The production order that will consume the materials.
+    /// </param>
+    /// <param name="_prodBOM">
+    ///     The bill of materials that specifies the raw material list.
+    /// </param>
+    /// <param name="_prodRoute">
+    ///     The route that specifies the consumption times of the raw materials.
+    /// </param>
+    protected void setBOMRawMaterialDate(
+        ProdTable           _prodTable,
+        ProdBOM             _prodBOM,
+        ProdRoute           _prodRoute)
+    {
+        date    currentDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        int     currentTime = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+
+        //if BOM is part of an operation the date and time is taken from the operation start date
+        if (_prodBOM.OprNum && _prodRoute.FromDate)
+        {
+            if (_prodRoute.FromDate < currentDate)
+            {
+                _prodBOM.RawMaterialDate = currentDate;
+                _prodBOM.RawMaterialTime = currentTime;
+            }
+            else
+            {
+                _prodBOM.RawMaterialDate = _prodRoute.FromDate;
+                _prodBOM.RawMaterialTime = _prodRoute.FromTime;
+            }
+        }
+        else if (_prodTable.SchedStart)
+        {
+            if (_prodTable.SchedStart < currentDate)
+            {
+                _prodBOM.RawMaterialDate = currentDate;
+                _prodBOM.RawMaterialTime = currentTime;
+            }
+            else
+            {
+                _prodBOM.RawMaterialDate = _prodTable.SchedStart;
+                _prodBOM.RawMaterialTime = _prodTable.SchedFromTime;
+            }
+        }
+        else
+        {
+            _prodBOM.RawMaterialDate = _prodTable.DlvDate;
+            _prodBOM.RawMaterialTime = _prodTable.DlvTime;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcProdBOMConsumption</Name>
+				<Source><![CDATA[
+    private void calcProdBOMConsumption(
+        BOMCalcData         _calcBOMData,
+        ProdBOM             _prodBOM,
+        ProdRoute           _prodRoute,
+        UnitOfMeasureSymbol _inventUnitId,
+        boolean             _isCWItem)
+    {
+        BOMCalcConsumption calcBOMConsumption = BOMCalcConsumption::construct(_prodBOM.Formula,_calcBOMData);
+
+        if (_isCWItem)
+        {
+            if (_prodBOM.Formula == BOMFormula::Formula5)
+            {
+                _prodBOM.PmfQtyWithoutYield = _prodBOM.pmfStepQty(this.prodTable().QtySched);
+                _prodBOM.bomQty = _prodBOM.PmfQtyWithoutYield;
+                _prodBOM.PdsCWQty = _prodBOM.pmfStepCWQty(this.prodTable().QtySched);
+            }
+
+            [_prodBOM.QtyInventCalc,
+            _prodBOM.PdsCWInventCalc] =
+                calcBOMConsumption.pdsCWCalcConsumption(_prodBOM);
+
+            _prodBOM.QtyBOMCalc  = UnitOfMeasureConverter::convert(
+                _prodBOM.QtyInventCalc,
+                UnitOfMeasure::unitOfMeasureIdBySymbol(_inventUnitId),
+                UnitOfMeasure::unitOfMeasureIdBySymbol(_prodBOM.UnitId),
+                NoYes::Yes,
+                InventTable::itemProduct(_prodBOM.ItemId));
+        }
+        else
+        {
+            _prodBOM.QtyBOMCalc     = calcBOMConsumption.calcConsumption(_prodBOM,_prodRoute.AccError ? _prodRoute.AccError : 1);
+            _prodBOM.QtyInventCalc  = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(_prodBOM.ItemId,
+                                                                                                            _prodBOM.InventDimId,
+                                                                                                            _prodBOM.QtyBOMCalc,
+                                                                                                            _prodBOM.UnitId,
+                                                                                                            _inventUnitId,
+                                                                                                            NoYes::Yes);
+        }
+
+        boolean  countryRegion_RU = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]);
+        if (countryRegion_RU)
+        {
+            _prodBOM.LineAmount_RU = _prodBOM.calcLineAmount_RU();
+        }
+
+        if (_prodBOM.RemainBOMFinancial)
+        {
+            if (_prodBOM.QtyBOMCalc)
+            {
+                _prodBOM.RemainBOMPhysical        = _prodBOM.QtyBOMCalc    - _prodBOM.RemainBOMFinancial;
+
+                if (_prodBOM.RemainBOMPhysical * _prodBOM.RemainBOMFinancial < 0)
+                {
+                    _prodBOM.RemainBOMPhysical    = 0;
+                }
+            }
+
+            if (_prodBOM.QtyInventCalc)
+            {
+                _prodBOM.RemainInventPhysical     = _prodBOM.QtyInventCalc - _prodBOM.remainInventFinancial();
+
+                if (_prodBOM.RemainInventPhysical * _prodBOM.remainInventFinancial() < 0)
+                {
+                    _prodBOM.RemainInventPhysical = 0;
+                }
+            }
+            if (_isCWItem
+                && _prodBOM.PdsCWInventCalc)
+            {
+                _prodBOM.PdsCWRemainPhysical = _prodBOM.pdsCWMaxQtyCalcStUpInvent() - _prodBOM.pdsCWRemainInventFinancial();
+
+                if (_prodBOM.PdsCWRemainPhysical * _prodBOM.pdsCWRemainInventFinancial() < 0)
+                {
+                    _prodBOM.PdsCWRemainPhysical = 0;
+                }
+            }
+        }
+        else
+        {
+            _prodBOM.RemainBOMPhysical       = _prodBOM.QtyBOMCalc;
+            _prodBOM.RemainInventPhysical    = _prodBOM.QtyInventCalc;
+            if (_isCWItem)
+            {
+                _prodBOM.PdsCWRemainPhysical =
+                _prodBOM.pdsCWMaxQtyCalcStUpInvent();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setItemConsumption</Name>
+				<Source><![CDATA[
+    protected void setItemConsumption(
+        BOMCalcData         _calcBOMData,
+        ProdTable           _prodTable,
+        ProdBOM             _prodBOM,
+        ProdRoute           _prodRoute,
+        InventTableModule   _inventTableModuleInvent = InventTableModule::find(_prodBOM.ItemId,ModuleInventPurchSales::Invent))
+    {
+        if (_prodBOM.EndConsump == NoYes::Yes)
+        {
+            return;
+        }
+
+        // skip re-estimation for already batch balanced ingredients 
+        if (_prodBOM.PDSBatchBalanced)
+        {
+            return;
+        }
+
+        boolean cwItem = PdsGlobal::pdsIsCWItem(_prodBOM.ItemId);
+        ProdBOM localProdBom = _prodBOM.data();
+        this.calcProdBOMConsumption(_calcBOMData, localProdBom, _prodRoute, _inventTableModuleInvent.UnitId, cwItem);
+
+        // Skip estimate when production order is already estimated and CW remain physical qty is not changed but inventory remain physical qty will be increased for CW item
+        // in order to avoid generating invalid inventory transaction whose CW qty is zero
+        if (cwItem &&
+            localProdBom.PdsCWRemainPhysical  == _prodBOM.PdsCWRemainPhysical &&
+            localProdBom.RemainInventPhysical >  _prodBOM.RemainInventPhysical &&
+            _prodTable.status().isAfterOrEqualTo(ProdStatus::CostEstimated))
+        {
+            return;
+        }
+ 
+        // Set calculated field value back
+        _prodBOM.QtyBOMCalc     = localProdBom.QtyBOMCalc;
+        _prodBOM.QtyInventCalc  = localProdBom.QtyInventCalc;
+
+        if (cwItem)
+        {
+            if (_prodBOM.Formula == BOMFormula::Formula5)
+            {
+                _prodBOM.PmfQtyWithoutYield = localProdBom.PmfQtyWithoutYield;
+                _prodBOM.bomQty = localProdBom.bomQty;
+                _prodBOM.PdsCWQty = localProdBom.PdsCWQty;
+            }
+
+            _prodBOM.PdsCWInventCalc = localProdBom.PdsCWInventCalc;
+
+        }
+
+        _prodBOM.LineAmount_RU = localProdBom.LineAmount_RU;
+
+        if (_prodBOM.isProjMethodConsumed())
+        {
+            ProjInventJournalTransMapForm::construct(_prodBOM).fieldModifiedQtyPost();
+        }
+
+        UnitQty qtyRemainBOMPhysicalOrig = _prodBOM.RemainBOMPhysical;
+        PdsCWInventQty cwQtyRemainOrig = cwItem ? _prodBOM.PdsCWRemainPhysical : 0;
+
+        _prodBOM.RemainBOMPhysical = localProdBom.RemainBOMPhysical;
+        _prodBOM.RemainInventPhysical = localProdBom.RemainInventPhysical;
+
+        if (cwItem)
+        {
+            _prodBOM.PdsCWRemainPhysical = localProdBom.PdsCWRemainPhysical;
+        }
+
+        ProdJournalIdBOM prodJournalIdBOM = '';
+        InventQty        qtyProdBOMJournal;
+        UnitQty          qtyBOMProdBOMJournal;
+        PdsCWInventQty   cwQtyProdBOMJournal, cwQtyFree;
+
+        // check if remaining quantity is used by open picking list journals, in case it is reducing
+        if (_prodBOM.RemainBOMPhysical < qtyRemainBOMPhysicalOrig)
+        {
+            [qtyProdBOMJournal,qtyBOMProdBOMJournal, prodJournalIdBOM, cwQtyProdBOMJournal] = ProdBOM::qtyProdJournalBOM(_prodBOM);
+
+            if (qtyBOMProdBOMJournal)
+            {
+                UnitQty freeBOMQty = qtyRemainBOMPhysicalOrig - qtyBOMProdBOMJournal;
+                if (freeBOMQty < (qtyRemainBOMPhysicalOrig - _prodBOM.RemainBOMPhysical))
+                {
+                    setPrefix(#PreFixField(_prodBOM,ItemId));
+                    if (prodJournalIdBOM)
+                    {
+                        throw error(strFmt("@SYS91467", qtyRemainBOMPhysicalOrig, _prodBOM.RemainBOMPhysical, prodJournalIdBOM), '', ProdJournalTable::infoActionProdJournalTable(prodJournalIdBOM));
+                    }
+                    else
+                    {
+                        throw error(strFmt("@SYS91468", qtyRemainBOMPhysicalOrig, _prodBOM.RemainBOMPhysical));
+                    }
+                }
+            }
+            if (cwQtyProdBOMJournal)
+            {
+                cwQtyFree = cwQtyRemainOrig - cwQtyProdBOMJournal;
+                if (cwQtyFree < (cwQtyRemainOrig - _prodBOM.PdsCWRemainPhysical))
+                {
+                    setPrefix(#PreFixField(_prodBOM,ItemId));
+                    if (prodJournalIdBOM)
+                    {
+                        throw error(strFmt(
+                                        "@PDS156",
+                                        cwQtyRemainOrig,
+                                        _prodBOM.PdsCWRemainPhysical,
+                                        prodJournalIdBOM),
+                                    '',
+                                    ProdJournalTable::infoActionProdJournalTable(
+                                        prodJournalIdBOM));
+                    }
+                    else
+                    {
+                        throw error(strFmt(
+                                        "@PDS157",
+                                        cwQtyRemainOrig,
+                                        _prodBOM.PdsCWRemainPhysical));
+                    }
+                }
+            }
+        }
+
+        if (! _prodBOM.RawMaterialDate)
+        {
+            this.setBOMRawMaterialDate(_prodTable, _prodBOM, _prodRoute);
+        }
+
+        if (_prodRoute.OprNum)
+        {
+            _prodBOM.OprNum = _prodRoute.OprNum;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setParameters</Name>
+				<Source><![CDATA[
+    protected void setParameters()
+    {
+        this.initProdTable(true);
+
+        if (prodTable.status().isBefore(ProdStatus::CostEstimated))
+        {
+            prodParmCostEstimation.References = NoYes::Yes;
+        }
+
+        phantomRouteExpanded = new Set(Types::String);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatingSubOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updating sub order.
+    /// </summary>
+    /// <param name="_prodTable">The <c>ProdTable</c> record</param>
+    /// <param name="_prodBOM">The <c>ProdBOM</c> record</param>
+    /// <param name="_currentInstance">The instance of the <c>ProdUpdCostEstimation</c> for which this delegate is called.</param>
+    delegate void updatingSubOrder(ProdTable _prodTable, ProdBOM _prodBOM, ProdUpdCostEstimation _currentInstance)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatingSubEventHandler</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Subscriber for updating sub order.
+    /// </summary>
+    /// <param name="_prodTable">The <c>ProdTable</c> record</param>
+    /// <param name="_prodBOM">The <c>ProdBOM</c> record</param>
+    /// <param name="_currentInstance">The instance of the <c>ProdUpdCostEstimation</c> for which this delegate is called.</param>
+    [SubscribesTo(classStr(ProdUpdCostEstimation), delegateStr(ProdUpdCostEstimation, updatingSubOrder))]
+    public static void updatingSubEventHandler(ProdTable _prodTable, ProdBOM _prodBOM, ProdUpdCostEstimation _currentInstance)
+    {
+        switch (_prodBOM.InventRefType)
+        {
+            case InventRefType::Production:
+                _currentInstance.updateSubProdTable(_prodTable, _prodBOM);
+                break;
+            case InventRefType::Purch:
+                _currentInstance.updateSubPurchLine(_prodTable, _prodBOM);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSub</Name>
+				<Source><![CDATA[
+    protected void updateSub(ProdTable _prodTable, ProdBOM _prodBOM)
+    {
+        this.updatingSubOrder(_prodTable, _prodBOM, this);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSubProdTable</Name>
+				<Source><![CDATA[
+    protected void updateSubProdTable(ProdTable _prodTable, ProdBOM _prodBOM)
+    {
+        setPrefix("@SYS28540");
+
+        ProdTable prodTableSub = ProdTable::find(_prodBOM.InventRefId,true);
+        if (   prodTableSub.RecId
+            && prodTableSub.status().isBefore(ProdStatus::Completed))
+        {
+            if (   prodTableSub.InventRefType == InventRefType::ProdLine
+                && prodTableSub.InventRefTransId == _prodBOM.InventTransId)
+            {
+                if (!_prodBOM.checkSubProduction(prodTableSub))
+                {
+                    throw error(strFmt("@SYS22552",_prodTable.ProdId));
+                }
+
+                if (this.canUpdateProductionOrder(_prodBOM, prodTableSub))
+                {
+                    prodTableSub.status().setQtySched(_prodBOM.QtyInventCalc);
+                    if (_prodBOM.QtyInventCalc != prodTableSub.QtySched)
+                    {
+                        checkFailed(strFmt("@SYS22128",prodTableSub.ProdStatus,prodTableSub.ProdId));
+                    }
+                    else
+                    {
+                        prodTableSub.update();
+                        this.addUpdateRec(prodTableSub);
+                    }
+                }
+            }
+
+            if (_prodBOM.type().isPeggedSupply() && prodParmCostEstimation.References)
+            {
+                this.costEstimate(prodTableSub);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canUpdateProductionOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether production order can be updated.
+    /// </summary>
+    /// <param name = "_prodBOM">The production BOM record.</param>
+    /// <param name = "_prodTableSub">The production order record.</param>
+    /// <returns>true if production order can be updated; otherwise, false.</returns>
+    protected boolean canUpdateProductionOrder(ProdBOM _prodBOM, ProdTable _prodTableSub)
+    {
+        return prodParmCostEstimation.References
+            && _prodBOM.QtyInventCalc != _prodTableSub.QtySched
+            && _prodBOM.type().isPeggedSupply();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSubPurchLine</Name>
+				<Source><![CDATA[
+    protected void updateSubPurchLine(ProdTable _prodTable, ProdBOM _prodBOM)
+    {
+        setPrefix("@SYS28539");
+
+        PurchLine purchLine = PurchLine::findInventTransId(_prodBOM.InventRefTransId, true);
+        if (purchLine.RecId && purchLine.ItemRefType == InventRefType::ProdLine && purchLine.InventRefTransId == _prodBOM.InventTransId)
+        {
+            if (!_prodBOM.checkSubPurch(purchLine))
+            {
+                throw error(strFmt("@SYS22552",_prodBOM.ProdId));
+            }
+
+            if (_prodBOM.ProdLineType != BOMType::Item && prodParmCostEstimation.References)
+            {
+                boolean needToReSubmitPurchaseOrderToWorkflow = false;
+                PurchTable purchaseOrder = purchLine.purchTable(true);
+                                       
+                if (!purchLine.canAutoUpdatePurchLine())
+                {
+                    VersioningPurchaseOrder versioningPurchaseOrder = VersioningPurchaseOrder::newPurchaseOrder(purchaseOrder);
+
+                    if (versioningPurchaseOrder.getDocumentState() != VersioningDocumentState::Draft)
+                    {
+                        versioningPurchaseOrder.resetToDraft();
+                        needToReSubmitPurchaseOrderToWorkflow = versioningPurchaseOrder.getDocumentState() == VersioningDocumentState::Draft;
+                        purchLine.reread();
+                     
+                    }
+                    else
+                    {
+                        versioningPurchaseOrder.resetToDraft();
+                        purchLine.reread();
+                    }
+                }
+
+                this.initializePurchLineConsumptionQty(purchLine, _prodBOM);
+
+                purchLine.setPriceDisc(InventDim::find(purchLine.InventDimId));
+
+                if (!purchLine.checkPurchQty())
+                {
+                    throw error(strFmt("@SYS22552",_prodBOM.ProdId));
+                }
+
+                if (this.mustUpdatePurchLine(purchLine))
+                {
+                    purchLine.update();
+                }
+
+                if (needToReSubmitPurchaseOrderToWorkflow && purchaseOrdersToBeSubmittedToWorkflow)
+                {
+                    purchaseOrdersToBeSubmittedToWorkflow.add(purchaseOrder.RecId);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustUpdatePurchLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines whether the purchase line can be updated.
+    /// </summary>
+    /// <param name = "_purchLine">
+    ///     The purchase line order record to be updated.
+    /// </param>
+    /// <returns>
+    ///     true if the purchase line should be updated; otherwise, false.
+    /// </returns>
+    protected boolean mustUpdatePurchLine(PurchLine _purchLine)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializePurchLineConsumptionQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Initializes quantities on a purchase line based on unit conversion.
+    /// </summary>
+    /// <param name = "_purchLine">
+    ///     The purchase line order record.
+    /// </param>
+    /// <param name = "_prodBOM">
+    ///     The production BOM record.
+    /// </param>
+    protected void initializePurchLineConsumptionQty(PurchLine _purchLine, ProdBOM _prodBOM)
+    {
+        PurchQty consumptionPurch = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(_prodBOM.ItemId,
+                                                                                                          _prodBOM.InventDimId,
+                                                                                                          _prodBOM.QtyInventCalc,
+                                                                                                          _prodBOM.inventUnit(),
+                                                                                                          _purchLine.PurchUnit,
+                                                                                                          NoYes::Yes);
+        consumptionPurch = consumptionPurch - _purchLine.PurchQty;
+        InventQty consumptionInvent = _prodBOM.QtyInventCalc - _purchLine.QtyOrdered;
+
+        _purchLine.PurchQty              += consumptionPurch;
+        _purchLine.QtyOrdered            += consumptionInvent;
+        _purchLine.RemainPurchPhysical   += consumptionPurch;
+        _purchLine.RemainInventPhysical  += consumptionInvent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pdsValidateIngredientType</Name>
+				<Source><![CDATA[
+    private boolean pdsValidateIngredientType(ProdBOM _prodBom)
+    {
+        PdsIngredient pdsIngredient = PdsIngredient::newFromType(_prodBom.pdsIngredientType);
+        return pdsIngredient.validateProdBom(_prodBom);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method runs normal validation and runs potency setup validation of corresponding Production BOM.
+    /// </summary>
+    /// <returns>
+    /// Returns Boolean
+    /// </returns>
+    public boolean validate()
+    {
+        boolean ret = super();
+
+        if (ret && #PDSPotencyEnabled)
+        {
+            ProdBOM  prodBOM;
+
+            while select prodBOM
+                where prodBOM.ProdId == prodParmCostEstimation.ProdId
+            {
+                ret = this.pdsValidateIngredientType(prodBOM);
+
+                if (!ret)
+                {
+                    break;
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new()
+    {
+        instrumentationLogger = PurchInstrumentationLogger::createLogger(classStr(ProdUpdCostEstimation));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static ProdUpdCostEstimation construct()
+    {
+        ProdUpdCostEstimation prodUpdCostEstimation = new ProdUpdCostEstimation();
+
+        return prodUpdCostEstimation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmBufferFromSched</Name>
+				<Source><![CDATA[
+    public static ProdParmCostEstimation initParmBufferFromSched(ProdParmScheduling _prodParmScheduling)
+    {
+        ProdParmCostEstimation   prodParmCostEstimation;
+
+        prodParmCostEstimation.ParmBuffer::initParmId();
+        prodParmCostEstimation.initParmDefault();
+        prodParmCostEstimation.ProdId       = _prodParmScheduling.ProdId;
+        prodParmCostEstimation.EndJob       = NoYes::Yes;
+        prodParmCostEstimation.AutoUpdate   = NoYes::Yes;
+
+        if (_prodParmScheduling.SchedRef || _prodParmScheduling.SyncRef)
+        {
+            prodParmCostEstimation.References = NoYes::Yes;
+        }
+
+        return prodParmCostEstimation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newParmBuffer</Name>
+				<Source><![CDATA[
+    public static ProdUpdCostEstimation newParmBuffer(
+        ProdParmCostEstimation _prodParmCostEstimation,
+        ProdPurch              _prodPurch = null)
+    {
+        if (!_prodParmCostEstimation.ParmId)
+        {
+            _prodParmCostEstimation.skipTTSCheck(true);
+            _prodParmCostEstimation.ParmBuffer::initParmId();
+            _prodParmCostEstimation.write();
+        }
+
+        ProdUpdCostEstimation prodUpdCostEstimation = ProdUpdCostEstimation::construct();
+        prodUpdCostEstimation.parmParmBuffer(_prodParmCostEstimation);
+
+        if (_prodPurch)
+        {
+            prodUpdCostEstimation.parmProdPurch(_prodPurch);
+        }
+
+        return prodUpdCostEstimation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newProdId</Name>
+				<Source><![CDATA[
+    public static ProdUpdCostEstimation newProdId(
+        ProdId        _prodId,
+        CostProfitSet _profit      = ProdParameters::find().ProfitSet,
+        NoYes         _references  = NoYes::Yes,
+        NoYes         _endJob      = NoYes::Yes)
+    {
+        ProdParmCostEstimation  prodParmCostEstimation;
+
+        if (!ProdTable::find(_prodId))
+        {
+            throw error(strFmt("@SYS12725",_prodId));
+        }
+
+        prodParmCostEstimation.ParmBuffer::initParmId();
+        prodParmCostEstimation.initParmDefault();
+        prodParmCostEstimation.ProdId          = _prodId;
+        prodParmCostEstimation.ProfitSet       = _profit;
+        prodParmCostEstimation.References      = _references;
+        prodParmCostEstimation.EndJob          = _endJob;
+        prodParmCostEstimation.insert();
+
+        ProdUpdCostEstimation prodUpdCostEstimation = ProdUpdCostEstimation::construct();
+        prodUpdCostEstimation.parmParmBuffer(prodParmCostEstimation);
+
+        return prodUpdCostEstimation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateVendId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Method runs Approved Vendor List validation of Production order and corresponding Production BOM.
+    /// </summary>
+    /// <returns>
+    ///  True if the vendor is valid, else false.
+    /// </returns>
+    private boolean validateVendId()
+    {
+        boolean                     ret = true;
+        ProdBOM                     prodBOM;
+
+        if (#PdsApprovedVendorListEnabled)
+        {
+            if (ret)
+            {
+                ret = this.pdsCheckApprovedVendorList();
+            }
+
+            if (ret && prodTable.inventTable().isFormulaAllowed())
+            {
+                ret = prodTable.pmfValidateTCA();
+            }
+
+            if (ret)
+            {
+                while select prodBOM
+                    where prodBOM.ProdId == prodParmCostEstimation.ProdId
+                       && prodBOM.VendId != ''
+                {
+                    PdsApprovedVendorListCheck bomCheck = PdsApprovedVendorListCheck::newFromTable(prodBOM);
+                    ret = bomCheck.validateCheck() && ret;
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instantiateProdPurchCreateParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a <c>ProdPurchCreateParameters</c> parameter class instance.
+    /// </summary>
+    /// <param name = "_vendId">Vendor account to search with (<c>parmVendAccount</c>).</param>
+    /// <param name = "_purchaseType">Purchase type to search with (<c>parmPurchaseType</c>).</param>
+    /// <param name = "_deliveryDate">Delivery date to search with (<c>parmDeliveryDate</c>).</param>
+    /// <param name = "_agreementId">Agreement ID to search with (<c>parmAgreementId</c>).</param>
+    /// <returns>The instance of the <c>ProdPurchCreateParameters</c> class.</returns>
+    protected ProdPurchCreateParameters instantiateProdPurchCreateParameters(VendAccount      _vendId,
+                                                                            PurchaseType     _purchaseType,
+                                                                            DlvDate          _deliveryDate,
+                                                                            PurchAgreementId _agreementId = '')
+    {
+        ProdPurchCreateParameters prodPurchCreateParameters = ProdPurchCreateParameters::construct();
+
+        prodPurchCreateParameters.parmVendAccount(_vendId);
+        prodPurchCreateParameters.parmPurchaseType(_purchaseType);
+        prodPurchCreateParameters.parmDeliveryDate(_deliveryDate);
+        prodPurchCreateParameters.parmAgreementId(_agreementId);
+
+        return prodPurchCreateParameters;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instantiateProdPurchCreate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a new instance of the <c>ProdPurchCreate</c> class.
+    /// </summary>
+    /// <param name = "_prodPurchCreateParameters">
+    /// The instance of the <c>ProdPurchCreateParameters</c> class
+    /// </param>
+    /// <returns>
+    /// The instance of the <c>ProdPurchCreate</c> class
+    /// </returns>
+    protected ProdPurchCreate instantiateProdPurchCreate(ProdPurchCreateParameters    _prodPurchCreateParameters)
+    {
+        ProdPurchCreate prodPurchCreate = ProdPurchCreate::construct(_prodPurchCreateParameters);
+        return prodPurchCreate;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

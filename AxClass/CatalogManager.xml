@@ -1,0 +1,2362 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>CatalogManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// The <c>CatalogManager</c> class manages the catalog details.
+/// </summary>
+class CatalogManager extends RunBaseBatch implements BatchRetryable
+{
+    // 10M rows (200K products * 50 stores = 10M) did not fill the SQL Azure transaction log
+    // Pick 100K as upper limit to
+    // a. At least allow 100 catalogs and not fill transcation log
+    // b. 100K alerts are already costly to generate, review and fix.
+    private static readonly int MaxProductAlertCount = 100 * 1000;
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+    RunBaseBatch runBaseBatch;
+    Catalog catalog;
+    boolean ignoreWarnings;
+    boolean areAnyValidationWarnings;
+    int64 productAlertCount;
+    boolean productAlertsTruncationWarned;
+    int64 internalOrgCountLazy;
+    boolean internalOrgCountInitialized;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addProductsToCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds product to the catalog.
+    /// </summary>
+    /// <param name="_tmpInventTable">
+    /// The new <c>TmpRetailProductsToAdd</c> table buffer to be used for the current instance.
+    /// </param>
+    public void addProductsToCatalog(RetailTmpProductsToAdd _tmpInventTable)
+    {
+        RetailTmpRecId productsForCatalog, newProducts, existingProducts;
+        int64 totalActuallyAdded, totalSkipped;
+
+        try
+        {
+            ttsbegin;
+
+            // Merging variant or non variant ids into one, which will be used in the next steps.
+            insert_recordset productsForCatalog
+                (ReferenceRecId)
+            select EcoResProduct
+                from _tmpInventTable
+                where !_tmpInventTable.EcoResDistinctProductVariant;
+
+            insert_recordset productsForCatalog
+                (ReferenceRecId)
+            select EcoResDistinctProductVariant
+                from _tmpInventTable
+                where _tmpInventTable.EcoResDistinctProductVariant;
+
+            // Separating new products from existing ones.
+            CatalogProduct catalogProduct;
+
+            insert_recordset newProducts
+                (ReferenceRecId)
+            select ReferenceRecId
+                from productsForCatalog
+            notexists join catalogProduct
+                where productsForCatalog.ReferenceRecId == catalogProduct.Product
+                    && catalogProduct.Catalog == catalog.RecId;
+
+            totalActuallyAdded = newProducts.RowCount();
+
+            insert_recordset existingProducts
+                (ReferenceRecId)
+            select ReferenceRecId
+                from productsForCatalog
+            join catalogProduct
+                where productsForCatalog.ReferenceRecId == catalogProduct.Product
+                    && catalogProduct.Catalog == catalog.RecId;
+
+            totalSkipped = existingProducts.RowCount();
+
+            // If the product already exists in the catalog, then set CatalogProduct attribute UseHierarchy as yes.
+            NoYes useHierarchyYes = NoYes::Yes;
+
+            update_recordset catalogProduct
+                setting UseHierarchy = useHierarchyYes
+                where catalogProduct.Catalog == catalog.RecId
+                    && catalogProduct.UseHierarchy == NoYes::No
+            exists join existingProducts
+                where existingProducts.ReferenceRecId == catalogProduct.Product;
+
+            CatalogProductCategory catalogProductCategory;
+
+            // If the product already exists in the catalog, then delete from catalog product category.
+            delete_from catalogProductCategory
+                where catalogProductCategory.IncludeExcludeType == CatalogProductExcludeIncludeType::Exclude
+            exists join catalogProduct
+                where catalogProduct.Catalog == catalog.RecId
+                    && catalogProduct.RecId == catalogProductCategory.CatalogProduct
+            exists join existingProducts
+                where catalogProduct.Product == existingProducts.ReferenceRecId;
+
+            // Add product to catalog.
+            RefRecId CatalogRecId = catalog.RecId;
+
+            insert_recordset catalogProduct
+                (Catalog, Product, UseHierarchy)
+            select CatalogRecId, ReferenceRecId, useHierarchyYes
+                from newProducts;
+
+            while select ReferenceRecId from newProducts
+            {
+                this.addCatalogKitProducts(catalog.RecId, newProducts.ReferenceRecId, catalogProduct.RecId);
+            }
+
+            ttscommit;
+        }
+        finally
+        {
+            // Dispose TempDb table variable instances since they are no longer needed. This will ensure quick cleanup
+            // and better for performance.
+            productsForCatalog.dispose();
+            newProducts.dispose();
+            existingProducts.dispose();
+        }
+
+        eventSource.EventWriteProductsAddProductsToCatalog(classId2Name(ClassIdGet(this)), funcName(), totalActuallyAdded, totalSkipped);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addProductsToCategory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds product to the category.
+    /// </summary>
+    /// <param name="_tmpInventTable">
+    /// The new <c>TmpRetailProductsToAdd</c> table buffer to be used for the current instance.
+    /// </param>
+    /// <param name="_hierarchyId">
+    /// The value of categroy hierarchy in the <c>CategoryHierarchy</c> field of <c>EcoResCategory</c> table.
+    /// </param>
+    /// <param name="_categoryId">
+    ///  The value of categroy Id.
+    /// </param>
+    public void addProductsToCategory(RetailTmpProductsToAdd _tmpInventTable, EcoResCategoryHierarchyId _hierarchyId, EcoResCategoryId _categoryId)
+    {
+        EcoResProduct product;
+        int totalActuallyAdded, totalSkipped;
+        EcoResProductRecId productIdToAdd;
+        CatalogProduct catalogProduct;
+        CatalogProductCategory catalogProductCategory;
+        NoYes useHierarchyNo = NoYes::No;
+
+        while select _tmpInventTable
+        {
+            productIdToAdd = _tmpInventTable.getProductRecId();
+
+            try
+            {
+                ttsbegin;
+
+                product = EcoResProduct::find(productIdToAdd);
+                catalogProduct = CatalogProduct::findByProduct(catalog.RecId, productIdToAdd, true);
+
+                if (catalogProduct)
+                {
+                    totalSkipped++;
+                }
+                else
+                {
+                    catalogProduct = CatalogProduct::createCatalogProduct(catalog.RecId, productIdToAdd, useHierarchyNo);
+
+                    // Validate if catalog contains product kit and add to CatalogKitProduct table.
+                    this.addCatalogKitProducts(catalog.RecId, productIdToAdd,catalogProduct.RecId);
+
+                    totalActuallyAdded++;
+                }
+
+                catalogProductCategory = CatalogProductCategory::findByCatalogProduct(catalogProduct.RecId, _hierarchyId, _categoryId, true);
+                if (!catalogProductCategory)
+                {
+                    CatalogProductCategory::createCatalogProductCategory(catalogProduct.RecId, _hierarchyId, _categoryId, CatalogProductExcludeIncludeType::Include);
+                }
+                else if (catalogProductCategory.IncludeExcludeType == CatalogProductExcludeIncludeType::Exclude)
+                {
+                    catalogProductCategory.IncludeExcludeType = CatalogProductExcludeIncludeType::Include;
+                    catalogProductCategory.update();
+                }
+
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                checkFailed("@SYS18447");
+            }
+        }
+
+        delete_from _tmpInventTable;
+
+        eventSource.EventWriteAddProductsToCategory('Catalog', funcName(), strFmt('%1 %3 added, %2 %3 skipped due to the fact that they were already present.', totalActuallyAdded, totalSkipped, 'products'));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>anyProductExist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the Catalog wheather a product is assigned or not.
+    /// </summary>
+    /// <returns>
+    /// Booelan true if product is found on catalog; else false.
+    /// </returns>
+    private boolean anyProductExist()
+    {
+        return (select firstonly RecId from catalogProduct
+            where catalogProduct.Catalog == catalog.RecId).RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>approve</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Mark a catalog as approved.
+    /// </summary>
+    /// <returns>
+    /// True if the operation is successful.
+    /// </returns>
+    public boolean approve()
+    {
+        boolean ret = false;
+
+        ret = this.setCatalogState(CatalogState::Approved);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildTempCatalogIntOrgPublishSummary</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds <c>RetailTmpCatalogIntOrgPublishSummary</c> table.
+    /// </summary>
+    /// <param name="retailTmpCatalogIntOrgPublishSummary">
+    /// The table buffer for <c>RetailTmpCatalogIntOrgPublishSummary</c> table.
+    /// </param>
+    public void buildTempCatalogIntOrgPublishSummary(RetailTmpCatalogIntOrgPublishSummary retailTmpCatalogIntOrgPublishSummary)
+    {
+        RetailTmpCatalogIntOrgPublishSummary tmpCatalogIntOrgPublishSummary;
+        RetailCatalogInternalOrg catalogInternalOrg;
+        RetailInternalOrganization internalOrganization;
+        OMInternalOrganization omInternalOrganization;
+        RetailCatalogPublishCreatedParentProduct catalogPublishCreatedParentProduct;
+        RetailCatalogPublishUpdatedParentProduct catalogPublishUpdatedParentProduct;
+        RetailCatalogPublishDeletedParentProduct catalogPublishDeletedParentProduct;
+        RetailCatalogIntOrgLastValidationSummary catalogIntOrgLastValidationSummary;
+        RetailCatalogIntOrgValidationSummary catalogIntOrgValidationSummary;
+        int64 newCount, updateCount, deleteCount;
+
+        select count(RecId) from catalogPublishCreatedParentProduct
+            where catalogPublishCreatedParentProduct.Catalog == catalog.RecId;
+        newCount = catalogPublishCreatedParentProduct.RecId;
+
+        select count(RecId) from catalogPublishUpdatedParentProduct
+            where catalogPublishUpdatedParentProduct.Catalog == catalog.RecId;
+        updateCount = catalogPublishUpdatedParentProduct.RecId;
+
+        select count(RecId) from catalogPublishDeletedParentProduct
+            where catalogPublishDeletedParentProduct.Catalog == catalog.RecId;
+        deleteCount = catalogPublishDeletedParentProduct.RecId;
+
+        delete_from tmpCatalogIntOrgPublishSummary
+            where tmpCatalogIntOrgPublishSummary.Catalog == catalog.RecId;
+
+        insert_recordset retailTmpCatalogIntOrgPublishSummary(
+            Catalog,
+            CatalogInternalOrg,
+            InternalOrgName,
+            LastValidationDateTime,
+            ProductNewCount,
+            ProductUpdateCount,
+            ProductDeleteCount
+        )
+        select Catalog, RecId from catalogInternalOrg
+            where catalogInternalOrg.Catalog == catalog.RecId
+        join internalOrganization
+            where internalOrganization.RecId == catalogInternalOrg.InternalOrganization
+        join Name from omInternalOrganization
+            where omInternalOrganization.RecId == internalOrganization.InternalOrganization
+        join catalogIntOrgLastValidationSummary
+            where catalogIntOrgLastValidationSummary.CatalogInternalOrg == catalogInternalOrg.RecId
+        join LastValidationDateTime, newCount, updateCount, deleteCount from catalogIntOrgValidationSummary
+            where catalogIntOrgValidationSummary.RecId == catalogIntOrgLastValidationSummary.MaxOfRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateActualCatalogProducts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates actual products in the catalog.
+    /// </summary>
+    public void calculateActualCatalogProducts()
+    {
+        CatalogProduct catalogProduct, variantCatalogProduct;
+        CatalogRefRecId catalogId = catalog.RecId;
+        EcoResDistinctProductVariant productVariant;
+        EcoResDistinctProduct distinctProduct;
+        EcoResProductMaster masterProduct;
+        CatalogTmpProduct tmpCatalogProduct;
+
+        this.cleanUpTempData();
+
+        //insert actual products from catalog that are distinct products
+        insert_recordset tmpCatalogProduct(Product, Catalog, CatalogProduct)
+        select Product, Catalog, RecId from catalogProduct
+        where catalogProduct.Catalog == catalog.RecId
+        join distinctProduct
+        where distinctProduct.RecId == catalogProduct.Product
+        notexists join productVariant
+        where productVariant.RecId == catalogProduct.Product;
+
+        //insert actual products from catalog that are masters
+        insert_recordset tmpCatalogProduct(Product, Catalog, CatalogProduct)
+        select Product, Catalog, RecId from catalogProduct
+        where catalogProduct.Catalog == catalog.RecId
+        join masterProduct
+        where masterProduct.RecId == catalogProduct.Product;
+
+        //insert actual products from catalog that are variants
+        insert_recordset tmpCatalogProduct(Product, Catalog, CatalogProduct, ProductMaster)
+        select Product, Catalog, RecId from catalogProduct
+        where catalogProduct.Catalog == catalog.RecId
+        join ProductMaster from productVariant
+        where productVariant.RecId == catalogProduct.Product;
+
+        // insert the variants that are not already included explicitly in the catalog
+        insert_recordset tmpCatalogProduct(Product, Catalog, ProductMaster)
+        select RecId, catalogId, ProductMaster from productVariant
+        exists join catalogProduct
+        where catalogProduct.Catalog == catalogId &&
+              productVariant.ProductMaster == catalogProduct.Product
+        notexists join variantCatalogProduct
+        where variantCatalogProduct.Catalog == catalogId &&
+              productVariant.RecId == variantCatalogProduct.Product;
+
+        // insert the master that are not explictly added to the catalog but a variant for them is.
+        insert_recordset tmpCatalogProduct(Product, Catalog)
+        select ProductMaster, catalogId from productVariant
+        group by ProductMaster
+        exists join catalogProduct
+        where catalogProduct.Catalog == catalogId &&
+              productVariant.RecId == catalogProduct.Product
+        notexists join variantCatalogProduct
+        where variantCatalogProduct.Catalog == catalogId &&
+              productVariant.ProductMaster == variantCatalogProduct.Product;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelCatalogApprovalWorkflow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancels a catalog approval workflow instance.
+    /// </summary>
+    /// <param name="_catalogRecId">
+    /// The value of RecID of the record to be cancelled.
+    /// </param>
+    public void cancelCatalogApprovalWorkflow(RecId _catalogRecId)
+    {
+        SysWorkflowTable workflowTable;
+
+        select WorkflowCorrelationId from workflowTable where workflowTable.ContextTableId == tableNum(Catalog) && workflowTable.ContextRecId == _catalogRecId;
+
+        if (workflowTable)
+        {
+            Workflow::cancelWorkflow(workflowTable.WorkflowCorrelationId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelSubmittedOrRejected</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancel the submit for approval action and returns the catalog to draft state.
+    /// </summary>
+    /// <returns>
+    /// True if the operation is successful.
+    /// </returns>
+    public boolean cancelSubmittedOrRejected()
+    {
+        boolean ret = false;
+
+        if (catalog.State == CatalogState::Submitted || catalog.State == CatalogState::Rejected)
+        {
+            ret = this.setCatalogState(CatalogState::Draft, true /*force action*/);
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canEdit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check whether the catalog is editable.
+    /// </summary>
+    /// <returns>
+    /// Whether the catalog is editable.
+    /// </returns>
+    public boolean canEdit()
+    {
+        return catalog.State == CatalogState::Draft;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canSubmitToWorkflow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns the value to state field of the <c>Catalog</c> table.
+    /// </summary>
+    /// <returns>
+    /// True if the action is successfull.
+    /// </returns>
+    public boolean canSubmitToWorkflow()
+    {
+        return catalog.State == CatalogState::Validated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAssortmentDates</Name>
+				<Source><![CDATA[
+    private List checkAssortmentDates(OMOperatingUnitRefRecId _omOperatingUnitRecId, RefRecId _catalogInternalOrgRecId)
+    {
+        RetailAssortmentView assortedProducts;
+        CatalogTmpProduct tmpCatalogProduct;
+        List assortmentDateRanges = new List(Types::Class);
+        RetailAssortmentDateRange assortmentDateRange;
+        RetailAssortmentDateRange catalogDateRange;
+        RetailAssortmentDateRange dateRange;
+        List dateRanges = new List(Types::Class);
+        ListEnumerator dateRangesEnumerator;
+        str dateRangesStr;
+
+        // Find all assortment data ranges intersecting with catalog date range.
+        while select ValidFrom, ValidTo
+            from assortedProducts
+            group by ValidFrom, ValidTo
+            order by ValidFrom, ValidTo
+                where assortedProducts.Variant == 0
+                    && ((assortedProducts.ValidFrom >= catalog.ValidFrom &&
+                        assortedProducts.ValidFrom <= catalog.ValidTo)
+                        || (catalog.ValidFrom >= assortedProducts.ValidFrom &&
+                        catalog.ValidFrom <= assortedProducts.ValidTo))
+                    && assortedProducts.OMOperatingUnitId == _omOperatingUnitRecId
+            join Product from tmpCatalogProduct
+                where tmpCatalogProduct.Catalog == catalog.RecId &&
+                        tmpCatalogProduct.Product == assortedProducts.Product
+        {
+            assortmentDateRange = new RetailAssortmentDateRange(assortedProducts.ValidFrom, assortedProducts.ValidTo);
+            assortmentDateRanges.addEnd(assortmentDateRange);
+        }
+
+        // Calculate unassorted date ranges within catalog data range.
+        catalogDateRange = new RetailAssortmentDateRange(catalog.ValidFrom, catalog.ValidTo);
+        dateRanges = catalogDateRange.excludeList(assortmentDateRanges);
+        dateRangesEnumerator = dateRanges.getEnumerator();
+
+        // Display an warning message summarizing unassorted date ranges for all products in the catalog.
+        while (dateRangesEnumerator.moveNext())
+        {
+            dateRange = dateRangesEnumerator.current();
+            if (dateRangesStr)
+            {
+                dateRangesStr = strFmt('%1, %2', dateRangesStr, dateRange.toString());
+            }
+            else
+            {
+                dateRangesStr = strFmt('%1', dateRange.toString());
+            }
+        }
+        if (dateRangesStr)
+        {
+            // the catalog is still valid but there are warnings that the user may choose to ignore.
+            areAnyValidationWarnings = true;
+            RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Warning, strFmt("@REX4161364", dateRangesStr), _catalogInternalOrgRecId);
+        }
+
+        return dateRanges;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkChannels</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the channel wheather a catalog is assigned to atleast one channel or not.
+    /// </summary>
+    /// <param name = "_channelToCatalogInternalOrg">
+    /// Temperory table containing the list of recids of channels, and the parent internal org, associated with a catalog.
+    /// </param>
+    /// <returns>
+    /// Booelan true if action is successful; else false.
+    /// </returns>
+    private boolean checkChannels(RetailTmpRecIdMap _channelToCatalogInternalOrg)
+    {
+        RetailOnlineChannelTable onlineChannel;
+        RetailStoreTable retailStore;
+        RetailChannelTable channel;
+        RetailInternalOrganization internalOrg;
+        RetailOnlineChannelPublishStatus channelStatus;
+        OMOperatingUnit oMOperatingUnit;
+        boolean ret = true;
+
+        boolean isMultipleCatalogFeatureEnabled = FeatureStateProvider::isFeatureEnabled(ChannelMultipleCatalogsFeature::instance());
+
+        // Check if the catalog has at least one channel.
+        select firstOnly RecId from _channelToCatalogInternalOrg;
+        if (!_channelToCatalogInternalOrg.RecId)
+        {
+            RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Error, "@RET15083");
+            ret = false;
+        }
+        else
+        {
+            if (isMultipleCatalogFeatureEnabled && catalog.CatalogTarget == RetailCatalogTarget::B2B)
+            {
+                // Validate that all Online and Retail Stores have published their changes (at least 1 time)
+                while select _channelToCatalogInternalOrg
+                join RecId from channel
+                    where channel.RecId == _channelToCatalogInternalOrg.KeyRecId 
+                       && ((channel.ChannelType == RetailChannelType::OnlineStore) ||
+                           (channel.ChannelType == RetailChannelType::RetailStore) ||
+                           (channel.ChannelType == RetailChannelType::OnlineMarketplace) ||
+                           (channel.ChannelType == RetailChannelType::SharePointOnlineStore))
+                join name from oMOperatingUnit
+                    where oMOperatingUnit.RecId == channel.OMOperatingUnitID
+                notExists join internalOrg
+                    where internalOrg.InternalOrganization == channel.OMOperatingUnitID
+                        && internalOrg.LastModifiedDateTime != DateTimeUtil::minValue()
+                {
+                    RetailCatalogIntOrgValidationSummary::addError(
+                        catalog.RecId,
+                        RetailCatalogValidationError::Error,
+                        strFmt("@RET4170000", oMOperatingUnit.Name),
+                        _channelToCatalogInternalOrg.ValueRecId);
+                    ret = false;
+                }
+
+                // Validate that all channels assigned to the catalog are Online channels of B2B type
+                while select _channelToCatalogInternalOrg
+                join RecId from channel
+                    where channel.RecId == _channelToCatalogInternalOrg.KeyRecId
+                join name from oMOperatingUnit
+                    where oMOperatingUnit.RecId == channel.OMOperatingUnitID
+                outer join onlineChannel
+                    where onlineChannel.RecId == _channelToCatalogInternalOrg.KeyRecId
+                {
+                    if (onlineChannel.CustomerType == OnlineStoreCustomerType::B2C)
+                    {
+                        RetailCatalogIntOrgValidationSummary::addError(
+                            catalog.RecId,
+                            RetailCatalogValidationError::Error,
+                            strFmt("@Retail:CatalogValidationB2BOnlineChannel", oMOperatingUnit.Name),
+                            _channelToCatalogInternalOrg.ValueRecId);
+                        ret = false;
+                    }
+                }
+            }
+            else
+            {
+                // Validate that Online channels have status "Published"
+                while select _channelToCatalogInternalOrg
+                join RecId from onlineChannel
+                    where onlineChannel.RecId == _channelToCatalogInternalOrg.KeyRecId
+                join name from oMOperatingUnit
+                    where oMOperatingUnit.RecId == onlineChannel.OMOperatingUnitID
+                notexists join channelStatus
+                    where channelStatus.OnlineChannel == onlineChannel.RecId
+                        && channelStatus.PublishStatus == RetailOnlineChannelPublishStatusType::Published
+                {
+                    RetailCatalogIntOrgValidationSummary::addError(
+                        catalog.RecId,
+                        RetailCatalogValidationError::Error,
+                        strFmt("@RET4170000",oMOperatingUnit.Name),
+                        _channelToCatalogInternalOrg.ValueRecId);
+                    ret = false;
+                }
+
+                // Validate that Retail Stores have published their changes (at least 1 time)
+                while select _channelToCatalogInternalOrg
+                join RecId from retailStore
+                    where retailStore.RecId == _channelToCatalogInternalOrg.KeyRecId
+                join name from oMOperatingUnit
+                    where oMOperatingUnit.RecId == retailStore.OMOperatingUnitID
+                notExists join internalOrg
+                    where internalOrg.InternalOrganization == retailStore.OMOperatingUnitID
+                        && internalOrg.LastModifiedDateTime != DateTimeUtil::minValue()
+                {
+                    RetailCatalogIntOrgValidationSummary::addError(
+                        catalog.RecId,
+                        RetailCatalogValidationError::Error,
+                        strFmt("@RET4170000",oMOperatingUnit.Name),
+                        _channelToCatalogInternalOrg.ValueRecId);
+                    ret = false;
+                }
+
+                if (isMultipleCatalogFeatureEnabled)
+                {
+                    // Validate that all Online channels assigned to the catalog have B2C type
+                    while select _channelToCatalogInternalOrg
+                    join RecId from channel
+                        where channel.RecId == _channelToCatalogInternalOrg.KeyRecId
+                    join name from oMOperatingUnit
+                        where oMOperatingUnit.RecId == channel.OMOperatingUnitID
+                    outer join onlineChannel
+                        where onlineChannel.RecId == _channelToCatalogInternalOrg.KeyRecId
+                    {
+                        if (catalog.CatalogTarget == RetailCatalogTarget::B2C && onlineChannel.CustomerType == OnlineStoreCustomerType::B2B)
+                        {
+                            RetailCatalogIntOrgValidationSummary::addError(
+                                catalog.RecId,
+                                RetailCatalogValidationError::Error,
+                                strFmt("@Retail:CatalogValidationB2COnlineChannel", oMOperatingUnit.Name),
+                                _channelToCatalogInternalOrg.ValueRecId);
+                            ret = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkProductCategories</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For a given catalog channel this method checks wheather the catalog product is assigned to a category hirarchy.
+    /// </summary>
+    /// <returns>
+    /// Boolean true if the action is successdul; else false.
+    /// </returns>
+    private boolean checkProductCategories()
+    {
+        boolean ret = true;
+
+        RetailCatalogInternalOrg retailCatalogInternalOrg;
+        CatalogProduct catalogProduct;
+        CatalogProductCategory catalogProductCategory;
+        EcoResDistinctProductVariant ecoResDistinctProductVariant;
+        EcoResProductCategory ecoResProductCategory;
+        EcoResCategoryHierarchy categoryHierarchy;
+        RetailChannelTable channel;
+        RetailOnlineChannelTable onlineChannel;
+        RetailCatalogIntOrgCategoryHierarchy catalogIntOrgCategoryHierarchy;
+        CatalogDisplayProductAll allCatalogProductCategory;
+        Map hierarchyByCatalogInternalOrgMap;
+        Set hierarchyRecIdSet;
+        SetEnumerator hierarchyRecIdEn;
+        RefRecId hierarchyRedId;
+        MapEnumerator hierarchyByCatalogInternalOrgMapEn;
+
+        boolean isMultipleCatalogFeatureEnabled = FeatureStateProvider::isFeatureEnabled(ChannelMultipleCatalogsFeature::instance());
+
+        if (isMultipleCatalogFeatureEnabled && catalog.CatalogTarget == RetailCatalogTarget::B2B)
+        {
+            // For B2B catalogs, check if there are uncategorized products in relation to the CATALOG Navigation hierarchy
+
+            // Loop over all catalog products which are not categorized directly on the Catalog (No CatalogProductCategory)
+            while select Product, RecId from catalogProduct
+                where catalogProduct.Catalog == catalog.RecId
+                outer join ProductMaster, RecId from ecoResDistinctProductVariant
+                    where ecoResDistinctProductVariant.RecId == catalogProduct.Product
+                notexists join CategoryHierarchy from catalogProductCategory
+                    where catalogProductCategory.CatalogProduct == catalogProduct.RecId
+                        && catalogProductCategory.CategoryHierarchy == catalog.CategoryHierarchy
+            {
+                if (ecoResDistinctProductVariant)
+                {
+                    // For variants look for the Master on the navigation hierarchy
+                    select firstonly RecId from ecoResProductCategory 
+                        where ecoResProductCategory.Product == ecoResDistinctProductVariant.ProductMaster
+                            && ecoResProductCategory.CategoryHierarchy == catalog.CategoryHierarchy;
+                }
+                else 
+                {
+                    // For Product Masters, Kits and stand-alone products, look for the product on the Nav Hierarchy
+                    select firstonly RecId from ecoResProductCategory
+                        where ecoResProductCategory.Product == catalogProduct.Product
+                            && ecoResProductCategory.CategoryHierarchy == catalog.CategoryHierarchy;
+                }
+
+                // Verify if the catalog product is a Product Master and does not exist in the navigation hierarchy
+                if (!ecoResProductCategory)
+                {
+                    categoryHierarchy = EcoResCategoryHierarchy::find(catalog.CategoryHierarchy);
+
+                    // Flag the product as uncategorized in all catalog channels
+                    while select InternalOrganization from retailCatalogInternalOrg
+                        where retailCatalogInternalOrg.Catalog == catalog.RecId
+                    {
+                        boolean isProductAlertAdded = this.addProductAlert(
+                            catalogProduct.RecId,
+                            RetailCatalogValidationError::Warning,
+                            strFmt("@Retail:RetailCatalogValidationProductCategoryMsg", catalog.CatalogId, categoryHierarchy.Name),
+                            retailCatalogInternalOrg.RecId);
+
+                        if (!isProductAlertAdded)
+                        {
+                            return ret;
+                        }
+                    }
+                }
+            }
+
+            // Loop over all catalog product masters and verify if there are no variants for them in the catalog
+            CatalogProduct catalogMasters, catalogVariants;
+            EcoResProductMaster productMasters;
+            while select Product, RecId from catalogMasters
+                where catalogMasters.Catalog == catalog.RecId
+                join DisplayProductNumber from productMasters
+                    where productMasters.RecId == catalogMasters.Product
+            {
+                select firstonly Product, RecId from catalogVariants
+                    join ecoResDistinctProductVariant
+                        where ecoResDistinctProductVariant.RecId == catalogVariants.Product &&
+                            ecoResDistinctProductVariant.ProductMaster == catalogMasters.Product &&
+                            catalogVariants.Catalog == catalog.RecId;
+
+                if (!catalogVariants)
+                {
+                    // Flag the product as invalid for missing variants on all catalog channels
+                    while select InternalOrganization from retailCatalogInternalOrg
+                        where retailCatalogInternalOrg.Catalog == catalog.RecId
+                    {
+                        boolean isProductAlertAdded = this.addProductAlert(
+                            catalogMasters.RecId,
+                            RetailCatalogValidationError::Error,
+                            strFmt("@Retail:RetailCatalogValidationProductMissingVariantsErrorMsg", productMasters.DisplayProductNumber),
+                            retailCatalogInternalOrg.RecId);
+                        ret = false;
+
+                        if (!isProductAlertAdded)
+                        {
+                            return ret;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            // For Non B2B catalogs, check if there are uncategorized products in relation to EACH CHANNEL Navigation hierarchy
+            hierarchyByCatalogInternalOrgMap = new Map(Types::Int64, Types::Int64);
+            hierarchyRecIdSet = new Set(Types::Int64);
+
+            // ignore channels without category hierarchy.
+            while select CatalogInternalOrg, CategoryHierarchy from catalogIntOrgCategoryHierarchy
+                where catalogIntOrgCategoryHierarchy.Catalog == catalog.RecId
+            {
+                hierarchyRecIdSet.add(catalogIntOrgCategoryHierarchy.CategoryHierarchy);
+                hierarchyByCatalogInternalOrgMap.insert(catalogIntOrgCategoryHierarchy.CatalogInternalOrg, catalogIntOrgCategoryHierarchy.CategoryHierarchy);
+            }
+
+            hierarchyRecIdEn = hierarchyRecIdSet.getEnumerator();
+            while (hierarchyRecIdEn.moveNext())
+            {
+                hierarchyRedId = hierarchyRecIdEn.current();
+
+                while select Product from catalogProduct
+                    where catalogProduct.Catalog == catalog.RecId
+                    notexists join allCatalogProductCategory
+                        where allCatalogProductCategory.Catalog == catalog.RecId
+                           && allCatalogProductCategory.Product == catalogProduct.Product
+                           && allCatalogProductCategory.CategoryHierarchy == hierarchyRedId
+                {
+                    hierarchyByCatalogInternalOrgMapEn = hierarchyByCatalogInternalOrgMap.getEnumerator();
+                    while (hierarchyByCatalogInternalOrgMapEn.moveNext())
+                    {
+                        if (hierarchyByCatalogInternalOrgMapEn.currentValue() == hierarchyRedId)
+                        {
+                            categoryHierarchy = EcoResCategoryHierarchy::find(hierarchyRedId);
+
+                            boolean isProductAlertAdded = this.addProductAlert(
+                                catalogProduct.RecId,
+                                RetailCatalogValidationError::Warning,
+                                strFmt("@RET4040031", categoryHierarchy.Name),
+                                hierarchyByCatalogInternalOrgMapEn.currentKey());
+
+                            if (!isProductAlertAdded)
+                            {
+                                return ret;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addCatalogKitProducts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For a given catalog channel this method checks wheather the catalog product is a Kit.
+    /// </summary>
+    /// <param name="_catalogRecId">
+    /// The value of catalog in the <c>Catalog</c> field of <c>CatalogProduct</c> table.
+    /// </param>
+    /// <param name="_productRecId">
+    /// The value of product in the <c>Product</c> field of <c>CatalogProduct</c> table.
+    /// </param>
+    /// <param name="_catalogProductRecId">
+    /// The value of record Id in the <c>RecId/c> field of <c>CatalogProduct</c> table.
+    /// </param>
+    private void addCatalogKitProducts(RecId _catalogRecId, EcoResProductRecId _productRecId, RecId _catalogProductRecId)
+    {
+        CatalogProduct                  catalogProduct;
+        RetailKit                       retailKit;
+        EcoResDistinctProductVariant    ecoResDistinctProductVariant;
+
+        retailKit = retailKit::findByProductmaster(_productRecId);
+        if (retailKit)
+        {
+            // If a product is a kit add its components and substitutes to CatalogKitProduct table
+            if (!CatalogKitProduct::checkKitElementExists(catalog.RecId,_productRecId,0))
+            {
+                CatalogKitProduct::addToCatalogKitProduct(catalog.RecId, _productRecId, retailKit.RecId, _catalogProductRecId,0);
+            }
+        }
+
+        // If a product variant is a specific kit configuration
+        select ProductMaster,RecId from ecoResDistinctProductVariant
+                where ecoResDistinctProductVariant.RecId == _productRecId
+            join RecId, ProductMaster from retailKit
+        where retailKit.ProductMaster == ecoResDistinctProductVariant.ProductMaster;
+
+        if (ecoResDistinctProductVariant.RecId)
+        {
+            // If a variant is a kit config add its components and substitutes to CatalogKitProduct table
+            if (!CatalogKitProduct::checkKitElementExists(catalog.RecId,_productRecId,_productRecId))
+            {
+                CatalogKitProduct::addToCatalogKitProduct(catalog.RecId, _productRecId, retailKit.RecId,_catalogProductRecId, _productRecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkProducts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method checks if the catalog contains a product and checks for the product attributes,availability and categorization.
+    /// </summary>
+    /// <returns>
+    /// Boolean true if the action is successdul; else false.
+    /// </returns>
+    private boolean checkProducts()
+    {
+        Query query = CatalogProduct::queryProductsByCatalog(catalog.RecId);
+        QueryRun executionQuery = new QueryRun(query);
+        boolean ret;
+        int numberOfProducts = 0;
+
+        this.setProgressText("@RET4040151");
+
+        while (executionQuery.next() && (numberOfProducts <= 0))
+        {
+            numberOfProducts++;
+        }
+        progress.incCount();
+
+        if (numberOfProducts > 0)
+        {
+            ret = true;
+
+            if (isConfigurationkeyEnabled(configurationKeyNum(Retail)))
+            {
+                this.setProgressText("@RET4040138");
+                ret = this.checkRequiredAttributes() && ret;
+                progress.incCount();
+
+                this.setProgressText("@RET4040140");
+                ret = this.checkProductCategories() && ret;
+                progress.incCount();
+
+                // Validate if all the Retail Kit Components and Substitutes are part of catalog
+                this.setProgressText("@REX4160902");
+                ret = this.ValidateProductKitInCatalog() && ret;
+                progress.incCount();
+            }
+        }
+        else
+        {
+            if (isConfigurationkeyEnabled(configurationKeyNum(Retail)))
+            {
+                RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Error, "@RET15084");
+            }
+
+            ret = ret && false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkRequiredAttributes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks whether values for required attributes were provided for all catalog products.
+    /// </summary>
+    /// <returns>
+    /// true if values for required attributes were provided for all catalog products; otherwise, false.
+    /// </returns>
+    private boolean checkRequiredAttributes()
+    {
+        RetailTmpPubProductAttributeValue tmpPubProductAttributeValue;
+        str tmpProductAttributeValuePhysicalTableName = RetailUtilities::getPhysicalTableName(tmpPubProductAttributeValue);
+
+        RetailTmpPubProductAttributeValue checkTmpPubProductAttributeValue;
+
+        RetailCatalogProdIntOrgAttribute catalogProdIntOrgAttribute;
+        RetailCatalogInternalOrgDefaultLanguage catalogInternalOrgDefaultLanguage;
+        RetailCatalogInternalOrg catalogInternalOrg;
+        RetailProductParentView productParent;
+
+        RetailTmpInternalOrgLanguage tmpInternalOrgLanguage;
+        str tmpInternalOrgLanguagePhysicalTableName = RetailUtilities::getPhysicalTableName(tmpInternalOrgLanguage);
+
+        RetailAttributeMapView attributeMap;
+        EcoResAttribute ecoResAttribute, actualAttribute;
+        EcoResAttributeType actualAttributeType;
+        EcoResDistinctProductVariant distinctProductVariant;
+
+        CatalogProduct catalogProduct;
+
+        LanguageId sysLanguage = SystemParameters::getSystemLanguageId();
+        RetailSharedParameters retailSharedParameters = RetailSharedParameters::find();
+        RetailCatalogManager retailCatalogManager = RetailCatalogManager::newCatalogId(catalog.RecId);
+        utcDateTime channelHierarchyDateTime = Catalog::getChannelHierarchyDateTime(catalog.RecId);
+
+        boolean ret = true;
+
+        //link physical table
+        checkTmpPubProductAttributeValue.linkPhysicalTableInstance(tmpPubProductAttributeValue);
+
+        RetailTmpRecId tmpRecId;
+
+        try
+        {
+            str tmpRecIdPhysicalTableName = RetailUtilities::getPhysicalTableName(tmpRecId);
+
+            ttsBegin;
+            delete_from tmpPubProductAttributeValue;
+
+            // Calculate attribute values for checking required attributes only.
+            retailCatalogManager.calculateProductAttributeValues(tmpPubProductAttributeValue, true);
+
+            // Check required attribute values
+            while select InternalOrganization from catalogProdIntOrgAttribute
+                where catalogProdIntOrgAttribute.Catalog == catalog.RecId
+                    && catalogProdIntOrgAttribute.IsRequired == NoYes::Yes
+                join RecId from catalogProduct
+                    where catalogProduct.Catalog == catalog.RecId
+                        && catalogProduct.Product == catalogProdIntOrgAttribute.Product
+                join RecId from catalogInternalOrg
+                    where catalogInternalOrg.Catalog == catalog.RecId
+                        && catalogInternalOrg.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join Name from ecoResAttribute
+                    where ecoResAttribute.RecId == catalogProdIntOrgAttribute.Attribute
+                join RecId from productParent
+                    where productParent.Product == catalogProduct.Product
+                notexists join checkTmpPubProductAttributeValue
+                    where checkTmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && (checkTmpPubProductAttributeValue.Product == 0
+                            || checkTmpPubProductAttributeValue.Product == productParent.ParentProduct
+                            || checkTmpPubProductAttributeValue.Product == productParent.Product)
+                        && (checkTmpPubProductAttributeValue.InternalOrganization == 0
+                            || checkTmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization)
+            {
+                boolean isProductAlertAdded = this.addProductAlert(
+                    catalogProduct.RecId,
+                    RetailCatalogValidationError::Error,
+                    strFmt("@RET490204", ecoResAttribute.Name),
+                    catalogInternalOrg.RecId);
+                ret = false;
+                if (!isProductAlertAdded)
+                {
+                    ttsabort;
+                    return ret;
+                }
+            }
+
+            // Prepare languages
+
+            // Ensure set based operations to not be downgraded to record-by-record operations
+            tmpInternalOrgLanguage.skipDatabaseLog(true);
+            tmpInternalOrgLanguage.skipEvents(true);
+
+            // Remove this once the TempDB bug is fixed. The TempDB table instance is not cleared when it is recylced
+            delete_from tmpInternalOrgLanguage;
+
+            // Populate non-sys default languages
+            insert_recordset tmpInternalOrgLanguage(InternalOrganization, LanguageId)
+                select InternalOrganization, LanguageId from catalogInternalOrgDefaultLanguage
+                    where catalogInternalOrgDefaultLanguage.ValidFrom <= channelHierarchyDateTime
+                        && catalogInternalOrgDefaultLanguage.ValidTo >= channelHierarchyDateTime
+                        && catalogInternalOrgDefaultLanguage.Catalog == catalog.RecId
+                        && catalogInternalOrgDefaultLanguage.LanguageId != sysLanguage;
+
+            // Prepare attributes
+
+            // Ensure set based operations to not be downgraded to record-by-record operations
+            tmpRecId.skipDatabaseLog(true);
+            tmpRecId.skipEvents(true);
+
+            // Remove this once the TempDB bug is fixed. The TempDB table instance is not cleared when it is recylced
+            delete_from tmpRecId;
+
+            // Populate text attributes.
+            insert_recordset tmpRecId(ReferenceRecId)
+                select Attribute from attributeMap
+                join actualAttribute
+                    where actualAttribute.RecId == attributeMap.ActualAttribute
+                join actualAttributeType
+                    where actualAttributeType.RecId == actualAttribute.AttributeType
+                        && actualAttributeType.DataType == AttributeDataType::Text
+                        && actualAttributeType.RecId != retailSharedParameters.ImagesAttributeType
+                        && actualAttributeType.RecId != retailSharedParameters.VideosAttributeType;
+
+            // Check required attribute value translations
+
+            // Product, InternalOrg
+            while select InternalOrganization from catalogProdIntOrgAttribute
+                where catalogProdIntOrgAttribute.Catalog == catalog.RecId
+                    && catalogProdIntOrgAttribute.IsRequired == NoYes::Yes
+                join RecId from catalogProduct
+                    where catalogProduct.Catalog == catalog.RecId
+                        && catalogProduct.Product == catalogProdIntOrgAttribute.Product
+                join RecId from catalogInternalOrg
+                    where catalogInternalOrg.Catalog == catalog.RecId
+                        && catalogInternalOrg.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join Name from ecoResAttribute
+                    where ecoResAttribute.RecId == catalogProdIntOrgAttribute.Attribute
+                join LanguageId from tmpInternalOrgLanguage
+                    where tmpInternalOrgLanguage.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join ReferenceRecId from tmpRecId
+                    where tmpRecId.ReferenceRecId == ecoResAttribute.RecId
+
+                // Product, InternalOrg, !LanguageId
+            join RecId from tmpPubProductAttributeValue
+                    where tmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && tmpPubProductAttributeValue.Product == catalogProdIntOrgAttribute.Product
+                        && tmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                        && !tmpPubProductAttributeValue.LanguageId
+
+                // Product, InternalOrg, LanguageId
+            notexists join RecId from checkTmpPubProductAttributeValue
+                    where checkTmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && checkTmpPubProductAttributeValue.Product == catalogProdIntOrgAttribute.Product
+                        && checkTmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                        && checkTmpPubProductAttributeValue.LanguageId == tmpInternalOrgLanguage.LanguageId
+            {
+                boolean isProductAlertAdded = this.addProductAlert(
+                    catalogProduct.RecId,
+                    RetailCatalogValidationError::Error,
+                    strFmt("@RET490205", ecoResAttribute.Name, tmpInternalOrgLanguage.LanguageId),
+                    catalogInternalOrg.RecId);
+                ret = false;
+                if (!isProductAlertAdded)
+                {
+                    ttsabort;
+                    return ret;
+                }
+            }
+
+            // Product, !InternalOrg
+            while select InternalOrganization from catalogProdIntOrgAttribute
+                where catalogProdIntOrgAttribute.Catalog == catalog.RecId
+                    && catalogProdIntOrgAttribute.IsRequired == NoYes::Yes
+                join RecId from catalogProduct
+                    where catalogProduct.Catalog == catalog.RecId
+                        && catalogProduct.Product == catalogProdIntOrgAttribute.Product
+                join RecId from catalogInternalOrg
+                    where catalogInternalOrg.Catalog == catalog.RecId
+                        && catalogInternalOrg.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join Name from ecoResAttribute
+                    where ecoResAttribute.RecId == catalogProdIntOrgAttribute.Attribute
+                join LanguageId from tmpInternalOrgLanguage
+                    where tmpInternalOrgLanguage.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join ReferenceRecId from tmpRecId
+                    where tmpRecId.ReferenceRecId == ecoResAttribute.RecId
+
+                // Product, !InternalOrg, !LanguageId
+            join RecId from tmpPubProductAttributeValue
+                    where tmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && tmpPubProductAttributeValue.Product == catalogProdIntOrgAttribute.Product
+                        && !tmpPubProductAttributeValue.InternalOrganization
+                        && !tmpPubProductAttributeValue.LanguageId
+
+                notexists join RecId from checkTmpPubProductAttributeValue
+                    where checkTmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && checkTmpPubProductAttributeValue.Product == catalogProdIntOrgAttribute.Product
+                        && (
+                            // InternalOrg
+            checkTmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+
+                            // !InternalOrg, LanguageId
+            || (!checkTmpPubProductAttributeValue.InternalOrganization
+                                && checkTmpPubProductAttributeValue.LanguageId == tmpInternalOrgLanguage.LanguageId)
+                        )
+            {
+                boolean isProductAlertAdded = this.addProductAlert(
+                    catalogProduct.RecId,
+                    RetailCatalogValidationError::Error,
+                    strFmt("@RET490205", ecoResAttribute.Name, tmpInternalOrgLanguage.LanguageId),
+                    catalogInternalOrg.RecId);
+                ret = false;
+                if (!isProductAlertAdded)
+                {
+                    ttsabort;
+                    return ret;
+                }
+            }
+
+            // ProductMaster, InternalOrg
+            while select InternalOrganization from catalogProdIntOrgAttribute
+                where catalogProdIntOrgAttribute.Catalog == catalog.RecId
+                    && catalogProdIntOrgAttribute.IsRequired == NoYes::Yes
+                join RecId from catalogProduct
+                    where catalogProduct.Catalog == catalog.RecId
+                        && catalogProduct.Product == catalogProdIntOrgAttribute.Product
+                join RecId from catalogInternalOrg
+                    where catalogInternalOrg.Catalog == catalog.RecId
+                        && catalogInternalOrg.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join Name from ecoResAttribute
+                    where ecoResAttribute.RecId == catalogProdIntOrgAttribute.Attribute
+                join LanguageId from tmpInternalOrgLanguage
+                    where tmpInternalOrgLanguage.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join ReferenceRecId from tmpRecId
+                    where tmpRecId.ReferenceRecId == ecoResAttribute.RecId
+                join RecId from distinctProductVariant
+                    where distinctProductVariant.RecId == catalogProduct.Product
+
+                // ProductMaster, InternalOrg, !LanguageId
+            join RecId from tmpPubProductAttributeValue
+                    where tmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && tmpPubProductAttributeValue.Product == distinctProductVariant.ProductMaster
+                        && tmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                        && !tmpPubProductAttributeValue.LanguageId
+
+                notexists join RecId from checkTmpPubProductAttributeValue
+                    where checkTmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && (
+                            // Product
+            checkTmpPubProductAttributeValue.Product == catalogProdIntOrgAttribute.Product
+
+                            // Product, InternalOrg, LanguageId
+            || (checkTmpPubProductAttributeValue.Product == distinctProductVariant.ProductMaster
+                                && checkTmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                                && checkTmpPubProductAttributeValue.LanguageId == tmpInternalOrgLanguage.LanguageId))
+            {
+                boolean isProductAlertAdded = this.addProductAlert(
+                    catalogProduct.RecId,
+                    RetailCatalogValidationError::Error,
+                    strFmt("@RET490205", ecoResAttribute.Name, tmpInternalOrgLanguage.LanguageId),
+                    catalogInternalOrg.RecId);
+                ret = false;
+                if (!isProductAlertAdded)
+                {
+                    ttsabort;
+                    return ret;
+                }
+            }
+
+            // ProductMaster, !InternalOrg
+            while select InternalOrganization from catalogProdIntOrgAttribute
+                where catalogProdIntOrgAttribute.Catalog == catalog.RecId
+                    && catalogProdIntOrgAttribute.IsRequired == NoYes::Yes
+                join RecId from catalogProduct
+                    where catalogProduct.Catalog == catalog.RecId
+                        && catalogProduct.Product == catalogProdIntOrgAttribute.Product
+                join RecId from catalogInternalOrg
+                    where catalogInternalOrg.Catalog == catalog.RecId
+                        && catalogInternalOrg.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join Name from ecoResAttribute
+                    where ecoResAttribute.RecId == catalogProdIntOrgAttribute.Attribute
+                join LanguageId from tmpInternalOrgLanguage
+                    where tmpInternalOrgLanguage.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join ReferenceRecId from tmpRecId
+                    where tmpRecId.ReferenceRecId == ecoResAttribute.RecId
+                join RecId from distinctProductVariant
+                    where distinctProductVariant.RecId == catalogProduct.Product
+
+                // ProductMaster, !InternalOrg, !LanguageId
+            join RecId from tmpPubProductAttributeValue
+                    where tmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && tmpPubProductAttributeValue.Product == distinctProductVariant.ProductMaster
+                        && !tmpPubProductAttributeValue.InternalOrganization
+                        && !tmpPubProductAttributeValue.LanguageId
+
+                notexists join RecId from checkTmpPubProductAttributeValue
+                    where checkTmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && (
+                            // Product
+            checkTmpPubProductAttributeValue.Product == catalogProdIntOrgAttribute.Product
+
+                            // ProductMaster, InternalOrg
+            || (checkTmpPubProductAttributeValue.Product == distinctProductVariant.ProductMaster
+                                && checkTmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization)
+
+                            // ProductMaster, !InternalOrg, LanguageId
+            || (checkTmpPubProductAttributeValue.Product == distinctProductVariant.ProductMaster
+                                && !checkTmpPubProductAttributeValue.InternalOrganization
+                                && checkTmpPubProductAttributeValue.LanguageId == tmpInternalOrgLanguage.LanguageId))
+            {
+                boolean isProductAlertAdded = this.addProductAlert(
+                    catalogProduct.RecId,
+                    RetailCatalogValidationError::Error,
+                    strFmt("@RET490205", ecoResAttribute.Name, tmpInternalOrgLanguage.LanguageId),
+                    catalogInternalOrg.RecId);
+                ret = false;
+                if (!isProductAlertAdded)
+                {
+                    ttsabort;
+                    return ret;
+                }
+            }
+
+            // !Product, InternalOrg
+            while select InternalOrganization from catalogProdIntOrgAttribute
+                where catalogProdIntOrgAttribute.Catalog == catalog.RecId
+                    && catalogProdIntOrgAttribute.IsRequired == NoYes::Yes
+                join RecId from catalogProduct
+                    where catalogProduct.Catalog == catalog.RecId
+                        && catalogProduct.Product == catalogProdIntOrgAttribute.Product
+                join RecId from catalogInternalOrg
+                    where catalogInternalOrg.Catalog == catalog.RecId
+                        && catalogInternalOrg.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join Name from ecoResAttribute
+                    where ecoResAttribute.RecId == catalogProdIntOrgAttribute.Attribute
+                join LanguageId from tmpInternalOrgLanguage
+                    where tmpInternalOrgLanguage.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join ReferenceRecId from tmpRecId
+                    where tmpRecId.ReferenceRecId == ecoResAttribute.RecId
+                join RecId from productParent
+                    where productParent.Product == catalogProduct.Product
+
+                // !Product, InternalOrg, !LanguageId
+            join RecId from tmpPubProductAttributeValue
+                    where tmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && !tmpPubProductAttributeValue.Product
+                        && tmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                        && !tmpPubProductAttributeValue.LanguageId
+
+                notexists join RecId from checkTmpPubProductAttributeValue
+                    where checkTmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && (
+                            // Product
+            checkTmpPubProductAttributeValue.Product == productParent.Product
+
+                            // ProductMaster
+            || checkTmpPubProductAttributeValue.Product == productParent.ParentProduct
+
+                            // !Product, InternalOrg, LanguageId
+            || (!checkTmpPubProductAttributeValue.Product
+                                && checkTmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                                && checkTmpPubProductAttributeValue.LanguageId == tmpInternalOrgLanguage.LanguageId))
+            {
+                boolean isProductAlertAdded = this.addProductAlert(
+                    catalogProduct.RecId,
+                    RetailCatalogValidationError::Error,
+                    strFmt("@RET490205", ecoResAttribute.Name, tmpInternalOrgLanguage.LanguageId),
+                    catalogInternalOrg.RecId);
+                ret = false;
+                if (!isProductAlertAdded)
+                {
+                    ttsabort;
+                    return ret;
+                }
+            }
+
+            // !Product, !InternalOrg
+            while select InternalOrganization from catalogProdIntOrgAttribute
+                where catalogProdIntOrgAttribute.Catalog == catalog.RecId
+                    && catalogProdIntOrgAttribute.IsRequired == NoYes::Yes
+                join RecId from catalogProduct
+                    where catalogProduct.Catalog == catalog.RecId
+                        && catalogProduct.Product == catalogProdIntOrgAttribute.Product
+                join RecId from catalogInternalOrg
+                    where catalogInternalOrg.Catalog == catalog.RecId
+                        && catalogInternalOrg.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join Name from ecoResAttribute
+                    where ecoResAttribute.RecId == catalogProdIntOrgAttribute.Attribute
+                join LanguageId from tmpInternalOrgLanguage
+                    where tmpInternalOrgLanguage.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization
+                join ReferenceRecId from tmpRecId
+                    where tmpRecId.ReferenceRecId == ecoResAttribute.RecId
+                join RecId from productParent
+                    where productParent.Product == catalogProduct.Product
+
+                // !Product, !InternalOrg, !LanguageId
+            join RecId from tmpPubProductAttributeValue
+                    where tmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && !tmpPubProductAttributeValue.Product
+                        && !tmpPubProductAttributeValue.InternalOrganization
+                        && !tmpPubProductAttributeValue.LanguageId
+
+                notexists join RecId from checkTmpPubProductAttributeValue
+                    where checkTmpPubProductAttributeValue.Attribute == catalogProdIntOrgAttribute.Attribute
+                        && (
+                            // Product
+            checkTmpPubProductAttributeValue.Product == productParent.Product
+
+                            // ProductMaster
+            || checkTmpPubProductAttributeValue.Product == productParent.ParentProduct
+
+                            // !Product, InternalOrg
+            || (!checkTmpPubProductAttributeValue.Product
+                                && checkTmpPubProductAttributeValue.InternalOrganization == catalogProdIntOrgAttribute.InternalOrganization)
+
+                            // !Product, !InternalOrg, LanguageId
+            || (!checkTmpPubProductAttributeValue.Product
+                                && !checkTmpPubProductAttributeValue.InternalOrganization
+                                && checkTmpPubProductAttributeValue.LanguageId == tmpInternalOrgLanguage.LanguageId))
+            {
+                boolean isProductAlertAdded = this.addProductAlert(
+                    catalogProduct.RecId,
+                    RetailCatalogValidationError::Error,
+                    strFmt("@RET490205", ecoResAttribute.Name, tmpInternalOrgLanguage.LanguageId),
+                    catalogInternalOrg.RecId);
+                ret = false;
+                if (!isProductAlertAdded)
+                {
+                    ttsabort;
+                    return ret;
+                }
+            }
+
+            ttsCommit;
+        }
+        finally
+        {
+            // Dispose TempDb table variable instances since they are no longer needed. This will ensure quick cleanup
+            // and better for performance.
+            tmpRecId.dispose();
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpTempData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cleanup temporary data created by catalog manager.
+    /// </summary>
+    /// <remarks>
+    /// Call this only after publishing, otherwise you may delete data need in different
+    /// steps of the publishing process.
+    /// </remarks>
+    public void cleanUpTempData()
+    {
+        CatalogTmpProduct tmpCatalogProduct;
+
+        delete_from tmpCatalogProduct
+        where tmpCatalogProduct.Catalog == catalog.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new catalog by copying an existing catalog.
+    /// </summary>
+    /// <param name="retailCatalogCopyFlags">
+    /// Flags of properties to copy.
+    /// </param>
+    /// <returns>
+    /// The newly created catalog.
+    /// </returns>
+    public Catalog copyCatalog(RetailCatalogCopyFlags  retailCatalogCopyFlags = null)
+    {
+        Catalog targetCatalog;
+
+        if (!catalog)
+        {
+            // No associated record was found.
+            return targetCatalog;
+        }
+
+        if (!retailCatalogCopyFlags)
+        {
+            retailCatalogCopyFlags = new RetailCatalogCopyFlags();
+        }
+
+        ttsbegin;
+
+        targetCatalog.initValue();
+        targetCatalog.EnableSnapshot = catalog.EnableSnapshot;
+
+        if (FeatureStateProvider::isFeatureEnabled(ChannelMultipleCatalogsFeature::instance()))
+        {
+            // Copy Category Hierarchy to new catalog
+            targetCatalog.CategoryHierarchy = catalog.CategoryHierarchy;
+        }
+
+        targetCatalog.insert();
+        CatalogTranslation::copyTranslations(catalog.RecId, targetCatalog.RecId);
+
+        // Copy the channel by default
+        if (isConfigurationkeyEnabled(configurationKeyNum(Retail)))
+        {
+            RetailCatalogInternalOrg::copyInternalOrgLines(
+                catalog.RecId,
+                targetCatalog.RecId);
+        }
+
+        // copy catalog script
+        if (retailCatalogCopyFlags.parmCopyCatalogScript())
+        {
+            MCRMessageAssociation::copyFromCatalog(catalog, targetCatalog.RecId);
+        }
+
+        // only copy when there is a call center channel
+        if (catalog.hasCallCenter())
+        {
+            if (retailCatalogCopyFlags.parmCopyCatalogPage())
+            {
+                // copy Catalog page
+                MCRCatalogPage::copyCatalogPage(catalog.RecId, targetCatalog.RecId);
+            }
+
+            if (retailCatalogCopyFlags.parmCopyPaymentSchedule())
+            {
+                // copy payment schedule
+                MCRInstallmentSetup::copyCatalogInstallment(catalog.RecId, targetCatalog.RecId);
+            }
+
+            if (retailCatalogCopyFlags.parmCopyFreeProduct())
+            {
+                // copy free product
+                MCRCatalogFreeProduct::copyFreeProducts(catalog.RecId, targetCatalog.RecId);
+            }
+        }
+
+        if (retailCatalogCopyFlags.parmCopyProduct())
+        {
+            // copy product
+            CatalogProduct::copyProductLines(catalog.RecId, targetCatalog.RecId);
+
+            // Copy the associated kit products
+            CatalogKitProduct::copyProductLines(catalog.RecId, targetCatalog.RecId);
+
+            if (retailCatalogCopyFlags.parmCopyUpCrossSell())
+            {
+                //copy up-sell/cross sell item
+                MCRUpSellItem::copyCatalogProductUpSell(catalog.RecId, targetCatalog.RecId);
+            }
+
+            if (retailCatalogCopyFlags.parmCopyPageLayout())
+            {
+                //copy page layout
+                MCRCatalogProductPage::copyCatalogProductUpSell(catalog.RecId, targetCatalog.RecId);
+            }
+
+            if (retailCatalogCopyFlags.parmCopyScript())
+            {
+                //copy product scripts
+                MCRMessageAssociation::copyFromCatalogProduct(catalog.RecId, targetCatalog.RecId);
+            }
+        }
+
+        ttscommit;
+
+        return targetCatalog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes a catalog.
+    /// </summary>
+    /// <remarks>
+    /// Will validate if the catalog can transitin in a deleted state.
+    /// </remarks>
+    public void deleteCatalog()
+    {
+        if (CatalogStateTransitionValidator::canTransition(catalog, CatalogState::Deleted))
+        {
+            this.retractCatalog();
+            RetailTmpCatBulkAttrib::deleteByCatalogRecId(catalog.RecId);
+            catalog.delete();
+            this.updateChannel();
+        }
+        else
+        {
+            warning(strFmt("@RET15097", catalog.name(), enum2str(catalog.State)));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>expireCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the catalog state to expires.
+    /// </summary>
+    public void expireCatalog()
+    {
+        if (this.setCatalogState(CatalogState::Expired, true))
+        {
+            RetailTmpCatBulkAttrib::deleteByCatalogRecId(catalog.RecId);
+        }
+        this.updateChannel();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mcrAddFreeProductsToCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds free product to the category.
+    /// </summary>
+    /// <param name="_tmpInventTable">
+    /// The new <c>TmpRetailProductsToAdd</c> table buffer to be used for the current instance.
+    /// </param>
+    public void mcrAddFreeProductsToCatalog(RetailTmpProductsToAdd _tmpInventTable)
+    {
+        EcoResProduct           product;
+        int                     totalActuallyAdded;
+        int                     totalSkipped;
+        EcoResProductRecId      productIdToAdd;
+        MCRCatalogFreeProduct   mcrCatalogFreeProduct;
+
+        while select _tmpInventTable
+        {
+            productIdToAdd = _tmpInventTable.getProductRecId();
+            try
+            {
+                ttsbegin;
+                product = EcoResProduct::find(productIdToAdd);
+                mcrCatalogFreeProduct = MCRCatalogFreeProduct::findByProduct(catalog.RecId,
+                                                                                productIdToAdd,
+                                                                                true);
+
+                if (mcrCatalogFreeProduct)
+                {
+                    totalSkipped++;
+                }
+                else
+                {
+                    mcrCatalogFreeProduct = MCRCatalogFreeProduct::createMCRCatalogFreeProduct(catalog.RecId,
+                                                                                            productIdToAdd);
+
+                    totalActuallyAdded++;
+                }
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                checkFailed("@SYS18447");
+            }
+        }
+
+        delete_from _tmpInventTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAreAnyValidationWarnings</Name>
+				<Source><![CDATA[
+    public boolean parmAreAnyValidationWarnings()
+    {
+        boolean ret = RetailCatalogIntOrgValidationSummary::areAnyWarnings(catalog.RecId);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIgnoreWarnings</Name>
+				<Source><![CDATA[
+    public boolean parmIgnoreWarnings(boolean _ignoreWarnings = ignoreWarnings)
+    {
+        ignoreWarnings = _ignoreWarnings;
+
+        return ignoreWarnings;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>publishCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Publishes a catalog.
+    /// </summary>
+    /// <param name="publishType">
+    /// The type of publishing: incremental or full.
+    /// </param>
+    public void publishCatalog(RetailCatalogPublishingType publishType = RetailCatalogPublishingType::Incremental)
+    {
+        if (CatalogStateTransitionValidator::canTransition(catalog, CatalogState::Published))
+        {
+            // if the catalog is valid and there are any warnings but the user choose to ignore them, proceed.
+            if (!this.parmAreAnyValidationWarnings() || ignoreWarnings)
+            {
+                ttsbegin;
+
+                this.cleanUpTempData();
+                this.setCatalogState(CatalogState::Published);
+
+                this.updateChannel(publishType);
+
+                ttscommit;
+            }
+        }
+        else
+        {
+            warning("@RET15074");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reject</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Rejects a catalog submitted for approval.
+    /// </summary>
+    /// <returns>
+    /// True if the action is successful.
+    /// </returns>
+    public boolean reject()
+    {
+        boolean ret = false;
+
+        ret = this.setCatalogState(CatalogState::Rejected);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeProductsFromCategory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes the products from category.
+    /// </summary>
+    /// <param name="_productRecId">
+    /// The value for reference RecID.
+    /// </param>
+    /// <param name="_hierarchyId">
+    /// The value of hierarchyID.
+    /// </param>
+    /// <param name="_categoryId">
+    /// The value of Category ID.
+    /// </param>
+    public void removeProductsFromCategory(RefRecId _productRecId, EcoResCategoryHierarchyId _hierarchyId, EcoResCategoryId _categoryId)
+    {
+        CatalogProduct catalogProduct;
+        CatalogProductCategory catalogProductCategory;
+        CatalogDisplayProductAll allProductCategory;
+        CatalogProductExcludeIncludeType exclude = CatalogProductExcludeIncludeType::Exclude;
+
+        ttsbegin;
+        catalogProduct = CatalogProduct::findByProduct(catalog.RecId, _productRecId, true);
+
+        if (catalogProduct)
+        {
+            // delete the product from the catalog if this is the only product category left.
+            select firstonly Category from allProductCategory
+                where allProductCategory.Catalog == catalogProduct.Catalog
+                    && allProductCategory.Product == catalogProduct.Product
+                    && allProductCategory.CategoryHierarchy == _hierarchyId
+                    && allProductCategory.Category != _categoryId;
+
+            if (allProductCategory.Category)
+            {
+                // Delete catalog override
+                catalogProductCategory = CatalogProductCategory::findByCatalogProduct(catalogProduct.RecId, _hierarchyId, _categoryId, true);
+                if (catalogProductCategory)
+                {
+                    catalogProductCategory.delete();
+                }
+
+                // Add exclusion override rule if the product still exists in the category for the catalog.
+                // This is beause the product exists in the category in the category hierarchy outside of catalog.
+                select firstonly Category from allProductCategory
+                    where allProductCategory.Catalog == catalogProduct.Catalog
+                        && allProductCategory.Product == catalogProduct.Product
+                        && allProductCategory.CategoryHierarchy == _hierarchyId
+                        && allProductCategory.Category == _categoryId;
+                if (allProductCategory.Category)
+                {
+                    CatalogProductCategory::createCatalogProductCategory(catalogProduct.RecId, _hierarchyId, _categoryId, exclude);
+                }
+            }
+            else
+            {
+                catalogProduct.delete();
+            }
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetPublishDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the published date in a catalog.
+    /// </summary>
+    private void resetPublishDate()
+    {
+        catalog.selectForUpdate(true);
+
+        ttsbegin;
+
+        catalog.PublishedDateTime = DateTimeUtil::minValue();
+        catalog.PublishedValidFrom = DateTimeUtil::date(DateTimeUtil::minValue());
+        catalog.PublishedValidTo = DateTimeUtil::date(DateTimeUtil::minValue());
+        catalog.update();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resubmitForApproval</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resubmits the catalog for approval.
+    /// </summary>
+    /// <returns>
+    /// True if the catalog is resubmited for approval;else false.
+    /// </returns>
+    public boolean resubmitForApproval()
+    {
+        boolean ret = false;
+
+        ret = this.setCatalogState(CatalogState::Submitted);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retractCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retracts a catalog. The result is removing the listing from all the channels of the catalog.
+    /// </summary>
+    /// <remarks>
+    /// The action is immediate, does not require publishing.
+    /// </remarks>
+    public void retractCatalog()
+    {
+        this.setCatalogState(CatalogState::Retracted, true);
+        this.updateChannel();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the catalog for the given catalog ID.
+    /// </summary>
+    /// <param name="_catalogId">
+    /// Reference RecID.
+    /// </param>
+    private void setCatalog(CatalogRefRecId _catalogId)
+    {
+        // Cache has been disabled, so that we get the latest record.
+        // The cache could be stale because the update to the record might have been made by the workflow batch process.
+        catalog = Catalog::find(_catalogId, true, true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCatalogState</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the state of the catalog.
+    /// </summary>
+    /// <param name="_targetState">
+    /// Desired state of the catalog.
+    /// </param>
+    /// <param name="_forceAction">
+    /// If we should force transition from current state.
+    /// </param>
+    /// <returns>
+    /// True if the action is successful.
+    /// </returns>
+    /// <remarks>
+    /// The method will validate if the transition is valid. If _forceAction is true,
+    /// the transition validation is ignored.
+    /// However only some transitions can be forced. See canForceTransition method.
+    /// </remarks>
+    public boolean setCatalogState(CatalogState _targetState, boolean _forceAction = false)
+    {
+        boolean ret;
+
+        if (CatalogStateTransitionValidator::canTransition(catalog, _targetState, true))
+        {
+            ttsbegin;
+
+            catalog.State = _targetState;
+            if (_targetState == CatalogState::Published)
+            {
+                catalog.PublishedDateTime = DateTimeUtil::utcNow();
+                catalog.PublishedValidFrom = catalog.ValidFrom;
+                catalog.PublishedValidTo = catalog.ValidTo;
+            }
+
+            catalog.update();
+
+            ttscommit;
+
+            ret = true;
+        }
+        else
+        {
+            warning(strFmt("@RET15098",
+                           catalog.State,
+                           catalog.name(),
+                           _targetState));
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitForApproval</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Marks a catalog as submitted for approval.
+    /// </summary>
+    /// <returns>
+    /// Tue of the action is successful.
+    /// </returns>
+    public boolean submitForApproval()
+    {
+        boolean ret = false;
+
+        ret = this.setCatalogState(CatalogState::Submitted);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateChannel</Name>
+				<Source><![CDATA[
+    private void updateChannel(RetailCatalogPublishingType publishType = RetailCatalogPublishingType::Incremental)
+    {
+        RetailCatalogManager retailCatalogManager;
+
+        if (RetailParameters::isRetailEnabledAndInUse())
+        {
+            retailCatalogManager = RetailCatalogManager::newCatalogId(catalog.RecId);
+            retailCatalogManager.updateChannel(publishType);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates a catalog. In order to be published a catalog need to be validated
+    /// (e.g. there are channels defined, products were added to the catalog,
+    /// the products are assorted on the targetd channels, etc.
+    /// </summary>
+    /// <param name = "_runBaseBatch">
+    /// The <c>RunBaseBatch</c> if the validate catalog is running as a batch job.
+    /// </param>
+    /// <returns>
+    /// True if the catalog is valid.
+    /// </returns>
+    public boolean validateCatalog(RunBaseBatch _runBaseBatch = null)
+    {
+        boolean ret = true;
+
+        runBaseBatch = _runBaseBatch;
+
+        if (catalog.State != CatalogState::Validating)
+        {
+            ttsBegin;
+            catalog.State = CatalogState::Validating;
+            catalog.update();
+            ttsCommit;
+        }
+
+        try
+        {
+            this.progressInit("@RET15087", 11, #aviUpdate, 1);
+
+            this.setProgressText("@RET4040147");
+            RetailTmpCatBulkAttrib::deleteByCatalogRecId(catalog.RecId);
+            RetailCatalogIntOrgValidationSummary::clean(catalog.RecId);
+            RetailCatalogIntOrgProductValidation::clean(catalog.RecId);
+            progress.incCount();
+
+            this.setProgressText("@RET4040148");
+            if (catalog.ValidTo < catalog.ValidFrom)
+            {
+                error("@RET490189");
+                RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Error, "@RET490189");
+                ret = false;
+            }
+
+            if (catalog.ValidTo < DateTimeUtil::date(DateTimeUtil::utcNow()))
+            {
+                warning("@RET490203");
+                RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Error, "@RET490203");
+                ret = false;
+            }
+            progress.incCount();
+
+            if (isConfigurationkeyEnabled(configurationKeyNum(Retail)))
+            {
+                if (FeatureStateProvider::isFeatureEnabled(ChannelMultipleCatalogsFeature::instance()) && catalog.CatalogTarget == RetailCatalogTarget::B2B)
+                {
+                    // Check if the Category Hierarchy field is not empty
+                    if (catalog.CategoryHierarchy == 0)
+                    {
+                        RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Error, "@Retail:RetailCatlogValidationEmptyCategoryHierarchyError");
+                        ret = false;
+                    }
+
+                    // Validate the Category hierarchy is of a valid type
+                    EcoResCategoryHierarchy categoryHierarchy = EcoResCategoryHierarchy::find(catalog.CategoryHierarchy);
+                    if (categoryHierarchy)
+                    {
+                        EcoResCategoryHierarchyRole hierarchyRole;
+
+                        select firstonly hierarchyRole 
+                            where hierarchyRole.CategoryHierarchy == catalog.CategoryHierarchy
+                                  && hierarchyRole.NamedCategoryHierarchyRole == EcoResCategoryNamedHierarchyRole::RetailChannelNavigation;
+
+                        if (!hierarchyRole)
+                        {
+                            RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Error, "@Retail:RetailCatlogValidationInvalidCategoryHierarchyRoleError");
+                            ret = false;
+                        }
+                    }
+                    else
+                    {
+                        RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Error, "@Retail:RetailCatlogValidationInvalidCategoryHierarchyError");
+                        ret = false;
+                    }
+
+                    // Validate Catalog has at least 1 assigned customer hierarchy 
+                    CustHierarchyCatalog custHierarchyCatalog = CustHierarchyCatalog::FindByCatalogId(catalog.CatalogId);
+                    if (!custHierarchyCatalog)
+                    {
+                        RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Error, "@Retail:RetailCatalogValidationNoAssignedCustomerHierarchy");
+                        ret = false;
+                    }
+                }
+
+                // Storing the RecIds of channels which are associated with the current catalog in a Temp table.
+                // Prevents issues that occur in high volume data.
+                RetailTmpRecIdMap channelToCatalogInternalOrg;
+
+                str tmpRecIdMapRecIdPhysicalTableName = RetailUtilities::getPhysicalTableName(channelToCatalogInternalOrg);
+
+                RetailCatalogChannelCurrent catalogChannels;
+
+                insert_recordset channelToCatalogInternalOrg(KeyRecId, ValueRecId)
+                select Channel, CatalogInternalOrg from catalogChannels
+                    where catalogChannels.Catalog == catalog.RecId;
+
+                this.setProgressText("@RET4040149");
+                ret = this.checkChannels(channelToCatalogInternalOrg) && ret;
+                progress.incCount();
+
+                // we want to check the products regardless of previous failures
+                ret = this.checkProducts() && ret;
+            }
+
+            RetailCatalogIntOrgValidationSummary::buildSummary(catalog.RecId);
+
+            if (ret)
+            {
+                this.setCatalogState(CatalogState::Validated);
+            }
+            else
+            {
+                ttsBegin;
+                // force back to draft.
+                catalog.State = CatalogState::Draft;
+                catalog.update();
+                ttsCommit;
+            }
+        }
+        // for any exception
+        catch
+        {
+            ttsBegin;
+            // force back to draft.
+            catalog.State = CatalogState::Draft;
+            catalog.update();
+            ttsCommit;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateProductKitInCatalog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates if all the Kit components and substitutes are included in the catalog by comparing the tables <c>CatalogKitProduct</c> and <c>CatalogProduct</c>.
+    /// </summary>
+    /// <returns>
+    /// Boolean true if the action is successful; else false.
+    /// </returns>
+    private boolean validateProductKitInCatalog()
+    {
+        boolean validationResult = true;
+        CatalogProduct          currentCatalogProduct;
+        RetailKitVariantComponent   retailKitVariantComponent;
+        EcoResDistinctProductVariant    ecoResDistinctProductVariant;
+        RetailKitElements       retailKitElements;
+        CatalogKitProduct       catalogKitProduct;
+
+        str infoMessage;
+
+        //Check if the components and substitutes of kit exists in the current catalog
+        while select Kit,KitElement,KitElementProductMaster from retailKitElements
+            join Catalog,Product,Kit,CatalogProduct from catalogKitProduct
+            where catalogKitProduct.Kit == retailKitElements.Kit &&
+                  catalogKitProduct.KitVariant ==0 &&
+                  catalogKitProduct.Catalog == catalog.RecId
+                notexists join currentCatalogProduct
+                    where (currentCatalogProduct.Product == retailKitElements.KitElement ||
+                           currentCatalogProduct.Product == retailKitElements.KitElementProductMaster ) &&
+                          currentCatalogProduct.Catalog == catalog.RecId
+
+        if (catalogKitProduct.CatalogProduct)
+        {
+            validationResult = false;
+
+            infoMessage = strFmt("@REX4160903", EcoResProduct::find(catalogKitProduct.Product).productName(), EcoResProduct::find(retailKitElements.KitElement).productName());
+
+            boolean isProductAlertAdded = this.addProductAlert(
+                catalogKitProduct.catalogProduct,
+                RetailCatalogValidationError::Error,
+                infoMessage);
+            if (!isProductAlertAdded)
+            {
+                return validationResult;
+            }
+        }
+
+        // check if the product kit is a kit specific config and validate if the elements of kit config are available in catalog.
+        while select Component,KitVariant from retailKitVariantComponent
+            join Catalog,Product,Kit,CatalogProduct,KitVariant from catalogKitProduct
+            where catalogKitProduct.KitVariant !=0 &&
+                  catalogKitProduct.KitVariant == retailKitVariantComponent.KitVariant &&
+                  catalogKitProduct.Catalog == catalog.RecId
+            outer join RecId,productmaster from ecoResDistinctProductVariant
+                where ecoResDistinctProductVariant.recid == retailKitVariantComponent.Component
+            notexists join currentCatalogProduct
+                where (currentCatalogProduct.Product == retailKitVariantComponent.Component ||
+                        currentCatalogProduct.Product == ecoResDistinctProductVariant.ProductMaster ) &&
+                        currentCatalogProduct.Catalog == catalog.RecId
+
+        if (catalogKitProduct.CatalogProduct)
+        {
+            validationResult = false;
+
+            infoMessage = strFmt("@REX4160903", EcoResProduct::find(catalogKitProduct.Product).productName(), EcoResProduct::find(retailKitVariantComponent.Component).productName());
+
+            boolean isProductAlertAdded = this.addProductAlert(
+                catalogKitProduct.catalogProduct,
+                RetailCatalogValidationError::Error,
+                infoMessage);
+            if (!isProductAlertAdded)
+            {
+                return validationResult;
+            }
+        }
+
+        return validationResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new insatnce of the class <c>CatalogManager</c>.
+    /// </summary>
+    /// <param name="_catalogId">
+    /// The value of CatalogRefRecId.
+    /// </param>
+    /// <returns>
+    /// A new instance of <c>CatalogManager</c> class.
+    /// </returns>
+    public static CatalogManager construct(CatalogRefRecId _catalogId)
+    {
+        CatalogManager catalogManager = new CatalogManager();
+        catalogManager.setCatalog(_catalogId);
+        return catalogManager;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSnapshottedPublishedCatalogRelated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether there exists a snapshotted published catalog which is related to current common table which is corresponding to a specific table(ex.RetailPeriodicDiscount, PriceDiscGroup).
+    /// </summary>
+    /// <param name="_common">
+    /// A common table which is corresponding to a specific table(ex.RetailPeriodicDiscount, PriceDiscGroup).
+    /// </param>
+    /// <returns>
+    /// true if there exists a snapshotted published catalog which is related to current common table; otherwise, false.
+    /// </returns>
+    public static boolean isSnapshottedPublishedCatalogRelated(Common _common)
+    {
+        boolean ret;
+        RetailPeriodicDiscount   retailPeriodicDiscount;
+        RetailDiscountPriceGroup retailDiscountPriceGroup;
+        PriceDiscGroup           priceDiscGroup;
+        RetailCatalogPriceGroup  retailCatalogPriceGroup;
+        Catalog                  catalog;
+
+        ret = false;
+
+        switch (_common.TableId)
+        {
+            case tablenum(PriceDiscGroup):
+                priceDiscGroup = _common as PriceDiscGroup;
+
+                while select priceDiscGroup
+                    from retailCatalogPriceGroup
+                        where retailCatalogPriceGroup.PriceDiscGroup == priceDiscGroup.RecId
+                    join State
+                    from catalog
+                        where catalog.RecId == retailCatalogPriceGroup.Catalog
+                {
+                    if (catalog.State == CatalogState::Published && catalog.EnableSnapshot)
+                    {
+                        ret = true;
+                        break;
+                    }
+                }
+                break;
+
+            case tablenum(RetailPeriodicDiscount):
+                retailPeriodicDiscount = _common as RetailPeriodicDiscount;
+
+                while select priceDiscGroup
+                    from retailDiscountPriceGroup
+                    join RecId
+                    from priceDiscGroup
+                        where   retailDiscountPriceGroup.OfferId == retailPeriodicDiscount.OfferId
+                             && retailDiscountPriceGroup.PriceDiscGroup == priceDiscGroup.RecId
+                             && priceDiscGroup.Module == ModuleInventCustVend::Cust
+                             && priceDiscGroup.Type == PriceGroupType::PriceGroup
+                    join PriceDiscGroup
+                    from retailCatalogPriceGroup
+                        where retailCatalogPriceGroup.PriceDiscGroup == priceDiscGroup.RecId
+                    join State
+                    from catalog
+                        where catalog.RecId == retailCatalogPriceGroup.Catalog
+                {
+                    if (catalog.State == CatalogState::Published && catalog.EnableSnapshot)
+                    {
+                        ret = true;
+                        break;
+                    }
+                }
+                break;
+
+            default:
+                ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Describes whether the class is designed for execution in a new session.
+    /// </summary>
+    /// <returns>
+    /// false.
+    /// </returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setProgressText</Name>
+				<Source><![CDATA[
+    private void setProgressText(str message)
+    {
+        progress.setText(message);
+        if (runBaseBatch && runBaseBatch.isInBatch())
+        {
+            info(strFmt('%1 %2', DateTimeUtil::toStr(DateTimeUtil::utcNow()), message));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>internalOrgCount</Name>
+				<Source><![CDATA[
+    private int64 internalOrgCount()
+    {
+        if (!internalOrgCountInitialized)
+        {
+            RetailCatalogInternalOrg catalogInternalOrg;
+            select count(RecId) from catalogInternalOrg where catalogInternalOrg.Catalog == catalog.RecId;
+            internalOrgCountLazy = catalogInternalOrg.RecId;
+            internalOrgCountInitialized = true;
+        }
+
+        return internalOrgCountLazy;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addProductAlert</Name>
+				<Source><![CDATA[
+    private boolean addProductAlert(RefRecId _catalogProductId, RetailCatalogValidationError _errorType, str _errorMessage, RefRecId _catalogIntOrgId = 0)
+    {
+        if (_catalogIntOrgId)
+        {
+            productAlertCount++;
+        }
+        else
+        {
+            productAlertCount += this.internalOrgCount();
+        }
+
+        if (productAlertCount <= MaxProductAlertCount)
+        {
+            RetailCatalogIntOrgProductValidation::updateErrorType(
+                catalog.RecId,
+                _catalogProductId,
+                _errorType,
+                _errorMessage,
+                _catalogIntOrgId);
+            return true;
+        }
+
+        if (!productAlertsTruncationWarned)
+        {
+            RetailCatalogIntOrgValidationSummary::addError(catalog.RecId, RetailCatalogValidationError::Warning, "@Retail:CatalogValidationProductAlertsTruncated");
+            productAlertsTruncationWarned = true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

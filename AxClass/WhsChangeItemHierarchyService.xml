@@ -1,0 +1,590 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsChangeItemHierarchyService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WHSChangeItemHierarchyService</c> class provides the stateless service operation for changing the
+/// reservation set on an item that already has transactions and inventory.
+/// </summary>
+class WhsChangeItemHierarchyService
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>adjustInventoryForHierarchy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adjust the inventory for an item to support the new hierarchy.
+    /// </summary>
+    /// <param name="_inventTable">
+    /// The item that will have its inventory changed to support the new hierarchy.
+    /// </param>
+    /// <param name="_levelChanged">
+    /// The highest level of the hierarchy in which the old and new hierarchy of the item differ.
+    /// </param>
+    protected void adjustInventoryForHierarchy(
+        InventTable                     _inventTable,
+        WHSReservationHierarchyLevel    _levelChanged)
+    {
+        WHSInventReserve                        whsInventReserve;
+        InventSum                               inventSum;
+        InventDim                               inventDim;
+        List                                    hierarchyList;
+        ListEnumerator                          le;
+        ListEnumerator                          leProduct;
+        QueryBuildDataSource                    qbds;
+        Query                                   query;
+        Query                                   baseItemQuery;
+        QueryRun                                queryRun;
+        WHSReservationHierarchyElementData      hierarchyElementData;
+        WHSReservationHierarchyLevel            curLevel;
+        RecordInsertList                        inventReserveList;
+
+        ttsbegin;
+
+        // Delete all levels of WHSInventReserve for the item that are equal to or below the level of change.
+        // "Below" in the hierarchy will be reflected by a higher number, thus >= is used.
+        delete_from whsInventReserve
+            where whsInventReserve.ItemId           == _inventTable.ItemId
+            &&    whsInventReserve.HierarchyLevel   >= _levelChanged;
+
+        hierarchyList = WHSReservationHierarchyProvider::construct().getDimListAllFromInventTable(_inventTable, WHSReservationHierarchySortOrder::BottomUp);
+        // Get bottom dimension of the hierarchy as the current level.
+        le = hierarchyList.getEnumerator();
+        le.moveNext();
+        hierarchyElementData = le.current();
+        curLevel = hierarchyElementData.parmLevel();
+
+        inventReserveList = new RecordInsertList(tableNum(WHSInventReserve));
+
+        // Create Query to summarize the InventSum records for the current level.
+        baseItemQuery = new Query();
+
+        qbds = baseItemQuery.addDataSource(tableNum(InventSum));
+
+        // If the item being updated is a catch weight item, the PdsCWPhysicalInvent must also be summed and used to append records to the WHSInventReserve table.
+        boolean isItemCWEnabled = PdsGlobal::pdsIsCWItem(_inventTable.ItemId);
+
+        if (isItemCWEnabled)
+        {
+            qbds.fields().addField(fieldNum(InventSum, PdsCWPhysicalInvent), SelectionField::Sum);
+            qbds.fields().addField(fieldNum(InventSum, PdsCWAvailOrdered), SelectionField::Sum);
+        }
+        
+        qbds.fields().addField(fieldNum(InventSum, PhysicalInvent), SelectionField::Sum);
+        qbds.fields().addField(fieldNum(InventSum, AvailOrdered), SelectionField::Sum);
+
+        qbds.addRange(fieldNum(InventSum, ItemId)).value(queryValue(_inventTable.ItemId));
+        
+        QueryBuildRange qbr = qbds.addRange(fieldNum(InventSum, PhysicalInvent));
+        qbr.value(strFmt('((%1 > 0) || (%2 > 0))', fieldStr(InventSum, PhysicalInvent), fieldStr(InventSum, AvailOrdered)));
+
+        qbds.addRange(fieldNum(InventSum, ClosedQty)).value(queryValue(NoYes::No));
+
+        if (!InventUseDimOfInventSumToggle::instance().isEnabled())
+        {
+            qbds = qbds.addDataSource(tableNum(InventDim));
+            qbds.relations(true);
+
+            // Add group by for all dim fields in the hierarchy except for the bottom dimension
+            // First group by Product dimensions
+            leProduct = InventDim::dimProductDimFieldList().getEnumerator();
+            while (leProduct.moveNext())
+            {
+                qbds.addGroupByField(leProduct.current());
+            }
+
+            while (curLevel >= _levelChanged)
+            {
+                query = new Query(baseItemQuery);
+                qbds = query.dataSourceTable(tableNum(InventDim));
+
+                // Next group by dimensions in the hierarchy up to the current level.
+                le = hierarchyList.getEnumerator();
+                while (le.moveNext())
+                {
+                    hierarchyElementData = le.current();
+                    // Skip over the lower dimensions we've already created WHSInventReserve Records for.
+                    if (hierarchyElementData.parmLevel() <= curLevel)
+                    {
+                        // Don't allow the current level dimension to be blank.
+                        // This accounts for License Plate which can be blank, and serial which can allow blank receipt, but be captured during picking or packing.
+                        if (hierarchyElementData.parmLevel() == curLevel)
+                        {
+                            qbds.addRange(hierarchyElementData.parmDimensionFieldId()).value(SysQuery::valueNotEmptyString());
+                        }
+                        qbds.addGroupByField(hierarchyElementData.parmDimensionFieldId());
+                    }
+                }
+
+                queryRun = new QueryRun(query);
+                // Run Query and create WHSinventReserve records for the current level of the hierarchy.
+                while (queryRun.next())
+                {
+                    inventSum = queryRun.get(tableNum(InventSum));
+                    inventDim = queryRun.get(tableNum(InventDim));
+                    inventDim = InventDim::findOrCreate(inventDim);
+
+                    // ParentInventDimId will be set in a single update statement. See call below, out of the loop before transaction commits.
+                    whsInventReserve.InventDimId    = inventDim.InventDimId;
+                    whsInventReserve.ItemId         = _inventTable.ItemId;
+                    whsInventReserve.HierarchyLevel = curLevel;
+                    // We can use physical invent for availPhysical and availOrdered
+                    // because we don't allow any reserved physical, reserved ordered transactions.
+                    whsInventReserve.AvailPhysical  = inventSum.PhysicalInvent;
+                    whsInventReserve.AvailOrdered   = inventSum.AvailOrdered;
+                    
+                    // Need to also account for WHS enabled CW items
+                    whsInventReserve.IsItemCatchWeightEnabled = isItemCWEnabled;
+                    whsInventReserve.CWAvailPhysical   = inventSum.PdsCWPhysicalInvent;
+                    whsInventReserve.CWAvailOrdered   = inventSum.PdsCWAvailOrdered;
+
+                    inventReserveList.add(whsInventReserve);
+                }
+
+                --curLevel;
+            }
+        }
+        else
+        {
+            leProduct = InventDim::dimProductDimFieldList().getEnumerator();
+            while (leProduct.moveNext())
+            {
+                qbds.addGroupByField(InventDim::getInventSumFieldIdFromInventDimFieldId(leProduct.current()));
+            }
+
+            while (curLevel >= _levelChanged)
+            {
+                query = new Query(baseItemQuery);
+                qbds = query.dataSourceTable(tableNum(InventSum));
+
+                // Next group by dimensions in the hierarchy up to the current level.
+                le = hierarchyList.getEnumerator();
+                while (le.moveNext())
+                {
+                    hierarchyElementData = le.current();
+                    // Skip over the lower dimensions we've already created WHSInventReserve Records for.
+                    if (hierarchyElementData.parmLevel() <= curLevel)
+                    {
+                        // Don't allow the current level dimension to be blank.
+                        // This accounts for License Plate which can be blank, and serial which can allow blank receipt, but be captured during picking or packing.
+                        if (hierarchyElementData.parmLevel() == curLevel)
+                        {
+                            qbds.addRange(InventDim::getInventSumFieldIdFromInventDimFieldId(hierarchyElementData.parmDimensionFieldId())).value(SysQuery::valueNotEmptyString());
+                        }
+                        qbds.addGroupByField(InventDim::getInventSumFieldIdFromInventDimFieldId(hierarchyElementData.parmDimensionFieldId()));
+                    }
+                }
+
+                queryRun = new QueryRun(query);
+                // Run Query and create WHSinventReserve records for the current level of the hierarchy.
+                while (queryRun.next())
+                {
+                    inventSum = queryRun.get(tableNum(InventSum));
+
+                    InventDim inventDimFromInventSum = InventDim::findOrCreateInventDimFromInventSum(inventSum);
+
+                    // ParentInventDimId will be set in a single update statement. See call below, out of the loop before transaction commits.
+                    whsInventReserve.InventDimId    = inventDimFromInventSum.InventDimId;
+                    whsInventReserve.ItemId         = _inventTable.ItemId;
+                    whsInventReserve.HierarchyLevel = curLevel;                    
+
+                    // We can use physical invent for availPhysical and availOrdered
+                    // because we don't allow any reserved physical, reserved ordered or ordered transactions.
+                    whsInventReserve.AvailPhysical  = inventSum.PhysicalInvent;
+                    whsInventReserve.AvailOrdered   = inventSum.PhysicalInvent;
+
+                    // Need to also account for WHS enabled CW items
+                    whsInventReserve.IsItemCatchWeightEnabled = isItemCWEnabled;
+                    whsInventReserve.CWAvailPhysical    = InventSum.PdsCWPhysicalInvent;
+                    whsInventReserve.CWAvailOrdered     = InventSum.PdsCWPhysicalInvent;
+
+                    inventReserveList.add(whsInventReserve);
+                }
+
+                --curLevel;
+            }
+        }
+        
+        inventReserveList.insertDatabase();
+
+        // Ensure ParentInventDimId field is properly set.
+        WHSInventReservePopulateParentInventDimId::populateForItem(_inventTable, _levelChanged);
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>changeItemHierarchy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Changes the reservation hierarchy of all selected items in the query to the hierarchy selected.
+    /// </summary>
+    /// <param name="_changeItemHierarchyDataContract">
+    /// An instance of <c>WHSChangeItemHierarchyDataContract</c> class.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// An error is thrown when <c>InventTrans</c> records are created for an item by an external process
+    /// while being converted to a new reservation hierarchy.
+    /// </exception>
+    public void changeItemHierarchy(WHSChangeItemHierarchyDataContract _changeItemHierarchyDataContract)
+    {
+        InventTable inventTable;
+        Counter     itemsSelected;
+        Counter     itemsConverted;
+
+        WHSReservationHierarchy reservationHierarchy = WHSReservationHierarchy::findByName(_changeItemHierarchyDataContract.parmNewHierarchyName());
+
+        if (!reservationHierarchy.RecId)
+        {
+            error("@WAX4814");
+            return;
+        }
+
+        QueryRun queryRun = new QueryRun(_changeItemHierarchyDataContract.getQuery());
+
+        try
+        {
+            while (queryRun.next())
+            {
+                ttsbegin;
+
+                inventTable = queryRun.get(tableNum(InventTable));
+                ++itemsSelected;
+
+                WHSReservationHierarchyItem reservationHierarchyItem = WHSReservationHierarchyItem::findByItem(inventTable.DataAreaId, inventTable.ItemId, true);
+
+                // This is the scenario that an existing items had a new storage dimension group assigned and warehouse management process is enabled.
+                // We assume that in order for the storage dimension group change to be possible all on-hand has been zeroed out, which allows us to assign the hierarchy without updating any sums.
+                if (!reservationHierarchyItem.RecId && this.validateItem(inventTable, reservationHierarchy.RecId))
+                {
+                    reservationHierarchyItem.clear();
+                    reservationHierarchyItem.ItemDataAreaId = inventTable.dataAreaId;
+                    reservationHierarchyItem.ItemId = inventTable.ItemId;
+                    reservationHierarchyItem.ReservationHierarchy = reservationHierarchy.RecId;
+                    reservationHierarchyItem.write();
+                    ++itemsConverted;
+                }
+                // Skip items that already use the hierarchy selected.
+                else if (reservationHierarchyItem.ReservationHierarchy != reservationHierarchy.RecId)
+                {
+                    // Get the last transaction modified date time
+                    ModifiedDateTime lastItemTransactionDateTime = this.selectLastItemTransactionDateTime(inventTable.ItemId);
+
+                    // Validate selected item can be converted to the new hierarchy
+                    if (this.validateItem(inventTable, reservationHierarchy.RecId))
+                    {
+                        // Change the reservation hierarchy the item uses.
+                        WHSReservationHierarchyRecId curHierarchy = reservationHierarchyItem.ReservationHierarchy;
+
+                        // Determine at what level the reservation hierarchy changed.
+                        WHSReservationHierarchyLevel levelChanged = this.determineInventoryLevelChanged(curHierarchy, reservationHierarchy.RecId);
+
+                        reservationHierarchyItem.ReservationHierarchy = reservationHierarchy.RecId;
+                        reservationHierarchyItem.update();
+
+                        // If the two hierarchies are the same then we don't need to convert inventory
+                        if (levelChanged)
+                        {
+                            // Adjust WHSInventReserve records to reflect the new hierarchy.
+                            this.adjustInventoryForHierarchy(inventTable, levelChanged);
+                        }
+
+                        if (this.checkNoTransactionChanges(inventTable.ItemId, lastItemTransactionDateTime))
+                        {
+                            ++itemsConverted;
+                        }
+                        else
+                        {
+                            throw error(strFmt("@WAX4850", inventTable.ItemId));
+                        }
+                    }
+                }
+
+                ttscommit;
+            }
+        }
+        catch
+        {
+            warning (strFmt("@WAX4821", inventTable.ItemId));
+        }
+
+        info (strFmt("@WAX4822", itemsConverted, itemsSelected));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkNoTransactionChanges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if there are no transactions in InventTrans for the given item which occurred after the given time.
+    /// </summary>
+    /// <param name = "_itemId">
+    /// Item for which the transactions are checked.
+    /// </param>
+    /// <param name = "_lastItemTransactionDateTime">
+    /// Time threshold against which the transactions are checked.
+    /// </param>
+    /// <returns>
+    /// If there are no transactions after the given time, return true; otherwise, false.
+    /// </returns>
+    protected boolean checkNoTransactionChanges(ItemId _itemId, ModifiedDateTime _lastItemTransactionDateTime)
+    {
+        return _lastItemTransactionDateTime == this.selectLastItemTransactionDateTime(_itemId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineInventoryLevelChanged</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines what the highest level of the hierarchy the old and new hierarchy differ.
+    /// </summary>
+    /// <param name="_curHierarchy">
+    /// The current hierarchy of an item.
+    /// </param>
+    /// <param name="_newHierarchy">
+    /// The new hierarchy of an item.
+    /// </param>
+    /// <returns>
+    /// The <c>WHSReservationHierarchyLevel</c> that is highest level of difference between the hierarchies.
+    /// </returns>
+    private WHSReservationHierarchyLevel determineInventoryLevelChanged(
+        WHSReservationHierarchyRecId    _curHierarchy,
+        WHSReservationHierarchyRecId    _newHierarchy)
+    {
+        List                                curHierarchyList;
+        List                                newHierarchyList;
+        ListEnumerator                      curLe;
+        ListEnumerator                      newLe;
+        WHSReservationHierarchyCache        hierarchyCache;
+        WHSReservationHierarchyLevel        levelChanged;
+        WHSReservationHierarchyElementData  curHierarchyElementData;
+        WHSReservationHierarchyElementData  newHierarchyElementData;
+
+        hierarchyCache = WHSReservationHierarchyCache::construct();
+        curHierarchyList = hierarchyCache.getDimListAll(_curHierarchy, WHSReservationHierarchySortOrder::TopDown);
+        newHierarchyList = hierarchyCache.getDimListAll(_newHierarchy, WHSReservationHierarchySortOrder::TopDown);
+        curLe = curHierarchyList.getEnumerator();
+        newLe = newHierarchyList.getEnumerator();
+
+        // Loop over current hierarchy to determine at what level the hierarchy has its first change.
+        while (curLe.moveNext())
+        {
+            newLe.moveNext();
+
+            curHierarchyElementData = curLe.current();
+            newHierarchyElementData = newLe.current();
+
+            if (curHierarchyElementData.parmDimensionFieldId() != newHierarchyElementData.parmDimensionFieldId())
+            {
+                levelChanged = curHierarchyElementData.parmLevel();
+                break;
+            }
+        }
+
+        return levelChanged;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectLastItemTransactionDateTime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Obtains the time when the last transaction in InventTrans occurred for the given item.
+    /// </summary>
+    /// <param name = "_itemId">
+    /// Item for which the transactions are checked.
+    /// </param>
+    /// <returns>
+    /// Time when the last transaction in InventTrans occurred for the given item.
+    /// </returns>
+    protected ModifiedDateTime selectLastItemTransactionDateTime(ItemId _itemId)
+    {
+        InventTrans inventTrans;
+
+        select firstonly maxof(ModifiedDateTime) from inventTrans
+            where inventTrans.ItemId        == _itemId
+            &&    (inventTrans.ValueOpen    == InventTransOpen::Yes
+            ||    inventTrans.ValueOpen     == InventTransOpen::Quotation);
+
+        ModifiedDateTime lastItemTransactionDateTime = inventTrans.ModifiedDateTime;
+
+        // The warehouse inventory transactions modify the InventSum. So we can rely on InventSum modifications.
+        if (WHSInventoryTransactionConfigurationProvider::isWarehouseInventoryTransactionStackEnabled())
+        {
+            InventSum inventSum;
+
+            select firstonly maxof(ModifiedDateTime) from inventSum
+                where  inventSum.ItemId == _itemId
+                    && inventSum.Closed == NoYes::No;   // this condition allows to use an index. Also this condition similar in nature to ValueOpen condition on the transactions.
+
+            lastItemTransactionDateTime = max(inventTrans.ModifiedDateTime, inventSum.ModifiedDateTime);
+        }
+
+        return lastItemTransactionDateTime;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isChangingHierarchyDimensionSequence</Name>
+				<Source><![CDATA[
+    private boolean isChangingHierarchyDimensionSequence(WHSReservationHierarchyRecId _oldReservationHierarchyRecId, WHSReservationHierarchyRecId _newReservationHierarchyRecId)
+    {
+        WHSReservationHierarchyProvider provider = WHSReservationHierarchyProvider::construct();
+
+        List oldHierarchyFields = provider.getDimListAllFromReservationHierarchy(WHSReservationHierarchy::find(_oldReservationHierarchyRecId), WHSReservationHierarchySortOrder::BottomUp);
+        List newHierarchyFields = provider.getDimListAllFromReservationHierarchy(WHSReservationHierarchy::find(_newReservationHierarchyRecId), WHSReservationHierarchySortOrder::BottomUp);
+
+        if (oldHierarchyFields.elements() != newHierarchyFields.elements())
+        {
+            return true;
+        }
+
+        ListEnumerator oldHierarchyFieldsEnumerator = oldHierarchyFields.getEnumerator();
+        ListEnumerator newHierarchyFieldsEnumerator = newHierarchyFields.getEnumerator();
+
+        while (oldHierarchyFieldsEnumerator.moveNext())
+        {
+            newHierarchyFieldsEnumerator.moveNext();
+
+            WHSReservationHierarchyElementData oldHierarchyElementData = oldHierarchyFieldsEnumerator.current();
+            WHSReservationHierarchyElementData newHierarchyElementData = newHierarchyFieldsEnumerator.current();
+
+            if (oldHierarchyElementData.parmDimensionFieldId() != newHierarchyElementData.parmDimensionFieldId()) // we don`t need to check level since we enumerate in same direction.
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isAnyDeactivationOfOrderCommittedReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if ability to reserve some below-location dimensions on demand order has been disabled.
+    /// </summary>
+    /// <param name = "_oldReservationHierarchyRecId">An identifier of the reservation hierarchy to convert from.</param>
+    /// <param name = "_newReservationHierarchyRecId">An identifier of the reservation hierarchy to convert to.</param>
+    /// <returns>true if convertion results in deactivation of ability of order-level reservations; false, otherwise.</returns>
+    /// <remarks>
+    /// Method assumes that hierarchies have same dimensions in the same sequence.
+    /// </remarks>
+    private boolean isAnyDeactivationOfOrderCommittedReservation(WHSReservationHierarchyRecId _oldReservationHierarchyRecId, WHSReservationHierarchyRecId _newReservationHierarchyRecId)
+    {
+        List locationAndBelowDimFieldList = WHSReservationHierarchyProvider::construct().getDimListLocationAndDownFromReservationHierarchy(_oldReservationHierarchyRecId, WHSReservationHierarchySortOrder::BottomUp);
+
+        ListEnumerator locationAndBelowDimFieldListEnumerator = locationAndBelowDimFieldList.getEnumerator();
+        while (locationAndBelowDimFieldListEnumerator.moveNext())
+        {
+            WHSReservationHierarchyElementData reservationElementData = locationAndBelowDimFieldListEnumerator.current();
+            FieldId dimFieldId = reservationElementData.parmDimensionFieldId();
+
+            if (    WHSReservationHierarchyElementPolicyProvider::singleton().isReservationOnDemandOrderEnabled(_oldReservationHierarchyRecId, dimFieldId)
+                && !WHSReservationHierarchyElementPolicyProvider::singleton().isReservationOnDemandOrderEnabled(_newReservationHierarchyRecId, dimFieldId))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allowToHaveInventoryTransactionsWhenChangeReservationHierarchy</Name>
+				<Source><![CDATA[
+    private boolean allowToHaveInventoryTransactionsWhenChangeReservationHierarchy(WHSReservationHierarchyRecId _oldReservationHierarchyRecId, WHSReservationHierarchyRecId _newReservationHierarchyRecId)
+    {
+        boolean ret = !this.isChangingHierarchyDimensionSequence(_oldReservationHierarchyRecId, _newReservationHierarchyRecId)
+                   && !this.isAnyDeactivationOfOrderCommittedReservation(_oldReservationHierarchyRecId, _newReservationHierarchyRecId);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that an item can be converted to the given reservation hierarchy.
+    /// </summary>
+    /// <param name="_item">
+    /// The item that needs to be validated.
+    /// </param>
+    /// <param name="_newReservationHierarchyRecId">
+    /// The record ID of the reservation hierarchy buffer.
+    /// </param>
+    /// <returns>
+    /// True if the item passes all validation and can change hierarchy; otherwise, false.
+    /// </returns>
+    protected boolean validateItem(InventTable _item, WHSReservationHierarchyRecId _newReservationHierarchyRecId)
+    {
+        boolean ret = true;
+
+        // Must be WHS controlled.
+        if (!WHSInventEnabled::exist(_item.ItemId))
+        {
+            ret = checkFailed(strFmt("@WAX4816", _item.ItemId));
+        }
+
+        // No transaction can exists in a Reserved Ordered, Reserved Physical, or Ordered status.
+        if (ret)
+        {
+            if (!this.allowToHaveInventoryTransactionsWhenChangeReservationHierarchy(_item.whsReservationHierarchy(), _newReservationHierarchyRecId))
+            {
+                InventTrans inventTrans;
+                WHSInventReserve inventReserve;
+
+                // The warehouse inventory transactions modify the WHSInventReserve. So we can rely on WHSInventReserve modifications.
+                if (WHSInventoryTransactionConfigurationProvider::isWarehouseInventoryTransactionStackEnabled())
+                {
+                    select firstonly RecId from inventReserve
+                        where  inventReserve.ItemId == _item.ItemId
+                            && inventReserve.ReservPhysical != 0;
+                }
+
+                if (!inventReserve.RecId)
+                {
+                    select firstonly RecId from inventTrans
+                        where inventTrans.ItemId        == _item.ItemId
+                        &&    (inventTrans.StatusIssue  == StatusIssue::ReservOrdered
+                        ||    inventTrans.StatusIssue   == StatusIssue::ReservPhysical);
+                }
+                
+                if (inventTrans.RecId || inventReserve.RecId)
+                {
+                    ret = checkFailed(strFmt("@WAX4817", _item.ItemId));
+                }
+            }
+        }
+
+        if (ret)
+        {
+            // Make sure the new hierarchy is valid for the item.
+            WHSInventTableReservationHierarchy itemReservationHierarchy = WHSInventTableReservationHierarchy::newFromParameters(_item.ItemId, _newReservationHierarchyRecId);
+            ret = itemReservationHierarchy.validateCanChangeHierarchy();
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

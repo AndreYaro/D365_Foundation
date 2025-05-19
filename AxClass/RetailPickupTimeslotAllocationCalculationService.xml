@@ -1,0 +1,396 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailPickupTimeslotAllocationCalculationService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// This class contains the main logic for pickup timeslot allocation calculation.
+/// </summary>
+internal class RetailPickupTimeslotAllocationCalculationService extends SysOperationServiceBase
+{
+    private static int allocationSourceTypeSalesOrder = 1;
+    private static int allocationSourceTypeRetailTransaction = 2;
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+ 
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>calculatePickupTimeslotAllocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The main logic to calculate pickup timeslot allocation for all pickup delivery modes and pickup stores.
+    /// </summary>
+    public void calculatePickupTimeslotAllocation()
+    {
+        using (RetailJobSyncManager jobSyncManager = this.initJobSyncManager())
+        {
+            
+            System.Exception exception = null;
+
+            try
+            {
+                // We will try to acquire an update lock such that only one pickup timeslot allocation calcultion job may execute at a time.
+                // If we are unable to acquire the lock, this job will immediately fail.
+                jobSyncManager.acquireUpdateLock(0);
+            }
+            catch (exception)
+            {
+                eventSource.EventWritePickupTimeslotAllocationCalculationJobAcquireLockFailed();
+                throw error("@Retail:RetailPickupTimeslotAllocationCalculationJobError");
+            }
+
+            System.Diagnostics.Stopwatch stopWatch = new System.Diagnostics.Stopwatch();
+
+            try
+            {
+                eventSource.EventWritePickupTimeslotAllocationCalculationJobStart();
+
+                
+                this.startNewTiming(stopWatch);
+
+                this.calculateTimeslotAllocation();
+                this.updateTransSnapshotTransDateTime();
+            }
+            catch (exception)
+            {
+                throw error("@Retail:RetailPickupTimeslotAllocationCalculationJobError");
+            }
+            finally
+            {
+                int64 durationInMs = this.stopTimingAndGetDurationInMs(stopWatch);
+
+                if (exception != null)
+                {
+                    eventSource.EventWritePickupTimeslotAllocationCalculationJobFailed(exception.Message, exception.StackTrace, durationInMs);
+                }
+                else
+                {
+                    eventSource.EventWritePickupTimeslotAllocationCalculationJobEnd(durationInMs);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateTimeslotAllocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate timeslot allocation based on sales order and unprocessed retail transactions then save into
+    /// RetailPickupTimeslotAllocation table for the use of CDX download job.
+    /// </summary>
+    private void calculateTimeslotAllocation()
+    {
+        RetailPickupTimeslotAllocationPerSourceResultTmp perSourceAllocationTempResult = this.calculateMultiSourceAllocationTempResults();
+        RetailPickupTimeslotAllocationResultTmp allocationResultTmp = this.sumMultiSourceAllocationTempResults(perSourceAllocationTempResult);
+
+        // Merge calculated temp results into RetailPickupTimeslotAllocation table.
+        RetailPickupTimeslotAllocation allocation;
+        allocation.skipDatabaseLog(true);
+        allocation.skipEvents(true);
+        allocation.skipDataMethods(true);
+
+        ttsbegin;
+        this.deleteLegacyResults(allocation, allocationResultTmp);
+        this.updateExistingResults(allocation, allocationResultTmp);
+        this.insertNonExistingResults(allocation, allocationResultTmp);
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateMultiSourceAllocationTempResults</Name>
+				<Source><![CDATA[
+    private RetailPickupTimeslotAllocationPerSourceResultTmp calculateMultiSourceAllocationTempResults()
+    {
+        RetailPickupTimeslotAllocationPerSourceResultTmp allocationPerSourceResultTmp;
+        allocationPerSourceResultTmp.skipDatabaseLog(true);
+        allocationPerSourceResultTmp.skipEvents(true);
+        allocationPerSourceResultTmp.skipDataMethods(true);
+
+        // We only care the allocation / availability of future pickup timeslots.
+        // Since stores may locate in different timezones comparing to user preferred timezone, we use yesterday as the starting date of the pickup timeslot we include in our calculation.
+        RetailPickupDate pickupDateRangeStart = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()) - 1;
+
+        CompanyInfo companyInfo;
+        while select crosscompany DataArea from companyInfo
+        {
+            DataAreaId companyId = companyInfo.DataArea;
+
+            changeCompany(companyId)
+            {
+                System.Diagnostics.Stopwatch stopWatch = new System.Diagnostics.Stopwatch();
+                this.startNewTiming(stopWatch);
+
+                RetailDlvModeTmp pickupDeliveryModes = RetailDlvMode::getPickupDeliveryModes();
+
+                // Persist quantity in SalesOrder into a temp table for further group by summary logic.
+                RetailPickupTimeslotSalesOrderAllocationView retailPickupTimeslotSalesOrderAllocationView;
+                insert_recordset allocationPerSourceResultTmp(
+                    DlvMode,
+                    PickupDate,
+                    FulfillmentStoreId,
+                    PickupStartTime,
+                    PickupEndTime,
+                    SourceType,
+                    AllocatedQuantity
+                )
+                select DlvMode, PickupDate, FulfillmentStoreId, PickupStartTime, PickupEndTime, allocationSourceTypeSalesOrder, AllocatedQuantity
+                    from retailPickupTimeslotSalesOrderAllocationView
+                    where retailPickupTimeslotSalesOrderAllocationView.PickupDate >= pickupDateRangeStart
+                    exists join pickupDeliveryModes
+                       where retailPickupTimeslotSalesOrderAllocationView.DlvMode == pickupDeliveryModes.Code;
+
+                int64 durationInMs = this.stopTimingAndGetDurationInMs(stopWatch);
+                if (allocationPerSourceResultTmp.RowCount() > 0)
+                {
+                    eventSource.EventWritePickupTimeslotAllocationCalculationJobSQLPerfResult(tableStr(RetailPickupTimeslotSalesOrderAllocationView), companyId, 'insert_recordset', allocationPerSourceResultTmp.RowCount(), durationInMs);
+                }
+
+                this.startNewTiming(stopWatch);
+
+                // Persist quantity in RetailTransaction into a temp table for further group by summary logic.
+                RetailPickupTimeslotRetailTransactionAllocationView retailPickupTimeslotRetailTransactionAllocationView;
+                insert_recordset allocationPerSourceResultTmp(
+                    DlvMode,
+                    PickupDate,
+                    FulfillmentStoreId,
+                    PickupStartTime,
+                    PickupEndTime,
+                    SourceType,
+                    AllocatedQuantity
+                )
+                select DlvMode, PickupDate, FulfillmentStoreId, PickupStartTime, PickupEndTime, allocationSourceTypeRetailTransaction, AllocatedQuantity
+                    from retailPickupTimeslotRetailTransactionAllocationView
+                    where retailPickupTimeslotRetailTransactionAllocationView.PickupDate >= pickupDateRangeStart
+                    exists join pickupDeliveryModes
+                       where retailPickupTimeslotRetailTransactionAllocationView.DlvMode == pickupDeliveryModes.Code;
+
+                durationInMs = this.stopTimingAndGetDurationInMs(stopWatch);
+                if (allocationPerSourceResultTmp.RowCount() > 0)
+                {
+                    eventSource.EventWritePickupTimeslotAllocationCalculationJobSQLPerfResult(tableStr(retailPickupTimeslotRetailTransactionAllocationView), companyId, 'insert_recordset', allocationPerSourceResultTmp.RowCount(), durationInMs);
+                }
+            }
+        }
+
+        return allocationPerSourceResultTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sumMultiSourceAllocationTempResults</Name>
+				<Source><![CDATA[
+    private RetailPickupTimeslotAllocationResultTmp sumMultiSourceAllocationTempResults(RetailPickupTimeslotAllocationPerSourceResultTmp allocationPerSourceResultTmp)
+    {
+        RetailPickupTimeslotAllocationResultTmp allocationResultTmp;
+        allocationResultTmp.skipDatabaseLog(true);
+        allocationResultTmp.skipEvents(true);
+        allocationResultTmp.skipDataMethods(true);
+
+        System.Diagnostics.Stopwatch stopWatch = new System.Diagnostics.Stopwatch();
+        this.startNewTiming(stopWatch);
+
+        insert_recordset allocationResultTmp(
+            DlvMode,
+            PickupDate,
+            FulfillmentStoreId,
+            PickupStartTime,
+            PickupEndTime,
+            AllocatedQuantity
+        )
+        select DlvMode, PickupDate, FulfillmentStoreId, PickupStartTime, PickupEndTime, sum(AllocatedQuantity)
+            from allocationPerSourceResultTmp
+            group by DlvMode, PickupDate, FulfillmentStoreId, PickupStartTime, PickupEndTime;
+
+        int64 durationInMs = this.stopTimingAndGetDurationInMs(stopWatch);
+        eventSource.EventWritePickupTimeslotAllocationCalculationJobSQLPerfResult(tableStr(RetailPickupTimeslotAllocationPerSourceResultTmp), '', 'insert_recordset', allocationResultTmp.RowCount(), durationInMs);
+
+        return allocationResultTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteLegacyResults</Name>
+				<Source><![CDATA[
+    private void deleteLegacyResults(RetailPickupTimeslotAllocation allocation, RetailPickupTimeslotAllocationResultTmp allocationResultTmp)
+    {
+        System.Diagnostics.Stopwatch stopWatch = new System.Diagnostics.Stopwatch();
+        this.startNewTiming(stopWatch);
+        delete_from allocation
+            notexists join allocationResultTmp
+            where allocation.DlvMode == allocationResultTmp.DlvMode
+               && allocation.PickupDate == allocationResultTmp.PickupDate
+               && allocation.FulfillmentStoreId == allocationResultTmp.FulfillmentStoreId
+               && allocation.PickupStartTime == allocationResultTmp.PickupStartTime
+               && allocation.PickupEndTime == allocationResultTmp.PickupEndTime;
+
+        int64 durationInMs = this.stopTimingAndGetDurationInMs(stopWatch);
+        eventSource.EventWritePickupTimeslotAllocationCalculationJobSQLPerfResult(tableStr(RetailPickupTimeslotAllocationResultTmp), '', 'delete_from', allocation.RowCount(), durationInMs);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExistingResults</Name>
+				<Source><![CDATA[
+    private void updateExistingResults(RetailPickupTimeslotAllocation allocation, RetailPickupTimeslotAllocationResultTmp allocationResultTmp)
+    {
+        System.Diagnostics.Stopwatch stopWatch = new System.Diagnostics.Stopwatch();
+        this.startNewTiming(stopWatch);
+
+        update_recordset allocation
+            setting AllocatedQuantity = allocationResultTmp.AllocatedQuantity
+            join allocationResultTmp
+            where allocation.DlvMode == allocationResultTmp.DlvMode
+               && allocation.PickupDate == allocationResultTmp.PickupDate
+               && allocation.FulfillmentStoreId == allocationResultTmp.FulfillmentStoreId
+               && allocation.PickupStartTime == allocationResultTmp.PickupStartTime
+               && allocation.PickupEndTime == allocationResultTmp.PickupEndTime
+               && allocation.AllocatedQuantity != allocationResultTmp.AllocatedQuantity;
+
+        int64 durationInMs = this.stopTimingAndGetDurationInMs(stopWatch);
+        eventSource.EventWritePickupTimeslotAllocationCalculationJobSQLPerfResult(tableStr(RetailPickupTimeslotAllocationResultTmp), '', 'update_recordset', allocation.RowCount(), durationInMs);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertNonExistingResults</Name>
+				<Source><![CDATA[
+    private void insertNonExistingResults(RetailPickupTimeslotAllocation allocation, RetailPickupTimeslotAllocationResultTmp allocationResultTmp)
+    {
+        System.Diagnostics.Stopwatch stopWatch = new System.Diagnostics.Stopwatch();
+        this.startNewTiming(stopWatch);
+
+        insert_recordset allocation(
+            DlvMode,
+            PickupDate,
+            FulfillmentStoreId,
+            PickupStartTime,
+            PickupEndTime,
+            AllocatedQuantity
+        )
+        select DlvMode, PickupDate, FulfillmentStoreId, PickupStartTime, PickupEndTime, AllocatedQuantity
+            from allocationResultTmp
+            notexists join allocation
+            where allocation.DlvMode == allocationResultTmp.DlvMode
+               && allocation.PickupDate == allocationResultTmp.PickupDate
+               && allocation.FulfillmentStoreId == allocationResultTmp.FulfillmentStoreId
+               && allocation.PickupStartTime == allocationResultTmp.PickupStartTime
+               && allocation.PickupEndTime == allocationResultTmp.PickupEndTime;
+
+        int64 durationInMs = this.stopTimingAndGetDurationInMs(stopWatch);
+        eventSource.EventWritePickupTimeslotAllocationCalculationJobSQLPerfResult(tableStr(RetailPickupTimeslotAllocationResultTmp), '', 'insert_recordset', allocation.RowCount(), durationInMs);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransSnapshotTransDateTime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Persist Snapshot TransDate and TransTime to identify uncalculated RetailTransactions of aysnc order creation within Channel side.
+    /// </summary>
+    private void updateTransSnapshotTransDateTime()
+    {
+        RetailPickupTimeslotAvailabilityTransSnapshotTransDateWithTime snapshotTransDateTime;
+        RetailChannelTable channelTable;
+        System.Diagnostics.Stopwatch stopWatch = new System.Diagnostics.Stopwatch();
+        this.startNewTiming(stopWatch);
+        int operatingChannelCount = 0;
+
+        ttsbegin;
+        
+        while select RecId from channelTable
+        {
+            RetailTransactionTable transTable;
+            select firstonly crosscompany transDate, transTime from transTable
+                order by transTable.transDate desc, transTable.transTime desc
+                where transTable.Channel == channelTable.RecId
+            outer join forupdate snapshotTransDateTime
+                where snapshotTransDateTime.ChannelRecId == channelTable.RecId;
+
+            if (transTable)
+            {
+                ++operatingChannelCount;
+            }
+
+            // Delete the row if no row found in transTable but exist in snapshotTransDateTime.
+            if (!transTable && snapshotTransDateTime)
+            {
+                snapshotTransDateTime.delete();
+            }
+            else if (transTable && !snapshotTransDateTime)
+            {
+                snapshotTransDateTime.ChannelRecId = channelTable.RecId;
+                snapshotTransDateTime.SnapshotTransDate = transTable.transDate;
+                snapshotTransDateTime.SnapshotTransTime = transTable.transTime;
+                snapshotTransDateTime.insert();
+            }
+            else if (transTable && snapshotTransDateTime // Update the row if SnapshotTransDate and/or SnapshotTransTime has been changed since last job running.
+                && (snapshotTransDateTime.SnapshotTransDate != transTable.transDate || snapshotTransDateTime.SnapshotTransTime != transTable.transTime))
+            {
+                snapshotTransDateTime.SnapshotTransDate = transTable.transDate;
+                snapshotTransDateTime.SnapshotTransTime = transTable.transTime;
+                snapshotTransDateTime.update();
+            }
+        }
+
+        ttscommit;
+
+        int64 durationInMs = this.stopTimingAndGetDurationInMs(stopWatch);
+        eventSource.EventWritePickupTimeslotAllocationCalculationJobUpdateTransDateWithTimeEnd(operatingChannelCount, durationInMS);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initJobSyncManager</Name>
+				<Source><![CDATA[
+    private RetailJobSyncManager initJobSyncManager()
+    {
+        str lockName = RetailJobSyncManagerHelper::getPickupTimeslotAllocationCalculationJobLockName();
+
+        RetailJobSyncManager jobSyncManager = RetailJobSyncManager::construct(lockName, funcName());
+        jobSyncManager.parmExceptionMessage("@Retail:RetailJobSyncManagerExceptionMessageCalculate");
+
+        return jobSyncManager;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startNewTiming</Name>
+				<Source><![CDATA[
+    private void startNewTiming(System.Diagnostics.Stopwatch stopWatch)
+    {
+        stopWatch.Reset();
+        stopWatch.Start();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stopTimingAndGetDurationInMs</Name>
+				<Source><![CDATA[
+    private int64 stopTimingAndGetDurationInMs(System.Diagnostics.Stopwatch stopWatch)
+    {
+        stopWatch.Stop();
+        System.TimeSpan timeSpan = stopWatch.Elapsed;
+        int64 durationInMs = timeSpan.TotalMilliseconds;
+        return durationInMs;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

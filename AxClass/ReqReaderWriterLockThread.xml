@@ -1,0 +1,435 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqReaderWriterLockThread</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Monitor = System.Threading.Monitor;
+
+/// <summary>
+/// The <c>ReqReaderWriterLockThread</c> class handles the SQL locking for the <c>ReqReaderWriterLock</c> class.
+/// </summary>
+/// <remarks>
+/// This was needed in order to keep the connections alive since SQL Azure now kills off any idle connection
+/// which takes longer than a certain duration (depending on many factors, for further info please check related documentation for SQL Azure).
+/// </remarks>
+class ReqReaderWriterLockThread
+{
+    UserId      curUserId;
+    str         curPartitionId;
+    int         sessionId;
+    Connection  connection;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new()
+    {
+        curUserId = curUserId();
+        curPartitionId = getCurrentPartition();
+        sessionId = sessionId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>connectionKeepAlivePingIntervalInMilliSec</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the interval in milliseconds that is used when pinging the connection that holds the SQL application lock.
+    /// </summary>
+    /// <returns>The interval in milliseconds that is used when pinging the connection that holds the SQL application lock.</returns>
+    public static int connectionKeepAlivePingIntervalInMilliSec()
+    {
+        return 4*60*1000; // 4 m in ms.
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>appLockAcquireIntervalInMilliSec</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the interval in milliseconds used for trying to acquire the SQL application lock.
+    /// </summary>
+    /// <returns>The interval in milliseconds used for trying to acquire the SQL application lock.</returns>
+    public static int appLockAcquireIntervalInMilliSec()
+    {
+        return 10 * 1000; //10 sec in ms;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runningInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// A delegate that is called from inside the runInternal method after a session is created.
+    /// </summary>
+    delegate void runningInternal()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitingToPingSQLConnection</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// A delegate that is called just before we wait to ping the SQL connection to keep it alive.
+    /// </summary>
+    delegate void waitingToPingSQLConnection()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the internal thread logic. Creates a connection, acquires the applock, and then keeps the connection alive until the main thread no longer needs it.
+    /// </summary>
+    /// <param name = "_lock">The lock object to be used for monitor, and thus inter-thread communication.</param>
+    public void runInternal(System.Object _lock)
+    {
+        using (var session = Microsoft.Dynamics.Ax.Xpp.SessionManager::createSession(curUserId, '', '', curPartitionId))
+        {
+            if (!session)
+            {
+                this.setLockStateToErrorInsideMonitor(_lock);
+                return;
+            }
+
+            //raise event after the session is created since a session is required for the internal arguments to be passed around
+            this.runningInternal();
+            ReqReaderWriterLockSynchronizer lock = _lock;
+            try
+            {
+                this.run(lock);
+            }
+            catch
+            {
+                this.setLockStateToErrorInsideMonitor(lock);
+            
+                error("@SCMPlanning:LockThreadUnexpectedExit");
+            }
+            finally
+            {
+                if (Monitor::IsEntered(lock))
+                {
+                    Monitor::Pulse(lock);
+                    Monitor::Exit(lock);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>escalateToUpdateLock</Name>
+				<Source><![CDATA[
+    [Hookable(true)]
+    private void escalateToUpdateLock(ReqReaderWriterLockSynchronizer _lock)
+    {
+        ReqReaderWriterLockState state = this.getLock(_lock, ReqAppLockMode::Update);
+
+        if (state == ReqReaderWriterLockState::Granted)
+        {
+            _lock.lockMode = ReqAppLockMode::Update;
+            _lock.parmReaderLockEscalationResult(UnknownNoYes::Yes);
+        }
+        else
+        {
+            _lock.parmReaderLockEscalationResult(UnknownNoYes::No);
+            if (state == ReqReaderWriterLockState::Error)
+            {
+                _lock.state = ReqReaderWriterLockState::Error;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lockStatusFromAppLockStatusWaitedTime</Name>
+				<Source><![CDATA[
+    internal static ReqReaderWriterLockState lockStatusFromAppLockStatusWaitedTime(
+        ReqAppLockStatus _reqAppLockStatus,
+        int _appLockTimeWaitedInMs)
+    {
+        ReqReaderWriterLockState lockState;
+        switch (_reqAppLockStatus)
+        {
+            case ReqAppLockStatus::TimedOut:
+                //If we timed out then signal that. If the global lock wait timeout is hit, an error state should be returned instead.                
+                lockState = _appLockTimeWaitedInMs >= ReqReaderWriterLockSynchronizer::defaultMaximumAllowedWaitingTimeToAcquireLockInMilliSec() ? ReqReaderWriterLockState::Error : ReqReaderWriterLockState::TimedOutBeforeGranted;
+                break;
+            case ReqAppLockStatus::GrantedAfterWait: //fallthrough
+            case ReqAppLockStatus::GrantedImmediately:              
+                lockState = ReqReaderWriterLockState::Granted;
+                break;
+            default: 
+                throw error(error::wrongUseOfFunction(funcName()));
+        }
+
+        return lockState;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLock</Name>
+				<Source><![CDATA[
+    [Hookable(true)]
+    private ReqReaderWriterLockState getLock(ReqReaderWriterLockSynchronizer _lock, ReqAppLockMode _mode)
+    {
+        ReqAppLockStatus requestStatus;
+        int getAppLockTimeWaitedInMs = 0;
+        int appLockPingIntervalInMs = min(_lock.maximumAllowedWaitingTimeToAcquireLockInMilliSec(), ReqReaderWriterLockThread::appLockAcquireIntervalInMilliSec());
+        do
+        {
+            requestStatus = ReqReaderWriterLockThread::getApplock(connection, _lock.lockName, _mode, appLockPingIntervalInMs);
+            getAppLockTimeWaitedInMs += appLockPingIntervalInMs;
+        }
+        while (requestStatus == ReqAppLockStatus::TimedOut &&  getAppLockTimeWaitedInMs < _lock.maximumAllowedWaitingTimeToAcquireLockInMilliSec());
+
+        return ReqReaderWriterLockThread::lockStatusFromAppLockStatusWaitedTime(requestStatus, getAppLockTimeWaitedInMs);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the thread logic. Creates a connection, acquires the applock, and then keeps the connection alive until the main thread no longer needs it.
+    /// </summary>
+    /// <param name = "_lock">The lock object to be used for monitor, and thus inter-thread communication.</param>
+    private void run(ReqReaderWriterLockSynchronizer _lock)
+    {
+        ReqReaderWriterLockSynchronizer lock = _lock;
+        
+        connection = new Connection();
+        try
+        {
+            boolean wasLockGranted = false;
+            Monitor::Enter(lock);            
+            //if the lock state is different from initial the main thread may allready have given up waiting
+            if (lock.state == ReqReaderWriterLockState::Initial)
+            {
+                //start the transaction since we may aquire the lock
+                connection.ttsbegin();
+            
+                lock.state = this.getLock(lock, lock.lockMode);  
+              
+                //be sure we only read state when we are in the monitor
+                wasLockGranted = (lock.state == ReqReaderWriterLockState::Granted);
+            }
+            //pulse + exit so the main thread can progress            
+            Monitor::Pulse(lock);
+            Monitor::Exit(lock);
+
+            if (wasLockGranted)
+            {
+                this.keepConnectionAlive(lock);
+
+                //once the transaction is committed SQL should release the lock
+                connection.ttscommit();
+                
+                //The lock is now released which should only happen when the main thread has signalled us
+                //So now we need to communicate back to the main thread so it can move on since it should be waiting for this thread to change the state
+                this.enterMonitorAndSetLockState(lock, ReqReaderWriterLockState::Released);                
+            }
+            else
+            {
+                connection.ttscommit();
+            }
+        }
+        catch//this is mainly to cover exceptions where the connection we use to keep the lock alive gets disconnected
+        {
+            this.setLockStateToErrorInsideMonitor(lock);
+            
+            if (connection && connection.ttsLevel() > 0)
+            {
+                connection.ttsabort();
+            }
+        }
+        finally
+        {
+            //this is a precautions in the unlikely event that we fail inside the catch block and fail to pulse+exit
+            if (Monitor::IsEntered(lock))
+            {
+                Monitor::Pulse(lock);
+                Monitor::Exit(lock);
+            }
+
+            if (connection)
+            {
+                connection.finalize();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAppLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Acquires the lock of the specified type and with the specified name.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock.
+    /// </param>
+    /// <param name="_mode">
+    ///     The type of the lock.
+    /// </param>
+    /// <param name="_waitMilliseconds">
+    ///     The number of milliseconds to wait for the lock to be acquired.
+    /// </param>
+    /// <returns>
+    ///     The value of the <c>ReqAppLockStatus</c> enumeration.
+    /// </returns>
+    ///<exception cref="Exception::Error">
+    ///    Exceptions can be thrown if the result from SQL cannot be handled.
+    ///</exception>
+    public static ReqAppLockStatus getAppLock(Connection _connection, str _lockName, ReqAppLockMode _mode, int _waitMilliseconds)
+    {
+        Statement        statement;
+        int              result;
+        str              sql;
+        ResultSet        resultSet;
+        ReqAppLockStatus lockStatus;
+
+        const var lockGrantedImmediately = 0;
+        const var lockGrantedAfterWait = 1;
+        const var lockRequestTimedOut = -1;
+
+        sql = strFmt('DECLARE @res int; EXEC @res = SP_GETAPPLOCK @resource = %1, @lockmode = \'%2\', @locktimeout = %3; SELECT @res;',
+            new SqlSystem().sqlLiteral(_lockName),
+            strLwr(new SysDictEnum(enumNum(ReqAppLockMode)).value2Symbol(_mode)),
+            _waitMilliseconds);
+
+        statement = _connection.createStatement();
+        resultSet = statement.executeQuery(sql);
+
+        resultSet.next();
+        result = resultSet.getInt(1);
+
+        switch (result)
+        {
+            case lockGrantedImmediately:
+                lockStatus = ReqAppLockStatus::GrantedImmediately;
+                break;
+            case lockGrantedAfterWait:
+                lockStatus = ReqAppLockStatus::GrantedAfterWait;
+                break;
+            case lockRequestTimedOut:
+                lockStatus = ReqAppLockStatus::TimedOut;
+                break;
+            default:
+                throw error(strFmt("@SYS341430", result));
+        }
+
+        return lockStatus;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>keepConnectionAlive</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method is used to keep the connection alive for the duration of the App locks life time. SQL Azure now has a hard time limit (variable depending on load)
+    /// and it will kill any idle connection. Thus it is required to issue a simple keep alive query from the connection in order to avoid this from happening.
+    /// </summary>
+    /// <param name = "_lock">The lock object to be used for monitor, and thus inter-thread communication.</param>
+    public void keepConnectionAlive(ReqReaderWriterLockSynchronizer _lock)
+    {
+        this.keepLockConnectionAlive(_lock);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>keepLockConnectionAlive</Name>
+				<Source><![CDATA[
+    private void keepLockConnectionAlive(ReqReaderWriterLockSynchronizer _lock)
+    {
+        var statement = connection.createStatement();
+        str sqlKeepAlive = 'select 1 AS REQREADERWRITERLOCKTHREADCOUNTER;';
+        
+        int connectionKeepAlivePingIntervalInMilliSec = ReqReaderWriterLockThread::connectionKeepAlivePingIntervalInMilliSec();
+        
+        Monitor::Enter(_lock);
+        // Wait for the main thread to signal release lock
+        while (_lock.state != ReqReaderWriterLockState::ToBeReleased)
+        {
+            
+            if (_lock.parmEscalateReaderLock())
+            {
+                this.escalateToUpdateLock(_lock);
+                _lock.parmEscalateReaderLock(false);
+                //notify main thread so it is ready to re-act when we leave the monitor in the wait
+                Monitor::Pulse(_lock);
+            }
+                
+            this.waitingToPingSQLConnection();
+            //Wait for a pulse OR for the time out so we can ping the connection to keep it alive
+            Monitor::wait(_lock, connectionKeepAlivePingIntervalInMilliSec);
+            
+            ResultSet resultset = statement.executeQuery(sqlKeepAlive);
+            resultset.next();
+
+            resultset.close();
+        }
+
+        if (statement)
+        {
+            statement.close();
+            statement.finalize();
+        }
+
+        //don't wrap in try/catch/finally since it prevents us from catching exceptions, e.g. due to lost connection, and controlling the lock state
+        Monitor::Exit(_lock);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLockStateToErrorInsideMonitor</Name>
+				<Source><![CDATA[
+    private void setLockStateToErrorInsideMonitor(ReqReaderWriterLockSynchronizer _lock)
+    {
+        if (!Monitor::IsEntered(_lock))
+        {
+            Monitor::Enter(_lock);
+        }
+
+        _lock.state = ReqReaderWriterLockState::Error;
+        Monitor::Pulse(_lock);
+        Monitor::Exit(_lock);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enterMonitorAndSetLockState</Name>
+				<Source><![CDATA[
+    private void enterMonitorAndSetLockState(ReqReaderWriterLockSynchronizer _lock, ReqReaderWriterLockState _state)
+    {
+        Monitor::Enter(_lock);
+        _lock.state = _state;
+        Monitor::Pulse(_lock);
+        Monitor::Exit(_lock);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

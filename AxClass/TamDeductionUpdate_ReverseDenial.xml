@@ -1,0 +1,313 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TamDeductionUpdate_ReverseDenial</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>TAMDeductionUpdate_ReverseDenial</c> class manages the update of deductions for
+/// the reverse denail action.
+/// </summary>
+class TamDeductionUpdate_ReverseDenial extends TAMDeductionUpdate
+{
+    TAMDeduction deduction;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(TAMDeduction _deduction)
+    {
+        super(_deduction);
+        deduction.data(_deduction);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTAMDeductionUpdateType</Name>
+				<Source><![CDATA[
+    protected TAMDeductionUpdateType parmTAMDeductionUpdateType()
+    {
+        return TAMDeductionUpdateType::ReverseDenial;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>update</Name>
+				<Source><![CDATA[
+    protected void update()
+    {
+        #OCCRetryCount
+        CustTable                   custTable;
+        CustTrans                   custTrans;
+        CustTransOpen               custTransOpen;
+        TAMDeductionUpdateHistory   deductionUpdateHistory;
+        LedgerJournalTable          ledgerJournalTable;
+        LedgerJournalTrans          ledgerJournalTrans;
+        LedgerJournalCheckPost      ledgerJournalCheckPost;
+        RecordSortedList            listLedgerJournalTrans;
+        TAMPromotionParameters      tamPromotionParameters;
+
+        this.initLedgerJournalTable(ledgerJournalTable);
+
+        // Store LedgerJournalTrans in a list.  Purpose is to initialize outside TTS
+        // and insert all records at once inside TTS
+        listLedgerJournalTrans = new RecordSortedList(tableNum(LedgerJournalTrans));
+
+        listLedgerJournalTrans.sortOrder(fieldNum(LedgerJournalTrans, LineNum));
+
+        // Initialize LedgerJournalTrans and add to list
+        // Reverse denial so amount is negative
+        this.initLedgerJournalTrans(ledgerJournalTrans,
+                                    deduction,
+                                    - deduction.DenyAmountCur);
+
+        listLedgerJournalTrans.ins(ledgerJournalTrans);
+
+        // See CustOpenTrans form setSpecOffsetVoucher
+        custTable = CustTable::find(deduction.AccountNum);
+        SpecTransExecutionContext context = SpecTransExecutionContext::newFromSource(custTable);
+        SpecTransManager specTransManager = SpecTransManager::newFromSpec(context.parmSpecContext());
+
+        try
+        {
+            ttsbegin;
+
+            // Post reversal (adds denial amount back to customer as credit)
+            ledgerJournalTable = this.insertJournalAndLines(ledgerJournalTable,
+                                                            listLedgerJournalTrans);
+
+            ledgerJournalCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(ledgerJournalTable,
+                                                                                   NoYes::Yes);
+            ledgerJournalCheckPost.parmBeQuiet(true);
+
+            tamPromotionParameters = TAMPromotionParameters::find();
+
+            LedgerJournalCheckPost::processOperation(ledgerJournalCheckPost);
+
+            this.updateDeductionsAfterPost(ledgerJournalTable.JournalNum);
+            this.insertDeductionUpdateHistory(listLedgerJournalTrans);
+
+            // Record that denial was reversed
+            select forupdate deductionUpdateHistory
+                where deductionUpdateHistory.tamDeductionID == deduction.tamDeductionID
+                    && deductionUpdateHistory.tamDeductionUpdateType == TAMDeductionUpdateType::Deny
+                    && deductionUpdateHistory.Reversed == NoYes::No;
+
+            deductionUpdateHistory.Reversed = NoYes::Yes;
+            deductionUpdateHistory.update();
+
+            // If original denial is an open transacation then settle just posted reversal against
+            // the denial transaction
+            // Find CustTransOpen of original denial
+            select RecId, AmountCur from custTransOpen
+                join CurrencyCode from custTrans
+                where custTransOpen.RefRecId == custTrans.RecId
+                exists join ledgerJournalTrans
+                where custTrans.RecId == ledgerJournalTrans.CustTransId
+                    && ledgerJournalTrans.RecId == deductionUpdateHistory.LedgerJournalTransRecId;
+
+            if (custTransOpen
+                && ! specTransManager.exist(curext(),
+                custTransOpen.TableId,
+                custTransOpen.RecId))
+            {
+                // Mark original denial to be settled
+                specTransManager.insert(curext(),
+                                        custTransOpen.TableId,
+                                        custTransOpen.RecId,
+                                        custTransOpen.AmountCur,
+                                        custTrans.CurrencyCode);
+
+                listLedgerJournalTrans.first(ledgerJournalTrans);
+
+                // Reread to get CustTransId value because CustTransId assigned during posting
+                ledgerJournalTrans.reread();
+
+                // Find CustTransOpen of just posted reversal
+                select RecId, AmountCur from custTransOpen
+                    join CurrencyCode from custTrans
+                    where custTransOpen.RefRecId == custTrans.RecId
+                        && custTrans.RecId == ledgerJournalTrans.CustTransId;
+
+                if (custTransOpen
+                    && ! specTransManager.exist(curext(),
+                    custTransOpen.TableId,
+                    custTransOpen.RecId))
+                {
+                    // Mark reversal to be settled
+                    specTransManager.insert(curext(),
+                                            custTransOpen.TableId,
+                                            custTransOpen.RecId,
+                                            custTransOpen.AmountCur,
+                                            custTrans.CurrencyCode);
+
+                    // Settle the transaction
+                    CustTrans::settleTransaction(context, CustTransSettleTransactionParameters::construct());
+                }
+                specTransManager.deleteAll();
+            }
+
+            ttscommit;
+            this.parmUpdateOccurred(true);
+        }
+
+        catch (Exception::Error)
+        {
+            error("@SYS21628");
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDeductionsAfterPost</Name>
+				<Source><![CDATA[
+    protected void updateDeductionsAfterPost(LedgerJournalId _ledgerJournalId)
+    {
+        TAMDeduction deductionLocal;
+
+        select forupdate deductionLocal
+            where deductionLocal.tamDeductionID == deduction.tamDeductionID;
+
+        this.updateDeductionAfterPost(deductionLocal, _ledgerJournalId);
+
+        if (deductionLocal.validateWrite())
+        {
+            deductionLocal.update();
+        }
+        else
+        {
+            throw error("@SYS104318");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDeductionAfterPost</Name>
+				<Source><![CDATA[
+    protected void updateDeductionAfterPost(TAMDeduction _deduction, LedgerJournalId _ledgerJournalId)
+    {
+        // Erase previous denial data
+        _deduction.TAMDeductionDenyReason = '';
+        _deduction.DenyJournalID = '';
+
+        // Add denial amount back to deduction and set status to open
+        _deduction.RemainAmountCur = _deduction.DenyAmountCur;
+        _deduction.DenyAmountCur = 0;
+        _deduction.TAMDeductionStatus = TAMDeductionStatus::Open;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    protected boolean validate()
+    {
+        boolean ret;
+
+        ret = true;
+
+        // Status must be closed
+        if (deduction.tamDeductionStatus != TAMDeductionStatus::Closed)
+        {
+            ret = checkFailed(strFmt("@MCR27652",
+                                     deduction.tamDeductionID,
+                                     deduction.tamDeductionStatus,
+                                     TAMDeductionStatus::Closed));
+        }
+
+        // Must be deny amount
+        if (ret
+            && ! deduction.DenyAmountCur)
+        {
+            ret = checkFailed(strFmt("@MCR27653",
+                                     deduction.tamDeductionID));
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new <c>TAMDeductionUpdate_ReverseDenaiL</c> object.
+    /// </summary>
+    /// <param name="_deduction">
+    /// The deduction record used to initalize the new object.
+    /// </param>
+    /// <returns>
+    /// An initialized <c>TAMDeductionUpdate_ReverseDenaiL</c> object.
+    /// </returns>
+    public static TAMDeductionUpdate_ReverseDenial construct(TAMDeduction _deduction)
+    {
+        TAMDeductionUpdate_ReverseDenial tamDeductionUpdate_ReverseDenial;
+        tamDeductionUpdate_ReverseDenial = new TAMDeductionUpdate_ReverseDenial(_deduction);
+        return tamDeductionUpdate_ReverseDenial;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        TAMDeduction                        deduction;
+        TAMDeductionUpdate_ReverseDenial    tamDeductionUpdate_ReverseDenial;
+        FormObjectSet                       formObjectSet;
+
+        if (_args.dataset() != tableNum(TAMDeduction))
+        {
+            throw error(strFmt("@MCR27651",
+                               classId2Name(classIdGet(tamDeductionUpdate_ReverseDenial)),
+                                            tablePName(TAMDeduction)));
+        }
+
+        deduction = _args.record();
+
+        tamDeductionUpdate_ReverseDenial = TAMDeductionUpdate_ReverseDenial::construct(deduction);
+        tamDeductionUpdate_ReverseDenial.run();
+
+        if (FormDataUtil::isFormDataSource(deduction))
+        {
+            formObjectSet = FormDataUtil::getFormDataSource(deduction);
+            formObjectSet.reread();
+            formObjectSet.refresh();
+            formObjectSet.active();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

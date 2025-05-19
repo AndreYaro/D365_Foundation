@@ -1,0 +1,1063 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BudgetReservationYearEndCloseService_PSN</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>BudgetReservationYearEndCloseService_PSN</c> class is a service class for <c>BudgetReservationYearEndClose_PSN</c> form.
+/// </summary>
+public class BudgetReservationYearEndCloseService_PSN extends SysOperationServiceBase
+{
+    BudgetReservationYearEndCloseContract_PSN   budgetReservationYearEndCloseContract;
+    BudgetTransactionMultiPost                  budgetTransactionMultiPost;
+    BudgetSourceInquiryDetails                  currentBudgetSourceInquiryDetails;
+    BudgetReservationRecId_PSN                  currentBudgetReservationRecId;
+    BudgetReservationHeader_PSN                 budgetReservationHeader;
+    List                                        budgetReservationList;
+    Map                                         budgetModels;
+    List                                        topSourceDocumentLineList;
+    ListEnumerator                              topSourceDocumentLineListEnumerator;
+    int                                         countBudgetTransactionLinesCreated;
+    RecordSortedList                            budgetTransactionLineRecordSortedList;
+
+    // Map used to cache ledger account budget reservations for encumbrances in the closing year.
+    // Key:    Top parent source document line (Int64)
+    // Value:  BudgetSourceInquiryDetails (Class)
+    Map budgetReservationEncumbranceDetails;
+    Map ledgerFundMapOnClient;
+
+    // Current processing flags.
+    boolean isBudgetCarryForward;
+    boolean isBudgetPost;
+    boolean foundAccountWithDisabledBudgetControl;
+    boolean isPreview;
+    boolean doRecordBudgetEncumbranceAsClosing;
+
+    // Multi-processing batch process.
+    BatchHeader batchHeader;
+    const int ParallelExecutionThreshold = 10;
+    const int ParallelExecutionBatchSize = 100;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createBudgetEncumbrances</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates budget encumbrance entries for a source document line.
+    /// </summary>
+    /// <param name="_sourceDocumentLine">
+    /// The <c>SourceDocumentLine</c> record for creating budget entries.
+    /// </param>
+    private void createBudgetEncumbrances(SourceDocumentLine _sourceDocumentLine)
+    {
+        if (!isPreview)
+        {
+            BudgetControlSourceDocumentProcessor::submitSourceDocumentLineToCheckBudget(
+                _sourceDocumentLine,
+                false,
+                null,
+                true,
+                curUserId(),
+                true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBudgetTransactionHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the <c>BudgetTransactionHeader</c> table record for a specified budget model.
+    /// </summary>
+    /// <param name="_modelId">
+    /// The budget model ID.
+    /// </param>
+    /// <param name="_ledgerDimension">
+    /// The ledger dimension.
+    /// </param>
+    /// <param name="_transDate">
+    /// The transaction date.
+    /// </param>
+    /// <param name="_budgetTransactionCode">
+    /// The budget transaction code record ID.
+    /// </param>
+    /// <returns>
+    /// A <c>BudgetTransactionHeader</c> record buffer.
+    /// </returns>
+    /// <exception cref="M:Exception::Error">
+    /// The creation process encountered an error and was not completed.
+    /// </exception>
+
+    private RefRecId createBudgetTransactionHeader(
+        BudgetModelId         _modelId,
+        LedgerDimensionBase   _ledgerDimension,
+        TransDate             _transDate,
+        RefRecId              _budgetTransactionCode)
+    {
+        BudgetTransactionHeader budgetTransactionHeader = null;
+        NumberSeq               numberSeq;
+        BudgetModel             budgetModel;
+
+        budgetTransactionHeader.clear();
+        budgetTransactionHeader.initValue();
+
+        numberSeq   = NumberSeq::newGetNum(BudgetParameters::numRefBudgetTransactionId());
+        budgetModel = this.findBudgetModelByLedgerDimensionAndDate(_ledgerDimension, _transDate);
+
+        budgetTransactionHeader.editBudgetModel(true, budgetModel.ModelId);
+        budgetTransactionHeader.TransactionNumber = numberSeq.num();
+
+        budgetTransactionHeader.setBudgetTransactionCode(_budgetTransactionCode);
+
+        budgetTransactionHeader.Date                    = _transDate;
+        budgetTransactionHeader.TransactionStatus       = BudgetTransactionStatus::Draft;
+        budgetTransactionHeader.TransferSourceNumber    = budgetReservationHeader.DocumentNumber;
+
+        if (budgetTransactionHeader.validateWrite())
+        {
+            budgetTransactionHeader.write();
+            budgetTransactionMultiPost.addBudgetTransactionHeaderToPost(budgetTransactionHeader.TransactionNumber);
+        }
+        else
+        {
+            // The budget transaction header must be created to complete the transfer.
+            throw error("@SYS131643");
+        }
+
+        budgetModels.insert(_modelId, budgetTransactionHeader.RecId);
+
+        return budgetTransactionHeader.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBudgetTransactionLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and inserts a budget transaction line.
+    /// </summary>
+    /// <param name="_transDate">
+    /// The transaction date of the budget line.
+    /// </param>
+    /// <param name="_ledgerAccount">
+    /// The ledger account to use for the budget line.
+    /// </param>
+    /// <param name="_transactionType">
+    /// The enumerated value <c>BudgetTransactionType</c> of the budget transaction line.
+    /// </param>
+    /// <param name="_currentAmountAvailable">
+    /// The amount to use on the budget transaction line.
+    /// </param>
+    /// <param name="_budgetTransactionCode">
+    /// The budget transaction code to use on the budget transaction.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// The error to throw if the operation does not complete succesfully.
+    /// </exception>
+    private void createBudgetTransactionLine(
+        TransDate               _transDate,
+        LedgerDimensionBase     _ledgerAccount,
+        BudgetTransactionType   _transactionType,
+        AmountMST               _currentAmountAvailable,
+        RefRecId                _budgetTransactionCode)
+    {
+        BudgetTransactionLine           budgetTransactionLine;
+        RecId                           budgetTransactionHeaderId;
+        BudgetModel                     budgetModel;
+        CurrencyCode                    currency = Ledger::accountingCurrency(CompanyInfo::current());
+
+        // Find or create header.
+        budgetModel                 = this.findBudgetModelByLedgerDimensionAndDate(_ledgerAccount, _transDate);
+        budgetTransactionHeaderId   = this.findBudgetTransactionHeader(budgetModel.ModelId);
+
+        if (!budgetTransactionHeaderId)
+        {
+            budgetTransactionHeaderId           = this.createBudgetTransactionHeader(budgetModel.ModelId, _ledgerAccount, _transDate, _budgetTransactionCode);
+            countBudgetTransactionLinesCreated  = 0;
+        }
+
+        countBudgetTransactionLinesCreated += 1;
+        budgetTransactionLine.clear();
+
+        budgetTransactionLine.LineNumber                = countBudgetTransactionLinesCreated;
+        budgetTransactionLine.BudgetTransactionHeader   = budgetTransactionHeaderId;
+        budgetTransactionLine.Date                      = _transDate;
+        budgetTransactionLine.LedgerDimension           = BudgetTransactionManager::saveBudgetLedgerDimension(_ledgerAccount);
+        budgetTransactionLine.BudgetType                = BudgetType::Expense;
+        budgetTransactionLine.TransactionCurrency       = currency;
+
+        // Create a negative budget transaction during the closing-process to offset the carry-forward budget amount.
+        if (_transactionType == BudgetTransactionType::OriginalBudget)
+        {
+            budgetTransactionLine.AccountingCurrencyAmount = CurrencyExchangeHelper::amount(_currentAmountAvailable, currency) * -1;
+        }
+        else
+        {
+            budgetTransactionLine.AccountingCurrencyAmount = CurrencyExchangeHelper::amount(_currentAmountAvailable, currency);
+        }
+
+        budgetTransactionLine.TransactionCurrencyAmount = budgetTransactionLine.AccountingCurrencyAmount;
+
+        if (budgetTransactionLine.validateWrite()
+            && BudgetTransactionManager::validateLedgerDimension(budgetTransactionLine.LedgerDimension, budgetTransactionLine.Date))
+        {
+            //
+            // Insert the budget transaction line - this will bypass the budget check at save, but
+            // this is not necessary since this budget transaction will be checked at confirmation as part of this process.
+            //
+
+            budgetTransactionLineRecordSortedList.ins(budgetTransactionLine);
+
+            budgetReservationHeader.CarriedForwardBudgetTransactionHeader = budgetTransactionHeaderId;
+        }
+        else
+        {
+            throw error("@SYS131643");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBudgetTransactionLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the <c>BudgetTransactionLine</c> table records.
+    /// </summary>
+    /// <param name="_budgetDetails">
+    /// The <c>BudgetDetails</c> object contains the information for the new <c>BudgetTransactionLine</c> table records.
+    /// </param>
+    /// <param name="_budgetTransactionCode">
+    /// A budget transaction code record ID.
+    /// </param>
+    /// <param name="_transactionType">
+    /// A budget transaction type.
+    /// </param>
+    /// <param name="_transDate">
+    /// A date to set on transaction lines.
+    /// </param>
+    private void createBudgetTransactionLines(
+        BudgetSourceInquiryDetails _budgetDetails,
+        RefRecId                   _budgetTransactionCode,
+        BudgetTransactionType      _transactionType,
+        TransDate                  _transDate)
+    {
+        LedgerDimensionBase     ledgerAccount;
+        boolean                 doCarryForwardBudgetLocal;
+        LedgerDimensionBase     fundLedgerAccount;
+        LedgerFundYearEndOption ledgerFundYearEndOption;
+
+        if (budgetReservationYearEndCloseContract.parmYearEndOption() == PurchYearEndOption::ProcessAndCarryForwardBudget)
+        {
+            ledgerFundYearEndOption = LedgerFundYearEndOption::ProcessAndCarryForwardBudget;
+        }
+        else
+        {
+            ledgerFundYearEndOption = LedgerFundYearEndOption::ProcessAndDoNotCarryForwardBudget;
+        }
+
+        _budgetDetails.resetCurrent();
+
+        while (_budgetDetails.next())
+        {
+            // Verify budget control status of the accounts.
+            ledgerAccount = currentBudgetSourceInquiryDetails.currentSourceLedgerDimension();
+
+            fundLedgerAccount = ledgerAccount;
+
+            doCarryForwardBudgetLocal = this.doCarryForwardBudget(fundLedgerAccount, ledgerFundYearEndOption) && (_budgetDetails.currentAmountAvailable() > 0);
+
+            if (doCarryForwardBudgetLocal
+                && !BudgetControlLedgerDimensionHelper::isLedgerDimensionEnabledForBudgetControl(Ledger::current(), ledgerAccount))
+            {
+                foundAccountWithDisabledBudgetControl = true;
+            }
+
+            if (doCarryForwardBudgetLocal)
+            {
+                // Create the transaction line.
+                this.createBudgetTransactionLine(_transDate, ledgerAccount, _transactionType, _budgetDetails.currentAmountAvailable(), _budgetTransactionCode);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createClosingEntries</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates budget closing entries for the top parent source document line.
+    /// </summary>
+    /// <param name="_topParentSourceDocumentLine">
+    /// A <c>SourceDocumentLine</c> table record.
+    /// </param>
+    private void createClosingEntries(SourceDocumentLine _topParentSourceDocumentLine)
+    {
+        currentBudgetSourceInquiryDetails = BudgetSourceSourceDocumentLine::getBudgetSourceInquiryDetails(_topParentSourceDocumentLine);
+
+        //
+        // Cache the budget reservation details so they can be retrieved during the opening process.
+        // The caching needs to be done before the relief of budget encumbrances.
+        //
+        if (isBudgetCarryForward && !isPreview)
+        {
+            budgetReservationEncumbranceDetails.insert(_topParentSourceDocumentLine.RecId, currentBudgetSourceInquiryDetails);
+        }
+
+        this.relieveBudgetEncumbrances(_topParentSourceDocumentLine);
+
+        // Creates budget transactions to offset the carry-forward budget amount in the closing year.
+        this.postClosingBudgetTransactions();
+
+        this.initializeLineItemForYearEnd(
+            SourceDocumentLineItem::newFromSourceDocumentLine(_topParentSourceDocumentLine),
+            dateNull(),
+            budgetReservationYearEndCloseContract.parmClosingPostingDate());
+
+        // Create reversing committed cost entries in project commitments to reflect closing entries.
+        ProjectCommitmentFacade::deleteProjectCommitments(_topParentSourceDocumentLine.RecId, true, budgetReservationYearEndCloseContract.parmOpeningPostingDate());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createOpeningEntries</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates carry-forward opening budget transactions.
+    /// </summary>
+    /// <param name="_topParentSourceDocumentLine">
+    /// A <c>SourceDocumentLine</c> table record.
+    /// </param>
+    private void createOpeningEntries(SourceDocumentLine _topParentSourceDocumentLine)
+    {
+        // If the budget is carry-forward, create budget transactions.
+        this.postCarryForwardBudgetTransactions(_topParentSourceDocumentLine.RecId);
+
+        // Encumber budget in the new year.
+        this.createBudgetEncumbrances(_topParentSourceDocumentLine);
+
+        this.initializeLineItemForYearEnd(
+            SourceDocumentLineItem::newFromSourceDocumentLine(_topParentSourceDocumentLine),
+            budgetReservationYearEndCloseContract.parmOpeningPostingDate());
+
+        // Create positive committed cost entries in project commitments to reflect opening entries.
+        ProjectCommitmentFacade::updateProjectCommitments(SourceDocumentLineItem::newFromSourceDocumentLine(_topParentSourceDocumentLine));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doCarryForwardBudget</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Filters the <c>SourceDocumentDistribution</c> records by the passed in <c>LedgerFundYearEndOption</c> value.
+    /// </summary>
+    /// <param name="_fundLedgerAccount">
+    /// A <c>LedgerDimensionBase</c> value.
+    /// </param>
+    /// <param name="_yearEndOption">
+    /// Represents the current <c>LedgerFundYearEndOption</c> carry-forward option of the year-end process.
+    /// </param>
+    /// <returns>
+    /// true if <c>SourceDocumentDistribution</c> amount needs to be carried forward; otherwise false.
+    /// </returns>
+
+    private boolean doCarryForwardBudget(LedgerDimensionBase _fundLedgerAccount, LedgerFundYearEndOption _yearEndOption)
+    {
+        LedgerFund  ledgerFund;
+        List        filteredDistList    = new List(Types::Record);
+        boolean     isCarryForward      = false;
+
+        if (!ledgerFundMapOnClient.exists(_fundLedgerAccount))
+        {
+            ledgerFundMapOnClient = BudgetReservationYearEndCloseService_PSN::lookupLedgerFundForAccountDim(_fundLedgerAccount, ledgerFundMapOnClient);
+        }
+
+        ledgerFund = ledgerFundMapOnClient.lookup(_fundLedgerAccount);
+
+        if (ledgerFund.OverrideYearEndOption == NoYes::No && _yearEndOption == LedgerFundYearEndOption::ProcessAndCarryForwardBudget)
+        {
+            isCarryForward = true;
+        }
+
+        if ((ledgerFund.OverrideYearEndOption == NoYes::Yes) && (ledgerFund.YearEndOption == LedgerFundYearEndOption::ProcessAndCarryForwardBudget))
+        {
+            isCarryForward = true;
+        }
+
+        if (!ledgerFund && _yearEndOption == LedgerFundYearEndOption::ProcessAndCarryForwardBudget)
+        {
+            isCarryForward = true;
+        }
+
+        return isCarryForward;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findBudgetModelByLedgerDimensionAndDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the <c>BudgetModel</c> table record for a specified ledger dimension and transaction date.
+    /// </summary>
+    /// <param name="_ledgerDimension">
+    /// The ledger dimension.
+    /// </param>
+    /// <param name="_date">
+    /// The transaction date.
+    /// </param>
+    /// <returns>
+    /// A <c>BudgetModel</c> record buffer.
+    /// </returns>
+    private BudgetModel findBudgetModelByLedgerDimensionAndDate(LedgerDimensionBase _ledgerDimension, date _date)
+    {
+        return BudgetControlLedgerDimensionHelper::findBudgetModelByLedgerDimensionAndDate(
+            Ledger::current(),
+            _ledgerDimension, _date);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findBudgetTransactionHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the <c>BudgetTransactionHeader</c> table record for a specified budget model.
+    /// </summary>
+    /// <param name="_modelId">
+    /// The budget model ID.
+    /// </param>
+    /// <returns>
+    /// A <c>BudgetTransactionHeader</c> record ID.
+    /// </returns>
+
+    private RecId findBudgetTransactionHeader(BudgetModelId _modelId)
+    {
+        RecId           transId;
+
+        if (budgetModels.exists(_modelId))
+        {
+            transId = budgetModels.lookup(_modelId);
+        }
+
+        return transId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProcessVariables</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes global variables used in budget reservation year-end processing.
+    /// </summary>
+
+    private void initProcessVariables()
+    {
+        budgetReservationEncumbranceDetails = new Map(Types::Int64, Types::Class);
+        ledgerFundMapOnClient               = new Map(Types::Int64, Types::Record);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeLineItemForYearEnd</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates and then caches the <c>BudgetReservationSourceDocumentLineItem</c> object into the transactional scope global cache to be consumed by the
+    /// <c>ProjectCommitmentFacade</c> class when a call to SourceDocumentLineItem::newFromSourceDocumentLine() is made by the
+    /// <c>ProjectCommitmentFacade</c> class. The newFromSourceDocumentLine method uses the transactional scope cache.
+    /// </summary>
+    /// <param name="_budgetReservationSourceDocumentLineItem">
+    /// If it is a <c>BudgetReservationSourceDocumentLineItem</c> object, the object is updated with the _openingDate and _closingDate parameters.
+    /// It is then stored in the cache.
+    /// </param>
+    /// <param name="_openingDate">
+    /// The opening period date for the year-end process.
+    /// </param>
+    /// <param name="_closingDate">
+    /// The closing period date for the year-end process.
+    /// </param>
+    private void initializeLineItemForYearEnd(
+        SourceDocumentLineItem _budgetReservationSourceDocumentLineItem,
+        AccountingDate _openingDate = dateNull(),
+        AccountingDate _closingDate = dateNull())
+    {
+        BudgetReservationSourceDocumentLineItem_PSN budgetReservationSourceDocumentLineItem;
+
+        if (_budgetReservationSourceDocumentLineItem
+            && _budgetReservationSourceDocumentLineItem is BudgetReservationSourceDocumentLineItem_PSN)
+        {
+            budgetReservationSourceDocumentLineItem = _budgetReservationSourceDocumentLineItem;
+            budgetReservationSourceDocumentLineItem.parmClosingDate(_closingDate);
+            budgetReservationSourceDocumentLineItem.parmOpeningDate(_openingDate);
+
+            SourceDocumentLineItem::addToCache(budgetReservationSourceDocumentLineItem);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postBudgetTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts budget transactions for the carry-forward budget to the general ledger.
+    /// </summary>
+// <PubSect>
+    private void postBudgetTransactions()
+    {
+        if (isBudgetPost && !isPreview)
+        {
+            budgetTransactionMultiPost.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postCarryForwardBudgetTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and posts budget transactions for a top parent source document line and related child
+    /// source document lines when carrying the budget forward to the next year.
+    /// </summary>
+    /// <param name="_topParentSourceDocumentLineRecId">
+    /// The record ID of the current top parent source document line for which to post the carry
+    /// forward budget transactions.
+    /// </param>
+
+    private void postCarryForwardBudgetTransactions(RecId _topParentSourceDocumentLineRecId)
+    {
+        // Retrieve the budget reservation details from cache.
+        if (isBudgetCarryForward
+            && !isPreview
+            && budgetReservationEncumbranceDetails.exists(_topParentSourceDocumentLineRecId))
+        {
+            currentBudgetSourceInquiryDetails = budgetReservationEncumbranceDetails.lookup(_topParentSourceDocumentLineRecId);
+
+            if (currentBudgetSourceInquiryDetails)
+            {
+                budgetModels                          = new Map(Types::String, Types::Int64);
+                budgetTransactionMultiPost            = BudgetTransactionMultiPost::construct();
+                budgetTransactionLineRecordSortedList = new RecordSortedList(tableNum(BudgetTransactionLine));
+
+                // Need to specify sort order to avoid false duplicate detection on insert.
+                budgetTransactionLineRecordSortedList.sortOrder(fieldnum(BudgetTransactionLine, LedgerDimension));
+
+                ttsbegin;
+
+                this.createBudgetTransactionLines(
+                    currentBudgetSourceInquiryDetails,
+                    budgetReservationYearEndCloseContract.parmCarryForwardBudgetTransactionCode(),
+                    BudgetTransactionType::CarryForwardBudget,
+                    budgetReservationYearEndCloseContract.parmOpeningPostingDate());
+                int test = budgetTransactionLineRecordSortedList.usageCount();
+                budgetTransactionLineRecordSortedList.insertDatabase();
+
+                this.postBudgetTransactions();
+
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postClosingBudgetTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and posts negative budget transactions for a top parent source document line and related child source document lines
+    /// to reduce the budget in the closing year.
+    /// </summary>
+
+    private void postClosingBudgetTransactions()
+    {
+        RecordInsertList                budgetTransactionLineClosingRecordInsertList;
+        BudgetTransactionLine           budgetTransactionLine;
+        BudgetTransactionLineClosing    budgetTransactionLineClosing;
+        boolean                         linesRemaining;
+
+        // Check that the conditions for creating budget transaction lines are met.
+        if (isBudgetCarryForward
+            && !isPreview
+            && currentBudgetSourceInquiryDetails)
+        {
+            budgetModels                          = new Map(Types::String, Types::Int64);
+            budgetTransactionMultiPost            = BudgetTransactionMultiPost::construct();
+            budgetTransactionLineRecordSortedList = new RecordSortedList(tableNum(BudgetTransactionLine));
+            budgetTransactionLineClosingRecordInsertList = new RecordInsertList(tableNum(BudgetTransactionLineClosing));
+
+            // Need to specify sort order to avoid false duplicate detection on insert.
+            budgetTransactionLineRecordSortedList.sortOrder(fieldnum(BudgetTransactionLine, LedgerDimension));
+
+            ttsbegin;
+
+            this.createBudgetTransactionLines(
+                currentBudgetSourceInquiryDetails,
+                budgetReservationYearEndCloseContract.parmOriginalBudgetTransactionCode(),
+                BudgetTransactionType::OriginalBudget,
+                budgetReservationYearEndCloseContract.parmClosingPostingDate());
+
+            budgetTransactionLineRecordSortedList.insertDatabase();
+
+            // Track entries that are created for a closing period.
+            if (budgetReservationYearEndCloseContract.parmDoRecordBudgetEncumbranceAsClosing())
+            {
+                linesRemaining = budgetTransactionLineRecordSortedList.first(budgetTransactionLine);
+
+                while (linesRemaining)
+                {
+                    budgetTransactionLineClosing.BudgetTransactionLine = budgetTransactionLine.RecId;
+                    budgetTransactionLineClosingRecordInsertList.add(budgetTransactionLineClosing);
+
+                    linesRemaining = budgetTransactionLineRecordSortedList.next(budgetTransactionLine);
+                }
+
+                budgetTransactionLineClosingRecordInsertList.insertDatabase();
+            }
+
+            this.postBudgetTransactions();
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processBudgetReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs year end processing for a budget reservation.
+    /// </summary>
+    /// <param name="_budgetReservationRecId">
+    /// The record ID of the budget reservation to process.
+    /// </param>
+    private void processBudgetReservation(BudgetReservationRecId_PSN _budgetReservationRecId)
+    {
+        this.setProcessingFlags();
+
+        ttsBegin;
+
+        budgetReservationHeader = BudgetReservationHeader_PSN::find(_budgetReservationRecId, true);
+
+        SourceDocumentProcessorFacade sourceDocumentProcessorFacade = SourceDocumentProcessorFacade::construct();
+
+        if (BudgetReservation_PSN::isBudgetControlEnabledForBudgetRes())
+        {
+            sourceDocumentProcessorFacade.processingPeriodEndImplEventHandler   += eventhandler(this.processingPeriodEndEventHandler);
+            sourceDocumentProcessorFacade.processingPeriodOpenImplEventHandler  += eventhandler(this.processingPeriodOpenEventHandler);
+        }
+
+        sourceDocumentProcessorFacade.submitYearEndSourceDocImplementation(budgetReservationHeader,
+            budgetReservationYearEndCloseContract.parmClosingPostingDate(),
+            budgetReservationYearEndCloseContract.parmOpeningPostingDate(),
+            budgetReservationYearEndCloseContract.parmClosingFiscalCalendarPeriod(),
+            isPreview);
+
+        if (!isPreview)
+        {
+            budgetReservationHeader.AccountingDate = budgetReservationYearEndCloseContract.parmOpeningPostingDate();
+
+            if (budgetReservationHeader.validateWrite())
+            {
+                budgetReservationHeader.doUpdate();
+            }
+        }
+
+        ttsCommit;
+
+        info(strFmt("@Budgeting_BudgetReservationPS:BudgetReservationYearEndCloseProcessedSuccessfullyInfolog", budgetReservationHeader.DocumentNumber));
+
+        this.reportWarnings();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCurrentLineForBudget</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes the budget functionality for the current top parent source document line for closing and
+    /// opening accounting events.
+    /// </summary>
+    /// <param name="_closing">
+    /// A boolean value that indicates whether the event is closing or opening.
+    /// </param>
+    /// <param name="_topParentSourceDocumentLine">
+    /// A <c>SourceDocumentLine</c> table record against which the closing and opening budget transactions will be created in the current and next year respectively.
+    /// </param>
+
+    protected void processCurrentLineForBudget(boolean _closing, SourceDocumentLine _topParentSourceDocumentLine)
+    {
+        if (_closing)
+        {
+            this.createClosingEntries(_topParentSourceDocumentLine);
+        }
+        else
+        {
+            this.createOpeningEntries(_topParentSourceDocumentLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processingPeriodEndEventHandler</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the budget reservation document for the period end event.
+    /// </summary>
+
+    public void processingPeriodEndEventHandler()
+    {
+        SourceDocumentLine currentSourceDocumentLine;
+
+        while select currentSourceDocumentLine
+            where currentSourceDocumentLine.SourceDocumentHeader == budgetReservationHeader.SourceDocumentHeader
+        {
+            topSourceDocumentLineList.addEnd(currentSourceDocumentLine);
+            this.processCurrentLineForBudget(true, currentSourceDocumentLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processingPeriodOpenEventHandler</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the budget reservation document for the period open event.
+    /// </summary>
+
+    public void processingPeriodOpenEventHandler()
+    {
+        topSourceDocumentLineListEnumerator = topSourceDocumentLineList.getEnumerator();
+
+        while (topSourceDocumentLineListEnumerator.moveNext())
+        {
+            this.processCurrentLineForBudget(false, topSourceDocumentLineListEnumerator.current());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>relieveBudgetEncumbrances</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Relieves budget encumbrances for a source document line in the previous year.
+    /// </summary>
+    /// <param name="_sourceDocumentLine">
+    /// The <c>SourceDocumentLine</c> of budget reservation line being processed.
+    /// </param>
+    private void relieveBudgetEncumbrances(SourceDocumentLine _sourceDocumentLine)
+    {
+        if (!isPreview)
+        {
+            BudgetControlSourceDocumentProcessor::submitSourceDocLineToReturnRemaining(
+                _sourceDocumentLine,
+                budgetReservationYearEndCloseContract.parmClosingPostingDate(),
+                null,
+                curuserid(),
+                budgetReservationYearEndCloseContract.parmDoRecordBudgetEncumbranceAsClosing());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reportErrors</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Shows the error message in the infolog.
+    /// </summary>
+    /// <param name="_budgetReservationDocumentNumber">
+    /// The document number of the budget reservation that has errors.
+    /// </param>
+
+    private void reportErrors(BudgetReservationDocumentNumber_PSN _budgetReservationDocumentNumber)
+    {
+        checkFailed(strFmt("@Budgeting_BudgetReservationPS:BudgetReservationYearEndCloseProcessingCancelledInfolog", _budgetReservationDocumentNumber));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reportWarnings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Shows a warning message in the infolog.
+    /// </summary>
+
+    private void reportWarnings()
+    {
+        // Show warning about disabled budget control for an account with carry-forward budget.
+        if (foundAccountWithDisabledBudgetControl)
+        {
+            warning(strFmt("@Budgeting_BudgetReservationPS:BudegetReservationIncludesCarryForwardAccountError", budgetReservationHeader.DocumentNumber));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>scheduleRunTimeTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Schedules run time tasks for batch processing.
+    /// </summary>
+    /// <param name="_subTaskController">
+    /// The <c>BudgetResYearEndCloseController_PSN</c> object to schedule.
+    /// </param>
+    private void scheduleRunTimeTasks(BudgetReservationYearEndCloseController_PSN _subTaskController)
+    {
+        if (this.isExecutingInBatch())
+        {
+            if (!batchHeader)
+            {
+                batchHeader = BatchHeader::getCurrentBatchHeader();
+            }
+        }
+        else
+        {
+            batchHeader = BatchHeader::construct();
+        }
+
+        // Create a run time task within the current batch job.
+        batchHeader.addRuntimeTask(_subTaskController, this.getCurrentBatchTask().RecId);
+        batchHeader.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setProcessingFlags</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the processing values for the specified processing option.
+    /// </summary>
+
+    private void setProcessingFlags()
+    {
+        isBudgetCarryForward    = true;
+        isBudgetPost            = isBudgetCarryForward;
+
+        foundAccountWithDisabledBudgetControl = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lookupLedgerFundForAccountDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Looks up the <c>LedgerFund</c> record based on the passed in ledger dimension.
+    /// </summary>
+    /// <param name="_ledgerDimension">
+    /// A <c>LedgerDimension</c> value.
+    /// </param>
+    /// <param name="_ledgerFundMap">
+    /// A <c>Map</c> containing the passed in <c>LedgerDimension</c> and the related <c>LedgerFund</c> record.
+    /// </param>
+    /// <returns>
+    /// A <c>Map</c> containing the passed in <c>LedgerDimension</c> and the related <c>LedgerFund</c> record.
+    /// </returns>
+    /// <remarks>
+    /// This method is used for caching and is marked static to ensure it is executed on the same tier it is called from.
+    /// </remarks>
+
+    private static Map lookupLedgerFundForAccountDim(
+        RecId   _ledgerDimension,
+        Map     _ledgerFundMap)
+    {
+        DimensionAttributeLevelValueView    dimensionAttributeLevelValueView;
+        DimensionAttribute                  dimensionAttribute;
+        LedgerFund                          ledgerFund;
+
+        if (_ledgerFundMap.exists(_ledgerDimension))
+        {
+            return _ledgerFundMap;
+        }
+
+        select firstonly DisplayValue from dimensionAttributeLevelValueView
+            join ledgerFund
+            exists join dimensionAttribute
+                where dimensionAttributeLevelValueView.ValueCombinationRecId == _ledgerDimension
+                    && dimensionAttribute.RecId == dimensionAttributeLevelValueView.DimensionAttribute
+                    && dimensionAttribute.BackingEntityType == tableNum(DimAttributeLedgerFund_PSN)
+                    && ledgerFund.FundNumber == dimensionAttributeLevelValueView.DisplayValue;
+
+        _ledgerFundMap.insert(_ledgerDimension, ledgerFund);
+
+        return _ledgerFundMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Manages the execution of the budget reservation year-end process.
+    /// </summary>
+    /// <param name="_contract">
+    /// An object instance of the <c>BudgetResYearEndCloseContract_PSN</c> class.
+    /// </param>
+    /// <exception cref="Exception::Deadlock">
+    /// Thrown when the execution process gets stuck.
+    /// </exception>
+    /// <exception cref="Exception::DuplicateKeyException">
+    /// Thrown when a duplicate of the primary or alternate key is inserted and thus violating unique index.
+    /// </exception>
+    /// <exception cref="Exception">
+    /// Handles any kind of exception.
+    /// </exception>
+    public void startProcess(BudgetReservationYearEndCloseContract_PSN _contract)
+    {
+        BudgetReservationYearEndCloseController_PSN subTaskController;
+        BudgetReservationYearEndCloseContract_PSN   subTaskContract;
+
+        ListEnumerator  subBudgetReservationListEnumerator;
+        List            subBudgetReservationList = new List(Types::Int64);
+        int             tryCount = 0;
+        int             subListCount = 0;
+
+        try
+        {
+            budgetReservationList = List::create(_contract.parmBudgetReservationContainer());
+
+            subTaskController = new BudgetReservationYearEndCloseController_PSN(classStr(BudgetReservationYearEndCloseService_PSN), methodStr(BudgetReservationYearEndCloseService_PSN, startSubTaskTestProcess));
+            subTaskContract = subTaskController.getDataContractObject();
+            subTaskContract.parmClosingPostingDate(_contract.parmClosingPostingDate());
+            subTaskContract.parmOpeningPostingDate(_contract.parmOpeningPostingDate());
+            subTaskContract.parmClosingFiscalCalendarPeriod(_contract.parmClosingFiscalCalendarPeriod());
+            subTaskContract.parmCarryForwardBudgetTransactionCode(_contract.parmCarryForwardBudgetTransactionCode());
+            subTaskContract.parmOriginalBudgetTransactionCode(_contract.parmOriginalBudgetTransactionCode());
+            subTaskContract.parmYearEndOption(_contract.parmYearEndOption());
+            subTaskContract.parmDoRecordBudgetEncumbranceAsClosing(FiscalCalendarPeriod::find(_contract.parmClosingFiscalCalendarPeriod()).Type == FiscalPeriodType::Closing);
+
+            if (!_contract.parmIsSubProcess() && budgetReservationList.elements() > ParallelExecutionThreshold)
+            {
+                subBudgetReservationListEnumerator = budgetReservationList.getEnumerator();
+
+                subTaskController.parmExecutionMode(SysOperationExecutionMode::ScheduledBatch);
+                subTaskContract.parmIsSubProcess(true);
+
+                while (subBudgetReservationListEnumerator.moveNext())
+                {
+                    subBudgetReservationList.addEnd(subBudgetReservationListEnumerator.current());
+                    subListCount++;
+
+                    if (subListCount >= ParallelExecutionBatchSize)
+                    {
+                        subTaskContract.parmBudgetReservationContainer(subBudgetReservationList.pack());
+
+                        this.scheduleRunTimeTasks(subTaskController);
+
+                        subBudgetReservationList = new List(Types::int64);
+                        subListCount = 0;
+                    }
+                }
+
+                if (subListCount > 0)
+                {
+                    subTaskContract.parmBudgetReservationContainer(subBudgetReservationList.pack());
+
+                    this.scheduleRunTimeTasks(subTaskController);
+
+                    subBudgetReservationList = new List(Types::int64);
+                    subListCount = 0;
+                }
+
+                info("@Budgeting_BudgetReservationPS:BudgetReservationYearEndBatchProcessMessage");
+            }
+            else
+            {
+                subTaskContract.parmBudgetReservationContainer(_contract.parmBudgetReservationContainer());
+
+                subTaskController.parmExecutionMode(SysOperationExecutionMode::Synchronous);
+                subTaskController.run();
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (tryCount < 3)
+            {
+                sleep(500);
+
+                retry;
+            }
+        }
+        catch
+        {
+            this.reportErrors(budgetReservationHeader.DocumentNumber);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startSubTaskTestProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Perform the execution of the year-end process.
+    /// </summary>
+    /// <param name="_contract">
+    /// An object of <c>BudgetResYearEndCloseContract_PSN</c> class.
+    /// </param>
+    public void startSubTaskTestProcess(BudgetReservationYearEndCloseContract_PSN _contract)
+    {
+        ListEnumerator  budgetReservationListEnumerator;
+
+        budgetReservationList           = List::create(_contract.parmBudgetReservationContainer());
+        budgetReservationListEnumerator = budgetReservationList.getEnumerator();
+
+        if (!budgetReservationYearEndCloseContract)
+        {
+            budgetReservationYearEndCloseContract = _contract;
+            budgetReservationYearEndCloseContract.parmClosingPostingDate(_contract.parmClosingPostingDate());
+            budgetReservationYearEndCloseContract.parmOpeningPostingDate(_contract.parmOpeningPostingDate());
+            budgetReservationYearEndCloseContract.parmClosingFiscalCalendarPeriod(_contract.parmClosingFiscalCalendarPeriod());
+            budgetReservationYearEndCloseContract.parmCarryForwardBudgetTransactionCode(_contract.parmCarryForwardBudgetTransactionCode());
+            budgetReservationYearEndCloseContract.parmOriginalBudgetTransactionCode(_contract.parmOriginalBudgetTransactionCode());
+            budgetReservationYearEndCloseContract.parmYearEndOption(_contract.parmYearEndOption());
+            budgetReservationYearEndCloseContract.parmDoRecordBudgetEncumbranceAsClosing(_contract.parmDoRecordBudgetEncumbranceAsClosing());
+        }
+
+        this.initProcessVariables();
+
+        while (budgetReservationListEnumerator.moveNext())
+        {
+            try
+            {
+                // Clear the list below between budget reservations so we only track the current.
+                topSourceDocumentLineList = new List(Types::Record);
+
+                currentBudgetReservationRecId = budgetReservationListEnumerator.current();
+
+                this.processBudgetReservation(currentBudgetReservationRecId);
+            }
+            catch
+            {
+                this.reportErrors(budgetReservationHeader.DocumentNumber);
+            }
+        }
+
+        info("@Budgeting_BudgetReservationPS:BudgetReservationYECloseProcessCompleteMessage");
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

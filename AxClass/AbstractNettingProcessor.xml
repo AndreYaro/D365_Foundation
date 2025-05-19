@@ -1,0 +1,417 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>AbstractNettingProcessor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+internal abstract class AbstractNettingProcessor implements INettingProcessor
+{
+    private INettingAmountCalculator nettingAmountCalculator;
+    private INettingJournalGenerator nettingJournalGenerator;
+    private CustVendNettingLogger logger;
+
+    internal protected RecId executionRecId;
+    internal protected TransDate transDate;
+    internal protected LedgerJournalTrans creditLine;
+    internal protected LedgerJournalTrans debitLine;
+
+    internal protected RecId custTransRecId;
+    internal protected RecId vendTransRecId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    internal void new(RecId _executionRecId, TransDate _transDate, INettingAmountCalculator _nettingAmountCalculator, INettingJournalGenerator _nettingJournalGenerator)
+    {
+        executionRecId = _executionRecId;
+        transDate = _transDate;
+        nettingAmountCalculator = _nettingAmountCalculator == null ? this.getDefaultCalculator() : _nettingAmountCalculator;
+        nettingJournalGenerator = _nettingJournalGenerator == null ? this.getDefaultJournalGenerator() : _nettingJournalGenerator;
+        logger = CustVendNettingLogger::getLogger();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    internal static INettingProcessor construct(
+        NettingProcessorType _processorType,
+        RecId _executionRecId,
+        TransDate _transDate,
+        INettingAmountCalculator _nettingAmountCalculator = null,
+        INettingJournalGenerator _nettingJournalGenerator = null)
+    {
+        INettingProcessor processor = SysExtensionAppClassFactory::getClassFromSysAttributeWithInstantiationStrategy(
+            classStr(AbstractNettingProcessor),
+            new NettingProcessorTypeAttribute(_processorType),
+            NettingProcessorInstantiationStrategy::construct(_executionRecId, _transDate, _nettingAmountCalculator, _nettingJournalGenerator));
+
+        return processor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public void process()
+    {
+        #OCCRetryCount
+
+        using (SysInstrumentationActivityContext runActivityContext = logger.activityContextWithCustomProperties(this.activityName()))
+        {
+            if (this.validate())
+            {
+                System.Exception exception;
+                boolean hasError;
+
+                try
+                {
+                    this.lockExecution();
+
+                    hasError = false;
+
+                    ttsbegin;
+
+                    CustVendNettingExecution execution = CustVendNettingExecution::find(executionRecId);
+
+                    this.preprocess(execution);
+
+                    NettingAmountDistribution amountDistribution = this.constructNettingAmountDistribution(execution);
+
+                    logger.logInformation('Start calculating netting amount distribution');
+
+                    nettingAmountCalculator.calculate(amountDistribution);
+
+                    runActivityContext.addCustomProperty(
+                        CustVendNettingInstrumentationConstants::CreditInvoiceCountMagnitude,
+                        ApplicationCommonInstrumentationMagnitude::log10magnitude(amountDistribution.getCreditDistribution().elements()));
+
+                    runActivityContext.addCustomProperty(
+                        CustVendNettingInstrumentationConstants::DebitInvoiceCountMagnitude,
+                        ApplicationCommonInstrumentationMagnitude::log10magnitude(amountDistribution.getDebitDistribution().elements()));
+
+                    logger.logInformation('Start generating netting journal');
+
+                    LedgerJournalTable journal = nettingJournalGenerator.generate(amountDistribution);
+
+                    logger.logInformation('Start posting netting journal');
+
+                    this.postJournal(journal);
+
+                    this.closeSettlement();
+
+                    this.updateExecution(execution, journal);
+
+                    this.validateResult(execution);
+
+                    this.unlockExecution(this.getFinalStatus(), runActivityContext);
+
+                    ttscommit;
+                }
+                catch (Exception::Deadlock)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        hasError = true;
+                        logger.logError(strFmt('Deadlock maximum retry count hit for %1', classId2Name(classIdGet(this))));
+                        throw;
+                    }
+                    else
+                    {
+                        logger.logInformation(strFmt('Deadlock occurred. Retry count: %1', xSession::currentRetryCount()));
+                        retry;
+                    }
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            hasError = true;
+                            logger.logError(strFmt('Update conflict maximum retry count hit for %1', classId2Name(classIdGet(this))));
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            logger.logInformation(strFmt('Update conflict occurred. Retry count: %1', xSession::currentRetryCount()));
+                            retry;
+                        }
+                    }
+                    else
+                    {
+                        hasError = true;
+                    }
+                }
+                catch (exception)
+                {
+                    logger.logException(exception, strFmt('Exception occurred for %1', classId2Name(classIdGet(this))));
+                    hasError = true;
+                    throw;
+                }
+                finally
+                {
+                    if (hasError)
+                    {
+                        this.unlockExecution(this.getErrorStatus(), runActivityContext);
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCustVendTransFullySettled</Name>
+				<Source><![CDATA[
+    internal protected void validateCustVendTransFullySettled(CustVendTrans _custVendTrans)
+    {
+        if (_custVendTrans.AmountCur != _custVendTrans.SettleAmountCur || _custVendTrans.Closed == dateNull())
+        {
+            throw error("@CashManagement:CustVendNettingNotFullySettled");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getErrorStatus</Name>
+				<Source><![CDATA[
+    internal protected CustVendNettingProcessStatus getErrorStatus()
+    {
+        return CustVendNettingProcessStatus::Error;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeCustSettlement</Name>
+				<Source><![CDATA[
+    internal protected void closeCustSettlement(RecId _custTransRecId)
+    {
+        CustSettlement custSettlement;
+        custSettlement.skipDataMethods(true);
+        custSettlement.skipEvents(true);
+        update_recordset custSettlement
+            setting CanBeReversed = NoYes::No
+            where custSettlement.TransRecId == _custTransRecId
+                || custSettlement.OffsetRecId == _custTransRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeVendSettlement</Name>
+				<Source><![CDATA[
+    internal protected void closeVendSettlement(RecId _vendTransRecId)
+    {
+        VendSettlement vendSettlement;
+        vendSettlement.skipDataMethods(true);
+        vendSettlement.skipEvents(true);
+        update_recordset vendSettlement
+            setting CanBeReversed = NoYes::No
+            where vendSettlement.TransRecId == _vendTransRecId
+                || vendSettlement.OffsetRecId == _vendTransRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCustVendTrans</Name>
+				<Source><![CDATA[
+    internal protected void setCustVendTrans()
+    {
+        if (creditLine.CustTransId)
+        {
+            custTransRecId = creditLine.CustTransId;
+        }
+        else if (creditLine.Company != curExt())
+        {
+            custTransRecId = this.findIntercompanyRelatedLedgerJournalTrans(creditLine).CustTransId;
+        }
+
+        if (debitLine.VendTransId)
+        {
+            vendTransRecId = debitLine.VendTransId;
+        }
+        else if (debitLine.Company != curExt())
+        {
+            vendTransRecId = this.findIntercompanyRelatedLedgerJournalTrans(debitLine).VendTransId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lockExecution</Name>
+				<Source><![CDATA[
+    private void lockExecution()
+    {
+        ttsbegin;
+        CustVendNettingExecution::updateProcessingStatus(executionRecId, CustVendNettingProcessStatus::Executing);
+        ttscommit;
+        logger.logInformation(strFmt('Lock CustVendNettingExecution %1 for processing', executionRecId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postJournal</Name>
+				<Source><![CDATA[
+    private void postJournal(LedgerJournalTable _journal)
+    {
+        LedgerJournalCheckPost ledgerJournalCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(_journal, NoYes::Yes, false);
+        LedgerJournalCheckPost::processOperation(ledgerJournalCheckPost);
+
+        select firstonly creditLine
+            where creditLine.JournalNum == _journal.JournalNum
+                && creditLine.AmountCurCredit != 0;
+
+        select firstonly debitLine
+            where debitLine.JournalNum == _journal.JournalNum
+                && debitLine.AmountCurDebit != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findIntercompanyRelatedLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    private LedgerJournalTrans findIntercompanyRelatedLedgerJournalTrans(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        RecId voucherGroupId = LedgerTransVoucherLink::findVoucherGroupId(
+            _ledgerJournalTrans.Voucher,
+            _ledgerJournalTrans.TransDate,
+            curExt());
+
+        LedgerTransVoucherLink voucherLink;
+        select firstonly crosscompany voucherLink
+            where voucherLink.VoucherGroupId == voucherGroupId
+                && voucherLink.Voucher != _ledgerJournalTrans.Voucher;
+
+        LedgerJournalTrans ledgerJournalTransIntercompany;
+        changecompany(voucherLink.company())
+        {
+            select firstonly ledgerJournalTransIntercompany
+                where ledgerJournalTransIntercompany.Voucher == voucherLink.Voucher
+                    && ledgerJournalTransIntercompany.TransDate == voucherLink.TransDate
+                    && (ledgerJournalTransIntercompany.AccountType == LedgerJournalACType::Cust || ledgerJournalTransIntercompany.AccountType == LedgerJournalACType::Vend);
+        }
+
+        return ledgerJournalTransIntercompany;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unlockExecution</Name>
+				<Source><![CDATA[
+    private void unlockExecution(CustVendNettingProcessStatus _status, SysInstrumentationActivityContext _activityContext)
+    {
+        ttsbegin;
+        CustVendNettingExecution::updateProcessingStatus(executionRecId, _status);
+        ttscommit;
+        _activityContext.addCustomProperty(CustVendNettingInstrumentationConstants::ExecutionResult, enum2Str(_status));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDefaultCalculator</Name>
+				<Source><![CDATA[
+    internal protected abstract INettingAmountCalculator getDefaultCalculator()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDefaultJournalGenerator</Name>
+				<Source><![CDATA[
+    internal protected abstract INettingJournalGenerator getDefaultJournalGenerator()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>activityName</Name>
+				<Source><![CDATA[
+    internal protected abstract str activityName()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    internal protected abstract boolean validate()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preprocess</Name>
+				<Source><![CDATA[
+    internal protected abstract void preprocess(CustVendNettingExecution _execution)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructNettingAmountDistribution</Name>
+				<Source><![CDATA[
+    internal protected abstract NettingAmountDistribution constructNettingAmountDistribution(CustVendNettingExecution _execution)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>closeSettlement</Name>
+				<Source><![CDATA[
+    internal protected abstract void closeSettlement()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExecution</Name>
+				<Source><![CDATA[
+    internal protected abstract void updateExecution(CustVendNettingExecution _execution, LedgerJournalTable _journal)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateResult</Name>
+				<Source><![CDATA[
+    internal protected abstract void validateResult(CustVendNettingExecution _execution)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFinalStatus</Name>
+				<Source><![CDATA[
+    internal protected abstract CustVendNettingProcessStatus getFinalStatus()
+    {
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

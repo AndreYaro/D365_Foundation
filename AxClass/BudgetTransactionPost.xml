@@ -1,0 +1,1608 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BudgetTransactionPost</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>BudgetTransactionPost</c> class contains the logic that is used to post a single budget
+/// transaction.
+/// </summary>
+public class BudgetTransactionPost extends RunBaseBatch implements BatchRetryable
+{
+    BudgetTransactionId         budgetTransactionId;
+
+    BudgetTransactionHeader     budgetTransactionHeader;
+
+    BudgetProvisionalReverseHelper budgetProvisionalReverseHelper;
+
+    Counter                     numOfLinesProcessed;
+    Counter                     progressCounter;
+    boolean                     userHasTransactionInUse;
+    boolean                     posted;
+    boolean                     isPostiveAmountForTransactionTypeIncreaseToBudget;
+    boolean                     isReversal;
+    boolean                     isPostFailed;
+    boolean                     isRetry;
+    boolean                     doValidateInUse;
+
+    BudgetParameters            budgetParameters;
+
+    RecId                       ledgerFiscalCalendarRecId;
+    RecId                       primaryLedgerRecId;
+
+    private boolean isBudgetReversal;
+    private NoYes isReversePreliminary;
+    private boolean useTodayDateToReversePreliminaryBudget;
+    private BudgetCode reversalTransactionCode;
+    private ReversalTransactionCodes specifyTransactionCode;
+
+    // Map contains DAVC from revenue lines and interval start date combinations
+    // and the associated values used when posting revenue lines.
+    //    key = [DAVC, interval start date]
+    //    value = [interval end date, total accounting amount for the DAVC in the interval, all lines in the interval are valid?]
+    Map ledgerDimensionIntervalBalances;
+
+    #DEFINE.CurrentVersion(3)
+    #LOCALMACRO.CurrentList
+        budgetTransactionId,
+        isReversal,
+        doValidateInUse,
+        primaryLedgerRecId,
+        isBudgetReversal,
+        isReversePreliminary,
+        reversalTransactionCode,
+        specifyTransactionCode
+    #ENDMACRO
+
+    #DEFINE.CurrentVersionV2(2)
+    #LOCALMACRO.CurrentListV2
+        budgetTransactionId,
+        isReversal,
+        doValidateInUse,
+        primaryLedgerRecId
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkBudget</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks whether there are budget funds available for the ledger dimension amount on the specified
+    /// budget transaction line.
+    /// </summary>
+    /// <param name="_budgetTransactionLine">
+    /// The budget transaction line to check.
+    /// </param>
+    /// <remarks>
+    /// If budget funds available check is not required for the ledger dimension amount, this method will
+    /// return true.
+    /// </remarks>
+    protected void checkBudget(BudgetTransactionLine _budgetTransactionLine)
+    {
+        if (_budgetTransactionLine.BudgetType == BudgetType::Expense)
+        {
+            BudgetControlBudgetTransactionProcessor::submitBudgetTransLineToCheckBudget(_budgetTransactionLine.RecId, false);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkBudgetBalanceRevenue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks the balance of the revised budget amount for a ledger dimension in a specified interval.
+    /// </summary>
+    /// <param name="_ledgerDimensionBudget">
+    ///    The ledger dimension to check.
+    /// </param>
+    /// <param name="_intervalStartDate">
+    ///    The interval start date.
+    /// </param>
+    /// <param name="_intervalEndDate">
+    ///    The interval end date.
+    /// </param>
+    /// <param name="_totalAmountMST">
+    ///    The total amount for the ledger dimension in the interval.
+    /// </param>
+    /// <returns>
+    ///    true if the ledger dimension passes the budget check; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    This validation applies when the budget transaction line is of the <c>Revenue</c> type.If the
+    ///    <c>BudgetParameter</c> option to check the budget balance for revenue amounts is set to
+    ///    <c>None</c>, no check is performed and true is returned.If the total amount for the interval is
+    ///    negative, no check is performed and true is returned as it is increasing the balance.
+    /// </remarks>
+    protected boolean checkBudgetBalanceRevenue(
+        LedgerDimensionBudget _ledgerDimensionBudget,
+        TransDate _intervalStartDate,
+        TransDate _intervalEndDate,
+        AmountMST _totalAmountMST)
+    {
+        boolean ok = true;
+        Query budgetBalanceQuery;
+        QueryRun budgetBalanceQueryRun;
+        QueryBuildRange transTypeRange;
+        BudgetTransactionLine balanceResultLine;
+        AmountMST budgetBalance;
+
+        if (budgetParameters.CheckRevenueBudgetBalanceOption != BudgetCheckRevenueBalanceOption::None &&
+            _totalAmountMST > 0)
+        {
+            // Budget balance must be checked for the ledger dimension and interval.
+            budgetBalanceQuery = new Query(querystr(BudgetCalculateBalance));
+
+            // Set up query ranges (header) - Primary Ledger, Budget Model, Transaction Types, Transaction Status already in query.
+            budgetBalanceQuery.dataSourceTable(tablenum(BudgetTransactionHeader)).findRange(fieldnum(BudgetTransactionHeader, PrimaryLedger)).value(int642str(primaryLedgerRecId));
+
+            budgetBalanceQuery.dataSourceTable(tablenum(BudgetTransactionHeader)).findRange(fieldnum(BudgetTransactionHeader, BudgetModelId)).value(budgetTransactionHeader.BudgetModelId);
+
+            transTypeRange = budgetBalanceQuery.dataSourceTable(tablenum(BudgetTransactionHeader)).findRange(fieldnum(BudgetTransactionHeader, BudgetTransactionType));
+            transTypeRange.value(strfmt('(%1 != %2) && (%1 != %3)',
+                            fieldstr(BudgetTransactionHeader, BudgetTransactionType),
+                            int2str(enum2int(BudgetTransactionType::Encumbrance)),
+                            int2str(enum2int(BudgetTransactionType::PreEncumbrance))));
+
+            // Remove existing group bys (Transaction type).
+            budgetBalanceQuery.clearGroupBy();
+
+            // Set up query ranges (line) - Date (range), Ledger dimension.
+            budgetBalanceQuery.dataSourceTable(tablenum(BudgetTransactionLine)).findRange(fieldnum(BudgetTransactionLine, Date)).value(SysQuery::range(_intervalStartDate, _intervalEndDate));
+            budgetBalanceQuery.dataSourceTable(tablenum(BudgetTransactionLine)).findRange(fieldnum(BudgetTransactionLine, LedgerDimension)).value(SysQuery::value(_ledgerDimensionBudget));
+
+            // Get budget balance from query.
+            budgetBalanceQueryRun = new QueryRun(budgetBalanceQuery);
+
+            if (budgetBalanceQueryRun.next())
+            {
+                balanceResultLine = budgetBalanceQueryRun.get(tablenum(BudgetTransactionLine)) as BudgetTransactionLine;
+                budgetBalance = balanceResultLine.AccountingCurrencyAmount;
+            }
+
+            // Compare to line amount.
+            if ((budgetBalance + _totalAmountMST) > 0)
+            {
+                // Budget balance including new line will result in positive balance.
+                if (budgetParameters.CheckRevenueBudgetBalanceOption == BudgetCheckRevenueBalanceOption::Warn)
+                {
+                    // Option to Warn - just add warning to infolog.
+                    warning(strfmt("@SYS135081",
+                            DimensionAttributeValueCombination::find(_ledgerDimensionBudget).DisplayValue,
+                            budgetParameters.CheckRevenueBudgetBalanceInterval,
+                            budgetTransactionHeader.TransactionNumber));
+                }
+                else if (budgetParameters.CheckRevenueBudgetBalanceOption == BudgetCheckRevenueBalanceOption::PreventUpdate)
+                {
+                    // Option to Prevent update - return check failed.
+                    ok = checkFailed(strfmt("@SYS135082",
+                                        DimensionAttributeValueCombination::find(_ledgerDimensionBudget).DisplayValue,
+                                        budgetParameters.CheckRevenueBudgetBalanceInterval,
+                                        budgetTransactionHeader.TransactionNumber));
+                }
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates the budget transaction header that was selected for posting.
+    /// </summary>
+    /// <returns>
+    ///    true if the budget transaction header is valid for processing; otherwise, false.
+    /// </returns>
+    private boolean checkHeader()
+    {
+        boolean ret = true;
+
+        if (budgetTransactionHeader.RecId == 0)
+        {
+            ret = checkFailed(strfmt("@SYS127812", budgetTransactionId));
+        }
+        else
+        {
+            if ((budgetTransactionHeader.checkBudgetTransAvailableToComplete() == false))
+            {
+                ret = checkFailed("@SYS191127");
+            }
+            else
+            {
+                ret = BudgetTransactionManager::validateBudgetModel(budgetTransactionHeader);
+
+                if (BudgetTransactionCode::exist(budgetTransactionHeader.BudgetTransactionCode) == false)
+                {
+                    // Budget transaction code does not exist.
+                    ret = checkFailed(strfmt("@SYS127919", ''));
+                }
+
+                if (budgetTransactionHeader.BudgetTransactionType == BudgetTransactionType::Transfer)
+                {
+                    // Check that the for Transfer transactions, the lines balance (sum is zero).
+                    if (budgetTransactionHeader.transactionTotal() != 0)
+                    {
+                        ret = checkFailed("@SYS128475");
+                    }
+
+                    // Check that the for Transfer transactions, all the lines have the same budget type value.
+                    if (budgetTransactionHeader.checkBudgetType() == false)
+                    {
+                        ret = checkFailed("@SYS128885");
+                    }
+
+                    if (budgetTransactionHeader.WorkflowStatus != BudgetTransactionWorkflowStatus::Approved &&
+                        !BudgetTransactionAllowTransferManager::isTransferAllowed(budgetTransactionHeader.RecId))
+                    {
+                        // The transaction was not workflow approved and transfer is not allowed.
+                        ret = checkFailed("@SYS320761");
+                    }
+                }
+
+                if (budgetTransactionHeader.WorkflowStatus == BudgetTransactionWorkflowStatus::Rejected ||
+                    budgetTransactionHeader.WorkflowStatus == BudgetTransactionWorkflowStatus::Submitted ||
+                    (budgetTransactionHeader.WorkflowStatus != BudgetTransactionWorkflowStatus::Approved &&
+                    BudgetTransactionCode::isWorkflowTableSequenceNumberValid(budgetTransactionHeader.BudgetTransactionCode)))
+                {
+                    // Workflow is currently running for the transaction or
+                    // workflow has not been approved and is required.
+                    ret = checkFailed(strfmt("@SYS323418", budgetTransactionHeader.TransactionNumber));
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks whether a <c>BudgetTransactionLine</c> record can be posted.
+    /// </summary>
+    /// <param name="_budgetTransactionLine">
+    /// The table buffer to check.
+    /// </param>
+    /// <returns>
+    /// true if the line is valid for posting; otherwise, false.
+    /// </returns>
+    private boolean checkLine(BudgetTransactionLine _budgetTransactionLine)
+    {
+        boolean ok = true;
+
+        // Check currency
+        ok = BudgetTransactionManager::validateCurrency(_budgetTransactionLine.TransactionCurrency) && ok;
+
+        if (ok && _budgetTransactionLine.AccountingCurrencyAmount == 0)
+        {
+            // The Accounting Currency amount has not been calculated yet. Calculate that amount now and update the line with the value.
+            // Based on validation that has already occurred we know that the transaction currency amount is not zero and that the currency is valid.
+            this.updateAccountingCurrencyAmount(_budgetTransactionLine);
+        }
+
+        // Check Ledger Dimension
+        if (isReversal == false)
+        {
+            // Line is not for a reversal transaction - validate LedgerDimension
+            ok = BudgetTransactionManager::validateAccountStructure(_budgetTransactionLine) && ok;
+
+            if (BudgetDimensionStructureChangePostingFixFlight::instance().isFlightEnabled())
+            {
+                DimensionValidationStatus dimensionValidationStatus = BudgetTransactionManager::validateLedgerDimensionV2(_budgetTransactionLine.LedgerDimension, _budgetTransactionLine.Date);
+            
+                // Updates ledger dimension on budget tranasaction line on-the-fly in case structure has been changed
+                if (dimensionValidationStatus == DimensionValidationStatus::StructureChanged)
+                {
+                    LedgerDimensionAccount updatedLedgerDimension = this.updateLedgerDimension(_budgetTransactionLine);
+                    dimensionValidationStatus = BudgetTransactionManager::validateLedgerDimensionV2(updatedLedgerDimension, _budgetTransactionLine.Date);
+                }
+
+                ok = (dimensionValidationStatus == DimensionValidationStatus::Valid) && ok;
+            }
+            else
+            {
+                ok = BudgetTransactionManager::validateLedgerDimension(_budgetTransactionLine.LedgerDimension, _budgetTransactionLine.Date) && ok;
+            }
+        }
+
+        // Check date
+        if (BudgetTransactionManager::validateTransactionDate(_budgetTransactionLine.Date) == false)
+        {
+            ok = checkFailed(strFmt("@SYS129411", _budgetTransactionLine.Date));
+        }
+
+        if (ok)
+        {
+            if (isConfigurationkeyEnabled(configurationKeyNum(PublicSector)))
+            {
+                if ((budgetTransactionHeader.BudgetTransactionType == BudgetTransactionType::OriginalBudget) &&
+                    (_budgetTransactionLine.BudgetType == BudgetType::Expense) &&
+                    (budgetProvisionalReverseHelper && budgetProvisionalReverseHelper.parmIsReversalRequired()))
+                {
+                    budgetProvisionalReverseHelper.parmBudgetTransactionHeader(budgetTransactionHeader);
+                    budgetProvisionalReverseHelper.parmBudgetTransactionLine(_budgetTransactionLine);
+                    budgetProvisionalReverseHelper.populateToReverse(_budgetTransactionLine.LedgerDimension);
+                }
+            }
+            this.checkBudget(_budgetTransactionLine);
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Finds and validates all lines for the budget transaction header that is being posted.
+    /// </summary>
+    /// <returns>
+    ///    true if all lines for the budget transaction header being posted are valid; otherwise, false.
+    /// </returns>
+    private boolean checkLines()
+    {
+        boolean ok = true;
+
+        this.determineTransactionTypeEffectToBudget();
+
+        // Process all revenue transactions first because these lines amounts have no impact to budget check
+        if (!this.postRevenueLines())
+        {
+            ok = false;
+        }
+
+        // Process all expense transactions whose amounts contribute to increases to the overall budget.
+        if (!this.postExpenseLinesIncrease())
+        {
+            ok = false;
+        }
+
+        // Process all expense transactions whose amounts contribute to decreases to the overall budget.
+        if (!this.postExpenseLinesDecrease())
+        {
+            ok = false;
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineAmountDebitCreditType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the accounting type by using the <c>TransactionCurrencyAmount</c>
+    ///    field in the <c>BudgetTransactionLine</c> table.
+    /// </summary>
+    /// <param name="_transactionCurrencyAmount">
+    ///    The amount to use to determine the debit or credit treatment of the amount.
+    /// </param>
+    /// <returns>
+    ///    The calculated debit or credit treatment of the amount.
+    /// </returns>
+    private DebitCredit determineAmountDebitCreditType(AmountCur _transactionCurrencyAmount)
+    {
+        DebitCredit debitCredit;
+
+        if (_transactionCurrencyAmount > 0)
+        {
+            // Expense budget transactions should have debit treatment when they are positive.
+            // Revenue budget transactions have their signs adjusted on storing in the database
+            // to aid in calculating totals without having to adjust the signs of the amounts,
+            // so a positive revenue transaction should have debit treatment.
+            debitCredit = DebitCredit::Debit;
+        }
+        else
+        {
+            // A negative expense transaction should have credit treatment.
+            // A negative revenue transaction should have credit treatment.
+            debitCredit = DebitCredit::Credit;
+        }
+
+        return debitCredit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineTransactionTypeEffectToBudget</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether a positive amount for the current transaction type will cause an increase or
+    /// decrease to budget.
+    /// </summary>
+    private void determineTransactionTypeEffectToBudget()
+    {
+        switch (budgetTransactionHeader.BudgetTransactionType)
+        {
+            case BudgetTransactionType::OriginalBudget,
+                 BudgetTransactionType::FixedAsset,
+                 BudgetTransactionType::FixedAsset_RU,
+                 BudgetTransactionType::Project,
+                 BudgetTransactionType::PurchForecast,
+                 BudgetTransactionType::SalesForecast,
+                 BudgetTransactionType::Amendment,
+                 BudgetTransactionType::CarryForwardBudget,
+                 BudgetTransactionType::Transfer,
+                 BudgetTransactionType::PreliminaryBudget:
+
+                isPostiveAmountForTransactionTypeIncreaseToBudget = true;
+                break;
+
+            case BudgetTransactionType::PreEncumbrance,
+                 BudgetTransactionType::Encumbrance,
+                 BudgetTransactionType::Apportionment:
+
+                isPostiveAmountForTransactionTypeIncreaseToBudget = false;
+                break;
+
+            default:
+                // Not supported
+                Debug::assert(false);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayProgress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the progress of the post operation using the specified line number and transaction date.
+    /// </summary>
+    /// <param name="_lineNum">
+    ///    The line number of the budget transaction.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date of a budget transaction line.
+    /// </param>
+    private void displayProgress(LineNum _lineNum, TransDate _transDate)
+    {
+        progressCounter++;
+        progress.setCount(progressCounter);
+        progress.setText(strfmt("@SYS97556", _lineNum, _transDate));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endPost</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Ends the posting process for the budget transaction lines that are associated with the budget
+    ///    transaction header.
+    /// </summary>
+    protected void endPost()
+    {
+        // Unblock the budget transaction header if necessary.
+        this.endSystemBlock();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endSystemBlock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Clears the <c>InUseBy</c> status of the budget transaction header involved in the posting process.
+    /// </summary>
+    private void endSystemBlock()
+    {
+        BudgetTransactionHeader budgetTransactionHeaderUpdate;
+        #OCCRetryCount
+
+        try
+        {
+            ttsbegin;
+
+            budgetTransactionHeaderUpdate = BudgetTransactionHeader::findByTransactionNumber(budgetTransactionId, primaryLedgerRecId, true);
+
+            if ((posted == true) || (userHasTransactionInUse == false))
+            {
+                // Clear the In Use if the transaction was posted.
+                // Also clear if the transaction was not posted due to error and the user didn't have the transaction in use before posting.
+                budgetTransactionHeaderUpdate.InUseBy = '';
+
+                budgetTransactionHeaderUpdate.doUpdate();
+            }
+
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findBalanceIntervalStartAndEndDates</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Finds the start and end dates for the specified ledger dimension and date.
+    /// </summary>
+    /// <param name="_ledgerDimensionBudget">
+    ///    The ledger dimension for which to find the interval start date and end date.
+    /// </param>
+    /// <param name="_date">
+    ///    The date for which to find the interval start date and end date.
+    /// </param>
+    /// <returns>
+    ///    A container with the start date and end date.
+    /// </returns>
+    /// <remarks>
+    ///    When the account does not have a fiscal calendar specified, the company fiscal calendar will be
+    ///    used.
+    /// </remarks>
+    private container findBalanceIntervalStartAndEndDates(LedgerDimensionBudget _ledgerDimensionBudget, TransDate _date)
+    {
+        container dates;
+        FiscalCalendarYear calendarYear;
+        FiscalCalendarPeriod period;
+        BudgetTransactionLine lastLineInYearForLedgerDimension;
+
+        // Check the cache for the dates.
+        dates = this.getIntervalDatesFromCache(_ledgerDimensionBudget, _date);
+
+        if (!dates)
+        {
+            if (ledgerFiscalCalendarRecId == 0)
+            {
+                ledgerFiscalCalendarRecId = Ledger::fiscalCalendar();
+            }
+
+            // Find dates based on interval.
+            switch (budgetParameters.CheckRevenueBudgetBalanceInterval)
+            {
+                case BudgetCheckRevenueBalanceInterval::FiscalPeriod:
+                    period = LedgerFiscalCalendar::findPeriodByPeriodCodeDate(ledgerFiscalCalendarRecId, _date);
+                    dates += period.StartDate;
+                    dates += period.EndDate;
+
+                    break;
+
+                case BudgetCheckRevenueBalanceInterval::FiscalYear:
+                    calendarYear = FiscalCalendarYear::findYearByCalendarDate(ledgerFiscalCalendarRecId, _date);
+                    dates += calendarYear.StartDate;
+                    dates += calendarYear.EndDate;
+
+                    break;
+
+                case BudgetCheckRevenueBalanceInterval::FiscalYearToDate:
+                    calendarYear = FiscalCalendarYear::findYearByCalendarDate(ledgerFiscalCalendarRecId, _date);
+                    dates += calendarYear.StartDate;
+
+                    // Get the last line by date in the transaction for the ledger dimension that is in the calendar year.
+                    select firstonly @Date from lastLineInYearForLedgerDimension
+                        order by lastLineInYearForLedgerDimension.Date desc
+                        where lastLineInYearForLedgerDimension.BudgetTransactionHeader == budgetTransactionHeader.RecId
+                            && lastLineInYearForLedgerDimension.LedgerDimension == _ledgerDimensionBudget
+                            && lastLineInYearForLedgerDimension.Date >= calendarYear.StartDate
+                            && lastLineInYearForLedgerDimension.Date <= calendarYear.EndDate;
+
+                    dates += LedgerFiscalCalendar::findPeriodEndDateByDate(ledgerFiscalCalendarRecId, lastLineInYearForLedgerDimension.Date);
+
+                    break;
+
+                default:
+                    Debug::assert(false);
+                    break;
+            }
+
+            // Add the calendar interval to the cache.
+            ledgerDimensionIntervalBalances.insert([_ledgerDimensionBudget, conpeek(dates, 1)], [conpeek(dates, 2), 0, true]);
+        }
+
+        return dates;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getIntervalDatesFromCache</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets the cached interval start date and end date for the specified ledger dimension and date.
+    /// </summary>
+    /// <param name="_ledgerDimensionBudget">
+    ///    The ledger dimension for which to find the interval start date and end date.
+    /// </param>
+    /// <param name="_date">
+    ///    The date for which to find the interval start date and end date.
+    /// </param>
+    /// <returns>
+    ///    A container with the interval start date and end date.
+    /// </returns>
+    /// <remarks>
+    ///    If the interval has not been cached, an empty container is returned.
+    /// </remarks>
+    private container getIntervalDatesFromCache(LedgerDimensionBudget _ledgerDimensionBudget, TransDate _date)
+    {
+        container dates;
+        container ledgerDimensionIntervalValues;
+        TransDate startDate;
+        TransDate endDate;
+        SetEnumerator ledgerDimensionIntervalKeys;
+        LedgerDimensionBudget ledgerDimensionBudget;
+
+        if (ledgerDimensionIntervalBalances == null)
+        {
+            ledgerDimensionIntervalBalances = new Map(Types::Container, Types::Container);
+        }
+
+        ledgerDimensionIntervalKeys = ledgerDimensionIntervalBalances.keySet().getEnumerator();
+
+        while (ledgerDimensionIntervalKeys.moveNext())
+        {
+            [ledgerDimensionBudget, startDate] = ledgerDimensionIntervalKeys.current();
+
+            if (ledgerDimensionBudget == _ledgerDimensionBudget && startDate <= _date)
+            {
+                // The ledger dimension and date may be in a cached interval.
+                // Get the end date from the cache.
+                ledgerDimensionIntervalValues = ledgerDimensionIntervalBalances.lookup([ledgerDimensionBudget, startDate]);
+                endDate = conpeek(ledgerDimensionIntervalValues, 1);
+
+                if (endDate >= _date)
+                {
+                    // The date is less than the end date and greater than the start date.
+                    // The ledger dimension and date are part of a cached combination.
+                    dates += startDate;
+                    dates += endDate;
+                    break;
+                }
+            }
+        }
+
+        return dates;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        primaryLedgerRecId = Ledger::current();
+
+        // By default InUse should be validated.
+        doValidateInUse = true;
+
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        container packed =  [#CurrentVersion, #CurrentList];
+        packed = SysPackExtensions::appendVariableToPack(packed, classStr(BudgetTransactionPost), varStr(useTodayDateToReversePreliminaryBudget), useTodayDateToReversePreliminaryBudget);
+
+        return packed;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsBudgetReversal</Name>
+				<Source><![CDATA[
+    internal boolean parmIsBudgetReversal(boolean _isBudgetReversal = isBudgetReversal)
+    {
+        isBudgetReversal = _isBudgetReversal;
+        return isBudgetReversal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsReversePreliminary</Name>
+				<Source><![CDATA[
+    internal NoYes parmIsReversePreliminary(NoYes _isReversePreliminary = isReversePreliminary)
+    {
+        isReversePreliminary = _isReversePreliminary;
+        return isReversePreliminary;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUseTodayDateToReversePreliminaryBudget</Name>
+				<Source><![CDATA[
+    internal boolean parmUseTodayDateToReversePreliminaryBudget(boolean _useTodayDateToReversePreliminaryBudget = useTodayDateToReversePreliminaryBudget)
+    {
+        useTodayDateToReversePreliminaryBudget = _useTodayDateToReversePreliminaryBudget;
+        return useTodayDateToReversePreliminaryBudget;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReversalTransactionCode</Name>
+				<Source><![CDATA[
+    internal BudgetCode parmReversalTransactionCode(BudgetCode _reversalTransactionCode = reversalTransactionCode)
+    {
+        reversalTransactionCode = _reversalTransactionCode;
+        return reversalTransactionCode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSpecifyTransactionCode</Name>
+				<Source><![CDATA[
+    internal ReversalTransactionCodes parmSpecifyTransactionCode(ReversalTransactionCodes _specifyTransactionCode = specifyTransactionCode)
+    {
+        specifyTransactionCode = _specifyTransactionCode;
+        return specifyTransactionCode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBudgetProvisionalReverseHelper</Name>
+				<Source><![CDATA[
+    public BudgetProvisionalReverseHelper parmBudgetProvisionalReverseHelper(BudgetProvisionalReverseHelper _budgetProvisionalReverseHelper = budgetProvisionalReverseHelper)
+    {
+        budgetProvisionalReverseHelper = _budgetProvisionalReverseHelper;
+
+        return budgetProvisionalReverseHelper;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBudgetTransactionId</Name>
+				<Source><![CDATA[
+    public BudgetTransactionId parmBudgetTransactionId(BudgetTransactionId _budgetTransactionId = budgetTransactionId)
+    {
+        budgetTransactionId = _budgetTransactionId;
+        return budgetTransactionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDoValidateInUse</Name>
+				<Source><![CDATA[
+    public boolean parmDoValidateInUse(boolean _doValidateInUse = doValidateInUse)
+    {
+        doValidateInUse = _doValidateInUse;
+        return doValidateInUse;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsReversal</Name>
+				<Source><![CDATA[
+    public boolean parmIsReversal(boolean _isReversal = isReversal)
+    {
+        isReversal = _isReversal;
+        return isReversal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPrimaryLedgerRecId</Name>
+				<Source><![CDATA[
+    public LedgerRecId parmPrimaryLedgerRecId(LedgerRecId _primaryLedgerRecId = primaryLedgerRecId)
+    {
+        primaryLedgerRecId = _primaryLedgerRecId;
+        return primaryLedgerRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postExpenseLinesDecrease</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Posts all expense transaction lines whose amounts contribute to decreases to the overall budget.
+    /// </summary>
+    /// <returns>
+    ///    true if all lines are posted; otherwise, false.
+    /// </returns>
+    private boolean postExpenseLinesDecrease()
+    {
+        BudgetTransactionLine budgetTransactionLine;
+        boolean allOk = true;
+
+        if (isPostiveAmountForTransactionTypeIncreaseToBudget)
+        {
+            while select budgetTransactionLine
+                order by budgetTransactionLine.Date
+                where (budgetTransactionLine.BudgetTransactionHeader == budgetTransactionHeader.RecId) &&
+                      (budgetTransactionLine.AccountingCurrencyAmount < 0) &&
+                      (budgetTransactionLine.BudgetType == BudgetType::Expense)
+            {
+                if (!this.postLine(budgetTransactionLine))
+                {
+                    allOk = false;
+                }
+            }
+        }
+        else
+        {
+            while select budgetTransactionLine
+                order by budgetTransactionLine.Date
+                where (budgetTransactionLine.BudgetTransactionHeader == budgetTransactionHeader.RecId) &&
+                      (budgetTransactionLine.AccountingCurrencyAmount > 0) &&
+                      (budgetTransactionLine.BudgetType == BudgetType::Expense)
+            {
+                if (!this.postLine(budgetTransactionLine))
+                {
+                    allOk = false;
+                }
+            }
+        }
+
+        return allOk;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postExpenseLinesIncrease</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Posts expense lines whose amounts contribute to increases to the overall budget.
+    /// </summary>
+    /// <returns>
+    ///    true if all lines are posted; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    Transaction lines with zero amounts are also processed.
+    /// </remarks>
+    private boolean postExpenseLinesIncrease()
+    {
+        BudgetTransactionLine budgetTransactionLine;
+        boolean allOk = true;
+
+        if (isPostiveAmountForTransactionTypeIncreaseToBudget)
+        {
+            while select budgetTransactionLine
+                order by budgetTransactionLine.Date
+                where (budgetTransactionLine.BudgetTransactionHeader == budgetTransactionHeader.RecId) &&
+                      (budgetTransactionLine.AccountingCurrencyAmount >= 0) &&
+                      (budgetTransactionLine.BudgetType == BudgetType::Expense)
+            {
+                if (!this.postLine(budgetTransactionLine))
+                {
+                    allOk = false;
+                }
+            }
+        }
+        else
+        {
+            while select budgetTransactionLine
+                order by budgetTransactionLine.Date
+                where (budgetTransactionLine.BudgetTransactionHeader == budgetTransactionHeader.RecId) &&
+                      (budgetTransactionLine.AccountingCurrencyAmount <= 0) &&
+                      (budgetTransactionLine.BudgetType == BudgetType::Expense)
+            {
+                if (!this.postLine(budgetTransactionLine))
+                {
+                    allOk = false;
+                }
+            }
+        }
+
+        return allOk;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Posts the specified transaction line.
+    /// </summary>
+    /// <param name="_budgetTransactionLine">
+    ///    The <c>BudgetTransactionLine</c> record to post.
+    /// </param>
+    /// <returns>
+    ///    true if the line is posted; otherwise, false.
+    /// </returns>
+    private boolean postLine(BudgetTransactionLine _budgetTransactionLine)
+    {
+        boolean ok = true;
+
+        this.displayProgress(_budgetTransactionLine.LineNumber, _budgetTransactionLine.Date);
+
+        ok = this.checkLine(_budgetTransactionLine);
+
+        numOfLinesProcessed++;
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postRevenueLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Posts revenue transaction lines.
+    /// </summary>
+    /// <returns>
+    ///    true if all lines are posted; otherwise, false.
+    /// </returns>
+    private boolean postRevenueLines()
+    {
+        BudgetTransactionLine budgetTransactionLine;
+        TransDate intervalStartDate;
+        TransDate intervalEndDate;
+        AmountMST totalAmountMST;
+        MapEnumerator ledgerDimensionInterval;
+        LedgerDimensionBudget ledgerDimensionBudget;
+        boolean lineOk = true;
+        boolean intervalOk = true;
+        boolean allOk = true;
+
+        // Create the map used to track values associated to the revenue line and interval combinations.
+        ledgerDimensionIntervalBalances = new Map(Types::Container, Types::Container);
+
+        while select budgetTransactionLine
+            order by budgetTransactionLine.Date
+            where (budgetTransactionLine.BudgetTransactionHeader == budgetTransactionHeader.RecId) &&
+                  (budgetTransactionLine.BudgetType == BudgetType::Revenue)
+        {
+            // Validate the line for posting.
+            lineOk = this.postLine(budgetTransactionLine);
+
+            if (budgetParameters.CheckRevenueBudgetBalanceOption != BudgetCheckRevenueBalanceOption::None)
+            {
+                [intervalStartDate, intervalEndDate] = this.findBalanceIntervalStartAndEndDates(
+                                                        budgetTransactionLine.LedgerDimension,
+                                                        budgetTransactionLine.Date);
+
+                if (ledgerDimensionIntervalBalances.exists([budgetTransactionLine.LedgerDimension, intervalStartDate]))
+                {
+                    // Get the existing values for the ledger dimension and interval this line is in.
+                    [intervalEndDate, totalAmountMST, intervalOk] = ledgerDimensionIntervalBalances.lookup([budgetTransactionLine.LedgerDimension, intervalStartDate]);
+                }
+
+                // Add the line amount to the total amount for the ledger dimension and interval.
+                totalAmountMST += budgetTransactionLine.AccountingCurrencyAmount;
+
+                // The ledger dimension and interval combination is valid when the cached combination is valid
+                // and the line being added to the combination is valid.
+                intervalOk = intervalOk && lineOk;
+
+                // Insert the values for this ledger dimension and interval.
+                ledgerDimensionIntervalBalances.insert(
+                    [budgetTransactionLine.LedgerDimension, intervalStartDate],
+                    [intervalEndDate, totalAmountMST, intervalOk]);
+            }
+
+            allOk = allOk && lineOk;
+        }
+
+        if (ledgerDimensionIntervalBalances.elements() > 0)
+        {
+            // Check the total transaction amount for each ledger dimension and interval combination.
+            ledgerDimensionInterval = ledgerDimensionIntervalBalances.getEnumerator();
+
+            while (ledgerDimensionInterval.moveNext())
+            {
+                [intervalEndDate, totalAmountMST, intervalOk] = ledgerDimensionInterval.currentValue();
+
+                if (intervalOk)
+                {
+                    // The ledger dimension and interval contains transaction lines that are all valid.
+                    [ledgerDimensionBudget, intervalStartDate] = ledgerDimensionInterval.currentKey();
+
+                    if (!this.checkBudgetBalanceRevenue(ledgerDimensionBudget, intervalStartDate, intervalEndDate, totalAmountMST))
+                    {
+                        // The total amount for the ledger dimension in the interval resulted in a positive balance.
+                        allOk = false;
+                    }
+                }
+            }
+        }
+
+        return allOk;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postToGeneralLedger</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Posts the budget transactions into the general ledger when the <c>isBudgetAppropriationEnabled</c>
+    ///    field of the <c>LedgerParameters</c> object is marked.
+    /// </summary>
+    private void postToGeneralLedger()
+    {
+        LedgerJournalCheckPost                  ledgerJournalCheckPost;
+        LedgerJournalTable                      ledgerJournalTable;
+        LedgerJournalTrans                      ledgerJournalTrans;
+        JournalizingDefinitionManagerBudget     journalizingDefinitionManagerBudget;
+        JournalizingDefinitionId                journalizingDefinitionId;
+        BudgetTransactionLine                   localBudgetTransactionLine;
+        NumberSeq                               numberSeq;
+        Voucher                                 voucher;
+        List                                    systemGeneratedEntriesList;
+        ListEnumerator                          systemGeneratedEntriesListEnumerator;
+        JournalizingDefinitionEntry             generatedOutput;
+        JournalizingDefinitionDebitCredit       debitCredit;
+        Map                                     budgetTransactionLineVoucher;
+        MapEnumerator                           budgetTransVoucherEnumerator;
+        boolean                                 isJournalCreated;
+
+        if (LedgerParameters::find().IsBudgetAppropriationEnabled == NoYes::Yes)
+        {
+            if (!budgetParameters.LedgerJournalName)
+            {
+                throw error("@Budget:BudgetJournalIsNotSetUp");
+            }
+
+            budgetTransactionLineVoucher = new Map(Types::Int64, Types::String);
+            journalizingDefinitionManagerBudget = JournalizingDefinitionManager::newJournalizingDefinitionManagerBudget(budgetTransactionHeader.BudgetTransactionCode, LedgerPostingType::Budget, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+            journalizingDefinitionId = journalizingDefinitionManagerBudget.getDefaultJournalizingDefinition();
+            journalizingDefinitionManagerBudget.parmJournalizingDefinition(journalizingDefinitionId);
+
+            if (journalizingDefinitionId)
+            {
+                while select RecId, TransactionCurrencyAmount, LedgerDimension, BudgetType, TransactionCurrency, @Date
+                    from localBudgetTransactionLine
+                    where localBudgetTransactionLine.BudgetTransactionHeader == budgetTransactionHeader.RecId
+                {
+                    // Fetch data from the budget transaction line and  post into general ledger.
+                    debitCredit = this.determineAmountDebitCreditType(localBudgetTransactionLine.TransactionCurrencyAmount);
+
+                    journalizingDefinitionManagerBudget.parmTransDate(localBudgetTransactionLine.Date);
+                    systemGeneratedEntriesList = journalizingDefinitionManagerBudget.getSystemGeneratedEntries(debitCredit, localBudgetTransactionLine.LedgerDimension);
+
+                    if (systemGeneratedEntriesList.elements() > 0)
+                    {
+                        // There are generated entries to be posted to general ledger
+                        if (!isJournalCreated)
+                        {
+                            // Create the journal & get the voucher series for the posting
+                            ledgerJournalTable.JournalName = budgetParameters.LedgerJournalName;
+                            ledgerJournalTable.JournalNum = JournalTableData::newTable(ledgerJournalTable).nextJournalId();
+                            ledgerJournalTable.JournalType = LedgerJournalName::find(budgetParameters.LedgerJournalName).JournalType;
+                            ledgerJournalTable.insert();
+
+                            numberSeq = NumberSeq::newGetVoucherFromId(LedgerJournalName::find(ledgerJournalTable.JournalName).NumberSequenceTable);
+
+                            isJournalCreated = true;
+                        }
+
+                        // Creates a voucher and fetch values from the system generated entries and budget transaction line and insert into ledger journal trans.
+                        voucher = numberSeq.voucher();
+                        systemGeneratedEntriesListEnumerator = systemGeneratedEntriesList.getEnumerator();
+                        budgetTransactionLineVoucher.insert(localBudgetTransactionLine.RecId, voucher);
+
+                        while (systemGeneratedEntriesListEnumerator.moveNext())
+                        {
+                            ledgerJournalTrans.clear();
+                            generatedOutput = systemGeneratedEntriesListEnumerator.current();
+                            ledgerJournalTrans.JournalNum = ledgerJournalTable.JournalNum;
+                            ledgerJournalTrans.LedgerDimension = LedgerDimensionFacade::serviceMergeLedgerDimensions(generatedOutput.parmLedgerDimension(), localBudgetTransactionLine.LedgerDimension);
+                            ledgerJournalTrans.TransDate = localBudgetTransactionLine.Date;
+                            ledgerJournalTrans.Voucher = voucher;
+                            ledgerJournalTrans.CurrencyCode = localBudgetTransactionLine.TransactionCurrency;
+                            ledgerJournalTrans.ExchRate = ExchangeRateHelper::exchRate(ledgerJournalTrans.CurrencyCode, ledgerJournalTrans.TransDate);
+                            ledgerJournalTrans.ExchRateSecond = ExchangeRateHelper::exchRateSecond(ledgerJournalTrans.CurrencyCode, ledgerJournalTrans.TransDate);
+                            if (Ledger::reportingCurrency())
+                            {
+                                ExchangeRateCalculation exchangeRateCalculation= ExchangeRateCalculation::newExchangeDate(Ledger::reportingCurrencyExchangeRateType(),
+                                                                                                ledgerJournalTrans.CurrencyCode,
+                                                                                                Ledger::reportingCurrency(),
+                                                                                                ledgerJournalTrans.TransDate);
+
+                                ledgerJournalTrans.ReportingCurrencyExchRate = exchangeRateCalculation.getExchangeRate1();
+                                ledgerJournalTrans.ReportingCurrencyExchRateSecondary = exchangeRateCalculation.getExchangeRate2();
+                            }
+
+                            ledgerJournalTrans.SkipBlockedForManualEntryCheck = NoYes::Yes;
+
+                            if (generatedOutput.parmJournalizingDefinitionDebitCredit() == DebitCredit::Debit)
+                            {
+                                // The sign of the amount was used to determine the debit or credit treatment
+                                // the absolute value of the amount should be used when creating the journal transaction
+                                ledgerJournalTrans.AmountCurDebit = abs(localBudgetTransactionLine.TransactionCurrencyAmount);
+                                ledgerJournalTrans.AmountCurCredit = 0;
+                            }
+                            else
+                            {
+                                ledgerJournalTrans.AmountCurCredit = abs(localBudgetTransactionLine.TransactionCurrencyAmount);
+                                ledgerJournalTrans.AmountCurDebit = 0;
+                            }
+
+                            ledgerJournalTrans.insert();
+                        }
+                    }
+                }
+
+                if (!budgetTransactionLineVoucher.elements())
+                {
+                    // If no vouchers are generated warn the user
+                    warning(strfmt("@SYS300580", JournalizingDefinition::findByRecId(journalizingDefinitionManagerBudget.parmJournalizingDefinition()).JournalizingDefinitionCode));
+                }
+                else
+                {
+                    ledgerJournalCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(ledgerJournalTable, NoYes::Yes);
+                    LedgerJournalCheckPost::processOperation(ledgerJournalCheckPost);
+
+                    budgetTransVoucherEnumerator = budgetTransactionLineVoucher.getEnumerator();
+
+                    while (budgetTransVoucherEnumerator.moveNext())
+                    {
+                        // Update budget transaction lines with specific GeneralJournalEntry.
+                        localBudgetTransactionLine = BudgetTransactionLine::find(budgetTransVoucherEnumerator.currentKey(), true);
+                        localBudgetTransactionLine.GeneralJournalEntry = GeneralLedgerExtension::findByReferenceNumberAccountingDate(budgetTransVoucherEnumerator.currentValue(), localBudgetTransactionLine.Date).RecId;
+                        localBudgetTransactionLine.update();
+                    }
+                }
+            }
+            else
+            {
+                warning(strfmt("@SYS300579", budgetTransactionHeader.BudgetTransactionType));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateBudgetProvisionalReverseHelper</Name>
+				<Source><![CDATA[
+    private BudgetProvisionalReverseHelper generateBudgetProvisionalReverseHelper()
+    {
+        budgetProvisionalReverseHelper = BudgetProvisionalReverseHelper::construct();
+
+        if (specifyTransactionCode == ReversalTransactionCodes::SpecifyTransactionCode)
+        {
+            budgetProvisionalReverseHelper.parmIsSpecificBudgetCode(true);
+            budgetProvisionalReverseHelper.parmBudgetTransactionCode(reversalTransactionCode);
+        }
+        else
+        {
+            budgetProvisionalReverseHelper.parmIsSpecificBudgetCode(false);
+        }
+
+        budgetProvisionalReverseHelper.parmIsReversalRequired(isReversePreliminary);
+        budgetProvisionalReverseHelper.parmUseTodayDateToReversePreliminaryBudget(useTodayDateToReversePreliminaryBudget);
+
+        return budgetProvisionalReverseHelper;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Contains the logic that is used to post a budget transaction.
+    /// </summary>
+    /// <remarks>
+    ///  The process includes the following procedure:
+    ///  <list type="bullet">
+    ///   <item>
+    ///    <description>
+    ///    Set the <c>InUseBy</c> value to true for the current user.
+    ///    </description>
+    ///   </item>
+    ///   <item>
+    ///   <description>Check that the header is valid.</description>
+    ///   </item>
+    ///   <item>
+    ///   <description>Check that all the lines are valid.</description>
+    ///   </item>
+    ///   <item>
+    ///   <description>Check budget availability for all the lines.</description>
+    ///   </item>
+    ///   <item>
+    ///    <description>
+    ///    Update the value of the <c>PostedStatus</c> parameter to <c>Posted</c>.
+    ///    </description>
+    ///   </item>
+    ///  </list>
+    /// </remarks>
+    public void run()
+    {
+        Counter progressTotal;
+        #OCCRetryCount
+
+        changeCompany(CompanyInfo::getDataArea(Ledger::find(primaryLedgerRecId).PrimaryForLegalEntity))
+        {
+            budgetParameters = BudgetParameters::find();
+
+            // Begin the transaction here; need to be within a transaction boundary when
+            // finding the BudgetTransactionHeader because caching on BudgetTransactionHeader is NotInTTS
+            ttsbegin;
+
+            budgetTransactionHeader = BudgetTransactionHeader::findByTransactionNumber(budgetTransactionId, primaryLedgerRecId);
+            setPrefix(strFmt("@Budget:RegisterEntryPostHeader", budgetTransactionHeader.TransactionNumber));
+
+            // Check that the budget transaction can be posted
+            if (!BudgetTransactionManager::validateCompany() ||
+                !this.checkHeader() ||
+                (doValidateInUse && budgetTransactionHeader.isUserBlocked()))
+            {
+                throw error("@Budget:RegisterEntryPostCancelled");
+            }
+
+            if (budgetTransactionHeader.InUseBy != '')
+            {
+                userHasTransactionInUse = true;
+            }
+
+            if (budgetTransactionHeader.WorkflowStatus == BudgetTransactionWorkflowStatus::Approved)
+            {
+                // Set all lines to be overrun approved that have already been checked for budget.
+                // Any lines that have not been checked yet for budget will not be updated since any failures
+                // from those lines would not have been seen by any reviewers.
+                BudgetControlBudgetTransactionProcessor::submitBudgetTransactionToApproveOverrun(budgetTransactionHeader.RecId, true);
+            }
+            else
+            {
+                // Set all lines to not be overrun approved for the scenario that this
+                // is not the first post attempt for the budget transaction header.
+                BudgetControlBudgetTransactionProcessor::submitBudgetTransactionToApproveOverrun(budgetTransactionHeader.RecId, false);
+            }
+
+            ttscommit;
+
+            try
+            {
+                this.startPost();
+
+                // Check that the budget transaction header can be posted, this is needed here so it is checked if code is in a retry
+                if (this.checkHeader() == false)
+                {
+                    throw error("@Budget:RegisterEntryPostCancelled");
+                }
+
+                numOfLinesProcessed = 0;
+                progressTotal = budgetTransactionHeader.numOfLines();
+
+                if (progressTotal)
+                {
+                    ttsbegin;
+
+                    this.progressInit("@SYS191126", progressTotal, #AviFormLetter);
+                    progress.setText("@SYS26577");
+
+                    if (isBudgetReversal && !budgetProvisionalReverseHelper)
+                    {
+                        budgetProvisionalReverseHelper = this.generateBudgetProvisionalReverseHelper();
+                    }
+
+                    if (this.checkLines() == false)
+                    {
+                        // Errors found in the lines
+                        throw error("@Budget:RegisterEntryPostCancelled");
+                    }
+                    else
+                    {
+                        // No errors on any lines for this budget transaction
+                        if (numOfLinesProcessed)
+                        {
+                            if (isConfigurationkeyEnabled(configurationKeyNum(PublicSector)))
+                            {
+                                if (budgetProvisionalReverseHelper && budgetProvisionalReverseHelper.parmIsReversalRequired())
+                                {
+                                    budgetProvisionalReverseHelper.proceedForReversal();
+                                }
+                            }
+                            this.postToGeneralLedger();
+
+                            ttsbegin;
+
+                            budgetTransactionHeader = BudgetTransactionHeader::findByTransactionNumber(budgetTransactionId, primaryLedgerRecId, true);
+                            budgetTransactionHeader.TransactionStatus = BudgetTransactionStatus::Completed;
+                            budgetTransactionHeader.update();
+
+                            ttscommit;
+
+                            posted = true;
+                        }
+
+                        if (appl.ttsLevel())
+                        {
+                            ttscommit;
+                        }
+
+                        info("@Budget:RegisterEntryPostCompleted");
+                    }
+                }
+                else
+                {
+                    // No lines to post
+                    warning(strFmt("@SYS128471", budgetTransactionHeader.TransactionNumber));
+                    throw error("@Budget:RegisterEntryPostCancelled");
+                }
+
+                this.endPost();
+
+                progress = null;
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    // Unblock the budget transaction header if necessary and throw the error.
+                    isPostFailed = true;
+                    this.endPost();
+
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    isRetry = true;
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        isPostFailed = true;
+                        this.endPost();
+
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        isRetry = true;
+                        retry;
+                    }
+                }
+                else
+                {
+                    isPostFailed = true;
+                    this.endPost();
+
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::Error)
+            {
+                isPostFailed = true;
+                this.endPost();
+
+                throw Exception::Error;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startPost</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Starts the posting process for the budget transaction lines that are associated with the budget
+    ///    transaction header.
+    /// </summary>
+    protected void startPost()
+    {
+        if (!isRetry)
+        {
+            // Update system locking values if we are not retrying the posting process.
+            this.startSystemBlock();
+        }
+
+        isPostFailed = false;
+        isRetry = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startSystemBlock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets <c>InUseBy</c> value of the budget transaction header that is being posted to.
+    /// </summary>
+    private void startSystemBlock()
+    {
+        BudgetTransactionHeader budgetTransactionHeaderUpdate;
+
+        ttsbegin;
+
+        // This will only update one record but doing this as an update recordset will give better performance.
+        update_recordset budgetTransactionHeaderUpdate
+            setting InUseBy = curuserid()
+            where budgetTransactionHeaderUpdate.TransactionNumber == budgetTransactionId
+            && budgetTransactionHeaderUpdate.PrimaryLedger == primaryLedgerRecId;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = RunBase::getVersion(packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion :
+                [version, #CurrentList] = packedClass;
+
+                useTodayDateToReversePreliminaryBudget = SysPackExtensions::extractPackedVariable(packedClass, classStr(BudgetTransactionPost), varStr(useTodayDateToReversePreliminaryBudget));
+                break;
+
+            case #CurrentVersionV2 :
+                [version, #CurrentListV2] = packedClass;
+                break;
+
+            default :
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAccountingCurrencyAmount</Name>
+				<Source><![CDATA[
+    private void updateAccountingCurrencyAmount(BudgetTransactionLine _budgetTransactionLine)
+    {
+        BudgetTransactionLine localBudgetTransactionLine;
+
+        // Update the budget transaction line with the calculated Accounting Currency amount.
+        localBudgetTransactionLine = BudgetTransactionLine::find(_budgetTransactionLine.RecId, true);
+        localBudgetTransactionLine.AccountingCurrencyAmount = _budgetTransactionLine.calculateTransAmountToAccountingAmount(true);
+        localBudgetTransactionLine.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLedgerDimension</Name>
+				<Source><![CDATA[
+    private LedgerDimensionAccount updateLedgerDimension(BudgetTransactionLine _budgetTransactionLine)
+    {
+        // select for update is called explicitly as it is not done by the parent function and it is not inside transaction block.
+        BudgetTransactionLine localBudgetTransactionLine = BudgetTransactionLine::find(_budgetTransactionLine.RecId, true);
+        localBudgetTransactionLine.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimensionForType(LedgerDimensionType::Budget, _budgetTransactionLine.LedgerDimension);
+        localBudgetTransactionLine.update();
+        return localBudgetTransactionLine.LedgerDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates new instance of the <c>BudgetTransactionPost</c> class and initalizes values.
+    /// </summary>
+    /// <param name="_budgetTransactionId">
+    ///    The <c>BudgetTransactionId</c> value of the budget transaction header to post.
+    /// </param>
+    /// <param name="_primaryLedgerRecId">
+    ///    The <c>LedgerRecId</c> value of the budget transaction header to post.
+    /// </param>
+    /// <returns>
+    ///    A new instance of the <c>BudgetTransactionPost</c> class.
+    /// </returns>
+    public static BudgetTransactionPost construct(BudgetTransactionId _budgetTransactionId, LedgerRecId _primaryLedgerRecId = Ledger::current())
+    {
+        BudgetTransactionPost budgetTransactionPost;
+
+        budgetTransactionPost = new BudgetTransactionPost();
+        budgetTransactionPost.parmBudgetTransactionId(_budgetTransactionId);
+        budgetTransactionPost.parmPrimaryLedgerRecId(_primaryLedgerRecId);
+
+        return budgetTransactionPost;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>create</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates an instance of the <c>BudgetTransactionPost</c> class initialized with the specified packed
+    ///    object.
+    /// </summary>
+    /// <param name="_packedObject">
+    ///    The packed object from which to initialize.
+    /// </param>
+    /// <returns>
+    ///    An instance of the <c>BudgetTransactionPost</c> class initialized with the specified packed object.
+    /// </returns>
+    /// <remarks>
+    ///    Part of the <c>SysPackable</c> interface. That is required to support packing and unpacking in
+    ///    lists.
+    /// </remarks>
+    public static BudgetTransactionPost create(container _packedObject)
+    {
+        BudgetTransactionPost budgetTransactionPost = BudgetTransactionPost::construct('');
+
+        budgetTransactionPost.unpack(_packedObject);
+
+        return budgetTransactionPost;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

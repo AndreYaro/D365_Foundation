@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>LedgerJournalCheckPostSales</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class LedgerJournalCheckPostSales
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>tamStoreDeductionParentSettlement</Name>
+				<Source><![CDATA[
+    public static void tamStoreDeductionParentSettlement(LedgerJournalId _journalNum, Map _ledgerJournalTransRecIdsByDeduction)
+    {
+        TAMDeduction        tamDeduction;
+        LedgerJournalTrans  ledgerJournalTransParent;
+        LedgerJournalTrans  ledgerJournalTransDeduction;
+        SpecTrans           specTransParent;
+        List                listCustTransOpenRecId;
+
+        // For each journal line that is a deduction
+        while select RecId from ledgerJournalTransDeduction
+            where ledgerJournalTransDeduction.JournalNum == _journalNum
+            join RecId from tamDeduction
+                where tamDeduction.LedgerJournalTransRecId == ledgerJournalTransDeduction.RecId
+            join RecId from ledgerJournalTransParent
+                where ledgerJournalTransParent.RecId == tamDeduction.LedgerJournalTransParentRecId
+        {
+            // If parent has not been inserted into map yet, then build list of CustTransOpen that
+            // parent will settle against and insert into map.
+            if (!_ledgerJournalTransRecIdsByDeduction.exists(ledgerJournalTransParent.RecId))
+            {
+                listCustTransOpenRecId = new List(typeName2Type(extendedTypeStr(RecId)));
+
+                // Add parent marks that are not credits to list
+                while select RefRecId from specTransParent
+                    where specTransParent.SpecTableId == tableNum(LedgerJournalTrans)
+                       && specTransParent.SpecRecId   == ledgerJournalTransParent.RecId
+                       && specTransParent.Balance01    > 0
+                {
+                    listCustTransOpenRecId.addEnd(specTransParent.RefRecId);
+                }
+                _ledgerJournalTransRecIdsByDeduction.insert(ledgerJournalTransParent.RecId,
+                                                                    listCustTransOpenRecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tamUpdateDeductionsAfterPost</Name>
+				<Source><![CDATA[
+    public static void tamUpdateDeductionsAfterPost(LedgerJournalId _journalNum, Map _ledgerJournalTransRecIdsByDeduction)
+    {
+        CustTable custTable;
+        CustTrans custTransDeduction;
+        CustTransOpen custTransOpenDeduction;
+        TAMDeduction tamDeduction;
+        LedgerJournalTrans ledgerJournalTransDeduction;
+        LedgerJournalTrans ledgerJournalTransParent;
+        Set setCustTransClosed = new Set(typeName2Type(extendedTypeStr(RecId)));
+        Set setProcessedDeduction = new Set(typeName2Type(extendedTypeStr(TAMDeductionID)));
+        boolean isInvoiceMatching = CustParameters::find().TAMDeductionCustPaymSettleMethod == TAMDeductionCustPaymSettleMethod::MatchInvoice;
+
+        while select CustTransId from ledgerJournalTransDeduction
+            where ledgerJournalTransDeduction.JournalNum == _journalNum
+            join forupdate tamDeduction
+                where tamDeduction.LedgerJournalTransRecId == ledgerJournalTransDeduction.RecId
+            join ledgerJournalTransParent
+                where tamDeduction.LedgerJournalTransParentRecId == ledgerJournalTransParent.RecId
+            join CurrencyCode from custTransDeduction
+                where custTransDeduction.RecId        == ledgerJournalTransDeduction.CustTransId
+            join RecId, AmountCur, AccountNum from custTransOpenDeduction
+                where custTransOpenDeduction.RefRecId == custTransDeduction.RecId
+            join custTable
+                where custTable.AccountNum == custTransOpenDeduction.AccountNum
+        {
+            if (setProcessedDeduction.in(tamDeduction.tamDeductionID))
+            {
+                continue;
+            }
+            setProcessedDeduction.add(tamDeduction.tamDeductionID);
+
+            if (!_ledgerJournalTransRecIdsByDeduction.exists(tamDeduction.LedgerJournalTransParentRecId))
+            {
+                throw error("@SYS77950");
+            }
+
+            tamDeduction.tamDeductionStatus = TAMDeductionStatus::Open;
+            tamDeduction.CustTransRecId = ledgerJournalTransDeduction.CustTransId;
+            tamDeduction.update();
+
+            SpecTransExecutionContext context = SpecTransExecutionContext::newFromSource(custTable);
+            SpecTransManager specTransManager = SpecTransManager::newFromSpec(context.parmSpecContext());
+            specTransManager.deleteAll();
+
+            specTransManager.insert(curext(),
+                                        custTransOpenDeduction.TableId,
+                                        custTransOpenDeduction.RecId,
+                                        custTransOpenDeduction.AmountCur,
+                                        custTransDeduction.CurrencyCode);
+
+            List listCustTransOpenRecId = _ledgerJournalTransRecIdsByDeduction.lookup(tamDeduction.LedgerJournalTransParentRecId);
+            ListEnumerator listEnumerator = listCustTransOpenRecId.getEnumerator();
+
+            while (listEnumerator.moveNext())
+            {
+                RecId custTransOpenRecId = listEnumerator.current();
+
+                if (isInvoiceMatching && !CustInvoiceJour::isCustTransOpenMatchesInvoiceId(TAMDeduction, custTransOpenRecId))
+                {
+                    continue;
+                }
+
+                // If transaction is now closed then skip
+                if (setCustTransClosed.in(custTransOpenRecId))
+                {
+                    continue;
+                }
+
+                CustTrans custTrans;
+                CustTransOpen custTransOpen;
+
+                select firstonly AmountCur, RecId from custTransOpen
+                    where custTransOpen.RecId == custTransOpenRecId
+                    join CurrencyCode from custTrans
+                        where custTrans.RecId == custTransOpen.RefRecId;
+
+                // If transaction not found, then it's no longer open (settled completley by
+                // payment or previous deductions).  Add to list so won't try to select it again.
+                if (! custTransOpen)
+                {
+                    setCustTransClosed.add(custTransOpenRecId);
+                    continue;
+                }
+
+                specTransManager.insert(curext(),
+                                            custTransOpen.TableId,
+                                            custTransOpen.RecId,
+                                            custTransOpen.AmountCur,
+                                            custTrans.CurrencyCode);
+            }
+            
+            if (CustTrans::settleTransaction(context, CustTransSettleTransactionParameters::construct()))
+            {
+                specTransManager.deleteAll();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

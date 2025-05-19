@@ -1,0 +1,334 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSWorkCreateWaveProd</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>WHSWorkCreateWaveProd</c> class creates work for a production wave.
+/// </summary>
+[WHSWaveTemplateTypeFactoryAttribute(WHSWaveTemplateType::Production)]
+public class WhsWorkCreateWaveProd extends WHSWorkCreateWave
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates the temporary work lines for the production BOM pool.
+    /// </summary>
+    public void createTempTable()
+    {
+        WHSProdWaveLine     prodWaveLine;
+        WHSProdBOMPool      prodBOMPool;
+        ProdBOM             prodBOM;
+        Qty                 workCreateQty;
+        InventTable         inventTable;
+        InventTrans         inventTrans;
+        InventTransOrigin   inventTransOrigin;
+        InventHandlingQty   openWorkQty;
+        InventDim           inventDim;
+
+        if (!waveTable.WorkBuildId)
+        {
+            ttsbegin;
+
+            tmpWorkLine.WorkType             = WHSWorkType::Pick;
+            tmpWorkLine.OriginType           = WHSOriginType::Wave;
+            tmpWorkLine.OriginRefId          = waveTable.WaveId;
+            tmpWorkLine.WorkCreateId         = workCreateId;
+            tmpWorkLine.WaveAttributeCode    = waveTable.WaveAttributeCode;
+            tmpWorkLine.WorkTransType        = workTransType;
+            tmpWorkLine.WaveId               = waveTable.WaveId;
+            tmpWorkLine.RefTableId           = tableNum(ProdBOM);
+            tmpWorkLine.StartLocationId      = startLocationId;
+
+            this.setGlobals();
+
+            using (var waveLockManager = WHSWaveLockManager::newStandard())
+            {
+                while select InventDimId, InventTransOrigin, StatusIssue, sum(Qty), sum(PdsCWQty) from inventTrans
+                    group by InventDimId, InventTransOrigin, StatusIssue
+                    where (inventTrans.StatusIssue      == StatusIssue::ReservPhysical
+                    ||    inventTrans.StatusIssue       == StatusIssue::ReservOrdered
+                    ||    inventTrans.StatusIssue       == StatusIssue::OnOrder)
+                    &&    inventTrans.StatusReceipt     == StatusReceipt::None
+                        exists join inventTransOrigin
+                        where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                            exists join prodWaveLine
+                            where prodWaveLine.InventTransId    == inventTransOrigin.InventTransId
+                            &&    prodWaveLine.WaveId           == waveTable.WaveId
+                {
+                    prodBOMPool = WHSProdBOMPool::find(InventTransOrigin::find(inventTrans.InventTransOrigin).InventTransId, true);
+                    prodBOM = ProdBOM::findTransId(prodBOMPool.InventTransId);
+                    
+                    boolean lockResult = waveLockManager.tryLockForItemDemandWaveAllocation(
+                                                        prodBOM.ItemId,
+                                                        prodBOM.InventDimId,
+                                                        waveTable.WaveId,
+                                                        whsParameters.WaveLockWait);
+
+                    // If we get a lock then we can try to allocate.
+                    if (lockResult)
+                    {
+                        inventDim = inventTrans.inventDim();
+
+                        // Always set these values early so they can be used for work creation history.
+                        this.initTmpWorkLineFromProductionBOM(inventTrans, prodBOM, prodBOMPool);
+
+                        if (this.validateCanAllocate(inventTrans, prodBOMPool.whsPoolProdBOM(), prodBOM, inventDim))
+                        {
+                            InventDimParm inventDimParm = WHSReservationHierarchyInventDimUtil::initInventDimParmAboveLocation(prodBOM.inventTable());
+                            openWorkQty = WHSPool::calculateOpenWorkHandlingQty(prodBOM.InventTransId, inventDim, inventDimParm);
+                            InventQty posTransQty = PdsGlobal::pdsIsCWItem(prodBOMPool.ItemId) ? -inventTrans.PdsCWQty : -inventTrans.Qty;
+
+                            if (posTransQty > openWorkQty)
+                            {
+                                tmpWorkLine.PackingQty      = WHSInventTable::getDefaultPackingQty(prodBOM.ItemId);
+
+                                inventTable = InventTable::find(prodBOM.ItemId);
+
+                                // If the item is batch active, and batch is above location in the reservation hierarchy, validate that the selected batch does not contain a disposition code making it unavailable for picking.
+                                if (inventDim.InventBatchId
+                                &&  WHSReservationHierarchyInventDimUtil::isBatchAboveLocation(inventTable)
+                                &&  !InventBatch::find(inventDim.InventBatchId, inventTable.ItemId).validateBatchDispCodeForPicking(workTransType))
+                                {
+                                    WHSWorkCreateHistory::createWorkHistoryLineFromTmpWorkLine(workCreateId, strFmt("@WAX5580", inventDim.InventBatchId), true, tmpWorkLine);
+                                }
+                                else
+                                {
+                                    workCreateQty = this.calculateWorkCreateQuantity(prodBOM, prodBOMPool, posTransQty, openWorkQty);
+                                    this.createTempLine(tmpWorkLine, workCreateQty);
+
+                                    prodBOMPool.WavedQty += this.parmWorkCreatedQty();
+                                    prodBOMPool.update();
+                                }
+                            }
+                        }
+
+                        // Release the lock since we are done allocating this demand.
+                        waveLockManager.releaseForItemDemandWaveAllocation(prodBOM.ItemId, prodBOM.InventDimId);
+                    }
+                    else
+                    {
+                        throw error(strFmt("@WAX:WaveAllocationLockFailureError", prodBOM.ItemId, prodBOM.InventDimId, InventDim::find(prodBOM.InventDimId).preFix(), whsParameters.WaveLockWait));
+                    }
+                }
+            }
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateWorkCreateQuantity</Name>
+				<Source><![CDATA[
+    protected Qty calculateWorkCreateQuantity(
+        ProdBOM _prodBom,
+        WHSProdBOMPool _prodBOMPool,
+        Qty _posTransQty,
+        Qty _openWorkQty)
+    {
+        Qty calculatedQtyForReleasing = _prodBOMPool.ReleasedInventQty - _prodBOMPool.WavedQty;
+        Qty calculatedAvailableQtyForWorkCreation = _posTransQty - _openWorkQty;
+
+        Qty workCreateQty = (calculatedQtyForReleasing <= 0 &&
+                            _prodBom.displayRemainingToReleaseQty() <= 0) ?
+                            calculatedAvailableQtyForWorkCreation : min(calculatedQtyForReleasing, calculatedAvailableQtyForWorkCreation);
+
+        return workCreateQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTmpWorkLineFromProductionBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Initializes temporary work line from production BOM.
+    /// </summary>
+    /// <param name = "_inventTrans">Instance of <c>InventTrans</c> to initalize from.</param>
+    /// <param name = "_prodBOM">Instance of <c>ProdBOM</c> to initalize from.</param>
+    /// <param name = "_prodBOMPool">Instance of <c>WHSProdBOMPool</c> to initalize from.</param>
+    /// <remarks><c>WHSProdBOMPool</c> used by the customization.</remarks>
+    protected void initTmpWorkLineFromProductionBOM(InventTrans _inventTrans, ProdBOM _prodBOM, WHSProdBOMPool _prodBOMPool)
+    {
+        tmpWorkLine.InventDimId     = _inventTrans.InventDimId;
+        tmpWorkLine.RefRecId        = _prodBOM.RecId;
+        tmpWorkLine.InventTransId   = _prodBOM.InventTransId;
+        tmpWorkLine.ItemId          = _prodBOM.ItemId;
+        tmpWorkLine.OrderNum        = _prodBOM.ProdId;
+        tmpWorkLine.ProdBOMOprNum   = _prodBOM.OprNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new(
+        Common          _common,
+        WHSWorkCreateId _workCreateId = '')
+    {
+        waveTable    = _common;
+        workCreateId = _workCreateId ? _workCreateId : NumberSeq::newGetNum(WHSParameters::numRefWHSWorkCreateId()).num();
+        workTransType = WHSWorkTransType::ProdPick;
+
+        super(waveTable, workCreateId);
+
+        waveId = waveTable.WaveId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCanAllocate</Name>
+				<Source><![CDATA[
+    protected boolean validateCanAllocate(
+        InventTrans     _inventTrans,
+        WHSPoolProdBOM  _whsPoolProdBOM,
+        ProdBOM         _prodBom,
+        InventDim       _inventDim)
+    {
+        boolean valid = true;
+
+        // Don't create work for production lines that have location specified.
+        if (_whsPoolProdBOM.inventDim().wmsLocationId)
+        {
+            WHSWorkCreateHistory::createWorkHistoryLineFromTmpWorkLine(workCreateId, "@WAX5702", true, tmpWorkLine);
+            valid = false;
+        }
+
+        // Only create work for reserved physical transactions.
+        if (valid && this.mustBeFullyReserved(_inventTrans))
+        {
+            WHSWorkCreateHistory::createWorkHistoryLineFromTmpWorkLine(workCreateId, "@WAX4686", true, tmpWorkLine);
+            valid = false;
+        }
+
+        // Only create work for transactions that have not been reserved at the production input location
+        if (valid && _inventTrans.StatusIssue == StatusIssue::ReservPhysical && _inventDim.WMSLocationId)
+        {
+            WHSWorkCreateHistory::createWorkHistoryLineFromTmpWorkLine(workCreateId, strFmt("@WAX:AlreadyReservedOnLocMessage", _inventDim.WMSLocationId), true, tmpWorkLine);
+            valid = false;
+        }
+
+        if (valid && tmpWorkLine.WorkTransType == WHSWorkTransType::ProdPick)
+        {
+            WMSLocationId wmsLocationId = WHSWorkCreateWaveProd::getLocationByWorkCenter(_prodBom.InventTransId, _prodBom.ProdId, _prodBom.OprNum);
+            if (!WHSWorkPolicy::isWorkAllowedToBeCreated(
+                                tmpWorkLine.WorkTransType,
+                                _prodBom.inventDim().InventLocationId,
+                                wmsLocationId,
+                                _prodBom.ItemId))
+            {
+                valid = false;
+            }
+        }
+
+        return valid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustBeFullyReserved</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the given transaction must be fully reserved when releasing to warehouse.
+    /// </summary>
+    /// <param name = "_inventTrans">The transaction to check.</param>
+    /// <returns>true if the transaction must be fully reserved; otherwise, false.</returns>
+    protected boolean mustBeFullyReserved(InventTrans _inventTrans)
+    {
+        return _inventTrans.StatusIssue != StatusIssue::ReservPhysical;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLocationByWorkCenter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the warehouse location for a production BOM line.
+    /// </summary>
+    /// <param name="_inventTransId">
+    ///    The inventory transaction ID of the BOM line.
+    /// </param>
+    /// <param name="_prodId">
+    ///    The production order ID.
+    /// </param>
+    /// <param name="_oprNum">
+    ///    The operation number; optional.
+    /// </param>
+    /// <returns>
+    ///    The work center input location.
+    /// </returns>
+    public static WMSLocationId getLocationByWorkCenter(
+        InventTransId _inventTransId,
+        ProdId        _prodId,
+        OprNum        _oprNum = 0)
+    {
+        ProdBOM     prodBOM;
+
+        if (_inventTransId)
+        {
+            select firstonly ProdId, OprNum, InventDimId from prodBOM
+                where prodBOM.InventTransId == _inventTransId;
+        }
+        else if (_oprNum)
+        {
+            WHSProdWorkUseWorkInventLocationIdForInputLocationContext context = WHSProdWorkUseWorkInventLocationIdForInputLocationContext::current();
+            InventLocationId inventLocationId;
+
+            if (context)
+            {
+                inventLocationId = context.workInventLocationId;
+            }
+
+            if (inventLocationId)
+            {
+                InventDim inventDim;
+
+                select firstonly ProdId, OprNum, InventDimId from prodBOM
+                    where prodBOM.ProdId == _prodId
+                       && prodBOM.OprNum == _oprNum
+                    exists join inventDim
+                        where inventDim.inventDimId == prodBOM.InventDimId
+                           && inventDim.InventLocationId == inventLocationId;
+            }
+
+            if (!prodBOM)
+            {
+                select firstonly ProdId, OprNum, InventDimId from prodBOM
+                    where prodBOM.ProdId == _prodId
+                       && prodBOM.OprNum == _oprNum;
+            }
+        }
+        else
+        {
+            select firstonly ProdId, OprNum, InventDimId from prodBOM
+                where prodBOM.ProdId == _prodId;
+        }
+
+        return WHSProdTable::getWorkCenterLocationFromProdId(prodBOM.ProdId, prodBOM.OprNum, prodBOM.InventDimId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWorkInventLocationId</Name>
+				<Source><![CDATA[
+    protected InventLocationId getWorkInventLocationId()
+    {
+        return waveTable.InventLocationId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

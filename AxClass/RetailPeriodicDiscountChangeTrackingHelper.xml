@@ -1,0 +1,494 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailPeriodicDiscountChangeTrackingHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Helper class for periodic discount change tracking.
+/// </summary>
+internal class RetailPeriodicDiscountChangeTrackingHelper
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>isDiscountTypeSupported</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Whether the discount type is supported for change tracking.
+    /// </summary>
+    /// <param name = "_discountType">The discount type.</param>
+    /// <returns>True if it should be tracked, otherwise, false.</returns>
+    internal static boolean isDiscountTypeSupported(RetailDiscountOfferTypeBase _discountType)
+    {
+        /// Now we support only simple discount and price adjustment,
+        /// As other discount types needs complex context like customer, quantity that are not supported by our clients (e.g. Azure search).
+        /// Customer can exstend this once they have client support.
+        if (_discountType == RetailDiscountOfferTypeBase::Promotion
+            || _discountType == RetailDiscountOfferTypeBase::DiscountOffer
+            || _discountType == RetailDiscountOfferTypeBase::DiscountOfferLineQuantityLimit)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackPeriodicDiscount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Track a periodic discount. This is used by the data event handlers and batch jobs.
+    /// </summary>
+    /// <param name = "_discount">The periodic discount.</param>
+    internal static void trackPeriodicDiscount(RetailPeriodicDiscount _discount)
+    {
+        if (!_discount || !RetailPeriodicDiscountChangeTrackingHelper::isDiscountTypeSupported(_discount.PeriodicDiscountType))
+        {
+            return;
+        }
+
+        RetailPeriodicDiscountChangeTrackingHelper::trackDiscountInternal(_discount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackRetailPeriodicDiscountLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Track a periodic discount line. This is used by the data event handler.
+    /// </summary>
+    /// <param name = "_discountLine">The discount line.</param>
+    internal static void trackRetailPeriodicDiscountLine(RetailPeriodicDiscountLine _discountLine)
+    {
+        RetailPeriodicDiscount discount = RetailPeriodicDiscount::findByOfferId(_discountLine.OfferId);
+
+        // On delete scenario, the discount may already be deleted, then we don't verify the discount type if not found.
+        if (discount && !RetailPeriodicDiscountChangeTrackingHelper::isDiscountTypeSupported(discount.PeriodicDiscountType))
+        {
+            return;
+        }
+
+        RetailPeriodicDiscountChangeTrackingHelper::trackDiscountLineInternal(_discountLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackRetailGroupMemberLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Track a retail group member line. This is used by the data event handler. The retail group member line could come from
+    /// 1) a periodic discount line.
+    /// 2) a speical category/supplemental category hierarchy.
+    /// </summary>
+    /// <param name = "_retailGroupMemberLine">The retail group member line.</param>
+    internal static void trackRetailGroupMemberLine(RetailGroupMemberLine _retailGroupMemberLine)
+    {
+        RetailPeriodicDiscountLine discountLine;
+
+        select firstonly RecId, OfferId from discountLine
+            where discountLine.RetailGroupMemberLine == _retailGroupMemberLine.RecId;
+
+        // Due to the delay of batch process, the linked information may already been deleted, then we still track if not found.
+        if (discountLine.RecId)
+        {
+            RetailPeriodicDiscount discount = RetailPeriodicDiscount::findByOfferId(discountLine.OfferId);
+            
+            // Filter by discount type, can add more filters like linked price group.
+            if (discount && !RetailPeriodicDiscountChangeTrackingHelper::isDiscountTypeSupported(discount.PeriodicDiscountType))
+            {
+                return;
+            }
+        }
+        
+        if (RetailPeriodicDiscountChangeTrackingHelper::isSpecialCategory(_retailGroupMemberLine))
+        {
+            RetailPeriodicDiscountChangeTrackingHelper::trackSpecialCategoryInternal(_retailGroupMemberLine.Category);
+        }
+        else
+        {
+            RetailPeriodicDiscountChangeTrackingHelper::trackGroupMemberLineInternal(_retailGroupMemberLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackDiscountInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Track discount internal
+    /// </summary>
+    /// <param name = "_discount">The discount to track.</param>
+    /// <param name = "_updateDatetime">The updated datetime.</param>
+    /// <param name = "_tag">The tag to track a operation.</param>
+    internal static void trackDiscountInternal(RetailPeriodicDiscount _discount, utcdatetime _updateDatetime = DateTimeUtil::utcNow(), guid _tag = newGuid())
+    {
+        RetailPeriodicDiscountChangeTrackingHelper::trackProductDiscountLines(_discount.OfferId, _updateDatetime, _tag);
+        RetailPeriodicDiscountChangeTrackingHelper::trackCategoryDiscountLines(_discount.OfferId, _updateDatetime, _tag);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackProductDiscountLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Track the discount lines configured with product lines.
+    /// </summary>
+    /// <param name = "_offerId">The offer id of discount.</param>
+    /// <param name = "_updateDatetime">The update datetime.</param>
+    /// <param name = "_tag">The tag to identify a change.</param>
+    private static void trackProductDiscountLines(str _offerId, utcdatetime _updateDatetime, guid _tag)
+    {
+        RetailPeriodicDiscountLine productDiscountLine, discountLine;
+        RetailGroupMemberLine groupMemberLine;
+        RetailPriceChangeTracking priceChangeTracking, existingRecords;
+
+        // check if there is discount line configured with product.
+        select firstonly RecId from productDiscountLine
+            where productDiscountLine.OfferId == _offerId
+        join groupMemberLine
+            where groupMemberLine.RecId == productDiscountLine.RetailGroupMemberLine
+                && groupMemberLine.Product != 0;
+
+        if (!productDiscountLine.RecId)
+        {
+            return;
+        }
+
+        ttsbegin;
+
+        // update products in product discount lines that are already in change tracking table.
+        update_recordset priceChangeTracking
+            setting UpdatedDatetime = _updateDatetime, Tag = _tag
+            where priceChangeTracking.Tag != _tag
+        exists join groupMemberLine
+            where groupMemberLine.Product != 0 && priceChangeTracking.ProductId == groupMemberLine.Product && priceChangeTracking.Tag != _tag
+        exists join discountLine
+            where discountLine.OfferId == _offerId && discountLine.RetailGroupMemberLine == groupMemberLine.RecId;
+
+        // Insert products in product discount lines that are not in change tracking table.
+        insert_recordset priceChangeTracking
+        (
+            ProductId,
+            Tag,
+            UpdatedDatetime // need to be the last as extra timezone field will be added automatically
+        )
+        select Product, _tag, _updateDatetime
+        from groupMemberLine
+            group by Product
+            where groupMemberLine.Product != 0
+        exists join discountLine
+            where discountLine.OfferId == _offerId && discountLine.RetailGroupMemberLine == groupMemberLine.RecId
+        notexists join existingRecords
+            where existingRecords.ProductId == groupMemberLine.Product;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackCategoryDiscountLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Track the category discount lines of a discount.
+    /// </summary>
+    /// <param name = "_offerId">The offer id of the discount.</param>
+    /// <param name = "_updateDatetime">The update datetime.</param>
+    /// <param name = "_tag">The tag to identify a change.</param>
+    private static void trackCategoryDiscountLines(str _offerId, utcdatetime _updateDatetime, guid _tag)
+    {
+        RetailPeriodicDiscountLine discountLine;
+        RetailGroupMemberLine groupMemberLine;
+
+        select firstonly RecId from discountLine
+            where discountLine.OfferId == _offerId
+        join groupMemberLine
+            where groupMemberLine.RecId == discountLine.RetailGroupMemberLine
+                && groupMemberLine.Product == 0;
+
+        if (!discountLine.RecId)
+        {
+            return;
+        }
+
+        // update products of category discount lines that are already in change tracking table.
+        RetailCategoryContainmentLookup containedCategory;
+        EcoResProductCategory productCategory;
+        RetailPriceChangeTracking priceChangeTracking, existingRecords;
+
+        ttsbegin;
+
+        update_recordset priceChangeTracking
+            setting UpdatedDatetime = _updateDatetime, Tag = _tag
+        exists join productCategory
+            where priceChangeTracking.ProductId == productCategory.Product && priceChangeTracking.Tag != _tag // not yet updated by previous steps.
+        join containedCategory
+            where productCategory.Category == containedCategory.ContainedCategory
+        join groupMemberLine
+            where groupMemberLine.Product == 0 && groupMemberLine.Variant == 0 && groupMemberLine.Category == containedCategory.Category
+        join discountLine
+            where discountLine.OfferId == _offerId && discountLine.RetailGroupMemberLine == groupMemberLine.RecId;
+
+        ttscommit;
+
+        ttsbegin;
+
+        // Insert products in category discount lines that are not in change tracking table.
+        insert_recordset priceChangeTracking
+        (
+            ProductId,
+            Tag,
+            UpdatedDatetime // need to be the last as extra timezone field will be added automatically
+        )
+        select Product, _tag, _updateDatetime
+        from productCategory
+            group by Product
+        exists join containedCategory
+            where productCategory.Category == containedCategory.ContainedCategory
+        join groupMemberLine
+            where groupMemberLine.Product == 0 && groupMemberLine.Variant == 0 && groupMemberLine.Category == containedCategory.Category
+        join discountLine
+            where discountLine.OfferId == _offerId && discountLine.RetailGroupMemberLine == groupMemberLine.RecId
+        notexists join existingRecords
+            where existingRecords.ProductId == productCategory.Product;
+
+        ttscommit;
+
+        ttsbegin;
+
+        // Deal with Special Category discount lines - only handle variants, underlying products & categories are covered in the same pattern as regular category.
+        RetailSpecialCategoryMember specialCategory;
+        RetailGroupMemberLine specialCategoryGroupMemberLine;
+
+        update_recordset priceChangeTracking
+            setting UpdatedDatetime = _updateDatetime, Tag = _tag
+        exists join specialCategoryGroupMemberLine
+            where specialCategoryGroupMemberLine.Variant > 0
+            && priceChangeTracking.ProductId == specialCategoryGroupMemberLine.Product && priceChangeTracking.Tag != _tag // not yet updated by previous steps.
+        join specialCategory
+            where specialCategory.RetailGroupMember == specialCategoryGroupMemberLine.RecId
+        join groupMemberLine
+            where groupMemberLine.Category == specialCategory.Category && groupMemberLine.Product == 0 && groupMemberLine.Variant == 0
+        join discountLine
+            where discountLine.OfferId == _offerId && discountLine.RetailGroupMemberLine == groupMemberLine.RecId;
+
+        ttscommit;
+
+        ttsbegin;
+
+        insert_recordset priceChangeTracking
+        (
+            ProductId,
+            Tag,
+            UpdatedDatetime // need to be the last as extra timezone field will be added automatically
+        )
+        select Product, _tag, _updateDatetime
+        from specialCategoryGroupMemberLine
+            group by Product
+            where specialCategoryGroupMemberLine.Variant > 0
+        exists join specialCategory
+            where specialCategory.RetailGroupMember == specialCategoryGroupMemberLine.RecId
+        join groupMemberLine
+            where groupMemberLine.Category == specialCategory.Category && groupMemberLine.Product == 0 && groupMemberLine.Variant == 0
+        join discountLine
+            where discountLine.OfferId == _offerId && discountLine.RetailGroupMemberLine == groupMemberLine.RecId
+        notexists join existingRecords
+            where existingRecords.ProductId == specialCategoryGroupMemberLine.Product;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackDiscountLineInternal</Name>
+				<Source><![CDATA[
+    private static void trackDiscountLineInternal(RetailPeriodicDiscountLine _discountLine)
+    {
+        RetailGroupMemberLine groupMemberLine = RetailGroupMemberLine::find(_discountLine.RetailGroupMemberLine);
+
+        // May not find in scenarios like delete, then don't need to track.
+        if (groupMemberLine)
+        {
+            if (RetailPeriodicDiscountChangeTrackingHelper::isSpecialCategory(groupMemberLine))
+            {
+                RetailPeriodicDiscountChangeTrackingHelper::trackSpecialCategoryInternal(groupMemberLine.Category);
+            }
+            else
+            {
+                RetailPeriodicDiscountChangeTrackingHelper::trackGroupMemberLineInternal(groupMemberLine);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackGroupMemberLineInternal</Name>
+				<Source><![CDATA[
+    private static void trackGroupMemberLineInternal(RetailGroupMemberLine _retailGroupMemberLine, utcdatetime _priceChangeDateTime = DateTimeUtil::utcNow())
+    {
+        if (_retailGroupMemberLine.Variant > 0)
+        {
+            if (_retailGroupMemberLine.Product > 0)
+            {
+                RetailPriceChangeTracking::writeProductPriceChangeRecord(_retailGroupMemberLine.Product, _priceChangeDateTime);
+            }
+            else
+            {
+                EcoResDistinctProductVariant productVariant = EcoResDistinctProductVariant::find(_retailGroupMemberLine.Variant);
+
+                // Track master only now.
+                if (productVariant)
+                {
+                    RetailPriceChangeTracking::writeProductPriceChangeRecord(productVariant.ProductMaster, _priceChangeDateTime);
+                }
+            }
+        }
+        else if (_retailGroupMemberLine.Product > 0)
+        {
+            RetailPriceChangeTracking::writeProductPriceChangeRecord(_retailGroupMemberLine.Product, _priceChangeDateTime);
+        }
+        else
+        {
+            RetailPeriodicDiscountChangeTrackingHelper::trackCategoryInternal(_retailGroupMemberLine.Category, _priceChangeDateTime);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSpecialCategory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check whether given RetailGroupMemberLine buffer references a special category.
+    /// </summary>
+    /// <param name = "_retailGroupMemberLine">The retail group member line.</param>
+    /// <returns>True if this is a special category, otherwise, false.</returns>
+    internal static boolean isSpecialCategory(RetailGroupMemberLine _retailGroupMemberLine)
+    {
+        if (_retailGroupMemberLine.Variant == 0 && _retailGroupMemberLine.Product == 0)
+        {
+            RetailSpecialCategoryMember specialCategoryMember;
+
+            select firstonly RecId from specialCategoryMember
+                where specialCategoryMember.Category == _retailGroupMemberLine.Category;
+
+            return specialCategoryMember.RecId > 0;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackCategoryInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Track changes of product category.
+    /// </summary>
+    /// <param name = "_categoryId">The category id.</param>
+    /// <param name = "_priceChangeDateTime">The date time when the change happened.</param>
+    internal static void trackCategoryInternal(int64 _categoryId, utcdatetime _priceChangeDateTime = DateTimeUtil::utcNow())
+    {
+        // To deal with regular category contained in special category, the condition of category hierarchy check is not added.
+        // Thus the category track might include extra products.
+        RetailCategoryContainmentLookup containedCategory;
+        EcoResProductCategory productCategory;
+        RetailPriceChangeTracking priceChangeTracking, existingRecords;
+        guid tag = newGuid();
+
+        ttsbegin;
+
+        // Update exist records.
+        update_recordset priceChangeTracking
+            setting UpdatedDatetime = _priceChangeDateTime, Tag = tag
+        exists join productCategory
+            where priceChangeTracking.ProductId == productCategory.Product && priceChangeTracking.Tag != tag // not yet updated by previous steps.
+        join containedCategory
+            where productCategory.Category == containedCategory.ContainedCategory
+            && containedCategory.Category == _categoryId;
+
+        // Insert products in category discount lines that are not in change tracking table.
+        insert_recordset priceChangeTracking
+        (
+            ProductId,
+            Tag,
+            UpdatedDatetime // need to be the last as extra timezone field will be added automatically
+        )
+        select Product, tag, _priceChangeDateTime
+        from productCategory
+            group by Product
+        exists join containedCategory
+            where productCategory.Category == containedCategory.ContainedCategory
+            && containedCategory.Category == _categoryId
+        notexists join existingRecords
+            where existingRecords.ProductId == productCategory.Product;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackSpecialCategoryInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Track changes of speical category.
+    /// </summary>
+    /// <param name = "_categoryId">The category id.</param>
+    /// <param name = "_priceChangeDateTime">The date time when the change happened.</param>
+    internal static void trackSpecialCategoryInternal(int64 _categoryId, utcdatetime _priceChangeDateTime = DateTimeUtil::utcNow())
+    {
+        RetailSpecialCategoryMember specialCategoryMember;
+        RetailGroupMemberLine retailGroupMemberLine;
+        RetailPriceChangeTracking priceChangeTracking, existingRecords;
+        guid tag = newGuid();
+
+        ttsbegin;
+
+        // Variants directly under a special category may not be covered by EcoResProductCategory relation, so we need to handle such case specifically.
+        update_recordset priceChangeTracking
+            setting UpdatedDatetime = _priceChangeDateTime, Tag = tag
+        exists join retailGroupMemberLine
+            where retailGroupMemberLine.Variant > 0
+            && retailGroupMemberLine.Product == priceChangeTracking.ProductId && priceChangeTracking.Tag != tag // not yet updated by previous steps.
+        join specialCategoryMember
+            where specialCategoryMember.RetailGroupMember == retailGroupMemberLine.RecId && specialCategoryMember.Category == _categoryId;
+
+        insert_recordset priceChangeTracking
+        (
+            ProductId,
+            Tag,
+            UpdatedDatetime // need to be the last as extra timezone field will be added automatically
+        )
+        select Product, tag, _priceChangeDateTime
+        from  retailGroupMemberLine
+            group by Product
+            where retailGroupMemberLine.Variant > 0
+        exists join specialCategoryMember
+            where specialCategoryMember.RetailGroupMember == retailGroupMemberLine.RecId && specialCategoryMember.Category == _categoryId
+        notexists join existingRecords
+            where existingRecords.ProductId == retailGroupMemberLine.Product;
+
+        ttscommit;
+
+        // Products and categories under a special category are covered in the same pattern as under a regular category.
+        RetailPeriodicDiscountChangeTrackingHelper::trackCategoryInternal(_categoryId, _priceChangeDateTime);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

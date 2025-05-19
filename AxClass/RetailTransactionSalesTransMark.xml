@@ -1,0 +1,1665 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailTransactionSalesTransMark</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// The class <c>RetailTransactionSalesTransMark</c> marks the sales transactions with the store, terminal and staff.
+/// </summary>
+class RetailTransactionSalesTransMark extends RunBaseBatch implements BatchRetryable
+{
+    RetailTransactionSalesTransTmp  tmpSalesTrans;
+
+    RetailStoreId      storeId;
+    RetailTerminalId   terminalId;
+    RetailStaffId      staffId;
+    RetailStatementId  statementId;
+
+    private boolean    shouldAcquireLock = true;
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+    boolean            reserveInventory;
+
+    // <GEERU>
+    boolean            countryRegion_W;
+    boolean            countryRegion_RU;
+
+    #ISOCountryRegionCodes
+    #EECountryRegionCodes
+    // </GEERU>
+
+    #define.CurrentVersion(2)
+
+    #localmacro.RetailTransactionSalesTransTempColumns
+        businessDate,
+        transactionid,
+        barcode,
+        transactionstatus,
+        costamount,
+        custaccount,
+        transactioncode,
+        terminalid,
+        variantid,
+        inventbatchid,
+        inventlocationid,
+        giftcard,
+        categoryid,
+        defaultdimension,
+        inventserialid,
+        inventstatussales,
+        inventtransid,
+        itemid,
+        Price,
+        qty,
+        staffid,
+        salesGroup,
+        statementcode,
+        statementid,
+        store,
+        TaxGroup,
+        TaxItemGroup,
+        unit,
+        netAmount,
+        LineNum,
+        returnTransactionId,
+        returnLineNum,
+        returnStore,
+        returnTerminalId,
+        Channel,
+        WarehouseLocation
+    #endmacro
+
+    #localmacro.CurrentList
+        storeId,
+        terminalId,
+        staffId
+    #endmacro
+
+    #localmacro.RetailSalesLineAggregationGroup
+        price,
+        businessDate,
+        itemId,
+        taxGroup,
+        taxItemGroup,
+        unit,
+        custAccount,
+        store,
+        terminalId,
+        staffId,
+        salesGroup,
+        statementId,
+        InventDimId,
+        inventTransId,
+        inventSerialId
+    #endmacro
+
+    #macro.RetailMatchedAggregatedSalesLine(
+                %1.price            == %2.price
+        &&      %1.businessDate     == %2.businessDate
+        &&      %1.itemId           == %2.itemId
+        &&      %1.taxGroup         == %2.taxGroup
+        &&      %1.TaxItemGroup     == %2.TaxItemGroup
+        &&      %1.unit             == %2.unit
+        &&      %1.custAccount      == %2.custAccount
+        &&      %1.store            == %2.store
+        &&      %1.terminalId       == %2.terminalId
+        &&      %1.staffId          == %2.staffId
+        &&      %1.salesGroup       == %2.salesGroup
+        &&      %1.statementId      == %2.statementId
+        &&      %1.inventDimId      == %2.inventDimId
+        &&      %1.inventSerialId   == %2.inventSerialId
+        &&      ((((%3) && (%1.qty <= 0)) || ((! %3) && (%1.qty > 0))) || (%4))
+    )
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createTransactionHeaderDefaultDimension</Name>
+				<Source><![CDATA[
+    private DimensionDefault createTransactionHeaderDefaultDimension(
+            RetailAsyncCustAccount _custAccount,
+            RetailStoreId _storeId,
+            RetailTerminalId _terminalId,
+            RetailStaffId _staffId)
+    {
+        CustAccount custAccount = _custAccount;
+        DimensionDefault defaultDimension;
+        if (!CustAccount)
+        {
+            custAccount = RetailStoreTable::find(_storeId).DefaultCustAccount;
+        }
+
+        boolean aggregateBeforePosting;
+        if (this.parmStatementId())
+        {
+            RetailEodStatementConfigurationAccessor statementTableAccessor = RetailEodStatementConfigurationAccessor::constructFromStatementId(this.parmStatementId());
+            aggregateBeforePosting = statementTableAccessor.isAggregateBeforePosting();
+        }
+        else
+        {
+            aggregateBeforePosting = RetailParameters::find().aggregateBeforePosting;
+        }
+
+        // Add terminal and worker default dimensions only for non-aggregated
+        if (!aggregateBeforePosting)
+        {
+            defaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(
+                custTable::find(custAccount).DefaultDimension,
+                RetailStoreTable::find(_storeId).DefaultDimension,
+                RetailTerminalTable::find(_terminalId).DefaultDimension,
+                HcmWorker::findByPersonnelNumber(_staffId).getDefaultDimension());
+        }
+        else
+        {
+            defaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(
+                custTable::find(custAccount).DefaultDimension,
+                RetailStoreTable::find(_storeId).DefaultDimension);
+        }
+
+        return defaultDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stampDefaultDimensionToTransactionTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Stamp default dimension of <c>RetailTransactionTable</c>, <c>RetailTransactioSalesTrans</c>, and <c>RetailTransactionPaymentTrans</c> table
+    /// </summary>
+    /// <param name = "_statementTable">Statement table record.</param>
+    /// <remarks>Only called when running in standalone mode, EOD logic is not calling this method since the dimensions are defaulted on the mark controller.</remarks>
+    private void stampDefaultDimensionToTransactionTable()
+    {
+        #define.dimensionGroup(custAccount, store, terminal, staff)
+
+        boolean shouldApplyDimensionsToPayments = false;
+        boolean shouldDefaultDimensionBeAppliedJustOne = RetailStatementFeatureControl::isStampDimensionsInPostInventoryOnceEnabled();
+
+        // Update default dimension for <c>RetailTransactionTable</c> table
+        RetailTransactionTable transTable, transTableUpd;
+        while select transTable
+        group by #dimensionGroup
+        where   transTable.store == this.parmStoreId() 
+            &&  transTable.statementId == this.parmStatementId() 
+            &&  !transTable.DefaultDimension
+            &&  (!shouldDefaultDimensionBeAppliedJustOne || !transTable.DefaultDimensionStamped)
+        {
+            DimensionDefault defaultDimHeader = this.createTransactionHeaderDefaultDimension(
+                        transTable.custAccount,
+                        transTable.store,
+                        transTable.terminal,
+                        transTable.staff);
+
+            if (shouldDefaultDimensionBeAppliedJustOne || defaultDimHeader != 0)
+            {
+                update_recordset transTableUpd
+                setting DefaultDimension = defaultDimHeader,
+                        DefaultDimensionStamped = NoYes::Yes
+                where   transTableUpd.custAccount == transTable.custAccount
+                    &&  transTableUpd.terminal == transTable.terminal
+                    &&  transTableUpd.staff == transTable.staff
+                    &&  transTableUpd.store == this.parmStoreId()
+                    &&  transTableUpd.statementId == this.parmStatementId()
+                    &&  !transTableUpd.DefaultDimension
+                    &&  (!shouldDefaultDimensionBeAppliedJustOne || !transTable.DefaultDimensionStamped);
+            }
+
+            if (defaultDimHeader != 0)
+            {
+                shouldApplyDimensionsToPayments = true;
+            }
+        }
+
+        // Update default dimension for <c>RetailTransactionPaymentTrans</c> table
+        RetailTransactionPaymentTrans paymentTrans;
+
+        if (shouldApplyDimensionsToPayments)
+        {
+            update_recordset paymentTrans
+            setting DefaultDimension = transTable.DefaultDimension
+            join DefaultDimension from transTable
+                where   transTable.transactionId    == paymentTrans.transactionId
+                    &&  transTable.store            == paymentTrans.store
+                    &&  transTable.terminal         == paymentTrans.terminal
+                    &&  transTable.Channel          == paymentTrans.Channel
+                    &&  transTable.store            == this.parmStoreId()
+                    &&  transTable.statementId      == this.parmStatementId()
+                    &&  !paymentTrans.DefaultDimension;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInventDimIdFromWorkingTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialises the inventory dimension values.
+    /// </summary>
+    /// <param name="_salesTrans">
+    /// The current record of <c>RetailTransactionSalesTransTmp</c> table.
+    /// </param>
+    /// <returns>
+    /// InventDimId.
+    /// </returns>
+    private InventDimId findInventDimIdFromWorkingTable(RetailTransactionSalesTransTmp _salesTrans)
+    {
+        InventDim                               inventDim;
+        RetailStoreTable                        storeTable = RetailStoreTable::find(_salesTrans.Store);
+        InventDimCombination                    inventDimCombination;
+        InventDirection                         inventDirection;
+        WMSLocation                             wmsLocation;
+        InventLocationId                        inventLocationId;
+        InventDimGroupSetup                     inventDimGroupSetup;
+
+        #Retail
+
+        inventLocationId = storeTable.InventLocation;
+
+        if (_salestrans.inventLocationId && InventLocation::exist(_salestrans.inventLocationId))
+        {
+            inventLocationId = _salestrans.inventLocationId;
+        }
+
+        inventDim.InventBatchId = _salestrans.InventBatchId;
+
+        if (inventLocationId)
+        {
+            inventDim.InventSiteId = InventLocation::find(inventLocationId).InventSiteId;
+
+            inventDimGroupSetup = InventDimGroupSetup::newItemId(_salesTrans.itemId);
+
+            if (inventDimGroupSetup.isDimensionActive(fieldNum(InventDim, InventLocationId)))
+            {
+                inventDim.inventlocationId = InventLocationId;
+            }
+        }
+
+        inventDim.InventSerialId = _salesTrans.InventSerialId;
+
+        if (_salesTrans.VariantId)
+        {
+            inventDimCombination = InventDimCombination::findVariantId(_salesTrans.VariantId);
+            inventDim.InventDimFieldsMap::initProductDimensionsFrom(inventDimCombination.inventDim());
+        }
+
+        inventDirection = _salesTrans.qty > 0 ? InventDirection::Receipt : InventDirection::Issue;
+        RetailStoreTable::fillInventDimWithStoreDefaults(_salesTrans.itemId, inventDim, inventDirection);
+
+        // inventDim.wmsLocationId may be populated in this method based on the configuration
+        inventDim = RetailWHSHandler::updateItemInventDimLocationV2(_salesTrans.itemId, inventDim, inventDirection, _salesTrans.WarehouseLocation);
+
+        inventDim = InventDim::findOrCreate(inventDim);
+
+        return inventDim.InventDimId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findSalesTransInventDimId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialises the inventory dimension values to be used when reserving inventory.
+    /// </summary>
+    /// <param name="_tmpSalesTrans">
+    /// The current record of <c>RetailTransactionSalesTransTmp</c> table.
+    /// </param>
+    /// <returns>
+    /// InventDimId.
+    /// </returns>
+    private InventDim findSalesTransInventDimId(RetailTransactionSalesTransTmp _tmpSalesTrans)
+    {
+        InventDim   inventDim = inventDim::find(this.findInventDimIdFromWorkingTable(_tmpSalesTrans));
+        inventDim   trackingRegisterInventDim;
+
+        inventDim.moveDimParmDim(InventTable::find(_tmpSalesTrans.ItemId).inventDimParmSalesProcessActiveDim(), trackingRegisterInventDim);
+
+        return InventDim::findOrCreate(inventDim);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Merges transaction sales lines back into the main table from the working table and also saves
+    /// cost amount to <c>RetailCostAmountTmp</c>, Inventory Dimension <c>InventDimTmp</c>, TransCodes <c>RetailTransCodeTmp</c>
+    /// and Updates the transaction in the <c>SalesLineTmp</c> to 'Reserved' status.
+    /// </summary>
+    public void markTransactions()
+    {
+        CostAmount                      lcostAmount;
+        EcoResCategoryId                itemCategoryId;
+
+        RetailTransCodeTmp              tmpTransCode;
+        InventDimTmp                    tmpInventDim;
+        RetailCostAmountTmp             tmpCostAmount;
+
+        RetailTransactionSalesTrans     salesTrans;
+
+        boolean                         aggregateSalesReturns = false;
+
+        #OCCRetryCount
+
+        /// <summary>
+        /// Merges transaction sales lines back into the main table from the working table.
+        /// Need to set back ItemID as it could be updated for giftcard item.
+        /// </summary>
+        void updateTransactionSalesLinesFromWorkingTable()
+        {
+            int retryCount = 0;
+
+            try
+            {
+                retryCount++;
+
+                update_recordset salesTrans
+                setting
+                        InventDimId = tmpSalesTrans.InventDimId,
+                        InventBatchId = tmpSalesTrans.InventBatchId,
+                        inventStatusSales = tmpSalesTrans.inventStatusSales,
+                        inventTransId = tmpSalesTrans.inventTransId,
+                        CategoryId = tmpSalesTrans.CategoryId,
+                        CostAmount = tmpSalesTrans.CostAmount,
+                        transactionCode = tmpSalesTrans.transactionCode,
+                        DefaultDimension = tmpSalesTrans.DefaultDimension,
+                        InventLocationId = tmpSalesTrans.InventLocationId,
+                        BlockQty = tmpSalesTrans.BlockQty,
+                        ReturnInventDimId = tmpSalesTrans.ReturnInventDimId,
+                        PostingCalculatedWMSLocationId = tmpSalesTrans.PostingCalculatedWMSLocationId
+                join tmpSalesTrans
+                where
+                        salesTrans.Channel == tmpSalesTrans.Channel
+                    && salesTrans.Store == tmpSalesTrans.Store
+                    && salesTrans.TerminalId == tmpSalesTrans.TerminalId
+                    && salesTrans.TransactionId == tmpSalesTrans.TransactionId
+                    && salesTrans.LineNum == tmpSalesTrans.LineNum;
+            }
+            catch (Exception::Deadlock)
+            {
+                if (retryCount >= #RetryNum)
+                {
+                    eventSource.EventWriteInventoryPostingExceptionWithRetries(funcName(), 'Deadlock', retryCount, #RetryNum, false);
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    eventSource.EventWriteInventoryPostingExceptionWithRetries(funcName(), 'Deadlock', retryCount, #RetryNum, true);
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (retryCount >= #RetryNum)
+                {
+                    eventSource.EventWriteInventoryPostingExceptionWithRetries(funcName(), 'UpdateConflict', retryCount, #RetryNum, false);
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    eventSource.EventWriteInventoryPostingExceptionWithRetries(funcName(), 'UpdateConflict', retryCount, #RetryNum, true);
+                    retry;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Saving cost amount groups.
+        /// </summary>
+        void insertTmpCostAmount(
+                        ItemId _itemId,
+                        RetailTransactionId _returnTransId,
+                        LineNum _returnLineNum,
+                        RetailStoreId _returnStore,
+                        RetailTerminalId _returnTerminalId,
+                        CostAmount _costAmount,
+                        EcoResCategoryId _categoryId)
+        {
+            tmpCostAmount.clear();
+            tmpCostAmount.ItemId = _itemId;
+            tmpCostAmount.ReturnTransactionId = _returnTransId;
+            tmpCostAmount.ReturnLineNum = _returnLineNum;
+            tmpCostAmount.ReturnSTore = _returnStore;
+            tmpCostAmount.ReturnTerminalId = _returnTerminalId;
+            tmpCostAmount.CostAmount = _costAmount;
+            tmpCostAmount.CategoryId = _categoryId;
+            tmpCostAmount.insert();
+        }
+    
+        /// <summary>
+        /// Updating temp sales lines table with cost amounts.
+        /// </summary>
+        void updateTransactionSalesLines_CostAmountCategoryId()
+        {
+            InventQty                         costInventQty;
+            AmountCur                         costInventValue;
+            InventTrans                       inventTrans;
+            RetailTransactionSalesTransTmp    tmpSalesTransCopy;
+
+            tmpSalesTransCopy.linkPhysicalTableInstance(tmpSalesTrans);
+
+            tmpCostAmount.skipDataMethods(true);
+
+            // non-return transaction items
+            while select tmpSalesTrans
+            group by ItemId, ReturnTransactionId, ReturnLineNum, ReturnSTore, ReturnTerminalId
+            where
+                    !tmpSalesTrans.ReturnTransactionId
+                &&  !tmpSalesTrans.ReturnLineNum
+                &&  !tmpSalesTrans.ReturnSTore
+                &&  !tmpSalesTrans.ReturnTerminalId
+            {
+                // select first record to get inventTransId
+                select firstonly tmpSalesTransCopy
+                where
+                    tmpSalesTransCopy.itemId == tmpSalesTrans.itemId
+                &&  !tmpSalesTransCopy.returnTransactionId
+                &&  !tmpSalesTransCopy.ReturnLineNum
+                &&  !tmpSalesTransCopy.ReturnSTore
+                &&  !tmpSalesTransCopy.ReturnTerminalId;
+
+                // For inventory lines the cost is based on inventTrans.
+                RecId inventTransOrigin = InventTransOrigin::findByInventTransId(tmpSalesTransCopy.inventTransId).RecId;       
+                [costInventQty, costInventValue] = InventTrans::calcCostValue(InventTransOrigin::findByInventTransId(tmpSalesTransCopy.inventTransId).RecId);
+                
+                if (costInventQty)
+                {
+                    if (costInventValue == 0)
+                    {
+                        eventSource.EventWriteCostInventValueZero(this.statementId, tmpSalesTransCopy.RefRecId, inventTransOrigin, false);
+                    }
+                    lcostAmount = costInventValue/costInventQty;
+                }
+                else
+                {
+                    eventSource.EventWriteFetchCostAmountFromInventTableModule(this.statementId, tmpSalesTransCopy.RefRecId, false);
+                    lcostAmount = InventTableModule::find(tmpSalesTrans.itemId, ModuleInventPurchSales::Invent).Price;
+                }
+
+                // category
+                if (!tmpSalesTrans.CategoryId)
+                {
+                    itemCategoryId = EcoResProductCategory::findRetailCategoryByItem(tmpSalesTrans.ItemId);
+                }
+                else
+                {
+                    itemCategoryId = tmpSalesTrans.CategoryId;
+                }
+    
+                insertTmpCostAmount(tmpSalesTrans.ItemId,
+                            tmpSalesTrans.ReturnTransactionId,
+                            tmpSalesTrans.ReturnLineNum,
+                            tmpSalesTrans.ReturnSTore,
+                            tmpSalesTrans.ReturnTerminalId,
+                            lcostAmount,
+                            itemCategoryId);
+            }
+    
+            // returned transaction items
+            while select tmpSalesTrans
+            group by ItemId, ReturnTransactionId, ReturnLineNum, ReturnSTore, ReturnTerminalId
+            where tmpSalesTrans.ReturnTransactionId &&
+                    tmpSalesTrans.ReturnLineNum &&
+                    tmpSalesTrans.ReturnSTore &&
+                    tmpSalesTrans.ReturnTerminalId
+            {
+                // cost amount
+                select tmpSalesTransCopy
+                where
+                    tmpSalesTransCopy.TransactionId == tmpSalesTrans.ReturnTransactionId
+                &&  tmpSalesTransCopy.LineNum       == tmpSalesTrans.ReturnLineNum
+                &&  tmpSalesTransCopy.Store         == tmpSalesTrans.ReturnSTore
+                &&  tmpSalesTransCopy.TerminalId    == tmpSalesTrans.ReturnTerminalId;
+                   
+                if (tmpSalesTransCopy)
+                {
+                    // For inventoried lines the cost is based on inventTrans.
+                    RecId inventTransOrigin = InventTransOrigin::findByInventTransId(tmpSalesTransCopy.inventTransId).RecId;
+                    [costInventQty, costInventValue] = InventTrans::calcCostValue(inventTransOrigin);
+                    
+                    if (costInventQty)
+                    {
+                        if (costInventValue == 0)
+                        {
+                            eventSource.EventWriteCostInventValueZero(this.statementId, tmpSalesTransCopy.RefRecId, inventTransOrigin, true);
+                        }
+                        lcostAmount = costInventValue/costInventQty;
+                    }
+                    else
+                    {
+                        eventSource.EventWriteFetchCostAmountFromInventTableModule(this.statementId, tmpSalesTransCopy.RefRecId, true);
+                        lcostAmount = InventTableModule::find(tmpSalesTransCopy.itemId, ModuleInventPurchSales::Invent).Price;
+                    }
+                }
+                else
+                {
+                    eventSource.EventWriteFetchCostAmountFromOriginalTransaction(this.statementId, tmpSalesTransCopy.RefRecId, true);
+                    lcostAmount = RetailTransactionSalesTrans::find(tmpSalesTrans.ReturnTransactionId,
+                                                            tmpSalesTrans.ReturnSTore,
+                                                            tmpSalesTrans.ReturnTerminalId,
+                                                            tmpSalesTrans.ReturnLineNum).CostAmount;
+                }
+    
+                // category
+                if (!tmpSalesTrans.CategoryId)
+                {
+                    itemCategoryId = EcoResProductCategory::findRetailCategoryByItem(tmpSalesTrans.ItemId);
+                }
+                else
+                {
+                    itemCategoryId = tmpSalesTrans.CategoryId;
+                }
+    
+                insertTmpCostAmount(tmpSalesTrans.ItemId,
+                            tmpSalesTrans.ReturnTransactionId,
+                            tmpSalesTrans.ReturnLineNum,
+                            tmpSalesTrans.ReturnSTore,
+                            tmpSalesTrans.ReturnTerminalId,
+                            lcostAmount,
+                            itemCategoryId);
+            }
+    
+            update_recordset tmpSalesTrans
+            setting CostAmount = tmpCostAmount.CostAmount,
+                    CategoryId = tmpCostAmount.CategoryId
+            join tmpCostAmount
+            where
+                tmpCostAmount.ItemId                == tmpSalesTrans.ItemId
+            &&  tmpCostAmount.ReturnTransactionId   == tmpSalesTrans.ReturnTransactionId
+            &&  tmpCostAmount.ReturnLineNum         == tmpSalesTrans.ReturnLineNum
+            &&  tmpCostAmount.ReturnSTore           == tmpSalesTrans.ReturnSTore
+            &&  tmpCostAmount.ReturnTerminalId      == tmpSalesTrans.ReturnTerminalId;
+        }
+
+        /// <summary>
+        /// Saving distinct inventory dimensions.
+        /// </summary>
+        void insertTmpInventDim(ItemId              _itemId,
+                            InventBatchId       _inventBatchId,
+                            InventSerialId      _inventSerialId,
+                            RetailVariantId     _variantId,
+                            RetailStoreId       _store,
+                            InventLocationId    _inventLocationId,
+                            WMSLocationId		_warehouseLocation,
+                            InventDirection     _inventDirection,
+                            InventDim           _inventDim
+                            )
+        {
+            tmpInventDim.clear();
+            // check if record is already there
+            select firstonly RecId from tmpInventDim
+                where  tmpInventDim.ItemId == _itemId
+                && tmpInventDim.InventBatchId == _inventBatchId
+                && tmpInventDim.InventSerialId == _inventSerialId
+                && tmpInventDim.variantId == _variantId
+                && tmpInventDim.store == _store
+                && tmpInventDim.InventLocationId == _inventLocationId
+                && tmpInventDim.WarehouseLocation == _warehouseLocation
+                && tmpInventDim.InventDirection == _inventDirection
+                && tmpInventDim.inventDimId == _inventDim.inventDimId
+                && tmpInventDim.WMSLocationId == _inventDim.wMSLocationId;
+
+            // only insert if not already there
+            if (!tmpInventDim.RecId)
+            {
+                tmpInventDim.ItemId = _itemId;
+                tmpInventDim.InventBatchId = _inventBatchId;
+                tmpInventDim.InventSerialId = _inventSerialId;
+                tmpInventDim.variantId = _variantId;
+                tmpInventDim.store = _store;
+                tmpInventDim.InventLocationId = _inventLocationId;
+                tmpInventDim.WarehouseLocation = _warehouseLocation;
+                tmpInventDim.InventDirection = _inventDirection;
+                tmpInventDim.inventDimId = _inventDim.inventDimId;
+                tmpInventDim.WMSLocationId = _inventDim.wMSLocationId;
+                tmpInventDim.insert();
+            }
+        }
+
+        /// <summary>
+        /// Updating invent dimensions in temp sales lines table.
+        /// </summary>
+        void updateTransactionSalesLines_InventDimId()
+        {
+            InventDim         inventDimLocal;
+            InventLocation    inventLocationLocal;
+
+            this.updateInventDimFromReturnPolicy();
+            tmpInventDim.skipDataMethods(true);
+
+            // Create inventDim for return lines
+            while select sum(qty) from tmpSalesTrans
+                group by ItemId, InventBatchId, InventSerialId, InventLocationId, VariantId, Store, WarehouseLocation
+                where !tmpSalesTrans.inventDimId && tmpSalesTrans.qty > 0
+            {
+                // inventory dimension
+                insertTmpInventDim(tmpSalesTrans.ItemId,
+                                    tmpSalesTrans.InventBatchId,
+                                    tmpSalesTrans.InventSerialId,
+                                    tmpSalesTrans.VariantId,
+                                    tmpSalesTrans.Store,
+                                    tmpSalesTrans.InventLocationId,
+                                    tmpSalesTrans.WarehouseLocation,
+                                    InventDirection::Receipt,
+                                    this.findSalesTransInventDimId(tmpSalesTrans)
+                );
+            }
+
+            // Update for return transactions
+            update_recordSet tmpSalesTrans
+                setting inventDimId = tmpInventDim.inventDimId,
+                    PostingCalculatedWMSLocationId = tmpInventDim.WMSLocationId
+                where !tmpSalesTrans.inventDimId && tmpSalesTrans.qty > 0
+                join tmpInventDim
+                where tmpInventDim.ItemId == tmpSalesTrans.ItemId
+                        && tmpInventDim.InventBatchId == tmpSalesTrans.InventBatchId
+                        && tmpInventDim.InventSerialId == tmpSalesTrans.InventSerialId
+                        && tmpInventDim.VariantId == tmpSalesTrans.VariantId
+                        && tmpInventDim.Store == tmpSalesTrans.Store
+                        && tmpInventDim.InventLocationId == tmpSalesTrans.InventLocationId
+                        && tmpInventDim.WarehouseLocation == tmpSalesTrans.WarehouseLocation
+                        && tmpInventDim.InventDirection == InventDirection::Receipt;
+            
+            // Create inventDim for sale lines
+            while select sum(qty) from tmpSalesTrans
+                group by ItemId, InventBatchId, InventSerialId, InventLocationId, VariantId, Store, WarehouseLocation
+                where tmpSalesTrans.qty <= 0
+            {
+                // inventory dimension
+                insertTmpInventDim(tmpSalesTrans.ItemId,
+                                    tmpSalesTrans.InventBatchId,
+                                    tmpSalesTrans.InventSerialId,
+                                    tmpSalesTrans.VariantId,
+                                    tmpSalesTrans.Store,
+                                    tmpSalesTrans.InventLocationId,
+                                    tmpSalesTrans.WarehouseLocation,
+                                    InventDirection::Issue,
+                                    this.findSalesTransInventDimId(tmpSalesTrans)
+                );
+            }
+                
+            // Update for sales transactions
+            update_recordSet tmpSalesTrans
+                setting inventDimId = tmpInventDim.inventDimId,
+                    PostingCalculatedWMSLocationId = tmpInventDim.WMSLocationId
+                where tmpSalesTrans.qty <= 0
+                join tmpInventDim
+                where tmpInventDim.ItemId == tmpSalesTrans.ItemId
+                        && tmpInventDim.InventBatchId == tmpSalesTrans.InventBatchId
+                        && tmpInventDim.InventSerialId == tmpSalesTrans.InventSerialId
+                        && tmpInventDim.VariantId == tmpSalesTrans.VariantId
+                        && tmpInventDim.Store == tmpSalesTrans.Store
+                        && tmpInventDim.InventLocationId == tmpSalesTrans.InventLocationId
+                        && tmpInventDim.WarehouseLocation == tmpSalesTrans.WarehouseLocation
+                        && tmpInventDim.InventDirection == InventDirection::Issue;
+        }
+
+        /// <summary>
+        /// Saving distinct trans codes.
+        /// </summary>
+        void insertTmpTransCode(ItemId                      _itemId,
+                                ItemBarCode                 _barCode,
+                                RetailGiftcard              _giftcard,
+                                RetailItemTransactionCode   _transactionCode)
+        {
+            tmpTransCode.clear();
+            tmpTransCode.ItemId = _itemId;
+            tmpTransCode.Barcode = _barCode;
+            tmpTransCode.Giftcard = _giftcard;
+            tmpTransCode.TransactionCode = _transactionCode;
+            tmpTransCode.insert();
+        }
+
+        /// <summary>
+        /// Updating transaction code on temp sales lines table.
+        /// </summary>
+        void updateTransactionSalesLines_TransCode()
+        {
+            tmpTransCode.skipDataMethods(true);
+            
+            RetailStoreTable storetable = RetailStoreTable::find(this.parmStoreId(), false);            
+            InventSiteId inventSiteId = InventLocation::find(storetable.inventLocation).InventSiteId;
+
+            while select tmpSalesTrans
+                group by ItemId, Barcode, giftcard
+            {                 
+                // transaction code
+                insertTmpTransCode(tmpSalesTrans.ItemId,
+                                    tmpSalesTrans.Barcode,
+                                    tmpSalesTrans.Giftcard,
+                                    RetailUtils::checkItemSoldInSite(tmpSalesTrans.ItemId, tmpSalesTrans.Barcode, tmpSalesTrans.giftcard, inventSiteId));
+            }
+
+            update_recordset tmpSalesTrans
+            setting TransactionCode = tmpTransCode.TransactionCode
+            join tmpTransCode
+            where   tmpTransCode.ItemId == tmpSalesTrans.ItemId
+                &&  tmpTransCode.Barcode == tmpSalesTrans.Barcode;
+        }
+
+        /// <summary>
+        /// Updating transaction batch number on temp sales lines table.
+        /// </summary>
+        void updateTransactionSalesLines_BatchNumber()
+        {
+            boolean                                 mustIncludeReserveDelta;
+            InventDim                               inventDim;
+            InventTable                             inventTable;
+            InventTrans                             inventTrans;
+            RetailTransactionSalesTrans             salesTransRecord;
+            whsReservationHierarchyLevelStrategy    reservationStrategy;
+
+            ttsbegin;
+
+            // returned items
+            while select forupdate tmpSalesTrans
+            where tmpSalesTrans.qty > 0
+            {
+                // If not batch active, skip
+                if(!InventDimGroupSetup::newItemId(tmpSalesTrans.itemId).isDimensionActive(fieldNum(InventDim, inventBatchId)))
+                {
+                    continue;
+                }
+
+                // look for the original retail transaction and assign the same batch id
+                salesTransRecord = RetailTransactionSalesTrans::find(
+                tmpSalesTrans.transactionId,
+                tmpSalesTrans.store,
+                tmpSalesTrans.terminalId,
+                tmpSalesTrans.lineNum);
+
+                InventTransId originalInventTransId = salesTransRecord.originalInventTransId();
+
+                if (originalInventTransId)
+                {
+                    inventTrans = InventTrans::findTransId(originalInventTransId);
+                    
+                    tmpSalesTrans.InventBatchId = inventTrans.inventBatchId();
+                    tmpSalesTrans.update();
+                }
+            }
+            ttscommit;
+        }
+
+        /// <summary>
+        /// Sets skip aggregation flag in temporary sales transactions.
+        /// </summary>
+        void SetSkipAggregation()
+        {
+            RetailTransactionTable transaction;
+
+            update_recordSet tmpSalesTrans
+            setting SkipAggregation = true
+                exists join transaction
+                where transaction.Channel         == tmpSalesTrans.Channel       &&
+                        transaction.store           == tmpSalesTrans.store         &&
+                        transaction.terminal        == tmpSalesTrans.terminalId    &&
+                        transaction.transactionId   == tmpSalesTrans.transactionId &&
+                        ((transaction.custAccount && aggregateSalesReturns == false) ||
+                        transaction.SkipAggregation == true ||
+                        transaction.incomeExpenseAmount != 0 ||
+                        (transaction.saleIsReturnSale == true && aggregateSalesReturns == false));
+        }
+
+        // <GEERU>
+        void SetSkipGiftcardSalesLine_RU()
+        {
+            RetailGiftCardTransactions      giftCardTrans;
+
+            // Add to gift card operations are non-inventory and should be ckipped during sales line creation
+            delete_from tmpSalesTrans
+            exists join salesTrans
+            where
+                salesTrans.giftcard && salesTrans.RecId == tmpSalesTrans.RefRecId
+            exists join giftCardTrans
+            where
+                giftCardTrans.cardNumber    == salesTrans.comment             &&
+                giftCardTrans.Channel       == salesTrans.Channel             &&
+                giftCardTrans.terminalId    == salesTrans.terminalId          &&
+                giftCardTrans.transactionId == salesTrans.transactionId       &&
+                giftCardTrans.operation     == RetailGiftCardOperation::AddTo;
+        }
+        // </GEERU>
+
+        /// <summary>
+        /// Updates the transaction in the <c>RetailTransactionSalesTrans</c> to 'Reserved' status.
+        /// </summary>
+        /// <param name="rboTransactionSalesTransSet">
+        /// The current record of <c>RetailTransactionSalesTransTmp</c> table.
+        /// </param>
+        /// <param name="_forSales">
+        /// Signifies the sign modifier
+        /// </param>
+        void setSalesTransReserved(RetailTransactionSalesTransTmp rboTransactionSalesTransSet, boolean _forSales)
+        {
+            // Update default dimension for <c>RetailTransactionSalesTrans</c> table
+            RetailTransactionSalesTransTmp    tmpSalesTransForUpdate;
+            SkipAOSValidationPermission skipAOSValidationPerm;
+            InventTransId               inventoryTransId;
+            EcoResCategoryId            categoryId;
+            DimensionDefault            defaultDimension;
+            
+            tmpSalesTransForUpdate.linkPhysicalTableInstance(tmpSalesTrans);
+
+            inventoryTransId = rboTransactionSalesTransSet.InventTransId;
+            categoryId = rboTransactionSalesTransSet.CategoryId ? rboTransactionSalesTransSet.CategoryId : EcoResProductCategory::findRetailCategoryByItem(rboTransactionSalesTransSet.ItemId);
+            
+            defaultDimension = this.createTransactionHeaderDefaultDimension(
+                rboTransactionSalesTransSet.custAccount,
+                rboTransactionSalesTransSet.store,
+                rboTransactionSalesTransSet.terminalId,
+                rboTransactionSalesTransSet.staffId);
+
+            InventTable inventTable = inventTable::Find(rboTransactionSalesTransSet.ItemId);
+            if (inventTable && inventTable.DefaultDimension)
+            {
+                defaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(defaultDimension, inventTable.DefaultDimension);
+            }
+
+            tmpSalesTransForUpdate.skipDataMethods(true);
+
+            skipAOSValidationPerm = new SkipAOSValidationPermission();
+            skipAOSValidationPerm.assert();
+
+            tmpSalesTransForUpdate.skipAosValidation(true);
+
+            if (rboTransactionSalesTransSet.RefRecId)
+            {
+                update_recordset tmpSalesTransForUpdate
+                setting
+                    InventTransId   = inventoryTransId,
+                    CategoryId      = categoryId,
+                    DefaultDimension = defaultDimension,
+                    InventStatusSales = RetailInventStatusSales::Reserved
+                where  tmpSalesTransForUpdate.RefRecId == rboTransactionSalesTransSet.RefRecId;
+            }
+            else
+            {
+                update_recordset tmpSalesTransForUpdate
+                setting
+                    InventTransId   = inventoryTransId,
+                    CategoryId      = categoryId,
+                    DefaultDimension = defaultDimension,
+                    InventStatusSales = RetailInventStatusSales::Reserved
+                where  tmpSalesTransForUpdate.InventStatusSales == RetailInventStatusSales::None
+                    && !tmpSalesTransForUpdate.InventTransId
+                    && !tmpSalesTransForUpdate.SkipAggregation
+                    && tmpSalesTransForUpdate.TransactionCode == RetailItemTransactionCode::ItemOnFile
+                    && #RetailMatchedAggregatedSalesLine(tmpSalesTransForUpdate, rboTransactionSalesTransSet, _forSales, aggregateSalesReturns);
+            }
+
+            tmpSalesTransForUpdate.skipAosValidation(false);
+            CodeAccessPermission::revertAssert();
+        }
+
+        /// <summary>
+        /// Updates the inventory transactions and reserve quantity values.
+        /// </summary>
+        /// <param name="_tmpSalesTransToPost">
+        /// A buffer of <RetailTransactionSalesTransTmp> contains sales trans info to be posted.
+        /// </param>
+        void updateEstimate(RetailTransactionSalesTransTmp _tmpSalesTransToPost)
+        {
+            if (InventTable::find(_tmpSalesTransToPost.ItemId).isStocked())
+            {
+                RetailTransactionSalesTrans salesTransBuf;
+
+                salesTransBuf.clear();
+                salesTransBuf.qty = _tmpSalesTransToPost.qty;
+                salesTransBuf.unit = _tmpSalesTransToPost.unit;
+                salesTransBuf.inventTransId = _tmpSalesTransToPost.inventTransId;
+                salesTransBuf.itemId = _tmpSalesTransToPost.itemId;
+                salesTransBuf.inventDimId = _tmpSalesTransToPost.inventDimId;
+                salesTransBuf.statementId = _tmpSalesTransToPost.statementId;
+                salesTransBuf.transactionId = _tmpSalesTransToPost.transactionId;
+                salesTransBuf.store = _tmpSalesTransToPost.store;
+                salesTransBuf.Channel = _tmpSalesTransToPost.Channel;
+                salesTransBuf.terminalId = _tmpSalesTransToPost.terminalId;
+                salesTransBuf.lineNum = _tmpSalesTransToPost.lineNum;
+                salesTransBuf.businessDate = _tmpSalesTransToPost.businessDate;
+                salesTransBuf.transDate = _tmpSalesTransToPost.transDate;
+
+                // Get the variant id for the sales trans line using the current InventDimId
+                select firstonly variantId from tmpInventDim
+                where tmpInventDim.inventDimId == _tmpSalesTransToPost.inventDimId;
+
+                salesTransBuf.variantId = tmpInventDim.variantId;
+
+                // Check for Retail kits if physical inventory is available. If not create and post an assembly Order
+                RetailTransactionSalesTransMark::findOrCreateKitPhysicalInventory(salesTransBuf);
+
+                salesTransBuf.updateEstimate();
+
+                _tmpSalesTransToPost.inventTransId = salesTransBuf.inventTransId;
+
+                setSalesTransReserved(_tmpSalesTransToPost, _tmpSalesTransToPost.qty < 0);
+            }
+        }
+
+        /// <summary>
+        /// Updates the transaction of <c>RetailTransactionSalesTrans</c> table to status reserved.
+        /// </summary>
+        /// <param name="transactionSalesTrans">
+        /// The current record of <c>transactionSalesTrans</c> table.
+        /// </param>
+        /// <param name="_forSales">
+        /// If this reservation is for a sales transaction.
+        /// </param>
+        /// <remarks>
+        /// Calls update method of <c>InventUpd_Estimated</c> class to reserve the Inventory.
+        /// </remarks>
+        void reserveInventoryInternal(RetailTransactionSalesTransTmp transactionSalesTrans, boolean _forSales)
+        {
+            RetailTransactionSalesTrans             postedSalesTrans;
+
+            select firstonly sum(qty) from postedSalesTrans
+            index hint AggregatedSalesTransPostInvIdx
+            group by ItemId, inventDimId, inventTransId
+            where
+            postedSalesTrans.inventTransId &&
+            #RetailMatchedAggregatedSalesLine(postedSalesTrans, transactionSalesTrans, _forSales, aggregateSalesReturns);
+
+            if (postedSalesTrans.qty > 0)
+            {
+                postedSalesTrans.RemoveReservation();
+                postedSalesTrans.DeleteInventoryReservation();
+
+                transactionSalesTrans.qty += postedSalesTrans.qty;
+            }
+            transactionSalesTrans.inventTransId = postedSalesTrans.inventTransId;
+
+            updateEstimate(transactionSalesTrans);
+        }
+
+        void reserveAggregatedInventoryPriv(boolean _forSales)
+        {
+            while select sum(Qty) from tmpSalesTrans
+            index hint AggregationIdx
+            group by #RetailSalesLineAggregationGroup
+            where
+                (aggregateSalesReturns || (_forSales && tmpSalesTrans.Qty <= 0) || (!_forSales && tmpSalesTrans.Qty > 0))
+                && tmpSalesTrans.transactionCode == RetailItemTransactionCode::ItemOnFile
+                && !tmpSalesTrans.SkipAggregation
+            {
+                reserveInventoryInternal(tmpSalesTrans, _forSales);
+            }
+        }
+
+        void ReserveNonAggregatedInventory(boolean _handleSkipAggregationTrans = false)
+        {
+            ttsbegin;
+
+            while select tmpSalesTrans
+            index hint AggregationIdx
+            order by RecId
+            where
+                    tmpSalesTrans.transactionCode == RetailItemTransactionCode::ItemOnFile
+                && (!_handleSkipAggregationTrans || tmpSalesTrans.SkipAggregation)
+            {
+                updateEstimate(tmpSalesTrans);
+            }
+
+            ttscommit;
+        }
+
+        eventSource.EventWriteSalesTransMarkTransactionsStarted(this.statementId);
+        System.Diagnostics.Stopwatch transMarkTransaction = new System.Diagnostics.Stopwatch();
+        transMarkTransaction.Start();
+
+        RetailTransactionSalesTransMark::checkGiftCardTaxItemGroupForStatement(this.statementId);
+
+        RetailParameters param = RetailParameters::find();
+
+        // Aggregate sales and returns
+        if (countryRegion_W)
+        {
+            aggregateSalesReturns = RetailParameters::isAggregateSalesAndReturns_W();
+        }
+
+        // Set skip aggregation sign
+        SetSkipAggregation();
+
+        // extract transaction codes
+        updateTransactionSalesLines_TransCode();
+
+        // identify invent batch for returned items
+        updateTransactionSalesLines_BatchNumber();
+
+        // extract invent dim id, this is done for all as we do not copy over invent dim id
+        updateTransactionSalesLines_InventDimId();
+
+        boolean processGiftCardsAsPrepayments_RU;
+        boolean aggregateBeforePosting;
+        if (this.statementId)
+        {
+            RetailEodStatementConfigurationAccessor statementTableAccessor = RetailEodStatementConfigurationAccessor::constructFromStatementId(this.statementId);
+            processGiftCardsAsPrepayments_RU = statementTableAccessor.isProcessGiftCardsAsPrepayments_RU();
+            aggregateBeforePosting = statementTableAccessor.isAggregateBeforePosting();
+        }
+        else
+        {
+            RetailParameters retailParameters = RetailParameters::find();
+            processGiftCardsAsPrepayments_RU = retailParameters.ProcessGiftCardsAsPrepayments_RU;
+            aggregateBeforePosting = retailParameters.aggregateBeforePosting;
+        }
+
+        // <GEERU>
+        if (processGiftCardsAsPrepayments_RU)
+        {
+            SetSkipGiftcardSalesLine_RU();
+        }
+
+        // Check if inventory reservation should be performed
+        if (reserveInventory)
+        {
+            if (RetailStatementFeatureControl::isNotAggregateInventoryReservationEnabled())
+            {
+                eventSource.EventWriteInventoryPostingStartInventoryReservationNotAggregated();
+
+                ReserveNonAggregatedInventory();
+
+                eventSource.EventWriteInventoryPostingFinishInventoryReservationNotAggregated();
+            }
+            else
+            {
+                eventSource.EventWriteInventoryPostingInventoryReservationBackwardCompatibility();
+                    
+                // Backwards compatibility - Old behavior
+                if (!aggregateBeforePosting)
+                {
+                    ReserveNonAggregatedInventory();
+
+                    Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXInventoryPostInfo(0, salesTrans.Store, salesTrans.TerminalId);
+                }
+                else
+                {
+                    ttsbegin;
+
+                    reserveAggregatedInventoryPriv(true);
+            
+                    // <GEERU>
+                    if (!aggregateSalesReturns)
+                    {
+                        // </GEERU>
+                        reserveAggregatedInventoryPriv(false);
+                        // <GEERU>
+                    }
+                    // </GEERU>
+
+                    //Reserving inventory for transactions with SkipAggregation sign
+                    ReserveNonAggregatedInventory(true);
+
+                    ttscommit;
+                }
+            }
+        }                
+
+        // extract cost amount
+        eventSource.EventWriteTransactionUpdatingStartForSalesLinesCostAmountCategoryId(this.statementId);
+
+        updateTransactionSalesLines_CostAmountCategoryId();
+
+        eventSource.EventWriteTransactionUpdatingFinishedForSalesLinesCostAmountCategoryId(this.statementId);
+
+        // merge back updates to transaction sales lines
+        eventSource.EventWriteTransactionUpdatingStartForSalesLinesFromWorkingTable(this.statementId);
+
+        updateTransactionSalesLinesFromWorkingTable();
+
+        eventSource.EventWriteTransactionUpdatingFinishedForSalesLinesFromWorkingTable(this.statementId);
+
+        transMarkTransaction.Stop();
+        eventSource.EventWriteSalesTransMarkTransactionsFinished(this.statementId, transMarkTransaction.ElapsedMilliseconds);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new()
+    {
+        super();
+
+        // <GEERU>
+        countryRegion_W = SysCountryRegionCode::isLegalEntityInCountryRegion(#easternEuropeAllandRU);
+        countryRegion_RU = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]);
+        // </GEERU>
+
+        reserveInventory = true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStaffId</Name>
+				<Source><![CDATA[
+    public RetailStaffId parmStaffId(RetailStaffId _staffId = staffId)
+    {
+        staffId = _staffId;
+
+        return staffId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStoreId</Name>
+				<Source><![CDATA[
+    public RetailStoreId parmStoreId(RetailStoreId _storeId = storeId)
+    {
+        storeId = _storeId;
+
+        return storeId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTerminalId</Name>
+				<Source><![CDATA[
+    public RetailTerminalId parmTerminalId(RetailTerminalId _terminalId = terminalId)
+    {
+        terminalId = _terminalId;
+
+        return terminalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReserveInventory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates if inventory reservation is going to be executed.
+    /// </summary>
+    /// <param name = "_reserveInventory">Boolean value to indicate if inventory reservation should be executed.</param>
+    /// <returns>True if the configuration indicates that inventory reservation is going to e executed; otherwise, false.</returns>
+    public boolean parmReserveInventory(boolean _reserveInventory = reserveInventory)
+    {
+        if (!prmIsDefault(_reserveInventory))
+        {
+            reserveInventory = _reserveInventory;
+        }
+
+        return reserveInventory;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initJobSyncManager</Name>
+				<Source><![CDATA[
+    private RetailJobSyncManager initJobSyncManager()
+    {
+        str lockName = RetailJobSyncManagerHelper::formatStoreLevelLockName(this.parmStoreId());
+
+        RetailJobSyncManager jobSyncManager = RetailJobSyncManager::construct(lockName, funcName());
+        jobSyncManager.parmExceptionMessage("@Retail:RetailJobSyncManagerExceptionMessagePostInventory");
+
+        return jobSyncManager;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Mark the sales transactions with the storeID, terminalID and staffID passed and then reserve the item.
+    /// </summary>
+    /// <exception cref="Exception::UpdateConflictNotRecovered">
+    /// Cannot update if any other user is trying update simultaneously. The update conflict cannot be recovered.
+    /// </exception>
+    /// <exception cref="Exception::UpdateConflict">
+    /// Update conflict as any other user is trying to update the record at the same time.
+    /// </exception>
+    public void run()
+    {
+        #OCCRetryCount
+
+        int                             recordCount = 0;
+
+        /// <summary>
+        /// Populates the temporary transaction sales lines table with lines corresponding to transactions in the scope of this statement.
+        /// </summary>
+        int populateTransactionSalesLinesWorkingTable()
+        {
+            RetailTransactionSalesTrans     salesTrans;
+            RetailTransactionTable          transactionTable;
+
+            // Skipping data-methods and AOS validation because we don't want the following update_recordset to be downgraded to record-by-record.
+            tmpSalesTrans.skipDataMethods(true);
+
+            // In case of retry, there might be some existing data in the temp table.
+            // We should clean up the table before loading data into it.
+            delete_from tmpSalesTrans;
+
+            insert_recordset tmpSalesTrans(
+                #RetailTransactionSalesTransTempColumns,
+            refrecid)
+            select
+                #RetailTransactionSalesTransTempColumns,
+            RecId
+            from salesTrans
+            where
+                    salesTrans.TransactionStatus == RetailEntryStatus::None
+                && salesTrans.InventStatusSales == RetailInventStatusSales::None
+                && (salesTrans.Store            == this.parmStoreId()   || !this.parmStoreId())
+                && (salesTrans.TerminalId       == this.parmTerminalId()|| !this.parmTerminalId())
+                && (salesTrans.StaffId          == this.parmStaffId()   || !this.parmStaffId())
+            exists join transactionTable
+            where transactionTable.store        == this.parmStoreId()
+                && transactionTable.Type        == RetailTransactionType::Sales
+                && transactionTable.EntryStatus == RetailEntryStatus::None
+                && transactionTable.StatementId == this.parmStatementId()
+                && salesTrans.transactionId     == transactionTable.transactionId
+                && salesTrans.Store             == transactionTable.Store
+                && salesTrans.channel           == transactionTable.channel
+                && salesTrans.TerminalId        == transactionTable.Terminal;
+
+            return any2int(tmpSalesTrans.RowCount());
+        }
+        // PopulateTransactionSalesLinesWorkingTable
+        ;
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXInventoryPostStart(0, '', '');
+
+        // Job concurrency management
+        boolean isJobConcurrencyEnabled = RetailStatementFeatureControl::isManageJobConcurrencyWithLocksEnabled();
+
+        using (RetailJobSyncManager jobSyncManager = this.initJobSyncManager())
+        {
+            try
+            {
+                if (isJobConcurrencyEnabled && shouldAcquireLock)
+                {
+                    // If post inventory is running as a standalone job it should either acquire the lock immediately or fail gracefully, so wait time is 0
+                    jobSyncManager.acquireUpdatelock(0);
+                }
+
+                // Processes kit disassembly transactions and updates the inventory of disassembled kits before processing sales trans
+                RetailKitAssemblyOrder::processKitTransactions(RetailStoreTable::find(this.parmStoreId()));
+            
+                // Only need to stamp inventory if we're in "reserve inventory mode"
+                // If not in "reserve inventory mode", RetailEodStatementCalculateMarkController will take care of stamping the default dimensions
+                if (this.parmReserveInventory())
+                {
+                    // Set default dimension of RetailTransactionTable and RetailTransactionPaymentTrans table.
+                    this.stampDefaultDimensionToTransactionTable();
+                }
+
+                // populate temp transaction sales lines table
+                recordCount = populateTransactionSalesLinesWorkingTable();
+                if (recordCount != 0)
+                {
+                    this.markTransactions();
+                }
+                else
+                {
+                    eventSource.EventWriteInventoryPostingNoTransactionsFound();
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    RetailStatementPostingLogger::Error(funcName(), #linenumber, 'Deadlock exception exceeded max number of retries. Throw Deadlock exception.');
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    RetailStatementPostingLogger::Error(funcName(), #linenumber, strFmt('DeadlockException occurred in inventory posting - retry count is %1.', int2Str(xSession::currentRetryCount())));
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    RetailStatementPostingLogger::Error(funcName(), #linenumber, 'UpdateConflict exception is not recovered. Throw UpdateConflictNotRecovered exception.');
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    RetailStatementPostingLogger::Error(funcName(), #linenumber, strFmt('UpdateConflict occurred in inventory posting - retry count is %1.', int2Str(xSession::currentRetryCount())));
+                    retry;
+                }
+            }
+            catch
+            {
+                // If we expected to acquire the lock but didn't we just show a warning and carry on. Surface all other errors.
+                if (isJobConcurrencyEnabled && shouldAcquireLock && !jobSyncManager.getIsLockAcquired())
+                {
+                    warning(strFmt("@Retail:RetailJobSyncManagerExceptionMessagePostInventory", jobSyncManager.getLockName()));
+                }
+                else
+                {
+                    throw Exception::Error;
+                }
+            }
+
+            Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXInventoryPostEnd(0, '', '');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Integer         version        = conPeek(_packedClass,1);
+        ;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = _packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkGiftCardTaxItemGroup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the gift card item is taxable
+    /// </summary>
+    /// <returns>
+    /// True if the gift card item is not taxable, otherwise, false.
+    /// </returns>
+    public static boolean checkGiftCardTaxItemGroup()
+    {
+        return RetailTransactionSalesTransMark::checkGiftCardTaxItemGroupForStatement('');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkGiftCardTaxItemGroupForStatement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the gift card item is taxable for a given statement.
+    /// </summary>
+    /// <param name="_statementId">The statement id.</param>
+    /// <returns>
+    /// True if the gift card item is not taxable, otherwise, false.
+    /// </returns>
+    public static boolean checkGiftCardTaxItemGroupForStatement(RetailStatementId _statementId = '')
+    {
+        boolean             ok = true;
+
+        boolean processGiftCardsAsPrepayments_RU;
+        boolean taxOnGiftCards;
+        ItemId giftcardItemId;
+        
+        if (_statementId)
+        {
+            RetailEodStatementConfigurationAccessor statementTableAccessor = RetailEodStatementConfigurationAccessor::constructFromStatementId(_statementId);
+            processGiftCardsAsPrepayments_RU = statementTableAccessor.isProcessGiftCardsAsPrepayments_RU();
+            taxOnGiftCards = statementTableAccessor.isTaxOnGiftCards();
+            giftcardItemId = statementTableAccessor.getGiftCardItem();
+        }
+        else
+        {
+            RetailParameters retailParameters = RetailParameters::find();
+            processGiftCardsAsPrepayments_RU = retailParameters.ProcessGiftCardsAsPrepayments_RU;
+            taxOnGiftCards = retailParameters.TaxOnGiftCards;
+            giftcardItemId = retailParameters.GiftcardItem;
+        }
+
+        // <GEERU>
+        if (processGiftCardsAsPrepayments_RU)
+        {
+            return true;
+        }
+        // </GEERU>
+
+        if (taxOnGiftCards)
+        {
+            return true;
+        }
+
+        TaxItemGroup giftcardItemTaxGroupId = InventTable::find(giftcardItemId).salesTaxItemGroupId();
+
+        if (giftcardItemTaxGroupId)
+        {
+            TaxOnItem           taxOnItem;
+            while select taxOnItem
+            where taxOnItem.TaxItemGroup == giftcardItemTaxGroupId
+            {
+                if (taxOnItem.showTaxValue())
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static RetailTransactionSalesTransMark construct()
+    {
+        return new RetailTransactionSalesTransMark();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static void main(Args args)
+    {
+        RetailTransactionSalesTransMark markSalesTransaction = new RetailTransactionSalesTransMark();
+
+        markSalesTransaction.parmStoreId(args.parm());
+        markSalesTransaction.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOrCreateKitPhysicalInventory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the available Physical quantity for a given inventory transaction.
+    /// </summary>
+    /// <param name="transactionSalesTrans">
+    /// The Retail transaction sales line of a store whose transaction is being processed.
+    /// </param>
+    public static void findOrCreateKitPhysicalInventory(RetailTransactionSalesTrans transactionSalesTrans)
+    {
+        RetailKit               retailKit;
+        Qty                     availableKitPhysicalQty;
+        Qty                     qtyRemaining;
+        InventSum               inventSum;
+        InventTable             inventTable;
+        InventDim               inventDimLocal;
+        InventIAvailability     inventAvailibility;
+
+        if (transactionSalesTrans.qty > 0)
+        {
+            // We should only post assembly orders for sales transactions, returns should be ignored.
+            return;
+        }
+
+        // For Retail kits check if physical inventory is available. If not create and post an assembly Order
+        retailKit = RetailKit::findByProductmaster(InventTable::find(transactionSalesTrans.ItemId).Product);
+
+        if (retailKit)
+        {
+            inventTable = InventTable::find(transactionSalesTrans.itemId);
+            inventDimLocal = InventDim::find(transactionSalesTrans.inventDimId);
+            inventSum = InventSum::find(inventTable.ItemId, inventDimLocal.InventDimId);
+
+            inventAvailibility = InventAvailabilityProvider::findByItemSumDim(inventTable,
+                                                                            inventSum,
+                                                                            inventDimLocal
+                                                                            ).parmInventAvailability();
+
+            availableKitPhysicalQty = inventAvailibility.availPhysical();
+            if (availableKitPhysicalQty < -(transactionSalesTrans.qty))
+            {
+                if (availableKitPhysicalQty < 0)
+                {
+                    qtyRemaining = -(transactionSalesTrans.qty);
+                }
+                else
+                {
+                    qtyRemaining = -(transactionSalesTrans.qty)-availableKitPhysicalQty;
+                }
+
+                EcoResProductName productName = EcoResProduct::find(retailKit.ProductMaster).productName();
+                info(strFmt("@REX4520734", productName, availableKitPhysicalQty, qtyRemaining));
+                eventSource.EventWriteFindOrCreatePhysicalInventoryForKitOrders(productName, availableKitPhysicalQty, qtyRemaining, transactionSalesTrans.qty);
+
+                // Create assembly order
+                RetailKitAssemblyOrder::assembleKitFromSalesTransactions(transactionSalesTrans, qtyRemaining);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStatementId</Name>
+				<Source><![CDATA[
+    public RetailStatementId parmStatementId(RetailStatementId _statementId = statementId)
+    {
+        statementId = _statementId;
+
+        return statementId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmShouldAcquireLock</Name>
+				<Source><![CDATA[
+    public boolean parmShouldAcquireLock(boolean _shouldAcquireLock = shouldAcquireLock)
+    {
+        this.shouldAcquireLock = _shouldAcquireLock;
+        return this.shouldAcquireLock;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>RetailTransactionSalesTransMark</c>
+    /// class can be run in a new session.
+    /// </summary>
+    /// <returns>true if the the class <c>RetailTransactionSalesTransMark</c> can
+    /// be run in a new session; otherwise, false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateInventDimFromReturnPolicy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Set the inventory dimension values from return policy or default return fields.
+    /// </summary>
+    /// <param name="_tmpSalesTrans">
+    ///     The table object of <c>RetailTransactionSalesTransTmp</c>
+    /// </param>
+    protected void updateInventDimFromReturnPolicy()
+    {
+        RetailTransactionInfocodeTrans          infocodeTrans;
+        RetailReturnPolicyHelper_SalesTransTmp  helper;
+        RetailReturnInfocodePolicyLine          policyLine;
+        RecId                                   retailStoreTableRecId;
+
+        ttsBegin;
+
+        while select forUpdate tmpSalesTrans
+        where tmpSalesTrans.qty > 0 //return
+        {
+            retailStoreTableRecId = RetailStoreTable::find(tmpSalesTrans.store).RecId;
+            //we need to process only last infocode that exists in the return policy
+            select firstOnly infocodeId, subInfocodeId from infocodeTrans
+            order by LineNum desc
+            where tmpSalesTrans.transactionId == infocodeTrans.transactionId
+                && tmpSalesTrans.store         == infocodeTrans.store
+                && tmpSalesTrans.terminalId    == infocodeTrans.terminal
+                && tmpSalesTrans.lineNum       == infocodeTrans.parentLineNum
+                && tmpSalesTrans.Channel       == infocodeTrans.Channel
+            exists join policyLine
+                    where policyLine.InfocodeId       == infocodeTrans.infocodeId
+                        && policyLine.RetailStoreTable == retailStoreTableRecId
+                        && policyLine.Policy           == RetailAttributesLegalEntityLookup::findReturnPolicyByCategory(EcoResProductCategory::findRetailCategoryByItem(tmpSalesTrans.itemId)).ReturnPolicy;
+
+            helper = RetailReturnPolicyHelper_SalesTransTmp::construct(retailStoreTableRecId, tmpSalesTrans.itemId, infocodeTrans.infocodeId, infocodeTrans.subInfocodeId, tmpSalesTrans);
+
+            //if policy applied update it
+            if (helper.apply(this.findInventDimIdFromWorkingTable(tmpSalesTrans)))
+            {
+                // Needed for backward compatibility
+                tmpSalesTrans.ReturnInventDimId = tmpSalesTrans.inventDimId;
+
+                tmpSalesTrans.update();
+            }
+        }
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

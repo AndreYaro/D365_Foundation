@@ -1,0 +1,1938 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PurchTotals_ParmTrans</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class PurchTotals_ParmTrans extends PurchTotals
+{
+    VendDocumentLineMap   parmLine;
+    VendDocumentTableMap  parmTable;
+    VendInvoiceJour vendInvoiceJour;
+    VendPackingSlipJour vendPackingSlipJour;
+
+    ParmId          parmId;
+    PurchId         sumPurchId;
+    DocumentStatus  documentStatus;
+    AmountCur       endDiscBalance;
+    boolean         updateBalance;
+    Common          updateTotalRecord;
+
+    private PurchInstrumentationLogger parmTransInstrumentationLogger;
+
+    // <GEERU><GEEPL><GIN>
+    #ISOCountryRegionCodes
+    // </GEERU></GEEPL></GIN>
+
+    #EECountryRegionCodes
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>fullCalculationParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the calculation parameters representing full totals calculation.
+    /// </summary>
+    /// <param name = "_parameters">The original calculation parameters.</param>
+    /// <returns>The calculation parameters representing full totals calculation, as opposed to taxes-only calculation.</returns>
+    protected container fullCalculationParameters(container _parameters)
+    {
+        boolean excludePendingInvoicesLocal;
+        boolean delayTaxCalcLocal;
+        boolean taxesOnlyLocal;
+
+        [excludePendingInvoicesLocal, delayTaxCalcLocal, taxesOnlyLocal] = _parameters;
+
+        return [excludePendingInvoicesLocal, delayTaxCalcLocal, false];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calc</Name>
+				<Source><![CDATA[
+    void calc(boolean _excludePendingInvoices = false, boolean _delayTaxCalc = false, boolean _taxesOnly = false)
+    {
+        QueryRun            queryTransact;
+        QueryRun            queryPurchTableMarkup;
+        Query               query;
+        QueryBuildDataSource queryBuildParmSubTable;
+        QueryBuildDataSource queryBuildMarkupTrans;
+        Markup              markup;
+        PurchCalcTax        purchCalcTax;
+
+        VendTable           vendTable;
+        VendDocumentSubTableMap   parmSubTable;
+        PdsCWInventQty      cwQty;
+        PurchQty            purchQty;
+        InventQty           inventQty;
+        AmountCur           lineAmount;
+        AmountCur           roundedOffTotalAmount;
+        Map                 mapLineAmount;
+        Map                 mapPurchLine;
+        boolean             rsListHasMore;
+        TableId             subTableId;
+        VendInvoiceInfoLine invoiceLine;
+        boolean                     taxParameters;
+        TmpTaxCalc_IN               tmpTaxCalc;
+        AmountCur                   markupAmtExclTax;
+        AmountCur                   gtaTaxAmount;
+        AmountCur                   foreignVendorTaxAmount;
+        boolean                     taxWithholdParameters;
+        boolean                     countryRegionIN = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]);
+        boolean                     checkVAT;
+        RecordSortedList            recordListvendInvoiceInfoLine;
+        boolean                     isServiceTaxEnableIN;
+        boolean                     isBillOfEntry = false;
+        TaxItemGroup                taxItemGroupRev;
+        TaxItemGroupHeading         taxItemGroupHeadingRev;
+
+        using (var activityContext = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().calc())
+        {            
+            parmTransInstrumentationLogger.logInformation(strFmt("Callstack: %1", ProjOpsInstrumentationLogger::getCallStack(xSession::xppCallStack())));
+
+            if (countryRegionIN)
+            {
+                recordListvendInvoiceInfoLine   = new RecordSortedList(tableNum(VendInvoiceInfoLine));
+                isServiceTaxEnableIN            = TaxParameters::isServiceTaxEnable_IN();
+                checkVAT                        = TaxParameters::isVATEnable_IN();
+                taxParameters                   = TaxParameters::checkTaxParameters_IN();
+                taxWithholdParameters           = TaxWithholdParameters_IN::checkTaxParameters();
+            }
+
+            // See if calculation has already been completed and cached
+            if (this.checkForCache([_excludePendingInvoices, _delayTaxCalc, _taxesOnly]))
+            {
+                parmTransInstrumentationLogger.logInformation("this.checkForCache([_excludePendingInvoices, _delayTaxCalc, _taxesOnly])");
+                return;
+            }
+
+            TradeInstrumentationStopWatch stopWatch = TradeInstrumentationStopwatch::newStopwatch();
+
+            if (parmTable.Ordering == DocumentStatus::Invoice
+                || parmTable.Ordering == DocumentStatus::ApproveJournal
+                // <GEERU>
+                || (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]) && parmTable.Ordering == DocumentStatus::Facture_RU)
+                // </GEERU>
+                // <GEEPL>
+                || (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoPL]) && parmTable.Ordering == DocumentStatus::PlSAD)
+                // </GEEPL>
+                )
+            {
+                subTableId = tableNum(VendInvoiceInfoSubTable);
+            }
+            else
+            {
+                subTableId = tableNum(PurchParmSubTable);
+            }
+
+            this.clear();
+
+            excludePurchLineMarkup  = !this.lineMarkupTransExist();
+
+            mapLineAmount  = new Map(typeName2Type(extendedTypeStr(RecId)), Types::Real);
+            mapPurchLine   = new Map(typeName2Type(extendedTypeStr(RecId)), Types::Record);
+
+            currency = (parmTable.isNonPO() || parmTable.isAdvance()) ? parmTable.CurrencyCode : purchTable.CurrencyCode;
+            markup = new Markup(currency);
+            markup.parmExchRate(this.exchRate(), this.exchRateSecondary(), Currency::noYes2UnknownNoYes(this.triangulation()));
+            markup.transDate(this.invoiceDate());
+
+            if (BrazilParameters::isEnabled())
+            {
+                salesTaxCurrency_BR = Ledger::accountingCurrency(CompanyInfo::current());
+            }
+
+            purchCalcTax = this.constructPurchCalcTax();
+            purchCalcTax.parmSkipLineMarkup(excludePurchLineMarkup);
+
+            if (!_delayTaxCalc)
+            {
+                this.calcTax(purchCalcTax);
+
+                // <GEERU>
+                if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]))
+                {
+                    // Tax on markups on purch invoice
+                    markup.setTax(purchCalcTax.tax());
+                    markup.parmInitMarkupTrans_RU(true);
+                    markup.parmInitTaxAmount_RU(false);
+                }
+                // </GEERU>
+
+                if (_taxesOnly)
+                {
+                    // Quick exit if the caller only wanted to calculate/generate taxes
+                    return;
+                }
+            }
+            // <GIN>
+
+            // this boolean variable Controls the complete logic Of creating withholding tax when the Quantity is Bill Of Entry
+            if (TaxParameters::isCustomsEnable_IN() && parmTable.purchParmUpdate().SpecQty == PurchUpdate::BillOfEntryQuantity_IN)
+            {
+                isBillOfEntry = true;
+            }
+
+            boolean isCalcWHTInInvoiceEnabled = TaxWithholdingGlobalFeature::isCalcWHTInInvoiceEnabled() && isWHTCalcNeeded;
+
+            if (isCalcWHTInInvoiceEnabled && !_delayTaxCalc)
+            {
+                vendTable = parmTable.vendTable_InvoiceAccount();
+                taxWithholdCalc = TaxWithholdCalcPurch::construct(purchCalcTax);
+
+                doCalculateGWHTChargesCode = this.doCalculateGWHTChargesCode(vendTable);
+
+                if (doCalculateGWHTChargesCode)
+                {
+                    markup.parmTaxWithholdCalculation(taxWithholdCalc);
+                    markup.setTax(purchCalcTax.tax());
+                }
+            }
+
+            if (taxWithholdParameters && !_delayTaxCalc && !isBillOfEntry)
+            {
+                this.calcWithholdTax_IN(purchCalcTax);
+                withholdingTaxAmount += taxWithholdAmount;
+            }
+            // </GIN>
+
+            queryTransact = this.queryBuild();
+
+            using (RoundingLineAmountContext roundingLineAmountContext = RoundingLineAmountContext::construct())
+            {
+                this.logInstrumentationMeasures();
+
+                roundingLineAmountContext.parmSkipRoundingLineAmount(RoundingLineAmountToggle::instance().isEnabled());
+
+                boolean instrumentationFligthtEnabled = PurchTotals_ParmTransInstrumentationFligtht::instance().isEnabled();
+
+                using (var activityContextCalcLines = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().calcLines())
+                {
+                    while (queryTransact.next())
+                    {
+                        using (SysInstrumentationActivityContext activityContextCalcLine = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().calcLine())
+                        {
+                            purchLine = this.queryGet(queryTransact);
+
+                            if (instrumentationFligthtEnabled)
+                            {
+                                boolean mustHavePurchLine = this.mustHavePurchLine(parmLine);
+
+                                if (!purchLine && mustHavePurchLine)
+                                {
+                                    activityContextCalcLine
+                                        .addCustomProperty(tableStr(PurchLine), '0')
+                                        .addCustomProperty('MustHavePurchLine', any2Str(mustHavePurchLine));
+
+                                    continue;
+                                }
+
+                                boolean shouldSkipParmLine = this.shouldSkipParmLine(parmLine);
+
+                                activityContextCalcLine
+                                    .addCustomProperty(tableStr(PurchLine), int642Str(purchLine.RecId))
+                                    .addCustomProperty(tableId2Name(parmLine.TableId), int642Str(parmLine.RecId))
+                                    .addCustomProperty('MustHavePurchLine', any2Str(mustHavePurchLine))
+                                    .addCustomProperty('ShouldSkipParmLine', any2Str(shouldSkipParmLine));
+
+                                if (shouldSkipParmLine)
+                                {
+                                    preAppliedAmount += abs(parmLine.LineAmount);
+                                    continue;
+                                }
+
+                                if (mustHavePurchLine)
+                                {
+                                    Debug::assert(purchLine.RecId != 0);
+                                    recordListPurchLine.ins(purchLine);
+                                }
+                            }
+                            else
+                            {
+                                if (purchLine)
+                                {
+                                    parmTransInstrumentationLogger.logInformation(strFmt("purchLine.RecId: %1", purchLine.RecId));
+                                }
+
+                                if (!purchLine && this.mustHavePurchLine(parmLine))
+                                {
+                                    parmTransInstrumentationLogger.logInformation("!purchLine && this.mustHavePurchLine(parmLine). Continue.");
+                                    continue;
+                                }
+
+                                if (this.shouldSkipParmLine(parmLine))
+                                {
+                                    preAppliedAmount += abs(parmLine.LineAmount);
+                                    parmTransInstrumentationLogger.logInformation(strFmt("this.shouldSkipParmLine(parmLine)"));
+                                    continue;
+                                }
+
+                                if (this.mustHavePurchLine(parmLine))
+                                {
+                                    parmTransInstrumentationLogger.logInformation("this.mustHavePurchLine(parmLine)");
+                                    Debug::assert(purchLine.RecId != 0);
+                                    recordListPurchLine.ins(purchLine);
+                                }
+                            }
+
+                            numberOfPurchLines++;
+
+                            //<GIN>
+                            if (isServiceTaxEnableIN && parmLine.isNonPO())
+                            {
+                                parmTransInstrumentationLogger.logInformation("isServiceTaxEnableIN && parmLine.isNonPO.");
+                                Debug::assert(parmLine.TableId == tableNum(VendInvoiceInfoLine));
+                                invoiceLine = parmLine;
+                                recordListvendInvoiceInfoLine.ins(invoiceLine);
+                            }
+
+                            if (invoiceLine)
+                            {
+                                parmTransInstrumentationLogger.logInformation(strFmt("invoiceLine.RecId: %1", invoiceLine.RecId));
+                            }
+
+                            //</GIN>
+                            purchQty         = this.qtyPurch();
+
+                            cwQty = 0.0;
+                            if (PdsGlobal::pdsIsCWItem(purchLine.ItemId))
+                            {
+                                parmTransInstrumentationLogger.logInformation("pdsIsCWItem(purchLine.ItemId)");
+                                cwQty = this.pdsCWPurchQty();
+                            }
+
+                            boolean isCategoryBased = this.isCategoryBased();
+
+                            // Initialize inventtable for item based lines.
+                            if (isCategoryBased)
+                            {
+                                inventTable = null;
+
+                                if (!instrumentationFligthtEnabled)
+                                {
+                                    parmTransInstrumentationLogger.logInformation("this.isCategoryBased()");
+                                }
+                            }
+                            else
+                            {
+                                inventTable = InventTable::find(parmLine.ItemId);
+                                inventDimId = parmLine.InventDimId;
+
+                                if (!instrumentationFligthtEnabled)
+                                {
+                                    parmTransInstrumentationLogger.logInformation("!this.isCategoryBased()");
+                                }
+                            }
+
+                            boolean isAdvance = parmLine.isAdvance();
+
+                            // calculate the qty in inventory units (can use inventTable for conversion)
+                            //check for an advance since the advance is non-inventoried so inventQty should be zero
+                            if (!isAdvance)
+                            {
+                                if (!instrumentationFligthtEnabled)
+                                {
+                                    parmTransInstrumentationLogger.logInformation("!parmLine.isAdvance()");
+                                }
+                                inventQty = this.qtyInventoryUnits(purchQty);
+                            }
+                            else
+                            {
+                                if (!instrumentationFligthtEnabled)
+                                {
+                                    parmTransInstrumentationLogger.logInformation("parmLine.isAdvance()");
+                                }
+                                inventQty = 0.0;
+                            }
+
+                            if (instrumentationFligthtEnabled)
+                            {
+                                activityContextCalcLine
+                                    .addCustomProperty(tableStr(InventTable), int642Str(inventTable.RecId))
+                                    .addCustomProperty('IsCategoryBased', any2Str(isCategoryBased))
+                                    .addCustomProperty('ParmLineIsAdvance', any2Str(isAdvance))
+                                    .addCustomProperty('ExcludePurchLineMarkup', any2Str(excludePurchLineMarkup));
+                            }
+
+                            this.updateQuantities(purchQty, inventQty, cwQty);
+
+                            lineAmount       = this.lineAmount(purchQty, purchCalcTax.invoiceDate());
+
+                            updateTotalRecord = VendDocumentLineMap::header(parmLine);
+                            updateBalance = false;
+                            this.updateOrderBalances(lineAmount);
+                            updateBalance = true;
+
+                            updateTotalRecord = VendDocumentLineMap::subHeader(parmLine);
+                            this.updateOrderBalances(lineAmount);
+
+                            if (instrumentationFligthtEnabled)
+                            {
+                                if (!isAdvance)
+                                {
+                                    boolean isNonPO = parmLine.isNonPO();
+
+                                    if (!isNonPO)
+                                    {
+                                        costValue += CurrencyExchangeHelper::amount(purchQty * purchLine.getEffectiveLinePrice(), '');
+                                    }
+
+                                    if (parmLine.PurchPrice && this.lineHasDiscount())
+                                    {
+                                        lineDisc += parmLine.lineDiscExclTax(purchCalcTax.invoiceDate(), tax);
+
+                                        activityContextCalcLine
+                                            .addCustomProperty('ParmLineIsNonPO', any2Str(isNonPO))
+                                            .addCustomProperty('HasPurchPrice', any2Str(true))
+                                            .addCustomProperty('LineHasDiscount', any2Str(true));
+                                    }
+                                    else
+                                    {
+                                        activityContextCalcLine
+                                            .addCustomProperty('ParmLineIsNonPO', any2Str(isNonPO))
+                                            .addCustomProperty('HasPurchPrice', any2Str(false))
+                                            .addCustomProperty('LineHasDiscount', any2Str(false));
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                if (!parmLine.isAdvance())
+                                {
+                                    parmTransInstrumentationLogger.logInformation("!parmLine.isAdvance()");
+                                    if (!parmLine.isNonPO())
+                                    {
+                                        parmTransInstrumentationLogger.logInformation("!parmLine.isNonPO()");
+                                        costValue += CurrencyExchangeHelper::amount(purchQty * purchLine.getEffectiveLinePrice(), '');
+                                    }
+
+                                    if (parmLine.PurchPrice && this.lineHasDiscount())
+                                    {
+                                        parmTransInstrumentationLogger.logInformation("parmLine.PurchPrice && this.lineHasDiscount()");
+                                        lineDisc += parmLine.lineDiscExclTax(purchCalcTax.invoiceDate(), tax);
+                                    }
+                                }
+                            }
+
+                            if (this.discPercent() && this.lineEndDisc())
+                            {
+                                parmTransInstrumentationLogger.logInformation("this.discPercent() && this.lineEndDisc()");
+                                endDiscBalance += lineAmount;
+                            }
+
+                            mapLineAmount.insert(parmLine.RecId, lineAmount);
+                            mapPurchLine.insert(parmLine.RecId, purchLine);
+
+                            // Include MarkupTrans on the lines, i.e. PurchParmLine, VendInvoiceInfoLine, and PurchLine
+                            if (!excludePurchLineMarkup)
+                            {
+                                if (!instrumentationFligthtEnabled)
+                                {
+                                    parmTransInstrumentationLogger.logInformation("!excludePurchLineMarkup");
+                                }
+
+                                MarkupAmount temp = markupAmount;
+                                markupAmount -= this.calcCustVendMarkupOnLine(markup, purchLine, purchQty, lineAmount, parmLine);
+                            }
+                        }
+                    }
+                }
+
+                using (var activityContextCheckLines = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().calcCheckLines())
+                {
+                    if (recordListParmLine.len() > 0)
+                    {
+                        // update enddiscounts based on calculated amounts
+                        TradeInstrumentationStopWatch stopWatchLineDiscount = TradeInstrumentationStopwatch::newStopwatch();
+
+                        for (rsListHasMore = recordListParmLine.first(parmLine); rsListHasMore; rsListHasMore = recordListParmLine.next(parmLine))
+                        {
+                            if (this.shouldSkipParmLine(parmLine))
+                            {
+                                continue;
+                            }
+
+                            if (this.mustHavePurchLine(parmLine))
+                            {
+                                if (!mapPurchLine.exists(parmLine.RecId))
+                                {
+                                    throw error("@SCM:PurchTotals_ParmTrans_calc_parmLine_inconsistency");
+                                }
+                                purchLine = mapPurchLine.lookup(parmLine.RecId);
+                            }
+
+                            if (this.lineEndDisc())
+                            {
+                                if (mapLineAmount.exists(parmLine.RecId))
+                                {
+                                    this.updateEndDiscBalances(mapLineAmount.lookup(parmLine.RecId));
+                                }
+                            }
+                        }
+
+                        runTimeCalcDiscountTotals += stopWatchLineDiscount.elapsedMilliseconds();
+                    }
+                }
+
+                using (var activityContextHeaders = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().calcHeaders())
+                {
+                    // Include MarkupTrans on the (Individual) Headers, i.e. PurchParmSubTable and VendInvoiceInfoSubTable
+                    queryPurchTableMarkup = this.queryBuildPurchTable();
+                    query = queryPurchTableMarkup.query();
+                    queryBuildParmSubTable = query.dataSourceTable(subTableId);
+                    queryBuildMarkupTrans = queryBuildParmSubTable.addDataSource(tableNum(MarkupTrans));
+                    queryBuildMarkupTrans.joinMode(JoinMode::ExistsJoin);
+                    queryBuildMarkupTrans.relations(true);
+
+                    while (queryPurchTableMarkup.next())
+                    {
+                        if (queryPurchTableMarkup.changed(subTableId))
+                        {
+                            parmSubTable = queryPurchTableMarkup.get(subTableId);
+                        }
+                        else
+                        {
+                            parmSubTable = null;
+                        }
+                        if (parmSubTable)
+                        {
+                            markupAmount -= this.calcCustVendMarkupOnTable(
+                                                    markup,
+                                                    purchTable,
+                                                    1,
+                                                    this.purchOrderBalance(parmSubTable.TableId, parmSubTable.RecId),
+                                                    parmSubTable);
+                        }
+                    }
+                }
+
+                // Include MarkupTrans on the (Summary) Header, i.e. PurchParmTable and VendInvoiceInfoTable
+                if (MarkupTrans::exist(parmTable.TableId, parmTable.RecId))
+                {
+                    markupAmount -= this.calcCustVendMarkupOnTable(markup, purchTable, 1, this.purchBalance(), parmTable);
+                }
+
+                endDisc             = this.endDisc();
+                calculatedEndDisc   = this.calculatedEndDisc();
+                // <GIN>
+                if (taxParameters && !_delayTaxCalc)
+                {
+                    parmTransInstrumentationLogger.logInformation("taxParameters && !_delayTaxCalc");
+                    this.loadToTmpTaxWorkTransWhileSalesTaxDetailIsNotNeededAndTmpTaxWorkTransIsNull();
+
+                    tmpTaxCalc = tax.tmpTaxCalc_IN();
+                    select sum(TaxOnCharges) from tmpTaxCalc
+                        where tmpTaxCalc.OrigChargeAmt == 0.0
+                            && tmpTaxCalc.ChargeCode == '';
+
+                    markupAmtExclTax = tmpTaxCalc.TaxOnCharges;
+
+                    if (markupAmtExclTax)
+                    {
+                        if (markupAmount > 0.0)
+                        {
+                            markupAmount -= abs(markupAmtExclTax);
+                        }
+                        else
+                        {
+                            markupAmount += abs(markupAmtExclTax);
+                        }
+                        markupAmount = CurrencyExchangeHelper::amount(markupAmount);
+                    }
+                }
+                // </GIN>
+
+                this.roundBalances(currency);
+            }
+
+            roundOff        = this.invoiceRoundOff();
+
+            // <GBR>
+            if (BrazilParameters::isEnabled())
+            {
+                if (purchCalcTax.directImport_BR() == true)
+                {
+                    markupAmount = markup.totalMarkupAmountCur_BR();
+                }
+            }
+            // </GBR>
+
+            totalAmount     = balance
+                            - endDisc
+                            + markupAmount
+                            + this.taxTotal()
+                            + this.purchTaxRoundOff()
+                            + roundOff;
+
+            if (totalAmount != 0.0)
+            {
+                if (TaxWithholdEnableIncludeTCSInTotalFeatureToggle::includeTCSInInvoiceAmount(taxWithhold))
+                {
+                    AmountCur amountToRound = this.purchTotalAmount() + taxWithholdAmount;
+                    roundedOffTotalAmount   = this.roundedOffAmount(amountToRound) - this.roundedOffAmount(taxWithholdAmount);
+                    roundOff += this.roundedOffAmount(amountToRound) - amountToRound;
+                }
+                else
+                {
+                    roundedOffTotalAmount = this.roundedOffTotalAmount();
+                    roundOff += roundedOffTotalAmount - totalAmount;
+                }
+
+                parmTransInstrumentationLogger.logInformation(strFmt("totalAmount != 0. Diff between total roundOff and tmpRoundOff (roundOff is increased by this amount): %1", int642Str(roundedOffTotalAmount - totalAmount)));
+                totalAmount             = roundedOffTotalAmount;
+            }
+
+            // <GBR>
+            if (BrazilParameters::isEnabled())
+            {
+                this.updateMarkupValues_BR(markup);
+
+                if (purchCalcTax.directImport_BR() && parmTable.TableId == tableNum(VendInvoiceInfoTable))
+                {
+                    if (!_delayTaxCalc)
+                    {
+                        this.loadToTmpTaxWorkTransWhileSalesTaxDetailIsNotNeededAndTmpTaxWorkTransIsNull();
+
+                        importDeclarationTotals =   PurchImportDeclarationTotals_BR::newFromParmTable(parmTable, tax.tmpTaxWorkTrans());
+                        importDeclarationTotals.parmMarkupAmountMap(markup.markupAmountMap_BR());
+                        importDeclarationTotals.calc();
+                    }
+                }
+            }
+            // </GBR>
+
+            vendTable = purchTable.vendTable_InvoiceAccount();
+            // <GIN>
+            if (!TaxSolutionScopeIntegrationUtil::isCompanyEnabled() && checkVAT && !_delayTaxCalc)
+            {
+                vatAmount = this.tax().vatAmountOfCapitalGoods_IN();
+            }
+            taxItemGroupRev = invoiceLine.TaxItemGroup ? invoiceLine.TaxItemGroup : purchLine.TaxItemGroup;
+            taxItemGroupHeadingRev = TaxItemGroupHeading::find(taxItemGroupRev);
+            if (isServiceTaxEnableIN
+               && taxItemGroupHeadingRev.ReverseChargePercentage_IN == 0// Block this execution for reverse charge.
+               && !_delayTaxCalc)
+            {
+                if (vendTable.isGTA())
+                {
+                    for (rsListHasMore = recordListvendInvoiceInfoLine.first(invoiceLine); rsListHasMore; rsListHasMore = recordListvendInvoiceInfoLine.next(invoiceLine))
+                    {
+                        gtaTaxAmount += this.tax().taxGTAVendorForNonPO_IN(invoiceLine);
+                    }
+                    for (rsListHasMore = recordListPurchLine.first(purchLine); rsListHasMore; rsListHasMore = recordListPurchLine.next(purchLine))
+                    {
+                        gtaTaxAmount += this.tax().taxGTAVendor_IN(purchLine);
+                    }
+                    totalAmount = totalAmount-gtaTaxAmount;
+                }
+                else if (vendTable.isForeign())
+                {
+                    for (rsListHasMore = recordListPurchLine.first(purchLine); rsListHasMore; rsListHasMore = recordListPurchLine.next(purchLine))
+                    {
+                        if (purchLine.purchTable().purchTable_W().CustomsImportOrder_IN)
+                        {
+                            foreignVendorTaxAmount += this.tax().taxGTAVendor_IN(purchLine);
+                        }
+                    }
+                    totalAmount = totalAmount - foreignVendorTaxAmount;
+                }
+            }
+            // </GIN>
+
+            if (vendTable.CreditMax)
+            {
+                freeValue = vendTable.freeValueMST(CurrencyExchangeHelper::mstAmount(totalAmount, currency, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), Currency::noYes2UnknownNoYes(this.triangulation()), this.exchRate(), this.exchRateSecondary()));
+            }
+            if (canApplyCashDiscOnInvoice_ES)
+            {
+                onlyOneCashDiscOnInvoice = true;
+            }
+
+            cashDisc = this.cashDisc();
+
+            if (canApplyCashDiscOnInvoice_ES)
+            {
+                this.purchTotalAmount();
+            }
+
+            cashDiscDate = this.cashDiscDate();
+
+            isCalculationComplete = true;
+
+            if (isCalcWHTInInvoiceEnabled && !_delayTaxCalc)
+            {
+                taxWithholdTotal = purchCalcTax.calcWithholdTax(this);
+            }
+
+            runTimeCalcTotals = stopWatch.elapsedMilliseconds();
+
+            this.logInstrumentationMeasures();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logInstrumentationMeasures</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logs instrumentation measures.
+    /// </summary>
+    protected void logInstrumentationMeasures()
+    {
+        const TradeInstrumentationMeasureName NumberOfLines = 'NumberOfPurchaseLines';
+        const TradeInstrumentationMeasureName NumberOfTaxLines = 'NumberOfTaxLines';
+        const TradeInstrumentationMeasureName NumberOfMarkupTransactions = 'NumberOfMarkupTransactions';
+        const TradeInstrumentationMeasureName RuntimeDiscountTotalsCalculation = 'RuntimeDiscountTotalsCalculation';
+        const TradeInstrumentationMeasureName RuntimeMarkupTotalsCalculation = 'RuntimeMarkupTotalsCalculation';
+
+        PurchInstrumentation::newInstrumentation(tableId2Name(parmTable.TableId), int642Str(parmTable.RecId))
+            .addMeasureElapsedMilliseconds(TradeInstrumentation::getMeasureNameByMethodName(classstr(PurchTotals_ParmTrans), methodStr(PurchTotals_ParmTrans, calc)), runTimeCalcTotals)
+            .addMeasureElapsedMilliseconds(TradeInstrumentation::getMeasureNameByMethodName(classstr(PurchTotals_ParmTrans), methodStr(PurchTotals_ParmTrans, calcTax)), runTimeCalcTaxTotals)
+            .addMeasureElapsedMilliseconds(RuntimeMarkupTotalsCalculation, runTimeCalcMarkupTotals)
+            .addMeasureElapsedMilliseconds(RuntimeDiscountTotalsCalculation, runTimeCalcDiscountTotals)
+            .addMeasureCount(NumberOfLines, numberOfPurchLines)
+            .addMeasureCount(NumberOfTaxLines, numberOfPurchTaxLines)
+            .addMeasureCount(NumberOfMarkupTransactions, numberOfMarkupTrans)
+            .logMeasures();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcCustVendMarkupOnLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the value of the <c>MarkupTrans</c> table records with a <c>CustVend</c> markup type
+    ///    that are attached to a <c>PurchParmLine</c> table record.
+    /// </summary>
+    /// <param name="_markup">
+    ///    A record in the <c>MarkupTrans</c> table.
+    /// </param>
+    /// <param name="_purchLine">
+    ///    The <c>PurchLine</c> table record that is associated with the <paramref name="_source" /> parameter.
+    /// </param>
+    /// <param name="_purchQty">
+    ///    The invoice line quantity.
+    /// </param>
+    /// <param name="_lineAmount">
+    ///    The invoice line amount.
+    /// </param>
+    /// <param name="_source">
+    ///    The source of the <c>MarkupTrans</c> table record.
+    /// </param>
+    /// <returns>
+    ///    The sum of the <c>CustVend</c> markup type miscellaneous charges for the specified line.
+    /// </returns>
+    /// <remarks>
+    ///    The <paramref name="_source" /> parameter is regularly a record in the <c>PurchParmLine</c> or
+    ///    <c>VendInvoiceInfoLine</c> table.
+    /// </remarks>
+    [HookableAttribute(true)]
+    protected AmountCur calcCustVendMarkupOnLine(Markup _markup, PurchLine _purchLine, PurchQty _purchQty, AmountCur _lineAmount, Common _source)
+    {
+        using (var activityContext = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().calcCustVendMarkupOnLine())
+        {
+            TradeInstrumentationStopwatch stopWatch = TradeInstrumentationStopwatch::newStopwatch();
+
+            // <GEERU>
+            //transaction is needed for update RU fields in MarkupTrans.initMarkupTrans_RU()
+            ttsbegin;
+            // </GEERU>
+
+            if (documentStatus == DocumentStatus::Invoice ||
+               // <GEERU>
+               (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]) && documentStatus == DocumentStatus::Facture_RU) ||
+               // </GEERU>
+               // <GEEPL>
+               (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoPL]) && documentStatus == DocumentStatus::PlSAD)      ||
+               // </GEEPL>
+               documentStatus == DocumentStatus::ApproveJournal)
+            {
+                // PurchParmLine and VendInvoiceInfoLine have MarkupTrans for invoices and approval journals
+                if (purchTable.isInterCompanyOrder())
+                {
+                    _markup.calc(_purchQty, _lineAmount, _source, documentStatus, this.interCompanyLineAmount(_purchLine, _purchQty, parmTable.TransDate), parmTable.Num);
+                }
+                else
+                {
+                    _markup.calc(_purchQty, _lineAmount, _source, documentStatus, this.interCompanyLineAmount(_purchLine, _purchQty, parmTable.TransDate));
+                }
+            }
+            else // PurchLine has MarkupTrans for other document types
+            {
+                _markup.calc(_purchQty, _lineAmount, _purchLine, documentStatus, this.interCompanyLineAmount(_purchLine, _purchQty, parmTable.TransDate));
+            }
+
+            if (doCalculateGWHTChargesCode)
+            {
+                taxWithholdCalc = _markup.parmTaxWithholdCalculation();
+            }
+
+            //<GEERU>
+            ttscommit;
+            //</GEERU>
+
+            numberOfMarkupTrans += _markup.getNumberOfMarkupTransactionsInCalculation();
+            runTimeCalcMarkupTotals += stopWatch.elapsedMilliseconds();
+
+            return _markup.markupCustVend();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcCustVendMarkupOnTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the value of the <c>MarkupTrans</c> table records with the <c>CustVend</c> markup type
+    ///    that are attached to a record in the <c>PurchParmSubTable</c>, <c>VendInvoiceSubTable</c>,
+    ///    <c>PurchParmTable</c>, or <c>VendInvoiceInfoTable</c> table.
+    /// </summary>
+    /// <param name="_markup">
+    ///    A record in the <c>MarkupTrans</c> table.
+    /// </param>
+    /// <param name="_purchTable">
+    ///    The <c>PurchTable</c> record that is associated with the <paramref name="_source" /> parameter.
+    /// </param>
+    /// <param name="_purchQty">
+    ///    The invoice line quantity.
+    /// </param>
+    /// <param name="_lineAmount">
+    ///    The invoice line amount.
+    /// </param>
+    /// <param name="_source">
+    ///    The source of the <c>MarkupTrans</c> record.
+    /// </param>
+    /// <returns>
+    ///    The sum of the <c>CustVend</c> markup type miscellaneous charges for the specified header.
+    /// </returns>
+    /// <remarks>
+    ///    The <paramref name="_source" /> parameter is regularly a record in the <c>PurchParmSubTable</c>,
+    ///    <c>VendInvoiceInfoSubTable</c>, <c>PurchParmTable</c>, or <c>VendInvoiceInfoTable</c> table.
+    /// </remarks>
+    [HookableAttribute(true)]
+    protected AmountCur calcCustVendMarkupOnTable(Markup _markup, PurchTable _purchTable, PurchQty _purchQty, AmountCur _lineAmount, Common _source)
+    {
+        using (var activityContext = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().calcCustVendMarkupOnTable())
+        {
+            TradeInstrumentationStopwatch stopWatch = TradeInstrumentationStopwatch::newStopwatch();
+
+            // <GEERU>
+            //transaction is needed for update RU fields in MarkupTrans.initMarkupTrans_RU()
+            ttsbegin;
+
+            // </GEERU>
+            if (documentStatus == DocumentStatus::Invoice ||
+                // <GEERU>
+                (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]) && documentStatus == DocumentStatus::Facture_RU) ||
+                // </GEERU>
+                // <GEEPL>
+                (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoPL]) && documentStatus == DocumentStatus::PlSAD)      ||
+                // </GEEPL>
+                documentStatus == DocumentStatus::ApproveJournal)
+            {
+                // Invoices have MarkupTrans on PurchParmSubTable, VendInvoiceInfoSubTable, PurchParmTable, or VendInvoiceInfoTable
+                _markup.calc(_purchQty, _lineAmount, _source, documentStatus);
+            }
+            else
+            {
+                // Other document types have MarkupTrans on PurchTable
+                _markup.calc(_purchQty, _lineAmount, _purchTable, documentStatus);
+            }
+
+            if (doCalculateGWHTChargesCode)
+            {
+                taxWithholdCalc = _markup.parmTaxWithholdCalculation();
+            }
+
+            //<GEERU>
+            ttscommit;
+            //</GEERU>
+
+            numberOfMarkupTrans += _markup.getNumberOfMarkupTransactionsInCalculation();
+            runTimeCalcMarkupTotals += stopWatch.elapsedMilliseconds();
+
+            return _markup.markupCustVend();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcTax</Name>
+				<Source><![CDATA[
+    void calcTax(PurchCalcTax _purchCalcTax)
+    {
+        using (var activityContext = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().calcTax())
+        {
+            PurchTotals     taxPurchTotals;
+
+            TradeInstrumentationStopwatch stopWatch = TradeInstrumentationStopwatch::newStopwatch();
+
+            if (_purchCalcTax is PurchCalcTax_ParmTransExpected)
+            {
+                taxPurchTotals = PurchTotals_ParmTransExpected::construct(parmTable, specQty, parmId, sumPurchId, documentStatus);
+            }
+            else
+            {
+                taxPurchTotals = PurchTotals::newParmTable(parmTable, specQty, parmId, sumPurchId, documentStatus);
+            }
+            taxPurchTotals.clear();
+            taxPurchTotals.parmKeepEndDisc(this.parmKeepEndDisc());
+
+            _purchCalcTax.setSpecQty(specQty);
+            _purchCalcTax.setSalesTaxDetailIsNotNeeded(isSalesTaxDetailNotNeeded);
+
+            // <GEEU>
+            if (TaxParameters::isEasternEuropeOrVatDueDateFeatureEnabled())
+            {
+                _purchCalcTax.vatRegData_W();
+            }
+            // </GEEU>
+
+            // <GTE>
+            if (TaxSolutionScopeIntegrationUtil::isCompanyEnabled())
+            {
+                ITaxableDocument taxableDocument = TaxableDocumentObject::construct(this.parmTaxableDocumentDescriptor());
+                ITaxDocument taxDocumentObject = TaxBusinessService::calculateTax(taxableDocument);
+
+                if (taxDocumentObject)
+                {
+                    ITaxDocumentMeasureValue totalTaxMeasureValue = taxDocumentObject.getTotalTax();
+                    taxTotalGTE = taxTotal + totalTaxMeasureValue.amountTransactionCurrency();
+
+                    ITaxDocumentMeasureValue partyTaxMeasureValue = taxDocumentObject.sumByTaxAccountingProvider(TaxAccountingProvider::Party, TaxAccountingPostingProfileDistributionSide::Credit);
+                    taxTotal += partyTaxMeasureValue.amountTransactionCurrency();
+
+                    partyTaxMeasureValue = taxDocumentObject.sumByTaxAccountingProvider(TaxAccountingProvider::Party, TaxAccountingPostingProfileDistributionSide::Debit);
+                    taxTotal -= partyTaxMeasureValue.amountTransactionCurrency();
+
+                    taxTotalReverseCharge = TaxDocumentUtils::calculateTaxTotalReverseCharge(taxDocumentObject);
+                }
+                else
+                {
+                    taxTotalGTE = taxTotal;
+                }
+
+                _purchCalcTax.tax(new TaxPurch(_purchCalcTax, false, false, false, true, false));
+                this.tax(_purchCalcTax.tax());
+            }
+            else
+            {
+                // </GTE>
+                taxTotal = _purchCalcTax.calcTax(taxPurchTotals);
+                this.tax(_purchCalcTax.tax());
+                if (isSalesTaxDetailNotNeeded)
+                {
+                    loadFromTaxUncommitted = _purchCalcTax.loadFromTaxUncommitted();
+                    loadFromTaxTrans = _purchCalcTax.loadFromTaxTrans();
+                }
+                // <GTE>
+            }
+            // </GTE>
+            this.updateNumberOfTaxLines(_purchCalcTax);
+            runTimeCalcTaxTotals += stopWatch.elapsedMilliseconds();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructPurchCalcTax</Name>
+				<Source><![CDATA[
+    PurchCalcTax constructPurchCalcTax()
+    {
+        if (documentStatus == DocumentStatus::PackingSlip)
+        {
+            return PurchCalcTax::construct(parmTable, parmId, sumPurchId, documentStatus, vendPackingSlipJour);
+        }
+        else
+        {
+            return PurchCalcTax::construct(parmTable, parmId, sumPurchId, documentStatus);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>discPercent</Name>
+				<Source><![CDATA[
+    public DiscPct discPercent()
+    {
+        if (parmTable.EndDisc && endDiscBalance)
+        {
+            return ( (parmTable.EndDisc * 100 / endDiscBalance));
+        }
+
+        if (parmTable.isNonPO() || parmTable.isAdvance())
+        {
+            return 0.0;
+        }
+
+        return parmTable.purchTable().DiscPercent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>documentDate</Name>
+				<Source><![CDATA[
+    DocumentDate documentDate()
+    {
+        return parmTable.documentDate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>exchRate</Name>
+				<Source><![CDATA[
+    ExchRate exchRate()
+    {
+        if (parmTable.FixedExchRate)
+        {
+            return parmTable.ExchRate;
+        }
+        else
+        {
+            // <GEEU>
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion(#easternEuropeAll))
+            {
+                return ExchangeRateHelper::exchRate(currency, parmTable.getExchRateDate(parmTable.updateDate()));
+            }
+            else
+            {
+                // </GEEU>
+                return ExchangeRateHelper::exchRate(currency, parmTable.updateDate());
+                // <GEEU>
+            }
+            // </GEEU>
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>exchRateSecondary</Name>
+				<Source><![CDATA[
+    ExchrateSecondary exchRateSecondary()
+    {
+        if (parmTable.FixedExchRate)
+        {
+            return parmTable.ExchRateSecondary;
+        }
+        else
+        {
+            // <GEEU>
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion(#easternEuropeAll))
+            {
+                return ExchangeRateHelper::exchRateSecond(currency, parmTable.getExchRateDate(parmTable.updateDate()));
+            }
+            else
+            {
+                // </GEEU>
+                return ExchangeRateHelper::exchRateSecond(currency, parmTable.updateDate());
+                // <GEEU>
+            }
+            // </GEEU>
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>interCompanyLineAmount</Name>
+				<Source><![CDATA[
+    LineAmount interCompanyLineAmount(PurchLine _purchLine, PurchQty _purchQty, InvoiceDate _invoiceDate)
+    {
+        return _purchLine.interCompanyLineAmount(_purchQty, _invoiceDate, tax);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>invoiceDate</Name>
+				<Source><![CDATA[
+    TransDate invoiceDate()
+    {
+        return parmTable.updateDate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lineAmount</Name>
+				<Source><![CDATA[
+    AmountCur lineAmount(PurchQty _purchQty, TransDate _transDate)
+    {
+        return parmLine.lineAmountExcludingTax(_transDate, tax, parmTable, this.parmKeepEndDisc());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lineEndDisc</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the line is eligible for total discount.
+    /// </summary>
+    /// <returns>
+    /// true if the line is eligible for total discount; otherwise, false.
+    /// </returns>
+    public boolean lineEndDisc()
+    {
+        if (parmLine.isNonPO() || parmLine.isAdvance())
+        {
+            return parmLine.endDisc();
+        }
+
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lineHasDiscount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines whether a discount is applied to the invoice line.
+    /// </summary>
+    /// <returns>
+    ///     true if a discount ammount, a discount percentage, a multi line discount amount or a multi line discount percentage is applied; otherwise, false.
+    /// </returns>
+    protected boolean lineHasDiscount()
+    {
+        return (parmLine.LineDisc
+                || parmLine.LinePercent
+                || parmLine.MultiLnDisc
+                || parmLine.MultiLnPercent);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lineMarkupTransExist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines if a <c>MarkupTrans</c> table record related to a <c>VendInvoiceInfoLine</c> table record exists.
+    /// </summary>
+    /// <returns>
+    ///     true if a <c>MarkupTrans</c> table record exists; otherwise, false.
+    /// </returns>
+    public boolean lineMarkupTransExist()
+    {
+        MarkupTrans localMarkUpTrans;
+
+        if (parmTable.TableId == tableNum(VendInvoiceInfoTable))
+        {
+            VendInvoiceInfoLine localVendInvoiceInfoLine;
+            VendInvoiceInfoTable localVendInvoiceInfoTable;
+
+            select firstonly RecId from localMarkUpTrans
+                where localMarkUpTrans.TransTableId == tableNum(VendInvoiceInfoLine)
+                    && localMarkUpTrans.IsDeleted == NoYes::No
+                exists join localVendInvoiceInfoLine
+                    where localVendInvoiceInfoLine.ParmId == parmTable.ParmId
+                        && localVendInvoiceInfoLine.TableRefId == parmTable.TableRefId
+                        && localVendInvoiceInfoLine.RecId == localMarkUpTrans.TransRecId;
+        }
+        else
+        {
+            PurchLine localPurchLine;
+            PurchParmLine purchParmLine;
+
+            select firstOnly RecId from localMarkUpTrans
+                where localMarkUpTrans.TransTableId == tableNum(PurchLine)
+                    && localMarkUpTrans.IsDeleted   == NoYes::No
+                exists join localPurchLine
+                    where localPurchLine.RecId      == localMarkUpTrans.TransRecId
+                exists join purchParmLine
+                    where localPurchLine.RecId      == purchParmLine.PurchLineRecId
+                        && purchParmLine.ParmId     == parmTable.ParmId
+                        && purchParmLine.TableRefId == parmTable.TableRefId;
+        }
+
+        return localMarkUpTrans.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustHavePurchLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the document line must be related to originating purchase order line.
+    /// </summary>
+    /// <param name="_parmLine">
+    /// Document line to consider.
+    /// </param>
+    /// <returns>
+    /// true, if the document line must be related to originating purchase order line; otherwise, false.
+    /// </returns>
+    protected boolean mustHavePurchLine(VendDocumentLineMap _parmLine)
+    {
+        return !_parmLine.isNonPO() && !_parmLine.isAdvance();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(
+            VendDocumentTableMap _source,
+            PurchUpdate    _specQty,
+            ParmId         _parmId,
+            PurchId        _sumPurchId,
+            DocumentStatus _documentStatus)
+    {
+        parmTable            = _source;
+        parmId               = _parmId;
+        sumPurchId           = _sumPurchId;
+        documentStatus       = _documentStatus;
+
+        super(parmTable.purchTable(), _specQty);
+
+        parmTransInstrumentationLogger = PurchInstrumentationLogger::createLogger(classStr(PurchTotals_ParmTrans));
+
+        if (parmTable.Ordering == DocumentStatus::ApproveJournal)
+        {
+            vendInvoiceJour = VendInvoiceJour::findFromPurchParmTable(parmTable.Num, parmTable.TransDate, parmTable.InvoiceAccount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>orderLine_orderTable</Name>
+				<Source><![CDATA[
+    protected Common orderLine_orderTable()
+    {
+        return updateTotalRecord;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmLineTableId</Name>
+				<Source><![CDATA[
+    protected TableId parmLineTableId()
+    {
+        if (documentStatus == DocumentStatus::ApproveJournal ||
+           // <GEERU>
+           (documentStatus == DocumentStatus::Facture_RU && SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU])) ||
+           // </GEERU>
+           // <GEEPL>
+           (documentStatus == DocumentStatus::PlSAD      && SysCountryRegionCode::isLegalEntityInCountryRegion([#isoPL])) ||
+           // </GEEPL>
+           documentStatus == DocumentStatus::Invoice)
+        {
+            return tableNum(VendInvoiceInfoLine);
+        }
+
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTable</Name>
+				<Source><![CDATA[
+    public VendDocumentTableMap parmTable()
+    {
+        return parmTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTaxableDocumentDescriptor</Name>
+				<Source><![CDATA[
+    public TaxableDocumentDescriptor parmTaxableDocumentDescriptor()
+    {
+        TaxableDocumentDescriptor taxableDocumentDescriptor;
+
+        if (parmTable.TableId == tableNum(PurchParmTable))
+        {
+            PurchParmTable purchParmTable = parmTable;
+            taxableDocumentDescriptor = TaxableDocumentDescriptorFactory::getTaxableDocumentDescriptor(purchParmTable);
+        }
+        else if (parmTable.TableId == tableNum(VendInvoiceInfoTable))
+        {
+            VendInvoiceInfoTable vendInvoiceInfoTable = parmTable;
+            taxableDocumentDescriptor = TaxableDocumentDescriptorFactory::getTaxableDocumentDescriptor(vendInvoiceInfoTable);
+        }
+        else
+        {
+            taxableDocumentDescriptor = TaxableDocumentDescriptorFactory::getTaxableDocumentDescriptor(parmTable);
+        }
+
+        return taxableDocumentDescriptor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pdsCWQtyPurch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Gets the parameter line quantity in catch weight units.
+    /// </summary>
+    /// <param name="_purchLine">
+    ///     The original source record.
+    /// </param>
+    /// <returns>
+    ///     The quantity in catch weight units.
+    /// </returns>
+    public PdsCWInventQty pdsCWQtyPurch(PurchLine _purchLine)
+    {
+        return parmLine.PdsCWReceiveNow;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postupdateOrderBalances_BR</Name>
+				<Source><![CDATA[
+    protected void postupdateOrderBalances_BR(AmountCur _amountCur)
+    {
+        if (updateBalance)
+        {
+            super(_amountCur);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>qtyInvent</Name>
+				<Source><![CDATA[
+    InventQty qtyInvent()
+    {
+        return parmLine.InventNow;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>qtyPurch</Name>
+				<Source><![CDATA[
+    PurchQty qtyPurch()
+    {
+        return parmLine.ReceiveNow;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryBuild</Name>
+				<Source><![CDATA[
+    Object queryBuild()
+    {
+        return new QueryRun(parmTable.queryLine(false));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryBuildPurchTable</Name>
+				<Source><![CDATA[
+    QueryRun queryBuildPurchTable()
+    {
+        return new QueryRun(parmTable.querySubTable());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryGet</Name>
+				<Source><![CDATA[
+    Common queryGet(QueryRun  _queryRun)
+    {
+        TableId lineTableId = this.parmLineTableId();
+
+        purchLine = null;
+
+        if (_queryRun.changed(lineTableId))
+        {
+            parmLine = _queryRun.get(lineTableId);
+
+            if (parmLine)
+            {
+                recordListParmLine.ins(parmLine);
+
+                if (this.mustHavePurchLine(parmLine))
+                {
+                    purchLine = parmLine.purchLine();
+                    purchLine.setInventReceivedNow();
+                }
+            }
+        }
+        return purchLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recordListParmLineSortOrder</Name>
+				<Source><![CDATA[
+    protected container recordListParmLineSortOrder()
+    {
+        TableId lineTableId = this.parmLineTableId();
+
+        switch (lineTableId)
+        {
+            case tableNum(PurchParmLine):
+                return super();
+
+            case tableNum(VendInvoiceInfoLine):
+                return [fieldNum(VendInvoiceInfoLine, TableRefId),
+                        fieldNum(VendInvoiceInfoLine, OrigPurchId),
+                        fieldNum(VendInvoiceInfoLine, LineNum),
+                        fieldNum(VendInvoiceInfoLine, PurchLineRecId),
+                        fieldNum(VendInvoiceInfoLine, RecId)];
+
+            default:
+                throw error(strFmt("@SYS19306",funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setVendPackingSlipJour</Name>
+				<Source><![CDATA[
+    public void setVendPackingSlipJour(VendPackingSlipJour _vendPackingSlipJour)
+    {
+        vendPackingSlipJour = _vendPackingSlipJour;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldSkipParmLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the document line should not be considered at all for totals calculation.
+    /// </summary>
+    /// <param name="_parmLine">
+    /// Document line to consider.
+    /// </param>
+    /// <returns>
+    /// true, if the document line should not be considered at all for totals calculation; otherwise, false.
+    /// </returns>
+    protected boolean shouldSkipParmLine(VendDocumentLineMap _parmLine)
+    {
+        VendInvoiceInfoLine invoiceLine;
+
+        if (parmLine.TableId == tableNum(VendInvoiceInfoLine))
+        {
+            invoiceLine = parmLine;
+        }
+
+        return _parmLine.isAdvanceApplication() || invoiceLine.isReverseAdvanceApplication();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taxCashDiscPercent</Name>
+				<Source><![CDATA[
+    DiscPct taxCashDiscPercent()
+    {
+        using (var activityContext = parmTransInstrumentationLogger.purchTotals_ParmTransActivities().taxCashDiscPercent())
+        {
+            AmountCur   amount;
+            AmountCur   cashDiscAmount;
+
+            QueryRun            queryTransact;
+            QueryRun            queryPurchTableMarkup;
+            Markup              markup;
+            PurchQty            purchQty;
+            AmountCur           lineAmount;
+            PurchCalcTax        purchCalcTax;
+            TableId             subTableId;
+            VendDocumentSubTableMap   parmSubTable;
+
+            if ((
+                // <GEERU><GEEPL>
+                (
+                // </GEERU></GEEPL>
+                parmTable.Ordering == DocumentStatus::Invoice
+                // <GEERU>
+                || (parmTable.Ordering == DocumentStatus::Facture_RU && SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]))
+                // </GEERU>
+                // <GEERU>
+                || (parmTable.Ordering == DocumentStatus::PlSAD && SysCountryRegionCode::isLegalEntityInCountryRegion([#isoPL]))
+                // </GEERU>
+                // <GEERU><GEEPL>
+                )
+                // </GEERU></GEEPL>
+                && ! parmTable.ReCalculate)
+                || parmTable.Ordering == DocumentStatus::ApproveJournal
+                || parmTable.isNonPO())
+            {
+                if (parmTable.ReCalculate)
+                {
+                    if (!(parmTable.isNonPO() || parmTable.isAdvance()))
+                    {
+                        return CashDisc::find(purchTable.CashDisc).Percent;
+                    }
+                    else
+                    {
+                        return CashDisc::find(parmTable.CashDiscCode).Percent;
+                    }
+                }
+                else
+                {
+                    subTableId = tableNum(VendInvoiceInfoSubTable);
+
+                    purchCalcTax    = this.constructPurchCalcTax();
+                    this.clear();
+
+                    currency    = (parmTable.isNonPO() || parmTable.isAdvance()) ? parmTable.CurrencyCode : purchTable.CurrencyCode;
+                    markup      = new Markup(currency);
+                    markup.parmExchRate(this.exchRate(), this.exchRateSecondary(), Currency::noYes2UnknownNoYes(this.triangulation()));
+                    markup.transDate(this.invoiceDate());
+
+                    queryTransact = this.queryBuild();
+
+                    while (queryTransact.next())
+                    {
+                        purchLine = this.queryGet(queryTransact);
+
+                        if ((!purchLine && this.mustHavePurchLine(parmLine)) || this.shouldSkipParmLine(parmLine))
+                        {
+                            continue;
+                        }
+
+                        purchQty         = this.qtyPurch();
+
+                        lineAmount       = this.lineAmount(purchQty, purchCalcTax.invoiceDate());
+
+                        updateTotalRecord = VendDocumentLineMap::header(parmLine);
+                        updateBalance = false;
+                        this.updateOrderBalances(lineAmount);
+                        updateBalance = true;
+
+                        updateTotalRecord = VendDocumentLineMap::subHeader(parmLine);
+                        this.updateOrderBalances(lineAmount);
+
+                        // Include MarkupTrans on the lines, i.e. PurchParmLine, VendInvoiceInfoLine, and PurchLine
+                        markupAmount -= this.calcCustVendMarkupOnLine(markup, purchLine, purchQty, lineAmount, parmLine);
+                    }
+
+                    // Include MarkupTrans on the (Individual) Headers, i.e. PurchParmSubTable and VendInvoiceInfoSubTable
+                    queryPurchTableMarkup = this.queryBuildPurchTable();
+
+                    while (queryPurchTableMarkup.next())
+                    {
+                        if (queryPurchTableMarkup.changed(subTableId))
+                        {
+                            parmSubTable = queryPurchTableMarkup.get(subTableId);
+                        }
+                        else
+                        {
+                            parmSubTable = null;
+                        }
+                        if (parmSubTable)
+                        {
+                            markupAmount -= this.calcCustVendMarkupOnTable(markup, purchTable, 1, this.purchOrderBalance(parmSubTable.TableId, parmSubTable.RecId), parmSubTable);
+                        }
+                    }
+
+                    // Include MarkupTrans on the (Summary) Header, i.e. PurchParmTable and VendInvoiceInfoTable
+                    markupAmount -= this.calcCustVendMarkupOnTable(markup, purchTable, 1, this.purchBalance(), parmTable);
+
+                    amount  = balance
+                            - this.endDisc()
+                            + markupAmount
+                            + this.invoiceRoundOff();
+
+                    cashDiscAmount = this.cashDisc();
+
+                    if (cashDiscAmount && amount)
+                    {
+                        return cashDiscAmount * 100 / amount;
+                    }
+
+                    if (this.shouldRespectZeroTaxCashDiscPercent(cashDiscAmount))
+                    {
+                        return 0.0;
+                    }
+                }
+            }
+
+            return super();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldRespectZeroTaxCashDiscPercent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the zero cash discount percent should be returned.
+    /// </summary>
+    /// <param name="_cashDiscAmount">The cash discount amount.</param>
+    /// <remarks>
+    /// If false is returned, the super taxCashDiscPercent() method will be called to determine the cash discount percent.
+    /// </remarks>
+    internal protected boolean shouldRespectZeroTaxCashDiscPercent(AmountCur _cashDiscAmount)
+    {
+        return (parmTable.isNonPO() || parmTable.isAdvance());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>triangulation</Name>
+				<Source><![CDATA[
+    EUROTriangulation triangulation()
+    {
+        if (parmTable.FixedExchRate)
+        {
+            return parmTable.euroTriangulation;
+        }
+        else
+        {
+            return Currency::triangulation(currency, parmTable.updateDate());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOrderBalances</Name>
+				<Source><![CDATA[
+    public void updateOrderBalances(AmountCur _amountCur)
+    {
+        Common common = this.orderLine_orderTable();
+        AmountCur orderBalance = this.purchOrderBalance(common.TableId, common.RecId);
+
+        if (updateBalance)
+        {
+            balance += _amountCur;
+        }
+        orderBalance += _amountCur;
+
+        orderBalances.insert(this.getOrderBalanceKey(common.TableId, common.RecId), orderBalance);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInclTaxAmountForPosting_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates inclusive tax amount.
+    /// </summary>
+    /// <param name="_common">
+    /// Recid of the PurchLine table.
+    /// </param>
+    /// <param name="_tax">
+    /// The Tax object passed in.
+    /// </param>
+    /// <returns>
+    /// The total tax amount committed.
+    /// </returns>
+    public static TaxAmountCur getInclTaxAmountForPosting_IN(Common _common, Tax _tax = null)
+    {
+        TaxAmountCur        inclTaxAmount;
+        TaxUncommitted      taxUncommittedIncl;
+        FormulaDesigner_IN  formulaDesigner;
+        TaxableBasis_IN     taxBasis;
+        TmpTaxCalc_IN       tmpTaxCalc;
+        TaxTable            taxTableIN;
+
+        if (_tax)
+        {
+            tmpTaxCalc = _tax.tmpTaxCalc_IN();
+        }
+
+        while select * from taxUncommittedIncl
+            where taxUncommittedIncl.SourceRecId    == _common.RecId
+                && taxUncommittedIncl.SourceTableId == _common.TableId
+                && taxUncommittedIncl.TaxDirection  != TaxDirection::UseTax
+                && taxUncommittedIncl.TaxOrigin     != TaxOrigin::TaxReversed
+            join * from formulaDesigner
+                where formulaDesigner.TaxItemGroup == taxUncommittedIncl.TaxItemGroup
+                    && formulaDesigner.TaxCode      == taxUncommittedIncl.TaxCode
+                    && formulaDesigner.PriceInclTax == NoYes::Yes
+            join * from taxTableIN
+                where taxTableIN.TaxCode == taxUncommittedIncl.TaxCode
+                    && taxTableIN.TaxType_IN != TaxType_IN::None
+        {
+            taxBasis = formulaDesigner.TaxableBasis;
+            if (taxBasis == TaxableBasis_IN::ExclAmount)
+            {
+                taxBasis = Tax::getTaxableBasis_IN(formulaDesigner);
+            }
+            if (taxBasis == TaxableBasis_IN::LineAmount
+                || taxBasis == TaxableBasis_IN::Assessable)
+            {
+                inclTaxAmount += taxUncommittedIncl.SourceRegulateAmountCur;
+                select firstonly tmpTaxCalc
+                    where tmpTaxCalc.TaxCode        == taxUncommittedIncl.TaxCode
+                        && tmpTaxCalc.SourceTableID == _common.TableId
+                        && tmpTaxCalc.SourceRecID   == _common.RecId;
+                if (tmpTaxCalc.TaxOnCharges != 0)
+                {
+                    if (inclTaxAmount < 0)
+                    {
+                        inclTaxAmount += tmpTaxCalc.TaxOnCharges;
+                    }
+                    else
+                    {
+                        inclTaxAmount -= tmpTaxCalc.TaxOnCharges;
+                    }
+                }
+            }
+        }
+        return CurrencyExchangeHelper::amount(inclTaxAmount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInclTaxAmountForPostingPerTable_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates inclusive tax amount.
+    /// </summary>
+    /// <param name="_common">
+    /// The table buffer passe in.
+    /// </param>
+    /// <param name="_tax">
+    /// The Tax object passed in.
+    /// </param>
+    /// <returns>
+    /// The total tax amount committed.
+    /// </returns>
+    public static TaxAmountCur getInclTaxAmountForPostingPerTable_IN(Common _common, Tax _tax = null)
+    {
+        TaxAmountCur            inclTaxAmount;
+        TaxUncommitted          taxUncommittedIncl;
+        PurchLine               purchlineLoc;
+        FormulaDesigner_IN      formulaDesigner;
+        TaxableBasis_IN         taxBasis;
+        TmpTaxCalc_IN           tmpTaxCalc;
+        TaxTable                taxTableIN;
+        PurchTable              purchTable;
+        VendInvoiceInfoTable    vendInvoiceInfoTable;
+        VendInvoiceInfoLine     vendInvoiceInfoLine;
+
+        void getInclusiveAmount()
+        {
+            if (FormulaDesigner_IN::isPriceInclTaxOnLineAmount(purchlineLoc.TaxItemGroup))
+            {
+                taxBasis = formulaDesigner.TaxableBasis;
+                if (taxBasis == TaxableBasis_IN::ExclAmount)
+                {
+                    taxBasis = Tax::getTaxableBasis_IN(formulaDesigner);
+                }
+                if (taxBasis == TaxableBasis_IN::LineAmount
+                    || taxBasis == TaxableBasis_IN::Assessable)
+                {
+                    inclTaxAmount += taxUncommittedIncl.SourceRegulateAmountCur;
+                    select firstonly tmpTaxCalc
+                        where tmpTaxCalc.TaxCode        == taxUncommittedIncl.TaxCode
+                            && tmpTaxCalc.SourceTableID == purchlineLoc.TableId
+                            && tmpTaxCalc.SourceRecID   == purchlineLoc.RecId;
+                    if (tmpTaxCalc.TaxOnCharges != 0)
+                    {
+                        if (inclTaxAmount < 0)
+                        {
+                            inclTaxAmount += tmpTaxCalc.TaxOnCharges;
+                        }
+                        else
+                        {
+                            inclTaxAmount -= tmpTaxCalc.TaxOnCharges;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (_tax)
+        {
+            tmpTaxCalc = _tax.tmpTaxCalc_IN();
+        }
+
+        if (_common.RecId != 0)
+        {
+            switch (_common.TableId)
+            {
+                case tableNum(PurchTable):
+                    purchTable = _common;
+                    break;
+                case tableNum(VendInvoiceInfoTable):
+                    vendInvoiceInfoTable = _common;
+                    break;
+            }
+        }
+
+        if (vendInvoiceInfoTable.RecId != 0)
+        {
+            while select * from taxUncommittedIncl
+                where taxUncommittedIncl.TaxDirection  != TaxDirection::UseTax
+                    && taxUncommittedIncl.TaxOrigin     != TaxOrigin::TaxReversed
+                join * from formulaDesigner
+                    where formulaDesigner.TaxItemGroup  == taxUncommittedIncl.TaxItemGroup
+                        && formulaDesigner.TaxCode      == taxUncommittedIncl.TaxCode
+                        && formulaDesigner.PriceInclTax == NoYes::Yes
+                join * from taxTableIN
+                    where taxTableIN.TaxCode     == taxUncommittedIncl.TaxCode
+                        && taxTableIN.TaxType_IN != TaxType_IN::None
+                join * from vendInvoiceInfoLine
+                    where vendInvoiceInfoLine.ParmId       == vendInvoiceInfoTable.ParmId
+                       && vendInvoiceInfoLine.TableRefId   == vendInvoiceInfoTable.TableRefId
+                       && taxUncommittedIncl.SourceRecId   == vendInvoiceInfoLine.RecId
+                       && taxUncommittedIncl.SourceTableId == vendInvoiceInfoLine.TableId
+            {
+                purchlineLoc = vendInvoiceInfoLine.purchLine();
+                getInclusiveAmount();
+            }
+        }
+        else if (purchTable.RecId != 0)
+        {
+            while select * from taxUncommittedIncl
+                where taxUncommittedIncl.TaxDirection != TaxDirection::UseTax
+                    && taxUncommittedIncl.TaxOrigin != TaxOrigin::TaxReversed
+                join * from formulaDesigner
+                    where formulaDesigner.TaxItemGroup == taxUncommittedIncl.TaxItemGroup
+                        && formulaDesigner.TaxCode == taxUncommittedIncl.TaxCode
+                        && formulaDesigner.PriceInclTax == NoYes::Yes
+                join * from taxTableIN
+                    where taxTableIN.TaxCode == taxUncommittedIncl.TaxCode
+                        && taxTableIN.TaxType_IN != TaxType_IN::None
+                join * from purchlineLoc
+                    where purchlineLoc.PurchId == purchTable.PurchId
+                        && purchlineLoc.RecId == taxUncommittedIncl.SourceRecId
+                        && purchlineLoc.TableId == taxUncommittedIncl.SourceTableId
+            {
+                getInclusiveAmount();
+            }
+        }
+
+        return CurrencyExchangeHelper::amount(inclTaxAmount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showTax</Name>
+				<Source><![CDATA[
+    static void showTax(str _menuItemDisplayStr, VendDocumentTableMap _parmTable, PurchUpdate _specQty, FormRun _formRun)
+    {
+        PurchTotals purchTotals = PurchTotals::newParmTable(
+            _parmTable,
+            _specQty,
+            _parmTable.ParmId,
+            '',
+            _parmTable.Ordering);
+
+        purchTotals.calc(false, false, true);
+
+        Tax::showTaxes(_menuItemDisplayStr, purchTotals.tax(), _parmTable, _formRun);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showWithholdTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Displays calculated withholding tax amount.
+    /// </summary>
+    /// <param name = "_menuItemDisplayStr">The string for display menu item.</param>
+    /// <param name = "_parmTable">A <c>VendInvoiceInfoTable</c> or <c>PurchParmTable</c> record.</param>
+    /// <param name = "_specQty">Indicates which quantity to use.</param>
+    /// <param name = "_formRun">A instance of the caller <c>FormRun</c> classs.</param>
+    internal static void showWithholdTax(str _menuItemDisplayStr, VendDocumentTableMap _parmTable, PurchUpdate _specQty, FormRun _formRun)
+    {
+        PurchTotals purchTotals = PurchTotals::newParmTable(
+            _parmTable,
+            _specQty,
+            _parmTable.ParmId,
+            '',
+            _parmTable.Ordering);
+
+        purchTotals.parmIsWHTCalcNeeded(true);
+        purchTotals.calc();
+
+        TaxWithholdCalculation::showWithholdTaxes(_menuItemDisplayStr, purchTotals.taxWithholdCalculation(), _parmTable, _formRun);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>roundBalances</Name>
+				<Source><![CDATA[
+    private void roundBalances(CurrencyCode _currency)
+    {
+        RoundingLineAmountContext context = RoundingLineAmountContext::current();
+        if (context && context.parmSkipRoundingLineAmount())
+        {
+            balance = CurrencyExchangeHelper::amount(balance, _currency);
+
+            this.roundBalanceMap(orderBalances, _currency);
+            this.roundBalanceMap(endDiscBalances, _currency);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>roundBalanceMap</Name>
+				<Source><![CDATA[
+    private void roundBalanceMap(Map _map, CurrencyCode _currency)
+    {
+        MapEnumerator enumerator = _map.getEnumerator();
+
+        while (enumerator.moveNext())
+        {
+            AmountCur value = CurrencyExchangeHelper::amount(enumerator.currentValue(), _currency);
+
+            _map.insert(enumerator.currentKey(), value);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadToTmpTaxWorkTransWhileSalesTaxDetailIsNotNeededAndTmpTaxWorkTransIsNull</Name>
+				<Source><![CDATA[
+    private void loadToTmpTaxWorkTransWhileSalesTaxDetailIsNotNeededAndTmpTaxWorkTransIsNull()
+    {
+        if (isSalesTaxDetailNotNeeded)
+        {
+            TmpTaxWorkTrans taxWorkTrans = tax.tmpTaxWorkTrans();
+            select firstonly RecId from taxWorkTrans;
+
+            if (!taxWorkTrans)
+            {
+                TaxLoadToTmpTaxWorkTransWhileSalesTaxDetailIsNotNeededParameters parameters = TaxLoadToTmpTaxWorkTransWhileSalesTaxDetailIsNotNeededParameters::construct();
+                parameters.loadFromTaxUncommitted = loadFromTaxUncommitted;
+                parameters.loadFromTaxTrans = loadFromTaxTrans;
+                parameters.headingTableId = parmTable.TableId;
+                parameters.headingRecId = parmTable.recid;
+                parameters.headingTableSourceDocumentRecId = sourceDocumentHeaderRecId;
+
+                taxworkTrans = taxworkTrans.loadToTmpTaxWorkTransWhileSalesTaxDetailIsNotNeeded(parameters);
+                        
+                tax.tmpTaxWorkTrans(taxWorkTrans);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

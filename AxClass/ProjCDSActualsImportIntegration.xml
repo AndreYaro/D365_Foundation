@@ -1,0 +1,951 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProjCDSActualsImportIntegration</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>ProjCDSActualsImportIntegration</c> class imports actuals from PSA into the project integration journal.
+/// </summary>
+public class ProjCDSActualsImportIntegration extends RunBaseBatch implements BatchRetryable
+{
+    RecId advancedJournalHeader;
+    boolean projOpsIntegEnabled;
+
+    private ProjOpsIntegrationLogger stagingCDSImportLogger = ProjOpsIntegrationLogger::createLogger(classStr(ProjCDSActualsImportIntegration));
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static ProjCDSActualsImportIntegration construct()
+    {
+        return new ProjCDSActualsImportIntegration();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@Proj:ImportFromStaging";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args args)
+    {
+        ProjCDSActualsImportIntegration projCDSActualsImportIntegration = ProjCDSActualsImportIntegration::construct();
+
+        if (!projCDSActualsImportIntegration.prompt())
+        {
+            return;
+        }
+
+        projCDSActualsImportIntegration.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        projOpsIntegEnabled = ProjProjectOperationsIntegrationFeatureHelper::isFeatureEnabled();
+        if (projOpsIntegEnabled)
+        {
+            throw error(strFmt("@Proj:MessageValidation_ProjIntegrationJournalProcessing", "@Proj:EnableProjectOperationsIntegration", "@FeatureManagement:EnabledFeature"));
+        }
+
+        this.processImportQueue();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processImportQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes actuals from the import queue.
+    /// </summary>
+    protected void processImportQueue()
+    {
+        ProjCDSActualsImport import;
+        Set matchedRecords = new Set(Types::Int64);
+
+        //
+        // Delete duplicate records
+        // These were created by the import process, but are not needed
+        //
+        delete_from import where import.IsDuplicate == NoYes::Yes;
+
+        // select all records that have not been integrated into standard ax tables
+        while select import
+            where import.IsProcessed == NoYes::No
+                && (import.IntegrationCount < ProjCDSConstants::ActualsIntegrationMaxRetry
+                    || projOpsIntegEnabled)
+        {
+            // Skip if the current record has already been processed
+            if (!matchedRecords.in(import.RecId))
+            {
+                try
+                {
+                    matchedRecords = Set::union(matchedRecords, this.processRecord(import));
+                }
+                catch (Exception::Error)
+                {
+                    // Assumes that any error message was already raised at the point that threw the exception, so continue to the next record.
+                    continue;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes an actual including related actuals.
+    /// </summary>
+    /// <param name = "_import">The actual record to process.</param>
+    /// <returns>A collection of record ID's for processed actuals.</returns>
+    protected set processRecord(ProjCDSActualsImport _import)
+    {
+        Set matchedRecords = new Set(Types::Int64);
+
+        // Add identifiable information to error messages
+        setPrefix(strFmt("%1, %2, %3 ", _import.Amount, _import.AccountingDate, _import.ActualId));
+
+        Map relatedTransactions = this.findRelatedTransactions(_import);
+
+        guid costActualId = relatedTransactions.lookup(ProjCDSActualsRecordTypes::Cost);
+        guid salesActualId = relatedTransactions.lookup(ProjCDSActualsRecordTypes::Sales);
+        guid taxCostActualId = relatedTransactions.lookup(ProjCDSActualsRecordTypes::TaxCost);
+        guid taxSalesActualId = relatedTransactions.lookup(ProjCDSActualsRecordTypes::TaxSales);
+
+        ProjCDSActualsImport costRecord = _import.ActualId == costActualId ? _import : ProjCDSActualsImport::findByActualId(costActualId);
+        ProjCDSActualsImport salesRecord = _import.ActualId == salesActualId ? _import : ProjCDSActualsImport::findByActualId(salesActualId);
+        ProjCDSActualsImport taxCostRecord = _import.ActualId == taxCostActualId ? _import : ProjCDSActualsImport::findByActualId(taxCostActualId);
+        ProjCDSActualsImport taxSalesRecord = _import.ActualId == taxSalesActualId ? _import : ProjCDSActualsImport::findByActualId(taxSalesActualId);
+
+        ttsbegin;
+
+        // Process all related data together
+        if (this.validateComponents(salesRecord, costRecord, taxCostRecord, taxSalesRecord))
+        {
+            // Create a new journal header if needed only when proj ops integration is not enabled.
+            // For proj ops integration each line may have a different header which will be created at the line level creation.
+            if (!projOpsIntegEnabled && !this.getAdvancedJournalHeaderRec(null))
+            {
+                advancedJournalHeader = this.findOrInsertProjAdvancedJournal();
+            }
+
+            if ((taxCostRecord && this.extractActualId(taxCostRecord.ExternalReference) != Global::emptyGuid())
+                || (taxSalesRecord && this.extractActualId(taxSalesRecord.ExternalReference) != Global::emptyGuid()))
+            {
+                // finalize importing tax record(s) that was computed from AX and is now being returned from PSA
+                if (taxCostRecord && this.extractActualId(taxCostRecord.ExternalReference) != Global::emptyGuid())
+                {
+                    //
+                    // When a record containing a tax computed in AX returns from PSA, a duplicate record is created in the import table instead
+                    // of updating the existing record (this is due to the key structure).  The original record needs to be removed.
+                    //
+                    this.deleteTaxRecord(taxCostRecord.ExternalReference, taxCostRecord.TransType);
+
+                    this.createTransactionRelationshipRecord(taxCostRecord.ActualId, costRecord.ActualId, ProjCDSConstants::TransactionRoleString_Tax, ProjCDSConstants::TransactionRoleString_TaxSource);
+                    this.persistJournalIdIntoImportRecord(costRecord.ProjAdvancedJournalLine, taxCostRecord, true);
+                }
+                else
+                {
+                    this.incrementIntegrationCount(taxCostRecord);
+                }
+
+                if (taxSalesRecord && this.extractActualId(taxSalesRecord.ExternalReference) != Global::emptyGuid() && taxCostRecord && taxCostRecord.ActualId)
+                {
+                    //
+                    // When a record containing a tax computed in AX returns from PSA, a duplicate record is created in the import table instead
+                    // of updating the existing record (this is due to the key structure).  The original record needs to be removed.
+                    //
+                    this.deleteTaxRecord(taxSalesRecord.ExternalReference, taxSalesRecord.TransType);
+
+                    this.createTransactionRelationshipRecord(taxCostRecord.ActualId, taxSalesRecord.ActualId, ProjCDSConstants::TransactionRoleString_Cost, ProjCDSConstants::TransactionRoleString_UnbilledSales);
+                    this.createTransactionRelationshipRecord(taxSalesRecord.ActualId, taxSalesRecord.ActualId, ProjCDSConstants::TransactionRoleString_Tax, ProjCDSConstants::TransactionRoleString_TaxSource);
+                    this.persistJournalIdIntoImportRecord(costRecord.ProjAdvancedJournalLine, taxSalesRecord, true);
+                }
+                else
+                {
+                    this.incrementIntegrationCount(taxSalesRecord);
+                }
+            }
+            else
+            {
+                if (this.mergeCostAndSales())
+                {
+                    ProjAdvancedJournalLine journalLine = this.initProjAdvancedJournalLineRecord(costRecord, salesRecord, taxCostRecord, this.getAdvancedJournalHeaderRec(costRecord));
+                    Recid lineRecIdCreated = this.insertProjAdvancedJournalLineRecord(journalLine);
+
+                    this.persistJournalIdIntoImportRecord(lineRecIdCreated, salesRecord, false);
+                    this.persistJournalIdIntoImportRecord(lineRecIdCreated, costRecord, false);
+                    this.persistJournalIdIntoImportRecord(lineRecIdCreated, taxCostRecord, false);
+                    this.persistJournalIdIntoImportRecord(lineRecIdCreated, taxSalesRecord, false);
+                }
+                else
+                {
+                    ProjCDSActualsImport emptyActuals;
+                    ProjAdvancedJournalLine costLine;
+                    boolean skipTax = !this.includeTax();
+
+                    if (costRecord && !costRecord.ProjAdvancedJournalLine)
+                    {
+                        costLine = this.initProjAdvancedJournalLineRecord(costRecord, emptyActuals, taxCostRecord, this.getAdvancedJournalHeaderRec(costRecord));
+
+                        this.persistJournalIdIntoImportRecord(this.insertProjAdvancedJournalLineRecord(costLine), costRecord, false);
+
+                        if (skipTax)
+                        {
+                            this.persistJournalIdIntoImportRecord(0, taxCostRecord, false);
+                        }
+                    }
+
+                    if (salesRecord && !salesRecord.ProjAdvancedJournalLine)
+                    {
+                        ProjAdvancedJournalLine line = this.initProjAdvancedJournalLineRecord(emptyActuals, salesRecord, emptyActuals, this.getAdvancedJournalHeaderRec(salesRecord));
+
+                        if (costLine)
+                        {
+                            this.initUnbilledSalesJournalLine(line, costLine);
+                        }
+
+                        this.persistJournalIdIntoImportRecord(this.insertProjAdvancedJournalLineRecord(line), salesRecord, false);
+
+                        if (skipTax)
+                        {
+                            this.persistJournalIdIntoImportRecord(0, taxSalesRecord, false);
+                        }
+                    }
+
+                    if (skipTax && (taxCostRecord || taxSalesRecord))
+                    {
+                        stagingCDSImportLogger.logWarning(strFmt("@Proj:ActualsImportTelemetryRecordSkippedTaxFound", _import.ActualId, _import.TableId, _import.RecId));
+                        warning("@Proj:MessageValidation_ProjIntegrationJournalProcessingTaxSkipped");
+                    }
+                }
+            }
+        }
+        else
+        {
+            this.incrementIntegrationCount(salesRecord);
+            this.incrementIntegrationCount(costRecord);
+            this.incrementIntegrationCount(taxSalesRecord);
+            this.incrementIntegrationCount(taxCostRecord);
+        }
+
+        ttscommit;
+
+        matchedRecords = this.packMatchedRecords(salesRecord, costRecord, taxCostRecord, taxSalesRecord);
+        return matchedRecords;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAdvancedJournalHeaderRec</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get <c>ProjAdvancedJournal</c> recId
+    /// </summary>
+    /// <param name = "_actualsImport"><c>ProjCDSActualsImport</c> table buffer.</param>
+    /// <returns>Rec ID of the advanced journal header.</returns>
+    protected internal RecId getAdvancedJournalHeaderRec(ProjCDSActualsImport _actualsImport)
+    {
+        return advancedJournalHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>incrementIntegrationCount</Name>
+				<Source><![CDATA[
+    private void incrementIntegrationCount(ProjCDSActualsImport _actualsImport)
+    {
+        if (_actualsImport && _actualsImport.isProcessed == NoYes::No)
+        {
+            _actualsImport.selectForUpdate(true);
+            _actualsImport.IntegrationCount++;
+            _actualsImport.update();
+
+            if (!projOpsIntegEnabled && _actualsImport.IntegrationCount >= ProjCDSConstants::ActualsIntegrationMaxRetry)
+            {
+                stagingCDSImportLogger.logError(strFmt("@Proj:ActualsImportTelemetryMaxRetries", _actualsImport.ActualId, _actualsImport.TableId, _actualsImport.RecId));
+                Error("@Proj:ProjCDSMaxRetryCountReached");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrievePostedTaxActualId</Name>
+				<Source><![CDATA[
+    private guid retrievePostedTaxActualId(str _externalReference, ProjCDSTransType _transType)
+    {
+        ProjCDSActualsImport actualsImport;
+
+        select firstonly actualsImport
+                    where actualsImport.ExternalReference == _externalReference
+                        && actualsImport.TransType == _transType
+                        && actualsImport.TransactionClassification == ProjCDSConstants::TransactionClassification_Tax
+                        && actualsImport.ActualId != Global::emptyGuid()
+                        && actualsImport.IsDuplicate == NoYes::No;
+
+        return actualsImport.ActualId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>persistJournalIdIntoImportRecord</Name>
+				<Source><![CDATA[
+    private void persistJournalIdIntoImportRecord(RecId _advancedJournalLineRecId, ProjCDSActualsImport _import, boolean _clearExternalReference)
+    {
+        if (_import)
+        {
+            // Record processing result into import record
+            _import.selectForUpdate(true);
+            _import.ProjAdvancedJournalLine = _advancedJournalLineRecId;
+            _import.IsProcessed = NoYes::Yes;
+            _import.IntegrationCount++;
+            if (_clearExternalReference)
+            {
+                _import.ExternalReference = '';
+            }
+
+            if (_import.validateWrite())
+            {
+                _import.update();
+            }
+            else
+            {
+                stagingCDSImportLogger.logError(strFmt("@Proj:ActualsImportTelemetryValidateWriteFailed", _import.ActualId, tableStr(ProjCDSActualsImport), methodStr(ProjCDSActualsImportIntegration, persistJournalIdIntoImportRecord), _import.TableId, _import.RecId));
+                throw Error("@Proj:UnableToSaveDueToErrors");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTaxPosted</Name>
+				<Source><![CDATA[
+    private boolean isTaxPosted(str _externalReference)
+    {
+        boolean retValue = false;
+
+        if (subStr(_externalReference, 1, strLen(ProjCDSConstants::TaxRecordMarkerPrefix)) == ProjCDSConstants::TaxRecordMarkerPrefix)
+        {
+            retValue = true;
+        }
+
+        return retValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>extractActualId</Name>
+				<Source><![CDATA[
+    private guid extractActualId(str _externalReference)
+    {
+        str extracted = subStr(_externalReference, strLen(ProjCDSConstants::TaxRecordMarkerPrefix) + 1, 38);
+        return str2Guid(extracted);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateComponents</Name>
+				<Source><![CDATA[
+    private boolean validateComponents(ProjCDSActualsImport _salesRecord, ProjCDSActualsImport _costRecord, ProjCDSActualsImport _taxCostRecord, ProjCDSActualsImport _taxSalesRecord)
+    {
+        boolean isValid = true;
+
+        if (_taxCostRecord && !_taxSalesRecord && !_salesRecord && !_costRecord && this.extractActualId(_taxCostRecord.ExternalReference) == Global::emptyGuid())
+        {
+            // If there is only a taxCost record and the tax originated from PSA
+            stagingCDSImportLogger.logWarning(strFmt("@Proj:ActualsImportTelemetryOnlyTaxRecordFound", _taxCostRecord.ActualId, _taxCostRecord.TableId, _taxCostRecord.RecId));
+            warning("@Proj:ProjCDSTaxOnlyImport");
+            isValid = false;
+        }
+        else if (_taxSalesRecord && !_taxCostRecord && !_salesRecord && !_costRecord && this.extractActualId(_taxSalesRecord.ExternalReference) == Global::emptyGuid())
+        {
+            // If there is only a taxSales record and the tax originated from PSA
+            stagingCDSImportLogger.logWarning(strFmt("@Proj:ActualsImportTelemetryOnlyTaxRecordFound", _taxCostRecord.ActualId, _taxCostRecord.TableId, _taxCostRecord.RecId));
+            warning("@Proj:ProjCDSTaxOnlyImport");
+            isValid = false;
+        }
+        else if (_costRecord && !_salesRecord && !_taxCostRecord && !_taxSalesRecord && _costRecord.TransactionClassification == ProjCDSConstants::TransactionClassification_Fee)
+        {
+            // There is only a cost record for a Fee transaction
+            stagingCDSImportLogger.logWarning(strFmt("@Proj:ActualsImportTelemetryOnlyCostOnFeeClassification", _costRecord.ActualId, _costRecord.TableId, _costRecord.RecId));
+            warning("@Proj:ProjCDSCostOnlyImport");
+            isValid = false;
+        }
+        else if (_taxCostRecord && this.isTaxPosted(_taxCostRecord.ExternalReference))
+        {
+            // do nothing, this is a valid scenario
+        }
+        else if (!_costRecord && !_salesRecord)
+        {
+            stagingCDSImportLogger.logWarning("@Proj:ProjCDSMatchingCostAndSalesNotFoundNotImported");
+            warning("@Proj:ProjCDSMatchingCostAndSalesNotFoundNotImported");
+            isValid = false;
+        }
+        else if (!_costRecord && _taxCostRecord)
+        {
+            stagingCDSImportLogger.logWarning(strFmt("@Proj:ActualsImportTelemetryCostRecordNotFound", _taxCostRecord.ActualId, _taxCostRecord.TableId, _taxCostRecord.RecId));
+            warning("@Proj:ProjCDSMatchingCostRecordNotFoundNotImported");
+            isValid = false;
+        }
+
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>packMatchedRecords</Name>
+				<Source><![CDATA[
+    private Set packMatchedRecords(ProjCDSActualsImport _salesRecord, ProjCDSActualsImport _costRecord, ProjCDSActualsImport _taxCostRecord, ProjCDSActualsImport _taxSalesRecord)
+    {
+        Set tableIds = new Set(Types::Int64);
+
+        if (_salesRecord)
+        {
+            tableIds.add(_salesRecord.RecId);
+        }
+        if (_costRecord)
+        {
+            tableIds.add(_costRecord.RecId);
+        }
+        if (_taxCostRecord)
+        {
+            tableIds.add(_taxCostRecord.RecId);
+        }
+        if (_taxSalesRecord)
+        {
+            tableIds.add(_taxSalesRecord.RecId);
+        }
+
+        return tableIds;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOrInsertProjAdvancedJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find or insert <c>ProjAdvancedJournal</c> record.
+    /// </summary>
+    /// <returns>Rec ID of the advanced journal record.</returns>
+    protected internal RecId findOrInsertProjAdvancedJournal()
+    {
+        str dateStr = date2Str(DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone()), 321, DateDay::Digits2, DateSeparator::Hyphen, DateMonth::Digits2, DateSeparator::Hyphen, DateYear::Digits4);
+        str description = strFmt(this.getJournalDescription(), dateStr);
+
+        ProjAdvancedJournal header;
+
+        select firstonly header
+            where header.Status == ProjAdvancedJournalStatus::Draft &&
+                header.Description == description &&
+                header.OriginalProjAdancedJournalId == '';
+        
+        // create header if not found
+        if (!header)
+        {
+            header.Description = description;
+            header.Status = ProjAdvancedJournalStatus::Draft;
+            if (header.validateWrite())
+            {
+                header.insert();
+            }
+            else
+            {
+                stagingCDSImportLogger.logError(strFmt("@Proj:ActualsImportTelemetryValidateWriteFailed", 0, tableStr(ProjAdvancedJournal), methodStr(ProjCDSActualsImportIntegration, findOrInsertProjAdvancedJournal), 0, 0));
+                throw Error("@Proj:UnableToSaveDueToErrors");
+            }
+        }
+
+        return header.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournalDescription</Name>
+				<Source><![CDATA[
+    protected LabelId getJournalDescription()
+    {
+        return "@Proj:ProjCDSAdvancedJournalDescription";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProjAdvancedJournalLineRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a project advanced journal line.
+    /// </summary>
+    /// <param name = "_costRecord">The cost actual record.</param>
+    /// <param name = "_unbilledSalesRecord">The unbilled sales actual record.</param>
+    /// <param name = "_taxCostRecord">The tax actual record.</param>
+    /// <param name = "_header">The record ID of the project advanced journal header.</param>
+    /// <returns>An initialized project advanced journal line.</returns>
+    protected ProjAdvancedJournalLine initProjAdvancedJournalLineRecord(ProjCDSActualsImport _costRecord, ProjCDSActualsImport _unbilledSalesRecord, ProjCDSActualsImport _taxCostRecord, RecId _header)
+    {
+        ProjAdvancedJournalLine line;
+
+        line.ProjAdvancedJournal = _header;
+
+        // Fields assigned from unbilledSales if it exists, Cost otherwise
+        line.TransType = this.convertTransClassificationToTransType(_unbilledSalesRecord ? _unbilledSalesRecord.TransactionClassification : _costRecord.TransactionClassification);
+        line.AccountingDate = _unbilledSalesRecord ? _unbilledSalesRecord.AccountingDate : _costRecord.AccountingDate;
+        // Regardless of the VAT due date type, the VAT registration date defaults to the same as the accounting date
+        // since <c>ProjAdvancedJournalLine</c> only has accounting date to be used for tax process.
+        line.VatDueDate_W = line.AccountingDate;
+        line.ProjId = _unbilledSalesRecord ? _unbilledSalesRecord.ProjectId : _costRecord.ProjectId;
+        line.ProjCategoryId = this.getProjectCategoryId(_unbilledSalesRecord ? _unbilledSalesRecord : _costRecord, line.TransType);
+        line.ProjTransDate = _unbilledSalesRecord ? _unbilledSalesRecord.DocumentDate : _costRecord.DocumentDate;
+        line.Quantity = _unbilledSalesRecord ? _unbilledSalesRecord.Quantity : _costRecord.Quantity;
+        line.Text = _unbilledSalesRecord ? _unbilledSalesRecord.Description : _costRecord.Description;
+        line.ActivityNumber = this.getActivityNumber(_unbilledSalesRecord ? _unbilledSalesRecord : _costRecord);
+        line.LinePropertyId = this.getLinePropertyId(_unbilledSalesRecord ? _unbilledSalesRecord.BillingType : _costRecord.BillingType);
+
+        // Currencies
+        line.PriceCurrency = _unbilledSalesRecord ? _unbilledSalesRecord.TransactionCurrencyId : _costRecord.TransactionCurrencyId;    // primary from unbilledSales
+        line.CostCurrency = _costRecord ? _CostRecord.TransactionCurrencyId : _unbilledSalesRecord.TransactionCurrencyId;              // primary from Cost
+        
+        // Status
+        if (FeatureStateProvider::isFeatureEnabled(ProjAdvancedJournalPostingEnhancementFeature::instance()))
+        {
+            line.Status = ProjAdvancedJournalLineStatus::Draft;
+        }
+
+        // Other
+        line.ProjDataAreaId = this.determineProjectDataAreaId(_unbilledSalesRecord, _costRecord);
+
+        if (_unbilledSalesRecord)
+        {
+            line.UnitPrice = _unbilledSalesRecord.UnitPrice;
+            line.ExtendedPrice = _unbilledSalesRecord.Amount;
+            line.PriceExchangeRate = _unbilledSalesRecord.ExchangeRate;
+        }
+
+        if (_costRecord)
+        {
+            line.UnitCost = _costRecord.UnitPrice;
+            line.ExtendedCost = _costRecord.Amount;
+            line.CostExchangeRate = _costRecord.ExchangeRate;
+        }
+
+        if (this.includeTax() &&
+            _taxCostRecord)
+        {
+            line.ProvidedTaxAmount = _taxCostRecord.Amount;
+        }
+
+        return line;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertProjAdvancedJournalLineRecord</Name>
+				<Source><![CDATA[
+    protected RecId insertProjAdvancedJournalLineRecord(ProjAdvancedJournalLine _line)
+    {
+        if (_line.validateWrite())
+        {
+            _line.insert();
+        }
+        else
+        {
+            stagingCDSImportLogger.logError(strFmt("@Proj:ActualsImportTelemetryValidateWriteFailed", 0, tableStr(ProjAdvancedJournalLine), methodStr(ProjCDSActualsImportIntegration, insertProjAdvancedJournalLineRecord), _line.TableId, 0));
+            throw Error("@Proj:UnableToSaveDueToErrors");
+        }
+
+        return _line.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initUnbilledSalesJournalLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes unbilled sales journal line based on a cost journal line.
+    /// </summary>
+    /// <param name = "_unbilledSalesLine">The unbilled sales journal line.</param>
+    /// <param name = "_costLine">The cost journal line.</param>
+    protected void initUnbilledSalesJournalLine(ProjAdvancedJournalLine _unbilledSalesLine, ProjAdvancedJournalLine _costLine)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLinePropertyId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the line property ID for a billing type.
+    /// </summary>
+    /// <param name = "_billingType">The billing type for which to find the line property ID.</param>
+    /// <returns>The line property ID for the specified billing type.</returns>
+    protected ProjLinePropertyId getLinePropertyId(ProjBillingType _billingType)
+    {
+        return ProjBillingTypeLinePropertyDefault::getLinePropertyIDByBillingType(_billingType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getActivityNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the activity number.
+    /// </summary>
+    /// <param name = "_record">The actuals for which to find the activity number.</param>
+    /// <returns>The activity number for the specified actuals.</returns>
+    protected smmActivityNumber getActivityNumber(ProjCDSActualsImport _record)
+    {
+        return ProjCDSTaskImport::findByTask(_record.TaskId).ActivityNumber;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mergeCostAndSales</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the cost and sales actuals should be merged into a single integration journal record.
+    /// </summary>
+    /// <returns>true if the cost and sales actuals should be merged into a single integration journal record; otherwise, false.</returns>
+    protected boolean mergeCostAndSales()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>includeTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the tax actuals should be included in the integration journal record.
+    /// </summary>
+    /// <returns>true if the tax actuals should be included in the integration journal record; otherwise, false.</returns>
+    protected boolean includeTax()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProjectCategoryId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the category ID.
+    /// </summary>
+    /// <param name = "_record">The actuals for which to find the category ID.</param>
+    /// <param name = "_transactionType">The transaction type for which to find the category ID.</param>
+    /// <returns>The category ID for the specified actuals.</returns>
+    protected CategoryId getProjectCategoryId(ProjCDSActualsImport _record, ProjTransType _transactionType)
+    {
+        return this.convertCategoryGuidToId(_record.TransactionCategory, _record.TransactionClassification);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>convertTransClassificationToTransType</Name>
+				<Source><![CDATA[
+    private ProjTransType convertTransClassificationToTransType(int64 _transClassification)
+    {
+        ProjTransType returnValue;
+
+        switch (_transClassification)
+        {
+            case ProjCDSConstants::TransactionClassification_Time:
+                returnValue = ProjTransType::Hour;
+                break;
+            case ProjCDSConstants::TransactionClassification_Expense:
+                returnValue = ProjTransType::Cost;
+                break;
+            case ProjCDSConstants::TransactionClassification_Material:
+                returnValue = ProjTransType::Item;
+                break;
+            case ProjCDSConstants::TransactionClassification_Milestone:
+                returnValue = ProjTransType::Cost;
+                break;
+            case ProjCDSConstants::TransactionClassification_Fee:
+                returnValue = ProjTransType::Revenue;
+                break;
+            case ProjCDSConstants::TransactionClassification_Tax:
+                returnValue = ProjTransType::Cost;
+                break;
+        }
+
+        return returnValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTransClassificationFee</Name>
+				<Source><![CDATA[
+    private boolean isTransClassificationFee(int64 _transClassification)
+    {
+        boolean returnValue;
+
+        if (_transClassification == ProjCDSConstants::TransactionClassification_Fee)
+        {
+            returnValue = true;
+        }
+
+        return returnValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>convertCategoryGuidToId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a category ID based on category defaults.
+    /// </summary>
+    /// <param name = "_categoryGuid">The category guid for which to find the category ID.</param>
+    /// <param name = "_transClassification">The transaction classification for which to find the category ID.</param>
+    /// <returns>The category ID for the specified category guid.</returns>
+    protected CategoryId convertCategoryGuidToId(guid _categoryGuid, int64 _transClassification)
+    {
+        CategoryTable categoryTable;
+        ProjCDSParameters cdsParameters;
+        CategoryId returnValue;
+        
+        if (_transClassification == ProjCDSConstants::TransactionClassification_Time)
+        {
+            cdsParameters = ProjCDSParameters::find();
+            returnValue = cdsParameters.TimeCategory;
+        }
+        else if (_transClassification == ProjCDSConstants::TransactionClassification_Fee)
+        {
+            cdsParameters = ProjCDSParameters::find();
+            returnValue = cdsParameters.FeeCategory;
+        }
+        else if (_categoryGuid != Global::emptyGuid())
+        {
+            select firstonly CategoryId from categoryTable
+                where categoryTable.integrationId == _categoryGuid;
+            returnValue = categoryTable.CategoryId;
+        }
+
+        return returnValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTransactionRelationshipRecord</Name>
+				<Source><![CDATA[
+    private void createTransactionRelationshipRecord(guid _transaction1Id, guid _transaction2Id, str _role1, str _role2)
+    {
+        ProjCDSTransactionRelationshipImport relationship;
+
+        relationship.Transaction1Id = _transaction1Id;
+        relationship.Transaction1Role = _role1;
+        relationship.Transaction1Type = ProjCDSConstants::TransactionTypeString_Actual;
+        relationship.Transaction2Id = _transaction2Id;
+        relationship.Transaction2Role = _role2;
+        relationship.Transaction2Type = ProjCDSConstants::TransactionTypeString_Actual;
+
+        if (relationship.validateWrite())
+        {
+            relationship.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineProjectDataAreaId</Name>
+				<Source><![CDATA[
+    private DataAreaId determineProjectDataAreaId(ProjCDSActualsImport _unbilledSalesRecord, ProjCDSActualsImport _costRecord)
+    {
+        DataAreaId dataArea;
+
+        if (_unbilledSalesRecord)
+        {
+            dataArea = _unbilledSalesRecord.ProjectDataAreaId ? _unbilledSalesRecord.ProjectDataAreaId : curExt();
+        }
+        else if (_costRecord)
+        {
+            dataArea = _costRecord.ProjectDataAreaId ? _costRecord.ProjectDataAreaId : curExt();
+        }
+        else
+        {
+            dataArea = curExt();
+        }
+
+        return dataArea;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteTaxRecord</Name>
+				<Source><![CDATA[
+    private void deleteTaxRecord(str _externalReference, ProjCDSTransType _transType)
+    {
+        ProjCDSActualsImport deleteRecord;
+        select firstonly forupdate RecId from deleteRecord
+                    where deleteRecord.ExternalReference == _externalReference
+                        && deleteRecord.TransType == _transType
+                        && deleteRecord.TransactionClassification == ProjCDSConstants::TransactionClassification_Tax
+                        && deleteRecord.ActualId == Global::emptyGuid();
+        if (deleteRecord)
+        {
+            deleteRecord.delete();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findRelatedTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Given the passed in record which is being processed, find all of its related
+    /// records from the ProjCDSActualsImport table and return them.
+    /// </summary>
+    /// <param name = "_import"><c>ProjCDSActualsImport</c> record</param>
+    /// <returns>Map for all related actuals.</returns>
+    protected Map findRelatedTransactions(ProjCDSActualsImport _import)
+    {
+        Map relatedTransactions = new Map(Types::Enum, Types::Guid);
+        guid    salesActualId;
+        guid    costActualId;
+        guid    taxCostActualId;
+        guid    taxSalesActualId;
+
+        if (_import.TransactionClassification == ProjCDSConstants::TransactionClassification_Tax)
+        {
+            boolean isTaxPosted = this.isTaxPosted(_import.ExternalReference);
+
+            if (_import.TransType == ProjCDSTransType::Cost)
+            {
+                taxCostActualId = _import.ActualId;
+                costActualId = isTaxPosted ? this.extractActualId(_import.ExternalReference)
+                                         : ProjCDSTransactionRelationshipImport::findOpposingTransactionId(_import.ActualId, ProjCDSConstants::TransactionRoleString_Tax, ProjCDSConstants::TransactionRoleString_TaxSource);
+                salesActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(costActualId, ProjCDSConstants::TransactionRoleString_Cost, ProjCDSConstants::TransactionRoleString_UnbilledSales);
+                taxSalesActualId = isTaxPosted ? this.retrievePostedTaxActualId(_import.ExternalReference, ProjCDSTransType::Sales)
+                                             : ProjCDSTransactionRelationshipImport::findOpposingTransactionId(salesActualId, ProjCDSConstants::TransactionRoleString_TaxSource, ProjCDSConstants::TransactionRoleString_Tax);
+            }
+            else    // Sales record
+            {
+                taxSalesActualId = _import.ActualId;
+
+                if (isTaxPosted)
+                {
+                    costActualId = this.extractActualId(_import.ExternalReference);
+                    salesActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(costActualId, ProjCDSConstants::TransactionRoleString_Cost, ProjCDSConstants::TransactionRoleString_UnbilledSales);
+                    taxCostActualId = this.retrievePostedTaxActualId(_import.ExternalReference, ProjCDSTransType::Cost);
+                    if (taxCostActualId == Global::emptyGuid())
+                    {
+                        // The taxCost record has already come back from PSA and has been processed even though the taxSales record hasn't been processed yet.
+                        taxCostActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(costActualId, ProjCDSConstants::TransactionRoleString_TaxSource, ProjCDSConstants::TransactionRoleString_Tax);
+                    }
+                }
+                else // tax originated from PSA
+                {
+                    salesActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(taxSalesActualId, ProjCDSConstants::TransactionRoleString_Tax, ProjCDSConstants::TransactionRoleString_TaxSource);
+                    costActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(salesActualId, ProjCDSConstants::TransactionRoleString_UnbilledSales, ProjCDSConstants::TransactionRoleString_Cost);
+                    taxCostActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(costActualId, ProjCDSConstants::TransactionRoleString_TaxSource, ProjCDSConstants::TransactionRoleString_Tax);
+                }
+            }
+        }
+        else if (_import.TransType == ProjCDSTransType::Cost)
+        {
+            costActualId = _import.ActualId;
+            salesActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(costActualId, ProjCDSConstants::TransactionRoleString_Cost, ProjCDSConstants::TransactionRoleString_UnbilledSales);
+            taxCostActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(costActualId, ProjCDSConstants::TransactionRoleString_TaxSource, ProjCDSConstants::TransactionRoleString_Tax);
+            taxSalesActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(salesActualId, ProjCDSConstants::TransactionRoleString_TaxSource, ProjCDSConstants::TransactionRoleString_Tax);
+        }
+        else if (_import.TransType == ProjCDSTransType::Sales)
+        {
+            salesActualId = _import.ActualId;
+            costActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(salesActualId, ProjCDSConstants::TransactionRoleString_UnbilledSales, ProjCDSConstants::TransactionRoleString_Cost);
+            taxCostActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(costActualId, ProjCDSConstants::TransactionRoleString_TaxSource, ProjCDSConstants::TransactionRoleString_Tax);
+            taxSalesActualId = ProjCDSTransactionRelationshipImport::findOpposingTransactionId(salesActualId, ProjCDSConstants::TransactionRoleString_TaxSource, ProjCDSConstants::TransactionRoleString_Tax);
+        }
+
+        relatedTransactions.insert(ProjCDSActualsRecordTypes::Cost, costActualId);
+        relatedTransactions.insert(ProjCDSActualsRecordTypes::Sales, salesActualId);
+        relatedTransactions.insert(ProjCDSActualsRecordTypes::TaxCost, taxCostActualId);
+        relatedTransactions.insert(ProjCDSActualsRecordTypes::TaxSales, taxSalesActualId);
+
+        return relatedTransactions;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

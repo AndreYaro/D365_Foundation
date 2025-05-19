@@ -1,0 +1,478 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailCDXJobUploadSourceContext</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Net;
+using Microsoft.Dynamics.Retail.CommerceDataExchange;
+using Microsoft.Dynamics.Retail.SynchLibrary.Metadata;
+
+internal class RetailCDXJobUploadSourceContext
+{
+    RetailCDXDataStoreRefRecId dataStoreRecID;
+    RetailConnJobId            jobID;
+    RetailCDXScheduleRefRecId  scheduleRecID;
+    str                        dataStoreName;
+    int64                      totalRowsAffected;
+    str                        workDir;
+    str                        workDirBase;
+    boolean                    isProcessingSkipped;
+    System.Reflection.Assembly cdxAssembly;
+
+    RetailCdxSqlCommandTimeout sqlTimeout;
+
+    RetailCDXFilePathOrGuid targetStorage;
+    RetailCDXFileSize fileSize = 0;
+    RetailCDXCheckSum checkSum;
+    RetailCDXSessionNumber axUploadSessionId; //AX upload session Id
+    RetailCDXSessionNumber rerunSessionId;
+    int64 localSessionId = 0;
+    guid                         packageId;
+    RetailCDXJobUploadSourceLogger logger;
+    guid correlationId;
+    private RecId batchJobId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct channel database data processing batch task
+    /// </summary>
+    /// <param name = "_jobID">Job ID.</param>
+    /// <param name = "_dataStoreRecID">Data store RecId.</param>
+    /// <param name = "_scheduleRecID">Schedule RecId.</param>
+    /// <param name = "_batchJobId">Batch job Id.</param>
+    /// <returns>The channel database data process task.</returns>
+    internal void new (RetailConnJobId _jobID, RetailCDXDataStoreRefRecId _dataStoreRecID, RetailCDXScheduleRefRecId _scheduleRecID, guid _correlationId = newGuid(), RecId _batchJobId = 0)
+    {
+        logger = new RetailCDXJobUploadSourceLogger(this);
+
+        this.jobID = _jobID;
+        this.dataStoreRecID = _dataStoreRecID;
+        this.scheduleRecID  = _scheduleRecID;
+        this.correlationId = _correlationId;
+        this.batchJobId = _batchJobId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    internal void execute()
+    {
+        RetailConnDatabaseProfile dataStore = RetailConnDatabaseProfile::findByRecId(this.dataStoreRecID);
+        this.paramDataStoreName(dataStore.Name);
+
+        if (dataStore.isDataStoreSynchronizationPaused())
+        {
+            logger.logCDXDataStoreDataSyncPausedByUser();
+            return;
+        }
+
+        Microsoft.Dynamics.Ax.Xpp.ErrorException xppEx;
+        System.Exception ex;
+
+        logger.logCDXUploadSourceProcessingStart();
+
+        using (ReqReaderWriterLock uploadJobDataStoreLock = ReqReaderWriterLock::construct())
+        {
+            str uploadLockName = strFmt(RetailCDXConstants::UploadJobDataStoreLockName, this.dataStoreRecID);
+
+            if(!uploadJobDataStoreLock.tryEnterWriterLock(uploadLockName))
+            {
+                // log and return from here as another upload process is already in progress for this datastore.
+                this.paramIsProcessingSkipped(true);
+
+                logger.logCDXJobUploadSourceProcessingSkipped();
+
+                return;
+            }
+
+            try
+            {
+                this.initializeContext();
+
+                str dataStoreConnectionString = dataStore.connectionStringEdit(false, '');
+
+                str stagingFileName = RetailCDXUploadHelper::GenerateUploadDataFileName(this.dataStoreRecID);
+                str stagingFilePath = System.IO.Path::Combine(this.workDir, stagingFileName);
+
+                RetailAsyncClientUploadParameter uploadParameter = RetailCDXPackageStore::getUploadParameter(
+                                                                                        dataStore.DataGroup,
+                                                                                        RetailCDXDownloadUpload::Upload,
+                                                                                        stagingFileName,
+                                                                                        RetailConnParameters::find().getSasTokenTimeout()
+                                                                                        );
+
+                int64 nextLocalUploadSessionId = RetailCDXUploadService::GetNextLocalUploadSessionId(dataStore.RecId);
+
+                RetailCDXUploadSession rerunUploadSession = RetailCDXUploadSession::getOldestRerunUploadSession(dataStore.Name, this.jobID);
+                rerunSessionId = rerunUploadSession.LocalUploadSessionId;
+
+                str uploadJobDefinition = RetailCDXUploadService::GetUploadJobDefinition(dataStore.Name, this.jobID);
+
+                Microsoft.Dynamics.Retail.CommerceDataExchange.SqlSourceRequestContext sourceRequestContext = this.createSourceRequestContext(uploadJobDefinition, this.rerunSessionId, rerunUploadSession.UploadSessionRerunType, nextLocalUploadSessionId, uploadParameter, dataStore);
+
+                Microsoft.Dynamics.Retail.SynchLibrary.Metadata.UploadSession localUploadSessionCreated = this.generatePackageFromSourceDatabase(sourceRequestContext);
+
+                if (localUploadSessionCreated != null)
+                {
+                    targetStorage= uploadParameter.paramTargetStorage();
+                    fileSize = localUploadSessionCreated.FileSize;
+                    checkSum = localUploadSessionCreated.Checksum;
+                    rerunSessionId = localUploadSessionCreated.RerunUploadSessionId;
+                    localSessionId = localUploadSessionCreated.LocalUploadSessionId;
+                    axUploadSessionId = localUploadSessionCreated.AXUploadSessionId;
+
+                    this.totalRowsAffected = localUploadSessionCreated.RowsAffected;
+
+                    if (this.totalRowsAffected > 0)
+                    {
+                        this.createUploadSession(true, targetStorage, fileSize, checkSum, localSessionId, '', rerunSessionId, dataStoreConnectionString);
+                    }
+                }
+            }
+            catch (xppEx)
+            {
+                ex = xppEx;
+                logger.logCDXUploadSourceProcessingFailure(ex);
+            }
+            catch (ex)
+            {
+                logger.logCDXUploadSourceProcessingFailure(ex);
+            }
+            finally
+            {
+                if (ex != null)
+                {
+                    try
+                    {
+                        // some of the values may be empty when error happens. try best to log all available info.
+                        this.createUploadSession(false, targetStorage, fileSize, checkSum, localSessionId, ex.ToString(), rerunSessionId);
+                    }
+                    catch
+                    {
+                        //swallow
+                    }
+                }
+
+                this.cleanUp();
+
+                logger.logCDXUploadSourceProcessingStop(ex);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generatePackageFromSourceDatabase</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates an upload data package from the source database.
+    /// </summary>
+    /// <param name = "_sourceRequestContextObject">The source request context that specifies the upload package generation parameters.</param>
+    /// <returns>The <c>UploadSession</c> object that contains information about the generated package.</returns>
+    private Microsoft.Dynamics.Retail.SynchLibrary.Metadata.UploadSession generatePackageFromSourceDatabase(Microsoft.Dynamics.Retail.CommerceDataExchange.SqlSourceRequestContext _sourceRequestContext)
+    {
+        return Microsoft.Dynamics.Retail.CommerceDataExchange.SqlSourceRequestHandler::GeneratePackageFromSourceDatabase(_sourceRequestContext);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeContext</Name>
+				<Source><![CDATA[
+    private void initializeContext()
+    {
+        this.sqlTimeout = RetailConnParameters::find().getSqlCommandTimeout();
+
+        workDirBase = System.IO.Path::GetTempPath();
+        str workDirName = System.IO.Path::GetRandomFileName();
+        workDir = System.IO.Path::Combine(workDirBase, workDirName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSourceRequestContext</Name>
+				<Source><![CDATA[
+    private System.Object createSourceRequestContext(str uploadJobDefinition, int64 rerunUploadSessionId, RetailCDXUploadSessionRerunType retailCDXUploadSessionRerunType, int64 nextLocalUploadSessionId, RetailAsyncClientUploadParameter _uploadParameter, RetailConnDatabaseProfile dataStore)
+    {
+        str channelDBConnectionString = dataStore.connectionStringEdit(false, "");
+        Microsoft.Dynamics.Retail.SynchLibrary.Metadata.UploadSessionRerunType rerunType;
+        switch (retailCDXUploadSessionRerunType)
+        {
+            case RetailCDXUploadSessionRerunType::IncludeRecordsFromSelectedSessionOnly:
+                rerunType = Microsoft.Dynamics.Retail.SynchLibrary.Metadata.UploadSessionRerunType::IncludeRecordsFromSelectedSessionOnly;
+                break;
+            case RetailCDXUploadSessionRerunType::IncludeRecordsFromSubsequentSessions:
+                rerunType = Microsoft.Dynamics.Retail.SynchLibrary.Metadata.UploadSessionRerunType::IncludeRecordsFromSubsequentSessions;
+                break;
+        }
+
+        return new Microsoft.Dynamics.Retail.CommerceDataExchange.SqlSourceRequestContext(
+                        channelDBConnectionString,
+                        this.sqlTimeout,
+                        dataStore.Name,
+                        this.paramCorrelationId(),
+                        Microsoft.Dynamics.Retail.SynchLibrary.Metadata.RequestOriginType::AX,
+                        this.workDir,
+                        uploadJobDefinition,
+                        rerunUploadSessionId,
+                        nextLocalUploadSessionId,
+                        _uploadParameter.ParamUploadUrl(),
+                        _uploadParameter.paramTargetStorage(),
+                        rerunType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createUploadSession</Name>
+				<Source><![CDATA[
+    private void createUploadSession(boolean _success, RetailCDXFilePathOrGuid _targetStorage, RetailCDXFileSize _fileSize, RetailCdxCheckSum _checkSum, RetailCdxLocalUploadSessionId _localUploadSessionId, str _errorMessage, RetailCDXSessionNumber _rerunFor, str _dataStoreConnectionString = '')
+    {
+        axUploadSessionId = RetailCDXUploadHelper::CreateUploadSession_v2(this.dataStoreRecID, this.jobID, this.scheduleRecID, _success, _targetStorage, _fileSize, _checkSum, _localUploadSessionId, _errorMessage, _rerunFor, RetailCDXUploadSessionRerunType::IncludeRecordsFromSubsequentSessions, this.batchJobId);
+
+        if (_success)
+        {
+            this.updateLocalUploadSession(axUploadSessionId, _localUploadSessionId, _dataStoreConnectionString);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLocalUploadSession</Name>
+				<Source><![CDATA[
+    private void updateLocalUploadSession(RetailCDXSessionNumber _axUploadSessionId, RetailCdxLocalUploadSessionId _localUploadSessionId, str _dataStoreConnectionString = '')
+    {
+        //update local upload session
+        Microsoft.Dynamics.Retail.SynchLibrary.Metadata.UploadSession localUploadSession = new Microsoft.Dynamics.Retail.SynchLibrary.Metadata.UploadSession();
+
+        localUploadSession.LocalUploadSessionId = _localUploadSessionId;
+        localUploadSession.AXUploadSessionId = _axUploadSessionId;
+        localUploadSession.Status = enum2int(RetailCDXUploadSessionStatus::Available);
+
+        SqlSourceRequestHandler::UpdateLocalUploadSession(_dataStoreConnectionString, localUploadSession);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUp</Name>
+				<Source><![CDATA[
+    private void cleanUp()
+    {
+        System.Exception ex;
+        try
+        {
+            if (this.workDir && System.IO.Directory::Exists(this.workDir))
+            {
+                System.IO.Directory::Delete(this.workDir, true);
+            }
+        }
+        catch (ex)
+        {
+            logger.logCDXResourceCleanUpFailureWarning(ex);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramJobID</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the value for job ID in <c>RetailConnJobID</c>.
+    /// </summary>
+    /// <param name="_jobID">The value of <c>RetailConnJobID</c>; optional.</param>
+    /// <returns>Job ID.</returns>
+    internal RetailConnJobID paramJobID(RetailConnJobID _jobID = jobID)
+    {
+        jobID = _jobID;
+
+        return jobID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramScheduleRecID</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the value of schedule record Id.
+    /// </summary>
+    /// <param name="_scheduleRecID">The value of <c>RetailScheduleRecID</c>.</param>
+    /// <returns>Schedule record Id.</returns>
+    internal RefRecId paramScheduleRecID(RefRecId _scheduleRecID = scheduleRecID)
+    {
+        scheduleRecID = _scheduleRecID;
+
+        return scheduleRecID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramDataStoreName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the dataStore name.
+    /// </summary>
+    /// <param name="_dataStoreName">The dataStore name.</param>
+    /// <returns>The dataStore name.</returns>
+    internal str paramDataStoreName(str _dataStoreName = dataStoreName)
+    {
+        dataStoreName = _dataStoreName;
+
+        return dataStoreName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramRowsAffected</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the number of rows affected.
+    /// </summary>
+    /// <param name = "_rowsAffected">The number of rows affected.</param>
+    /// <returns>The number of rows affected.</returns>
+    internal int64 paramRowsAffected(int64 _rowsAffected = totalRowsAffected)
+    {
+        totalRowsAffected = _rowsAffected;
+
+        return totalRowsAffected;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramFileSize</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the package file size.
+    /// </summary>
+    /// <param name = "_fileSize">The file size</param>
+    /// <returns>The file size.</returns>
+    internal int64 paramFileSize(int64 _fileSize = fileSize)
+    {
+        fileSize = _fileSize;
+
+        return fileSize;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the value of the upload session.
+    /// </summary>
+    /// <param name="_session">The value of <c>RetailCDXSessionNumber</c>; optional.</param>
+    /// <returns>Session number.</returns>
+    internal RetailCDXSessionNumber paramSession(RetailCDXSessionNumber _session = axUploadSessionId)
+    {
+        axUploadSessionId = _session;
+
+        return axUploadSessionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramRerunSessionId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or Sets the rerun session Id.
+    /// </summary>
+    /// <param name="_rerunSessionId">The value of the rerun session Id.</param>
+    /// <returns>The value of the rerun session Id.</returns>
+    internal RetailCDXSessionNumber paramRerunSessionId(RetailCDXSessionNumber _rerunSessionId = rerunSessionId)
+    {
+        rerunSessionId = _rerunSessionId;
+
+        return rerunSessionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramLocalSessionId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or Sets the local session Id.
+    /// </summary>
+    /// <param name="_localSessionId">The value of the local session Id.</param>
+    /// <returns>The value of the local session Id.</returns>
+    internal RetailCDXSessionNumber paramLocalSessionId(RetailCDXSessionNumber _localSessionId = localSessionId)
+    {
+        localSessionId = _localSessionId;
+
+        return localSessionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramPackageId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the package Id.
+    /// </summary>
+    /// <param name = "_packageId">The package Id.</param>
+    /// <returns>The package Id.</returns>
+    internal guid paramPackageId(guid _packageId = packageId)
+    {
+        packageId = _packageId;
+
+        return packageId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramIsProcessingSkipped</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the flag which indicates the cdx job upload processing is skipped or not.
+    /// </summary>
+    /// <param name = "_isProcessingSkipped">The flag which indicates if the cdx job upload source processing is skipped or not.</param>
+    /// <returns>True if processing of the upload job is skipped for the specified datastore; false otherwise.</returns>
+    /// <remarks>The CDX upload processing is skipped if there is another process which is already in the progress of processing the upload source for the current datastore.</remarks>
+    internal boolean paramIsProcessingSkipped(boolean _isProcessingSkipped = isProcessingSkipped)
+    {
+        isProcessingSkipped = _isProcessingSkipped;
+
+        return isProcessingSkipped;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramCorrelationId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the correlation Id..
+    /// </summary>
+    /// <param name="_correlationId">The correlation Id.</param>
+    /// <returns>The correlation Id.</returns>
+    internal guid paramCorrelationId(guid _correlationId = correlationId)
+    {
+        correlationId = _correlationId;
+
+        return correlationId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

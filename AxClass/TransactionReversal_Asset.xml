@@ -1,0 +1,3768 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TransactionReversal_Asset</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>TransactionReversal_Asset</c> class extends the <c>TransactionReversal</c> class and
+///    contains the logic to reverse asset transactions, both value model and depreciation book, together
+///    with the associated ledger transactions.
+/// </summary>
+public class TransactionReversal_Asset extends TransactionReversal
+{
+    #ISOCountryRegionCodes
+
+    AssetJournalId reversalJournalNumber;
+    AssetTrans assetTrans;
+    private AssetTrans assetTransValidation;
+    TransDate correctionReversalDate;
+    boolean isFTICorrection;
+    AssetTrans assetTransOrig;
+
+    private AssetReversalRelatedVoucherManager reversalRelatedVoucherManager;
+    private guid reversalRelationId;
+    private boolean isRelatedVoucher;
+
+    boolean countryRegion_DEAT = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoDE, #isoAT]);
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>canReverse_Acq_AcqAdj</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks whether an acquisition or acquisition adjustment transaction can be reversed.
+    /// </summary>
+    /// <param name="_assetTransForOrig">
+    ///    An <c>AssetTransTable</c> buffer that contains the original transaction to reverse.
+    /// </param>
+    /// <param name="_assetTransMain">
+    ///    An <c>AssetTransTable</c> buffer that contains the selected transaction to reverse.
+    /// </param>
+    /// <param name="_assetRecId">
+    ///    The <c>RefRecId</c> value of the original transaction.
+    /// </param>
+    /// <param name="_assetTransDate">
+    ///    Tthe <c>AssetTransDate</c> value of the original transaction.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specifies whether to validate a reversal or a revoke.
+    /// </param>
+    /// <returns>
+    ///    A container of an <c>ErrorTolerance</c> value; either Error, Warning, or Accept; and a string. The
+    ///    container contains Accept if the transaction can be reversed or revoked, Warning if the transaction
+    ///    can be reversed or revoked pending user approval, or Error if the transaction cannot be reversed.
+    ///    The string contains the error or warning message to display to the user.
+    /// </returns>
+    private container canReverse_Acq_AcqAdj(
+        AssetTrans _assetTransForOrig, 
+        AssetTrans _assetTransMain, 
+        RefRecId _assetRecId, 
+        AssetTransDate _assetTransDate, 
+        boolean _revoke)
+    {
+        ErrorTolerance              reversalTolerance = ErrorTolerance::Accept;
+        str                         errorMsg = '';
+
+        AssetTable                  assetTable;
+        InventTrans                 inventTrans;
+        InventTransOrigin           inventTransOrigin;
+
+        // This next checks are only for non-reversed Acquisitions.
+        if ((_assetTransForOrig.TransType == AssetTransType::Acquisition) && (_assetTransForOrig.reversed() == false)
+              // <GEEU>
+              && AssetParameters::find().AllowPreAcquisition_CZ == AssetAllowPreAcquisition_CZ::No
+             // </GEEU>
+                )
+        {
+            // First, check to see if this asset is linked to an PO invoice/packing slip.  If it is, then check and see if it was posted
+            // in the same voucher as the inventory 'sold' transaction.  If it was, it cannot be reversed.
+            assetTable = AssetTable::find(_assetTransMain.AssetId);
+
+            if ((assetTable.PurchLineRecId > 0) && (_assetTransMain.Voucher != ''))
+            {
+                select firstonly RecId from inventTrans
+                    where inventTrans.Voucher     == _assetTransMain.Voucher
+                       && inventTrans.StatusIssue == StatusIssue::Sold
+                       && inventTrans.StatusReceipt == StatusReceipt::None
+                    exists join inventTransOrigin
+                        where inventTransOrigin.RecId             == inventTrans.InventTransOrigin
+                           && inventTransOrigin.ReferenceCategory == InventTransType::Asset;
+
+                if (inventTrans.RecId)
+                {
+                    // Found an inventory "sold" transaction related to this acquisition.  Can't reverse.
+                    errorMsg = strFmt("@FixedAssets:FA_TransactionReversalInventorySold", _assetTransForOrig.Voucher);
+                    reversalTolerance = ErrorTolerance::Error;
+                }
+            }
+
+            if (reversalTolerance != ErrorTolerance::Error)
+            {
+                if (!this.hasOtherNonReversedAcquisition(_assetTransMain, _assetRecId))
+                {
+                    if (this.hasOtherNonReversedTransaction(_assetTransMain, _assetRecId))
+                    {
+                        errorMsg = strFmt(
+                            "@FixedAssets:FA_TransactionReversal_TransactionsExists", 
+                            _assetTransForOrig.Voucher, 
+                            _assetTransForOrig.AssetId, 
+                            _assetTransMain.BookId);
+
+                        reversalTolerance = ErrorTolerance::Error;
+                    }
+                }
+            }
+        }
+
+        // If the Acq/AcqAdj has it's revaluation executed marked, cannot reverse.
+        if ((reversalTolerance != ErrorTolerance::Error) && (_assetTransForOrig.RevaluationDone == true))
+        {
+            if (_revoke)
+            {
+                errorMsg = strFmt(
+                    "@FixedAssets:FA_TransactionReversal_RevaluationExistsRevoke", 
+                    _assetTransForOrig.Voucher, 
+                    _assetTransForOrig.AssetId, 
+                    _assetTransMain.BookId);
+                reversalTolerance = ErrorTolerance::Error;
+            }
+            else
+            {
+                errorMsg = strFmt(
+                    "@FixedAssets:FA_TransactionReversal_RevaluationExists", 
+                    _assetTransForOrig.Voucher, 
+                    _assetTransForOrig.AssetId, 
+                    _assetTransMain.BookId);
+                reversalTolerance = ErrorTolerance::Error;
+            }
+        }
+
+        //
+        // If the user is trying to revoke a reversed Acq/AcqAdj and a Revaluation Trans exists after it, must warn the user.
+        // Can only happen when Legal Entity is in Spain
+        //
+        if ((reversalTolerance != ErrorTolerance::Error) && (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoES]) && (_revoke)))
+        {
+            if (this.hasOtherNonReversedRevaluation(_assetTransMain, _assetRecId, _assetTransDate))
+            {
+                errorMsg = this.formatWarningMessages(errorMsg, strFmt("@FixedAssets:FA_TransactionReversal_RevaluationExists", 
+                        _assetTransForOrig.Voucher, 
+                        _assetTransForOrig.AssetId, 
+                        _assetTransMain.BookId));
+
+                reversalTolerance = ErrorTolerance::Warning;
+            }
+        }
+
+        return [reversalTolerance, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReverse_AdditionalAllocation_JP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks whether an additional depreciation allocation can be reversed.
+    /// </summary>
+    /// <param name="_assetTransForOrig">
+    ///    An <c>AssetTransTable</c> buffer that contains the original transaction to reverse.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specifies whether to validate a reversal or a revoke.
+    /// </param>
+    /// <returns>
+    ///    A container of an <c>ErrorTolerance</c> value; either Error, Warning, or Accept; and a string. The
+    ///    container contains Accept if the transaction can be reversed or revoked, Warning if the transaction
+    ///    can be reversed or revoked pending user approval, or Error if the transaction cannot be reversed.
+    ///    The string contains the error or warning message to display to the user.
+    /// </returns>
+    private container canReverse_AdditionalAllocation_JP(AssetDepTransMap_JP _assetTransForOrig, boolean _revoke)
+    {
+        ErrorTolerance              reversalTolerance = ErrorTolerance::Accept;
+        str                         errorMsg = '';
+        AssetDepTransMap_JP         additionalReserveTrans;
+        AssetDepDistribution_JP     depDistribution;
+        AssetDepDistributionLine_JP depDistributionLine;
+        TransactionReversalTrans    transReversal;
+
+        //This next checks are only for reversed additional depreciation allocation
+        if (revoke)
+        {
+            additionalReserveTrans = AssetDepTransMap_JP::getEmptyTableBuffer(AssetDepCalculationHelper_JP::determineAssetBookType(_assetTransForOrig.TableId));
+
+            select firstOnly RecId from additionalReserveTrans
+                where additionalReserveTrans.TransType == AssetTransType::AdditionalDepReserve_JP
+                exists join depDistributionLine
+                    where depDistributionLine.RefReserveTableId == additionalReserveTrans.TableId
+                        && depDistributionLine.RefReserveRecId == additionalReserveTrans.RecId
+                exists join depDistribution
+                    where depDistribution.RecId == depDistributionLine.AssetDepDistribution_JP
+                        && depDistribution.RefRecId == _assetTransForOrig.RecId
+                        && depDistribution.RefTableId == _assetTransForOrig.TableId
+                exists join transReversal
+                    where transReversal.RefRecId == additionalReserveTrans.RecId
+                        && transReversal.RefTableId == additionalReserveTrans.TableId
+                        && transReversal.Reversed == true;
+
+            if (additionalReserveTrans.RecId)
+            {
+                // Found an bases additional depreciation reserve has been reversed
+                errorMsg = strFmt("@FixedAssets:FA_TransactionReversal_RevokeDepReserveExists", 
+                    assetTransValidation.Voucher);
+                reversalTolerance = ErrorTolerance::Error;
+            }
+        }
+
+        return [reversalTolerance, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReverse_AdditionalReverse_JP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks whether an additional depreciation reserve can be reversed.
+    /// </summary>
+    /// <param name="_assetTransForOrig">
+    ///    An <c>AssetTransTable</c> buffer that contains the original transaction to reverse.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specifies whether to validate a reversal or a revoke.
+    /// </param>
+    /// <returns>
+    ///    A container of an <c>ErrorTolerance</c> value; either Error, Warning, or Accept; and a string. The
+    ///    container contains Accept if the transaction can be reversed or revoked, Warning if the transaction
+    ///    can be reversed or revoked pending user approval, or Error if the transaction cannot be reversed.
+    ///    The string contains the error or warning message to display to the user.
+    /// </returns>
+    private container canReverse_AdditionalReverse_JP(AssetDepTransMap_JP _assetTransForOrig, boolean _revoke)
+    {
+        ErrorTolerance              reversalTolerance = ErrorTolerance::Accept;
+        str                         errorMsg = '';
+        AssetDepTransMap_JP         additionalAllocationTrans;
+        AssetDepDistribution_JP     depDistribution;
+        AssetDepDistributionLine_JP depDistributionLine;
+        TransactionReversalTrans    transReversal;
+
+        //This next checks are only for non reversed additional depreciation reserve
+        if (!revoke)
+        {
+            additionalAllocationTrans = AssetDepTransMap_JP::getEmptyTableBuffer(AssetDepCalculationHelper_JP::determineAssetBookType(_assetTransForOrig.TableId));
+
+            select firstOnly RecId from additionalAllocationTrans
+                where additionalAllocationTrans.AssetId == _assetTransForOrig.AssetId
+                    && additionalAllocationTrans.AssetBookId == _assetTransForOrig.AssetBookId
+                    && additionalAllocationTrans.TransType == AssetTransType::AdditionalDepReserveAllocation_JP
+                exists join depDistribution
+                    where depDistribution.RefTableId == additionalAllocationTrans.TableId
+                        && depDistribution.RefRecId == additionalAllocationTrans.RecId
+                exists join depDistributionLine
+                    where depDistributionLine.AssetDepDistribution_JP == depDistribution.RecId
+                        && depDistributionLine.RefReserveTableId == _assetTransForOrig.TableId
+                        && depDistributionLine.RefReserveRecId == _assetTransForOrig.RecId
+                notExists join transReversal
+                    where transReversal.RefRecId == additionalAllocationTrans.RecId
+                        && transReversal.RefTableId == additionalAllocationTrans.TableId
+                        && transReversal.Reversed == true;
+
+            if (additionalAllocationTrans.RecId)
+            {
+                // Found an additional depeciation allocation based on the origninal trans
+                errorMsg = strFmt("@FixedAssets:FA_TransactionReversal_DepReserveAllocationExists", 
+                    assetTransValidation.Voucher);
+	            reversalTolerance = ErrorTolerance::Error;
+	        }
+	    }
+	    return [reversalTolerance, errorMsg];
+	}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReverse_AnyTransType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks whether a transaction can be reversed.
+    /// </summary>
+    /// <param name="_assetTransForOrig">
+    ///    An <c>AssetTransTable</c> buffer that contains the original transaction to reverse.
+    /// </param>
+    /// <param name="_assetTransMain">
+    ///    An <c>AssetTransTable</c> buffer that contains the selected transaction to reverse.
+    /// </param>
+    /// <param name="_assetRecId">
+    ///    The <c>RefRecId</c> value of the original transaction.
+    /// </param>
+    /// <param name="_assetTransDate">
+    ///    The <c>AssetTransDate</c> value of the original transaction.
+    /// </param>
+    /// <returns>
+    ///    A container of an <c>ErrorTolerance</c> value; either Error, Warning, or Accept; and a string. The
+    ///    container contains Accept if the transaction can be reversed or revoked, Warning if the transaction
+    ///    can be reversed or revoked pending user approval, or Error if the transaction cannot be reversed. A
+    ///    string contains the error or warning message to display to the user.
+    /// </returns>
+    private container canReverse_AnyTransType(AssetTrans _assetTransForOrig, AssetTrans _assetTransMain, RefRecId _assetRecId, AssetTransDate _assetTransDate)
+    {
+        ErrorTolerance reversalTolerance = ErrorTolerance::Accept;
+        str errorMsg = '';
+
+        AssetBook  assetBook;
+        AssetTransDate assetTransDateDerogatoryTrans;
+        
+        AssetTrans assetTransAll = this.getOtherNonReversedDisposal(_assetTransMain, _assetRecId, _assetTransDate);
+
+        if (assetTransAll.RecId)
+        {
+            select firstonly Status from assetBook
+            where
+                assetBook.AssetId == _assetTransMain.AssetId
+                && assetBook.BookId == _assetTransMain.BookId;
+
+            // Should only get to this point when the status=open, but check anyway.
+            if (assetBook.Status == AssetStatus::Open)
+            {
+                errorMsg = this.formatWarningMessages(errorMsg, strFmt("@FixedAssets:FA_TransactionReversal_TransactionsExistsSpecific", 
+                    assetTrans.Voucher, 
+                    assetTransAll.TransType,
+                    _assetTransForOrig.AssetId, 
+                    _assetTransMain.BookId));
+
+                reversalTolerance = ErrorTolerance::Warning;
+            }
+        }
+
+        // French derogatory depreciation have two transactions posted on the same date and the same value model:
+        // Depreciation and Derogatory Decrease/Derogatory Increase.
+        // If this is a derogatory transaction, the check for depreciation transactions will exclude the date
+        // on which derogatory transaction happened.
+        if (_assetTransForOrig.TransType == AssetTransType::DerogatoryIncrease ||
+            _assetTransForOrig.TransType == AssetTransType::DerogatoryDecrease)
+        {
+            assetTransDateDerogatoryTrans = _assetTransDate + 1;
+        }
+        else
+        {
+            assetTransDateDerogatoryTrans = _assetTransDate;
+        }
+
+        assetTransAll = this.getOtherNonReversedDepreciation(_assetTransMain, _assetRecId, assetTransDateDerogatoryTrans);
+
+        if (assetTransAll.RecId != 0)
+        {
+            errorMsg = this.formatWarningMessages(errorMsg, strFmt("@FixedAssets:FA_TransactionReversal_TransactionExistsDepNotCalc", 
+                assetTransAll.TransType,
+                _assetTransForOrig.AssetId, 
+                _assetTransMain.BookId, 
+                _assetTransForOrig.Voucher));
+
+            reversalTolerance = ErrorTolerance::Warning;
+        }
+
+        if (this.hasOtherNonReversedTransfer(_assetTransMain, _assetRecId, _assetTransDate))
+        {
+            // In case it is found that this transaction cannot be reversed due to presence of an asset transfer
+            // transaction following this one, we need to generate an error, not a warning.
+            // Therefore, we need to send all previous warnings to infolog first, before generating this error,
+            // as the error message cannot be appened to the warning messages, as it needs to be a separate message
+            // on the infolog on on its own line.
+            if (errorMsg && reversalTolerance == ErrorTolerance::Warning)
+            {
+                warning(errorMsg);
+            }
+
+            errorMsg = strFmt("@FixedAssets:FA_MessageError_TransferExistsForThisOrLaterTransactionDate", 
+                _assetTransForOrig.AssetId, 
+                _assetTransMain.BookId, 
+                _assetTransForOrig.Voucher);
+
+            reversalTolerance = ErrorTolerance::Error;
+        }
+
+        return [reversalTolerance, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReverse_CapReserve</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks whether a capital reserve transaction can be reversed.
+    /// </summary>
+    /// <param name="_assetTransForOrig">
+    ///    An <c>AssetTransTable</c> buffer that contains the original transaction to reverse.
+    /// </param>
+    /// <param name="_assetTransMain">
+    ///    An <c>AssetTransTable</c> buffer that contains the selected transaction to reverse.
+    /// </param>
+    /// <param name="_assetRecId">
+    ///    The <c>RefRecId</c> value of the original transaction.
+    /// </param>
+    /// <param name="_assetTransDate">
+    ///    The <c>AssetTransDate</c> value of the original transaction.
+    /// </param>
+    /// <returns>
+    ///    A container of an <c>ErrorTolerance</c> value; either Error, Warning, or Accept; and a string. The
+    ///    container contains Accept if the transaction can be reversed or revoked, Warning if the transaction
+    ///    can be reversed or revoked pending user approval, or Error if the transaction cannot be reversed.
+    ///    The string contains the error or warning message to display to the user.
+    /// </returns>
+    private container canReverse_CapReserve(AssetTrans _assetTransForOrig, AssetTrans _assetTransMain, RefRecId _assetRecId, AssetTransDate _assetTransDate)
+    {
+        ErrorTolerance reversalTolerance = ErrorTolerance::Accept;
+        str errorMsg = '';
+
+        AssetTrans assetTransAll;
+        TransactionReversalTrans reversalTrans;
+
+        // If original is CapReserve and there is a CapReserve after it, warn the user.
+
+        select firstonly RecId, AssetId, BookId, TransType from assetTransAll
+            where
+            assetTransAll.AssetId == _assetTransMain.AssetId
+            && assetTransAll.BookId == _assetTransMain.BookId
+            && assetTransAll.RecId != _assetRecId
+            && assetTransAll.TransDate >= _assetTransDate
+            && assetTransAll.TransType == AssetTransType::CapitalReserve
+        notexists join
+            reversalTrans
+            where
+            reversalTrans.RefRecId == assetTransAll.RecId
+            && reversalTrans.RefTableId == assetTransAll.TableId
+            && (reversalTrans.Reversed == true);
+
+        if (assetTransAll.RecId != 0)
+        {
+            errorMsg = this.formatWarningMessages(errorMsg, strFmt("@FixedAssets:FA_TransactionReversal_ProvisionReserveExists", 
+                _assetTransForOrig.Voucher, 
+                _assetTransForOrig.AssetId, 
+                _assetTransMain.BookId));
+
+            reversalTolerance = ErrorTolerance::Warning;
+        }
+
+        return [reversalTolerance, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReverse_Disposal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks whether a disposal transaction can be reversed.
+    /// </summary>
+    /// <param name="_assetTransForOrig">
+    ///    An <c>AssetTransTable</c> buffer that contains the original transaction to reverse.
+    /// </param>
+    /// <param name="_assetTransMain">
+    ///    An <c>AssetTransTable</c> buffer that contains the selected transaction to reverse.
+    /// </param>
+    /// <param name="_assetTransDate">
+    ///    The <c>AssetTransDate</c> value of the original transaction.
+    /// </param>
+    /// <returns>
+    ///    A container of an <c>ErrorTolerance</c> value; either Error, Warning, or Accept; and a string. The
+    ///    container contains Accept if the transaction can be reversed or revoked, Warning if the transaction
+    ///    can be reversed or revoked pending user approval, or Error if the transaction cannot be reversed.
+    ///    The string contains the error or warning message to display to the user.
+    /// </returns>
+    private container canReverse_Disposal(AssetTrans _assetTransForOrig, AssetTrans _assetTransMain, AssetTransDate _assetTransDate)
+    {
+        ErrorTolerance reversalTolerance = ErrorTolerance::Accept;
+        str errorMsg = '';
+
+        AssetTrans assetTransAll;
+
+        // If a Disposal has a Provision for Reserve (CapitalReserve) following it, and the PfR is in a separate voucher, warn the user.
+        select firstonly RecId, AssetId, BookId, TransType from assetTransAll
+            where
+            assetTransAll.AssetId == _assetTransMain.AssetId
+            && assetTransAll.BookId == _assetTransMain.BookId
+            && assetTransAll.Voucher != _assetTransMain.Voucher
+            && assetTransAll.TransDate >= _assetTransDate
+            && assetTransAll.TransType == AssetTransType::CapitalReserve;
+
+        if (assetTransAll.RecId != 0)
+        {
+            errorMsg = this.formatWarningMessages(errorMsg, strFmt("@FixedAssets:FA_TransactionReversal_ProvisionReserveExists", 
+                _assetTransForOrig.Voucher, 
+                _assetTransForOrig.AssetId, 
+                _assetTransMain.BookId));
+
+            reversalTolerance = ErrorTolerance::Warning;
+        }
+
+        return [reversalTolerance, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReverse_PreAcq_CZ</Name>
+				<Source><![CDATA[
+    private container canReverse_PreAcq_CZ(AssetTrans _assetTransForOrig,
+                                           AssetTrans _assetTransMain,
+                                           RefRecId _assetRecId)
+    {
+        ErrorTolerance reversalTolerance = ErrorTolerance::Accept;
+        str            errorMsg = '';
+        AssetTrans     assetTransAll;
+        TransactionReversalTrans reversalTrans;
+
+        if (_assetTransForOrig.TransType  == AssetTransType::PreAcquisition_CZ &&
+            _assetTransForOrig.reversed() == false)
+        {
+            select firstonly RecId from assetTransAll
+                where
+                assetTransAll.AssetId == _assetTransMain.AssetId
+                && assetTransAll.BookId == _assetTransMain.BookId
+                && assetTransAll.RecId != _assetRecId
+                && assetTransAll.TransType == AssetTransType::PreAcquisition_CZ
+            notexists join
+                reversalTrans
+            where
+                reversalTrans.RefRecId == assetTransAll.RecId
+                && reversalTrans.RefTableId == assetTransAll.TableId
+                && (reversalTrans.Reversed == true);
+
+            if (assetTransAll.RecId == 0)
+            {
+                assetTransAll.clear();
+                reversalTrans.clear();
+
+                select firstonly RecId, AssetId, BookId from assetTransAll
+                    where
+                        assetTransAll.AssetId == _assetTransMain.AssetId
+                        && assetTransAll.BookId == _assetTransMain.BookId
+                        && assetTransAll.RecId != _assetRecId
+                    notexists join
+                        reversalTrans
+                    where
+                        reversalTrans.RefRecId == assetTransAll.RecId
+                        && reversalTrans.RefTableId == assetTransAll.TableId
+                        && (reversalTrans.Reversed == true);
+
+                if (assetTransAll.RecId)
+                {
+                    errorMsg = strFmt("@FixedAssets:FA_TransactionReversal_TransactionsExists", 
+                        _assetTransForOrig.Voucher, 
+                        _assetTransForOrig.AssetId, 
+                        _assetTransMain.BookId);
+
+                    reversalTolerance = ErrorTolerance::Error;
+                }
+            }
+        }
+
+        return [reversalTolerance, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canReverse_Revaluation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks whether a revaluation transaction can be reversed.
+    /// </summary>
+    /// <param name="_assetTransForOrig">
+    ///    An <c>AssetTransTable</c> buffer that contains the original transaction to reverse.
+    /// </param>
+    /// <param name="_assetTransMain">
+    ///    An <c>AssetTransTable</c> buffer that contains the selected transaction to reverse.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specifies whether to validate a reversal or a revoke.
+    /// </param>
+    /// <returns>
+    ///    A container of an <c>ErrorTolerance</c> value; either Error, Warning, or Accept; and a string. The
+    ///    container contains Accept if the transaction can be reversed or revoked, Warning if the transaction
+    ///    can be reversed or revoked pending user approval, or Error if the transaction cannot be reversed.
+    ///    The string contains the error or warning message to display to the user.
+    /// </returns>
+    private container canReverse_Revaluation(AssetTrans _assetTransForOrig, AssetTrans _assetTransMain, boolean _revoke)
+    {
+        ErrorTolerance reversalTolerance = ErrorTolerance::Accept;
+        str errorMsg = '';
+        boolean canReverse = true;
+
+        AssetTrans assetTransAll;
+        TransactionReversalTrans transRevTrans;
+
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoES]) && (_revoke))
+        {
+            //
+            // Attempting to revoke a Revaluation w/ Spanish key enabled. Need to look at related transaction (Acq or Acq Adj).
+            // If the related trans is reversed, or the revaluation executed is marked on the related transaction,
+            // then the Revaluation cannot be reversed.
+            //
+
+            select firstonly RecId from assetTransAll
+            where
+                assetTransAll.AssetId == _assetTransMain.AssetId
+                && assetTransAll.BookId == _assetTransMain.BookId
+                && assetTransAll.RecId == _assetTransForOrig.RevaluedTransID
+                && assetTransAll.RevaluationDone == NoYes::Yes;
+
+            if (assetTransAll.RecId)
+            {
+                canReverse = false;
+            }
+            else
+            {
+                select firstonly RecId from transRevTrans
+                where
+                    transRevTrans.RefRecId == _assetTransForOrig.RevaluedTransID
+                    && transRevTrans.RefTableId == _assetTransForOrig.TableId
+                    && (transRevTrans.Original == NoYes::Yes)
+                    && (transRevTrans.Reversed == NoYes::Yes);
+
+                if (transRevTrans.RecId)
+                {
+                    canReverse = false;
+                }
+            }
+
+            if (!canReverse)
+            {
+                reversalTolerance = ErrorTolerance::Error;
+                errorMsg = strFmt("@FixedAssets:FA_TransactionReversal_AcquisitionAdjustmentsPreventReverse", 
+                    assetTransValidation.Voucher);
+            }
+        }
+
+        return [reversalTolerance, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canTranBeReversed_ValueModels</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines whether an asset transaction is eligible to be reversed or revoked.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher number that corresponds to the transaction to find.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date of the transaction to reverse or revoke.
+    /// </param>
+    /// <param name="_revoke">
+    ///    The attribute that determines to whether to validate a reversal or a revoke.
+    /// </param>
+    /// <returns>
+    ///    A container of two Boolean fields and one string: The first Boolean is the
+    ///    <c>nonReverseConditionFound</c> field. true if the transaction can be reversed or revoked;
+    ///    otherwise, false. The second Boolean is the <c>origTranFound</c> field. true if a transaction that
+    ///    matches the specified voucher and transaction date was found; otherwise false. The string that is
+    ///    returned contains the error message to display to the user.
+    /// </returns>
+    /// <remarks>
+    ///    This method first finds the original transaction that corresponds to the specified voucher and
+    ///    transaction date. If no transaction is found, then false, false, and an empty string are returned.
+    ///    If an original transaction is found using that transaction, it then examines all transactions that
+    ///    occurred after it, chronologically. If there are any unreversed, unrevoked transactions, the one
+    ///    passed in cannot be reversed, and false, true, and the appropriate error message is returned. If
+    ///    the original transaction is found and no reversing issues are found, then true, true, and an empty
+    ///    string are returned.
+    /// </remarks>
+    public container canTranBeReversed_ValueModels(Voucher _voucher, AssetTransDate _transDate, boolean _revoke)
+    {
+        ErrorTolerance reversalTolerance = ErrorTolerance::Accept;
+        ErrorTolerance reversalToleranceAll = ErrorTolerance::Accept;
+        boolean origTranFound = false;
+        boolean nonReverseConditionFound = false;
+        str errorMsg = '';
+        str errorMsgAll = '';
+        TraceNum traceNum = '';
+        RefRecId assetRecId = 0;
+        AssetTransDate assetTransDate = dateNull();
+
+        AssetTrans assetTransMain;
+        AssetTrans assetTransForOrig;
+        AssetTrans assetTransForDate;
+        TransactionReversalTrans transRevTransForOrig;
+
+        RefTableId assetTableId = tableNum('AssetTrans');
+
+        //
+        // Find all the AssetTrans transactions with the passed in Voucher for the given AssetTransDate in Value Models.
+        // Only look for those transaction types which are allowed to be reversed; the rest are excluded earlier in the process.
+        //
+        while select AssetId, BookId, RecId, TransDate, Voucher from assetTransMain
+            where (assetTransMain.Voucher == _voucher)
+            && (assetTransMain.TransDate == _transDate)
+            && (assetTransMain.TransType == AssetTransType::Acquisition ||
+            // <GEEU>
+            assetTransMain.TransType == AssetTransType::PreAcquisition_CZ ||
+            // </GEEU>
+            assetTransMain.TransType == AssetTransType::AcquisitionAdj ||
+            assetTransMain.TransType == AssetTransType::BonusDepreciation ||
+            assetTransMain.TransType == AssetTransType::CapitalReserve ||
+            assetTransMain.TransType == AssetTransType::CapitalReserveTransfer ||
+            assetTransMain.TransType == AssetTransType::Depreciation ||
+            assetTransMain.TransType == AssetTransType::DepreciationAdj ||
+            assetTransMain.TransType == AssetTransType::DisposalSale ||
+            assetTransMain.TransType == AssetTransType::DisposalScrap ||
+            assetTransMain.TransType == AssetTransType::ExtraordinaryDepreciation ||
+            assetTransMain.TransType == AssetTransType::Revaluation ||
+            assetTransMain.TransType == AssetTransType::DerogatoryDecrease ||
+            assetTransMain.TransType == AssetTransType::DerogatoryIncrease ||
+            assetTransMain.TransType == AssetTransType::WriteDownAdj ||
+            assetTransMain.TransType == AssetTransType::WriteUpAdj ||
+            assetTransMain.TransType == AssetTransType::AssetTransfer||
+            assetTransMain.TransType == AssetTransType::AccumulatedDepreciation_PL
+            // <GJP>
+            || assetTransMain.TransType == AssetTransType::ReductionEntryReserve_JP
+            || assetTransMain.TransType == AssetTransType::ReductionEntryReserveAllocation_JP
+            || assetTransMain.TransType == AssetTransType::AssetRetirementObligationInterest_JP
+	        || assetTransMain.TransType == AssetTransType::SpecialDepReserve_JP
+	        || assetTransMain.TransType == AssetTransType::SpecialDepReserveAllocation_JP
+	        || assetTransMain.TransType == AssetTransType::AdditionalDepReserve_JP
+	        || assetTransMain.TransType == AssetTransType::AdditionalDepReserveAllocation_JP
+            // </GJP>
+            )
+        {
+            //
+            // First, need to get the original transaction corresponding to the _voucher and _transDate for this BookId.
+            // Start with the transaction we have. It may be the original.
+            //
+            select firstonly TraceNum, Original, RefRecId from transRevTransForOrig
+                where transRevTransForOrig.RefRecId == assetTransMain.RecId
+                && transRevTransForOrig.RefTableId == assetTableId;
+
+            traceNum = transRevTransForOrig.TraceNum;
+            if (!(traceNum == ''))
+            {
+                if (transRevTransForOrig.Original == NoYes::No)
+                {
+                    // The transaction is not the original.  Get the original one using the returned TraceNum.
+                    select firstonly RefRecId from transRevTransForOrig
+                        join assetTransForOrig
+                        where transRevTransForOrig.RefRecId == assetTransForOrig.RecId
+                        && transRevTransForOrig.TraceNum == traceNum
+                        && transRevTransForOrig.Original == NoYes::Yes
+                        && transRevTransForOrig.RefTableId == assetTableId
+                        && assetTransForOrig.BookId == assetTransMain.BookId;
+
+                    if (transRevTransForOrig.RefRecId == 0)
+                    {
+                        //Should have been a record here - bad data.  Can't reverse this one.
+                        nonReverseConditionFound = true;
+                        break;
+                    }
+                    else
+                    {
+                        //Found the original, record its ID.
+                        assetRecId = transRevTransForOrig.RefRecId;
+                        origTranFound = true;
+                    }
+                }
+                else
+                {
+                    // Found the original, record its ID.
+                    assetRecId = transRevTransForOrig.RefRecId;
+                    origTranFound = true;
+                }
+            }
+            else
+            {
+                // No tracing, so we have an original transaction already.
+                assetRecId = assetTransMain.RecId;
+                assetTransDate = assetTransMain.TransDate;
+                origTranFound = true;
+            }
+
+            // We now have the original transaction, in assetRecId variable.  If we don't have assetTransDate, get it.
+            if (assetTransDate == dateNull())
+            {
+                select firstonly TransDate from assetTransForDate where assetTransForDate.RecId == assetRecId;
+                assetTransDate = assetTransForDate.TransDate;
+            }
+
+            if (!nonReverseConditionFound)
+            {
+                //
+                // We now have the original transaction record Id value in the assetRecId variable.  Find the original transaction
+                // type and depending on the type of transaction the orig is, check for non-reversal situations.
+                //
+                select AssetId, TransType, RevaluationDone, RecId, RevaluedTransID from assetTransForOrig
+                where
+                    assetTransForOrig.RecId == assetRecId;
+
+                switch (assetTransForOrig.TransType)
+                {
+                    // <GEEU>
+                    case AssetTransType::PreAcquisition_CZ:
+                        [reversalTolerance, errorMsg] = this.canReverse_PreAcq_CZ(assetTransForOrig, assetTransMain, assetRecId);
+                        break;
+
+                    // </GEEU>
+                    case AssetTransType::Acquisition:
+                    case AssetTransType::AcquisitionAdj:
+                        [reversalTolerance, errorMsg] = this.canReverse_Acq_AcqAdj(assetTransForOrig, assetTransMain, assetRecId, assetTransDate, _revoke);
+                        break;
+
+                    case AssetTransType::Revaluation:
+                        [reversalTolerance, errorMsg] = this.canReverse_Revaluation(assetTransForOrig, assetTransMain, _revoke);
+                        break;
+
+                    case AssetTransType::DisposalSale:
+                    case AssetTransType::DisposalScrap:
+                        [reversalTolerance, errorMsg] = this.canReverse_Disposal(assetTransForOrig, assetTransMain, assetTransDate);
+                        break;
+
+                    case AssetTransType::CapitalReserve:
+                        [reversalTolerance, errorMsg] = this.canReverse_CapReserve(assetTransForOrig, assetTransMain, assetRecId, assetTransDate);
+                        break;
+	                // <GJP>
+	                case AssetTransType::AdditionalDepReserve_JP:
+	                    [reversalTolerance, errorMsg] = this.canReverse_AdditionalReverse_JP(assetTransForOrig, _revoke);
+	                    break;
+
+	                case AssetTransType::AdditionalDepReserveAllocation_JP:
+	                    [reversalTolerance, errorMsg] = this.canReverse_AdditionalAllocation_JP(assetTransForOrig, _revoke);
+	                    break;
+	                // </GJP>
+                }
+
+                if (reversalTolerance != ErrorTolerance::Error)
+                {
+                    [reversalToleranceAll, errorMsgAll] = this.canReverse_AnyTransType(assetTransForOrig, assetTransMain, assetRecId, assetTransDate);
+
+                    if (reversalToleranceAll == ErrorTolerance::Warning)
+                    {
+                        errorMsg = this.formatWarningMessages(errorMsg, errorMsgAll);
+                        reversalTolerance = reversalToleranceAll;
+                    }
+                    else if (reversalToleranceAll == ErrorTolerance::Error)
+                    {
+                        errorMsg = errorMsgAll;
+                        reversalTolerance = reversalToleranceAll;
+                    }
+                }
+                else
+                {
+                    // If an error condition was found, stop.
+                    break;
+                }
+            }
+        }
+
+        return [reversalTolerance, origTranFound, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canTransactionBeReversed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Takes information about an assets transaction and determines whether it is eligible to be reversed
+    ///    or revoked.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher number that corresponds to the transaction to find.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date of the transaction to reverse or revoke.
+    /// </param>
+    /// <param name="_journalNumber">
+    ///    The journal number of the depreciation book transaction to reverse or revoke; optional.
+    /// </param>
+    /// <param name="_journalLineNum">
+    ///    The journal line number of the depreciation book transaction to reverse or revoke; optional.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specifies whether to validate a reversal or a revoke.
+    /// </param>
+    /// <returns>
+    ///    A container of one Boolean and one string: The Boolean is set to true if the transaction can be
+    ///    reversed or revoked; otherwise, false.The string contains the error message to display to the user.
+    /// </returns>
+    public container canTransactionBeReversed(Voucher _voucher, AssetTransDate _transDate, AssetJournalId _journalNumber, LineNum _journalLineNum, boolean _revoke)
+    {
+        boolean valModelTranFound = false;
+        str errorMsg = '';
+        str errorMsgTmp = '';
+
+        ErrorTolerance reversalToleranceVM = ErrorTolerance::Accept;
+        ErrorTolerance reversalTolerance   = ErrorTolerance::Accept;
+
+        if (!(_transDate == dateNull()))
+        {
+            if (!(_voucher == ''))
+            {
+                // We have a voucher, so check VMs
+                [reversalToleranceVM,valModelTranFound, errorMsg]  = this.canTranBeReversed_ValueModels(_voucher, _transDate, _revoke);
+            }
+
+            if (reversalToleranceVM == ErrorTolerance::Accept)
+            {
+                reversalTolerance = ErrorTolerance::Accept;
+            }
+            else if (reversalToleranceVM == ErrorTolerance::Warning)
+            {
+                reversalTolerance = ErrorTolerance::Warning;
+            }
+            else if (reversalToleranceVM == ErrorTolerance::Error)
+            {
+                reversalTolerance = ErrorTolerance::Error;
+            }
+
+            if (valModelTranFound == false)
+            {
+                // No transaction found; cannot reverse.
+                reversalTolerance = ErrorTolerance::Error;
+                errorMsg = strFmt("@SYS112346", _voucher, date2StrUsr(_transDate, DateFlags::FormatAll));
+            }
+        }
+        else
+        {
+            // Can't continue if no valid date.
+            reversalTolerance = ErrorTolerance::Error;
+            errorMsg = strFmt("@SYS112346", _voucher, dateNull());
+        }
+
+        return [reversalTolerance, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAssetStatusApplicable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates all transactions for reversal or revoke based on type and status.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher number of the transactions to reverse or revoke; optional
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date of the transactions to reverse or revoke.
+    /// </param>
+    /// <param name="_journalNumber">
+    ///    The journal number of the depreciation book transactions to reverse or revoke; optional
+    /// </param>
+    /// <param name="_journalLineNum">
+    ///    The journal line number of the depreciation book transactions to reverse or revoke; optional
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specifies whether the transactions will be revoked or reversed.
+    /// </param>
+    /// <returns>
+    ///    A container that holds a Boolean value and a string. The Boolean value is set to true if all asset
+    ///    statuses found are acceptable to reverse or revoke the transactions; otherwise, false. The error
+    ///    message states why the transaction could not be reversed or revoked.
+    /// </returns>
+    /// <remarks>
+    ///    This method loops through select transactions in all the value models and depreciation books of the
+    ///    asset. It then verifies that the asset status is appropriate for the transaction type that will be
+    ///    reversed or revoked. The transactions are selected based on the voucher and transaction date passed
+    ///    in. Or, for the asset depreciation books that do not have voucher numbers, they are selected based
+    ///    on journal number and journal line number.
+    /// </remarks>
+    public container checkAssetStatusApplicable(Voucher _voucher, AssetTransDate _transDate, AssetJournalId _journalNumber, LineNum _journalLineNum, boolean _revoke)
+    {
+        boolean ret = true;
+        str retError = "";
+
+        AssetTrans assetTransRec;
+        AssetBook assetBookRec;
+
+        while select TransType, ReserveTransferDone from assetTransRec join BookId, Status from assetBookRec
+            where assetTransRec.BookId == assetBookRec.BookId
+            && assetTransRec.AssetId == assetBookRec.AssetId
+            && assetTransRec.Voucher == _voucher
+            && assetTransRec.TransDate == _transDate
+
+        {
+            [ret,retError] = this.checkStatusApplicable(assetTransRec.TransType,assetBookRec.Status,assetBookRec.BookId, _revoke, assetTransRec.ReserveTransferDone);
+        }
+
+        return [ret, retError];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLedgerPostingTypeApplicable</Name>
+				<Source><![CDATA[
+    boolean checkLedgerPostingTypeApplicable(Voucher   _voucher,
+                                             TransDate _transDate)
+    {
+        // <GJP>
+        if (AssetComponentReversal_JP::isAssetTransRelatedToAssembling(assetTransValidation.RecId))
+        {
+            return true;
+        }
+        // </GJP>
+        return super(_voucher, _transDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkStatusApplicable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates a transaction for reversal or revoke based on type and status.
+    /// </summary>
+    /// <param name="_transType">
+    ///    The asset transaction type of the transaction that will be validated.
+    /// </param>
+    /// <param name="_status">
+    ///    The asset status of the value model or the depreciation book for the transaction that will be
+    ///    validated.
+    /// </param>
+    /// <param name="_bookId">
+    ///    The value model ID or depreciation book ID for the transaction that will be validated.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specified whether the transactions are will be revoked or reversed.
+    /// </param>
+    /// <param name="_reserveTransferDone">
+    ///    A value that indicates where a transfer from reserve transaction has been posted against this
+    ///    assets reserve amount.
+    /// </param>
+    /// <returns>
+    ///    A container that has a Boolean value and a string.The Boolean value is set to true if all asset
+    ///    statuses found are acceptable to reverse or revoke the transactions; otherwise, false.The string
+    ///    contains the error message that states why the transaction could not be reversed or revoked.
+    /// </returns>
+    public container checkStatusApplicable(AssetTransType _transType, AssetStatus _status, AssetBookId _bookId, boolean _revoke, AssetReserveTransferDone _reserveTransferDone)
+    {
+        boolean isValid = true;
+        str retError = '';
+
+        switch (_transType)
+        {
+            case AssetTransType::Acquisition:
+                if (!_revoke)
+                {
+                    if (!this.checkAssetStatusIsOpen(_transType, _status, _bookId, _revoke, _reserveTransferDone))
+                    {
+                        // Situation: Trying to reverse an Acq with asset status not "Open".
+                        isValid = false;
+                        retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Open);
+                    }
+                }
+                else
+                {
+                    // <GEEU>
+                    if (( !(_status == AssetStatus::NoAcquisition) && !(_status == AssetStatus::Open) ) && !(_status == AssetStatus::Acquired_CZ))
+                        // </GEEU>
+                    {
+                        //Situation: Trying to revoke a reversed Acq when asset status is not "Not yet acquired" and not "Open".
+                        isValid = false;
+                        // <GEEU>
+                        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoCZ, #isoHU]))
+                        {
+                            retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, 
+                                                                        AssetParameters::find().AllowPreAcquisition_CZ != AssetAllowPreAcquisition_CZ::No ? AssetStatus::Acquired_CZ : AssetStatus::NoAcquisition);
+                        }
+                    }
+                }
+
+                break;
+
+            case AssetTransType::PreAcquisition_CZ:
+                if (_revoke)
+                {
+                    if ((_status != AssetStatus::NoAcquisition) && !(_status == AssetStatus::Open))
+                    {
+                        //Situation: Trying to revoke a reversed Acq when asset status is not "Not yet acquired".
+                        isValid = false;
+                        // </GEEU>
+                        retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::NoAcquisition);
+                        // <GEEU>
+                    }
+                }
+                else
+                {
+                    if (_status != AssetStatus::Acquired_CZ && _status != AssetStatus::Open
+                        && SysCountryRegionCode::isLegalEntityInCountryRegion([#isoCZ, #isoHU]))
+                    {
+                        // Situation: Trying to reverse an Acq with asset status not "Open".
+                        isValid = false;
+                        retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Acquired_CZ);
+                        // </GEEU>
+                    }
+                }
+
+            break;
+
+            case AssetTransType::AcquisitionAdj:
+            case AssetTransType::Depreciation:
+            case AssetTransType::DerogatoryDecrease:
+            case AssetTransType::DerogatoryIncrease:
+            case AssetTransType::DepreciationAdj:
+            case AssetTransType::Revaluation:
+            case AssetTransType::WriteUpAdj:
+            case AssetTransType::WriteDownAdj:
+            case AssetTransType::BonusDepreciation:
+                if (!this.checkAssetStatusIsOpen(_transType, _status, _bookId, _revoke, _reserveTransferDone)
+                    && !((_status == AssetStatus::Scrapped || _status == AssetStatus::Sold)
+                    && AssetReversalRelatedVoucher::isRelatedToDisposal(assetTrans.Voucher, assetTrans.TransDate)))
+                {
+                    //Situation: Trying to revoke a reversed Acq when asset status is not "Open".
+                    isValid = false;
+                    retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Open);
+                }
+
+                break;
+
+            case AssetTransType::DisposalSale:                
+                if (!_revoke)
+                {
+                    if (!this.checkAssetStatusIsOpenOrSold(_transType, _status, _bookId, _revoke, _reserveTransferDone))
+                    {
+                        // Situation: Trying to reverse an Disposal sale with asset status not "Open" nor "Sold".
+                        isValid = false;
+                        retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Sold);
+                    }
+                }
+                else
+                {
+                    if (!this.checkAssetStatusIsOpen(_transType, _status, _bookId, _revoke, _reserveTransferDone))
+                    {
+                        //Situation: Trying to revoke a reversed Disposal Sale when asset status is not "Open".
+                        isValid = false;
+                        retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Open);
+                    }
+                }
+
+                break;
+
+            case AssetTransType::DisposalScrap:
+                if (!_revoke)
+                {
+                    if (!this.checkAssetStatusIsOpenOrScrapped(_transType, _status, _bookId, _revoke, _reserveTransferDone))
+                    {
+                        // Situation: Trying to reverse an Disposal scrap with asset status not "Open" nor "Scrapped".
+                        isValid = false;
+                        retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Scrapped);
+                    }
+                }
+                else
+                {
+                    if (!this.checkAssetStatusIsOpen(_transType, _status, _bookId, _revoke, _reserveTransferDone))
+                    {
+                        //Situation: Trying to revoke a reversed Disposal Scrap when asset status is not "Open".
+                        isValid = false;
+                        retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Open);
+                    }
+                }
+
+                break;
+
+            case AssetTransType::CapitalReserve:
+                if (!this.checkAssetStatusIsOpenOrSold(_transType, _status, _bookId, _revoke, _reserveTransferDone))
+                {
+                    // Situation: Trying to reverse/revoke a Provision for Reserve with asset status not "Open" nor "Sold".
+                    isValid = false;
+                    retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Open);
+                }
+                else
+                {
+                    if ((_revoke) && (_reserveTransferDone == true))
+                    {
+                        // Situation: Trying to revoke a Provision for Reserve where original transaction has had the ReserveTransferDone field set to true,
+                        //             meaning some other Tranfer from Reserve has been done against the original, so we can't undo this one.
+                        // Note: the ReserveTransferDone field will only be set to true on the original transaction, so if we find any with that value, bail.
+                        isValid = false;
+                        retError = strFmt("@FixedAssets:FA_TransactionReversal_TransferReverseFirst", 
+                            assetTransValidation.Voucher);
+                    }
+                }
+
+                break;
+
+            case AssetTransType::CapitalReserveTransfer:
+                if (!this.checkAssetStatusIsOpenOrSold(_transType, _status, _bookId, _revoke, _reserveTransferDone))
+                {
+                    // Situation: Trying to reverse/revoke a Transfer from Reserve with asset status not "Open" nor "Sold".
+                    isValid = false;
+                    retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Open);
+                }
+
+                break;
+
+            case AssetTransType::ExtraordinaryDepreciation:
+                if (!this.checkAssetStatusIsOpen(_transType, _status, _bookId, _revoke, _reserveTransferDone))
+                {
+                    // Situation: Trying to reverse/revoke an Extraordinary Depreciation with asset status not "Open".
+                    isValid = false;
+                    retError = this.getAssetStatusErrorMessage(_transType, _status, _bookId, _revoke, _reserveTransferDone, AssetStatus::Open);
+                }
+
+                break;        
+        }
+
+        return [isValid, retError];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAssetStatusIsOpen</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines if the asset status is Open.
+    /// </summary>
+    /// <param name="_transType">
+    ///    The asset transaction type of the transaction that will be validated.
+    /// </param>
+    /// <param name="_status">
+    ///    The asset status of the value model or the depreciation book for the transaction that will be
+    ///    validated.
+    /// </param>
+    /// <param name="_bookId">
+    ///    The value model ID or depreciation book ID for the transaction that will be validated.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specified whether the transactions are will be revoked or reversed.
+    /// </param>
+    /// <param name="_reserveTransferDone">
+    ///    A value that indicates where a transfer from reserve transaction has been posted against this
+    ///    assets reserve amount.
+    /// </param>
+    /// <returns>
+    ///    true if the asset status is Open; otherwise, false.
+    /// </returns>
+    protected boolean checkAssetStatusIsOpen(AssetTransType _transType, AssetStatus _status, AssetBookId _bookId, boolean _revoke, AssetReserveTransferDone _reserveTransferDone)
+    {
+        return (_status == AssetStatus::Open || _status == AssetStatus::TransferredToLowValuePool);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAssetStatusIsOpenOrSold</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines if the asset status is Open or Sold.
+    /// </summary>
+    /// <param name="_transType">
+    ///    The asset transaction type of the transaction that will be validated.
+    /// </param>
+    /// <param name="_status">
+    ///    The asset status of the value model or the depreciation book for the transaction that will be
+    ///    validated.
+    /// </param>
+    /// <param name="_bookId">
+    ///    The value model ID or depreciation book ID for the transaction that will be validated.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specified whether the transactions are will be revoked or reversed.
+    /// </param>
+    /// <param name="_reserveTransferDone">
+    ///    A value that indicates where a transfer from reserve transaction has been posted against this
+    ///    assets reserve amount.
+    /// </param>
+    /// <returns>
+    ///    true if the asset status is Open or Sold; otherwise, false.
+    /// </returns>
+    protected boolean checkAssetStatusIsOpenOrSold(AssetTransType _transType, AssetStatus _status, AssetBookId _bookId, boolean _revoke, AssetReserveTransferDone _reserveTransferDone)
+    {
+        return (_status == AssetStatus::Open || _status == AssetStatus::Sold || _status == AssetStatus::TransferredToLowValuePool);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAssetStatusIsOpenOrScrapped</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines if the asset status is Open or Scrapped.
+    /// </summary>
+    /// <param name="_transType">
+    ///    The asset transaction type of the transaction that will be validated.
+    /// </param>
+    /// <param name="_status">
+    ///    The asset status of the value model or the depreciation book for the transaction that will be
+    ///    validated.
+    /// </param>
+    /// <param name="_bookId">
+    ///    The value model ID or depreciation book ID for the transaction that will be validated.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specified whether the transactions are will be revoked or reversed.
+    /// </param>
+    /// <param name="_reserveTransferDone">
+    ///    A value that indicates where a transfer from reserve transaction has been posted against this
+    ///    assets reserve amount.
+    /// </param>
+    /// <returns>
+    ///    true if the asset status is Open or Scrapped; otherwise, false.
+    /// </returns>
+    protected boolean checkAssetStatusIsOpenOrScrapped(AssetTransType _transType, AssetStatus _status, AssetBookId _bookId, boolean _revoke, AssetReserveTransferDone _reserveTransferDone)
+    {
+        return (_status == AssetStatus::Open || _status == AssetStatus::Scrapped || _status == AssetStatus::TransferredToLowValuePool);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAssetStatusErrorMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Gets the error message for when an asset's status is not in the required state.
+    /// </summary>
+    /// <param name="_transType">
+    ///    The asset transaction type of the transaction that will be validated.
+    /// </param>
+    /// <param name="_status">
+    ///    The asset status of the value model or the depreciation book for the transaction that will be
+    ///    validated.
+    /// </param>
+    /// <param name="_bookId">
+    ///    The value model ID or depreciation book ID for the transaction that will be validated.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specified whether the transactions are will be revoked or reversed.
+    /// </param>
+    /// <param name="_reserveTransferDone">
+    ///    A value that indicates where a transfer from reserve transaction has been posted against this
+    ///    assets reserve amount.
+    /// </param>
+    /// <returns>
+    ///    An error message stating that an asset's status is not in the required state.
+    /// </returns>
+    protected str getAssetStatusErrorMessage(AssetTransType _transType, AssetStatus _status, AssetBookId _bookId, boolean _revoke, AssetReserveTransferDone _reserveTransferDone, AssetStatus _requiredStatus)
+    {
+        return strFmt("@FixedAssets:FA_TransactionReversal_InvalidAssetStatus", 
+            assetTransValidation.Voucher, 
+            _bookId, 
+            _status, 
+            _requiredStatus);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkVoucherPostingTypesApplicable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks for vendor or customer transactions for the given voucher number and transaction date.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher number.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date.
+    /// </param>
+    /// <returns>
+    ///    A container that has a Boolean value, a string that contains an error message, and the offending
+    ///    ledger <c>posting</c> type. The Boolean value is set to true if no transactions that match the
+    ///    voucher and transaction date are found; otherwise, false.The string contains a message that states
+    ///    what type of transaction was found. The type is the posting type of the transaction that cannot be
+    ///    reversed.
+    /// </returns>
+    /// <remarks>
+    ///    This routine will determine whether there are any customer or vendor transactions that are
+    ///    associated with the voucher. If any are found, an error message is returned because asset
+    ///    transactions that originated from customers or vendors can only be reversed from that originating
+    ///    program.
+    /// </remarks>
+    public container checkVoucherPostingTypesApplicable(Voucher _voucher, TransDate _transDate)
+    {
+        boolean             isValid = true;
+        str                 errorMessage;
+        CustTrans           custTransRec;
+        VendTrans           vendTransRec;
+        LedgerPostingType   retTranType;
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+        GeneralJournalEntry generalJournalEntry;
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntry;
+
+        // Okay first check and see if there are any customer records associated with the asset voucher.
+        select firstonly RecId from custTransRec
+            where custTransRec.Voucher == _voucher &&
+                custTransRec.TransDate == _transDate
+        join RecId from subledgerVoucherGeneralJournalEntry
+            where subledgerVoucherGeneralJournalEntry.Voucher == custTransRec.Voucher &&
+                  subledgerVoucherGeneralJournalEntry.AccountingDate == custTransRec.TransDate
+        join RecId from generalJournalEntry
+            where generalJournalEntry.RecId == subledgerVoucherGeneralJournalEntry.GeneralJournalEntry &&
+                  generalJournalEntry.Ledger == Ledger::current()
+        join PostingType from generalJournalAccountEntry
+            where generalJournalEntry.RecId == generalJournalAccountEntry.GeneralJournalEntry;
+
+        if (custTransRec != null)
+        {
+            // We found a customer record so return an error.
+            isValid = false;
+            errorMessage = "@SYS111475";
+            retTranType = generalJournalAccountEntry.PostingType;
+        }
+
+        if (isValid)
+        {
+            // Okay now check and see if there are any vendor records associated with the asset voucher.
+            select firstonly RecId from vendTransRec
+                where vendTransRec.Voucher == _voucher &&
+                    vendTransRec.TransDate == _transDate
+            join RecId from subledgerVoucherGeneralJournalEntry
+                where subledgerVoucherGeneralJournalEntry.Voucher == vendTransRec.Voucher &&
+                      subledgerVoucherGeneralJournalEntry.AccountingDate == vendTransRec.TransDate
+            join RecId from generalJournalEntry
+                where generalJournalEntry.RecId == subledgerVoucherGeneralJournalEntry.GeneralJournalEntry &&
+                      generalJournalEntry.Ledger == Ledger::current()
+            join PostingType from generalJournalAccountEntry
+                where generalJournalEntry.RecId == generalJournalAccountEntry.GeneralJournalEntry;
+
+            if (vendTransRec != null)
+            {
+                // We found a customer record so return an error.
+                isValid = false;
+                errorMessage = "@SYS111473";
+                retTranType = generalJournalAccountEntry.PostingType;
+            }
+        }
+
+        return [isValid, errorMessage, retTranType];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAllAssetTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates all reversing or revoking asset transactions for the associated voucher.
+    /// </summary>
+    /// <param name="_voucher">
+    /// The associated voucher to reverse or revoke transactions.
+    /// </param>
+    /// <param name="_transDate">
+    /// The associated transaction date to reverse or revoke transactions.
+    /// </param>
+    /// <remarks>
+    /// Selects all associated <c>AssetTrans</c> records to be updated based on the specified voucher and
+    /// transaction date. The <see cref="M:AssetPostDisposal.createAssetTrans" /> takes the individual
+    /// transactions and reverses them.
+    /// </remarks>
+    public void createAllAssetTransactions(Voucher _voucher, TransDate _transDate)
+    {
+        AssetTrans    assetTransUpdate;
+
+        reversalVoucher = this.parmReversalVoucher();
+        reversalDate = this.parmReversalDate();
+        reversalTraceNum = this.parmReversalTraceNum();
+        reasonRefRecID = this.parmReasonRefRecId();
+
+        while select assetTransUpdate where
+            assetTransUpdate.Voucher == _voucher &&
+            assetTransUpdate.TransDate == _transDate
+        {
+            this.createAssetTrans(assetTransUpdate);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAssetDocumentTrans_JP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates <c>AssetDocumentTrans_JP</c> record based on reversed or revoked individual asset transaction.
+    /// </summary>
+    /// <param name="_assetTransOrig">
+    ///  Original asset transaction
+    /// </param>
+    /// <param name="_assetTransNew">
+    ///  New asset transaction
+    /// </param>
+    public void createAssetDocumentTrans_JP(Common _assetTransOrig, Common _assetTransNew)
+    {
+        AssetDocumentTrans_JP     assetDocumentTransOrign;
+
+        assetDocumentTransOrign = AssetDocumentTrans_JP::findByReference(_assetTransOrig.TableId, _assetTransOrig.RecId);
+        if (assetDocumentTransOrign)
+        {
+            AssetDocumentProcessor_JP::revertAssetDocumentTrans(
+                assetDocumentTransOrign,
+                _assetTransOrig,
+                _assetTransNew
+            );
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAssetTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates and reverses or revokes an individual asset transaction.
+    /// </summary>
+    /// <param name="_assetTransOrig">
+    ///    The original asset transaction to reverse or revoke.
+    /// </param>
+    /// <remarks>
+    ///    This method first creates a new asset transaction for the reversal. It then creates an original
+    ///    transaction reversal record if this is the first record. Next, it updates the value model
+    ///    attributes depending on whether the transactions was reversed or revoked.Finally, it creates a
+    ///    transaction reversal record for the new reversal or revoke.
+    /// </remarks>
+    public void createAssetTrans(AssetTrans _assetTransOrig)
+    {
+        AssetTrans                  assetTransNew;
+        TransactionReversalTrans    transactionReversalTransLast;
+        TraceNum                    traceNumOrig;
+
+        this.setTransactionTxt(_assetTransOrig.TransDate, _assetTransOrig.Voucher);
+
+        // Create a new asset transaction record for the reversal/revoke
+        assetTransNew.clear();
+        assetTransNew.data(_assetTransOrig);
+        assetTransNew.Voucher           = reversalVoucher;
+        assetTransNew.TransDate         = reversalDate;
+        assetTransNew.Txt               = transactionTxt.txt();
+        assetTransNew.ReasonRefRecId    = ReasonTableRef::checkCreateInCompany(reasonRefRecID, assetTransNew.DataAreaId);
+
+        // reverse the original amount
+        assetTransNew.AmountCur         = - _assetTransOrig.AmountCur;
+        assetTransNew.AmountMST         = - _assetTransOrig.AmountMST;
+        assetTransNew.ReportingCurrencyAmount = -_assetTransOrig.ReportingCurrencyAmount;
+
+        if (countryRegion_DEAT)
+        {
+            assetTransNew.InterestAmount = -_assetTransOrig.InterestAmount;
+        }
+    
+        // Go find the original tracing number if one exists.
+        traceNumOrig = TransactionReversalTrans::findTransactionReversalTrans(_assetTransOrig.TableId, _assetTransOrig.RecId).TraceNum;
+        transactionReversalTransLast = TransactionReversalTrans::findLastTransactionReversalTrans(traceNumOrig, true);
+
+        // If no tracing number is found it is a first time reversal and we must create an original
+        // transaction reversal record.
+        if (!traceNumOrig)
+        {
+            TransactionReversalTrans::createTransaction(tableNum(AssetTrans),
+                                                        _assetTransOrig.RecId,
+                                                        reversalTraceNum,
+                                                        true,
+                                                        false,
+                                                        false);
+        }
+        else
+          // Okay we found a tracing number so now update the last flag to false for the previous last record
+            if (transactionReversalTransLast)
+            {
+                transactionReversalTransLast.Last = false;
+                transactionReversalTransLast.update();
+            }
+
+        if (revoke) // If true, the transaction is closed and the original should be opened
+        {
+            assetTransNew.AmountCur          = - assetTransNew.AmountCur;
+            assetTransNew.AmountMST          = - assetTransNew.AmountMST;
+            assetTransNew.ReportingCurrencyAmount = -assetTransNew.ReportingCurrencyAmount;
+
+            if (countryRegion_DEAT)
+            {
+                assetTransNew.InterestAmount = -assetTransNew.InterestAmount;
+            }
+
+            assetTransNew.insert();
+            // <GJP>
+            if (AssetDocumentUtility_JP::isAssetDocumentEnabled())
+            {
+                this.createAssetDocumentTrans_JP(_assetTransOrig, assetTransNew);
+            }
+            // </GJP>
+            // Create the transaction reversal record for the reversal.
+            TransactionReversalTrans::createTransaction(tableNum(AssetTrans),
+                                                    assetTransNew.RecId,
+                                                    reversalTraceNum, false, true);
+
+            this.updateAssetBookOrigRevoke(assetTransNew, _assetTransOrig);
+        }
+        else // is opened = reverse - the orig should be closed now
+        {
+            assetTransNew.insert();
+            // <GJP>
+            if (AssetDocumentUtility_JP::isAssetDocumentEnabled())
+            {
+                this.createAssetDocumentTrans_JP(_assetTransOrig, assetTransNew);
+            }
+            // </GJP>
+            // Create the transaction reversal record for the reversal.
+            TransactionReversalTrans::createTransaction(tableNum(AssetTrans),
+                                                    assetTransNew.RecId,
+                                                    reversalTraceNum, false, true);
+
+            this.updateAssetBookOrigReversal(assetTransNew, _assetTransOrig);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatWarningMessages</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Builds a string that contains warning messages that have each message on its own line.
+    /// </summary>
+    /// <param name="_currentMsg">
+    ///    The current string message on which to add the new string message.
+    /// </param>
+    /// <param name="_newMsg">
+    ///    The new string message to be added.
+    /// </param>
+    /// <returns>
+    ///    A string that contains warning messages that have each message on its own line.
+    /// </returns>
+    //protected
+    str formatWarningMessages(str _currentMsg, str _newMsg)
+    {
+        #DEFINE.NewLine('\n')
+
+        if (_currentMsg == '')
+        {
+            return _newMsg;
+        }
+        else
+        {
+            return (_currentMsg + #NewLine + _newMsg);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNumberOfPeriods</Name>
+				<Source><![CDATA[
+    private AssetDepreciationTime getNumberOfPeriods(AssetTrans _assetTransOrig)
+    {
+        LedgerJournalTrans          ledgerJournalTrans;
+        LedgerJournalTrans_Asset    ledgerJournalTransAsset;
+        AssetDepreciationTime       returnValue;
+
+        while select RecId from ledgerJournalTrans
+            where ledgerJournalTrans.TransDate == _assetTransOrig.TransDate
+                && ledgerJournalTrans.Voucher   == _assetTransOrig.Voucher
+            join DepreciationTime from ledgerJournalTransAsset
+                where ledgerJournalTransAsset.RefRecId == ledgerJournalTrans.RecId
+                && ledgerJournalTransAsset.AssetId  == _assetTransOrig.AssetId
+                && ledgerJournalTransAsset.BookId   == _assetTransOrig.BookId
+                && ledgerJournalTransAsset.TransType== AssetTransTypeJournal::Depreciation
+        {
+            returnValue += ledgerJournalTransAsset.DepreciationTime;
+        }
+
+        return returnValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initLedgerVoucher</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the ledger voucher for posting.
+    /// </summary>
+    /// <returns>
+    ///    The <c>LedgerVoucher</c> table buffer that has the record that is created.
+    /// </returns>
+    /// <remarks>
+    ///    This method creates a new ledger voucher for posting. It also obtains a new reversal voucher number.
+    /// </remarks>
+    public LedgerVoucher initLedgerVoucher()
+    {
+        ledgerVoucher = LedgerVoucher::newLedgerPost(DetailSummary::Detail, SysModule::FixedAssets, LedgerParameters::numRefLedgerReversalVoucher().numberSequenceTable().NumberSequence);
+        ledgerVoucher.parmReversal(true);
+
+        return ledgerVoucher;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isBudgetCheckRequired</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines whether the budget funds available check is required for the fixed assets transaction
+    ///    reversal process.
+    /// </summary>
+    /// <returns>
+    ///    true if the budget funds available check is required for the fixed assets value model transaction
+    ///    reversal process; otherwise, false.
+    /// </returns>
+    protected boolean isBudgetCheckRequired()
+    {
+        LedgerJournalTrans ledgerJournalTrans = LedgerJournalTrans::findJournalForVoucher(assetTrans.Voucher, assetTrans.TransDate);
+
+        return BudgetSourceCollectionIntegrator::isDocumentBudgetTracked(ledgerJournalTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCorrection</Name>
+				<Source><![CDATA[
+    private boolean isCorrection()
+    {
+        boolean ret;
+
+        if (correctionReversalDate != dateNull())
+        {
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsFTICorrection</Name>
+				<Source><![CDATA[
+    public boolean parmIsFTICorrection(boolean _isFTICorrection = isFTICorrection)
+    {
+        isFTICorrection = _isFTICorrection;
+        return isFTICorrection;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReasonRefRecId</Name>
+				<Source><![CDATA[
+    public ReasonRefRecID parmReasonRefRecId(ReasonRefRecID  _reasonRefRecID = reasonRefRecID)
+    {
+        reasonRefRecID = _reasonRefRecID;
+
+        return reasonRefRecID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReversalJournalNumber</Name>
+				<Source><![CDATA[
+    public AssetJournalId parmReversalJournalNumber(AssetJournalId  _reversalJournalNumber = reversalJournalNumber)
+    {
+        reversalJournalNumber = _reversalJournalNumber;
+
+        return reversalJournalNumber;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRevoke</Name>
+				<Source><![CDATA[
+    public boolean parmRevoke(boolean  _revoke = revoke)
+    {
+        revoke = _revoke;
+
+        return revoke;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reversal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calls the reversal routine for the value model or depreciation book.
+    /// </summary>
+    /// <param name="_args">
+    ///    A container that contains the current transaction record. This is then passed in to the actual
+    ///    reversal routine and is used to determine the type of routine, value model, or depreciation book to
+    ///    call.
+    /// </param>
+    public void reversal(Args _args)
+    {
+        super(_args);
+
+        correctionReversalDate = str2Date(_args.parm(), -1);
+
+        this.reversalBook(_args);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reversalBook</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates and reverses all asset value model transaction records that are associated with the
+    ///    currently selected transaction.
+    /// </summary>
+    /// <param name="_args">
+    ///    The currently selected asset transaction record.
+    /// </param>
+    /// <remarks>
+    ///    This is the main routine that drives the reversal of asset value model transaction reversals. It is
+    ///    called from the value model transaction form. The routine first validates that the transaction and
+    ///    all its related transactions can be reversed. A prompt is then displayed to the user to obtain the
+    ///    transaction posting date. This date is then validated against any asset calendars that may be
+    ///    related to the value model or depreciation books.
+    ///    The routine first reverses all ledger
+    ///    transactions that are associated with the transactions. Next, all associated value model
+    ///    transactions are reversed. Finally, all associated depreciation book transactions are reversed.
+    /// </remarks>
+    public void reversalBook(Args _args)
+    {
+        #OCCRetryCount
+
+        // Get the current asset transaction record to be reversed.
+        assetTrans = _args.record();
+
+        // Find the original asset Trans record if one exists
+        [assetTransOrig, revoke, reversalTraceNum] = TransactionReversalTrans::findAssetTransOrig(assetTrans);
+        // If assetTransOrig is empty, assetTrans is the original
+        
+        // Validate all associated transactions.  This validations includes posting type, verifying the
+        // transactions only originated from fixed asset journals and finally verifying that all statuses are correct.
+        // If current voucher is related voucher, skip validation, 
+        // because related vouchers have been already validated at the beginning.
+        if (this.parmIsRelatedVoucher()
+            || this.validateReversal(assetTransOrig ? assetTransOrig.Voucher : assetTrans.Voucher,
+                assetTransOrig ? assetTransOrig.TransDate : assetTrans.TransDate,
+                '', 0, revoke))
+        {
+            // assetTrans is now the last/newest asset transaction
+            assetTrans = TransactionReversalTrans::findLastAssetTrans(assetTrans);
+            minimumDate = assetTransOrig.TransDate ? (revoke ? assetTrans.TransDate : assetTransOrig.TransDate) : assetTrans.TransDate;
+
+            this.defaultReversalDate(minimumDate);
+
+            this.saveLast();
+
+            // Okay prompt the user for the new transaction date.
+            if (this.shouldProceedWithReversal(_args))
+            {
+                this.initializeReversalDate();
+
+                FiscalCalendarRecID calendarRecId;
+                boolean validPeriod;
+
+                // Now check any asset transaction calendars and make sure the date is valid within those open periods.
+                [validPeriod, calendarRecId] = TransactionReversal_Asset::checkValidAssetTranCalendar(
+                    assetTrans.Voucher, 
+                    assetTrans.TransDate, 
+                    '', 
+                    0, 
+                    reversalDate);
+
+                if (!validPeriod)
+                {
+                    this.sendErrorMessage(strFmt("@FixedAssets:FA_TransactionReversal_FiscalPeriodNotOpen_Message",
+                        assetTrans.Voucher,
+                        date2StrUsr(reversalDate, DateFlags::FormatAll),
+                        FiscalCalendar::find(calendarRecId).CalendarId));
+                }
+                else
+                {
+                    try
+                    {
+                        //Okay now we are ready to reverse transactions
+                        ttsbegin;
+	                    // <GJP>
+	                    if (AssetComponentReversal_JP::isAssetTransRelatedToAssembling(assetTrans.RecId))
+	                    {
+	                        AssetComponentReversal_JP::reverseTransaction(assetTrans.RecId, this);
+	                        ttsCommit;
+	                        return;
+	                    }
+	                    // </GJP>
+
+                        // <GJP>
+                        if (AssetComponentReversal_JP::isAssetTransRelatedToAssembling(assetTrans.RecId))
+                        {
+                            AssetComponentReversal_JP::reverseTransaction(assetTrans.RecId, this);
+                            ttsCommit;
+                            return;
+                        }
+                        // </GJP>
+
+                        if (!assetTransOrig)  // If assetTransOrig is empty, assetTrans is the original
+                        {
+                            assetTransOrig = AssetTrans::find(assetTrans.RecId, true);
+                        }
+                        else
+                        {
+                            assetTransOrig = AssetTrans::find(assetTransOrig.RecId, true); // Select must be within the tts
+                        }
+
+                        RecId assetTransOrigRecId = assetTransOrig.RecId;
+
+                        // Find an associated ledger transactions
+
+                        // Performs the reversal/revoking of the ledger transactions connected to the asset transactions
+                        this.initLedgerVoucher();
+                        TransactionReversal_Ledger transactionReversal_Ledger = this.createLedgerTransactionReversalForBookReversal();
+
+                        AssetBook assetBookToUpdate = AssetBook::find(assetTransOrig.AssetId, assetTransOrig.BookId, true);
+                        reversalVoucher  = transactionReversal_Ledger.parmReversalVoucher();
+
+                        // If reversal originated by FTI correction then we need to only reverse transaction posted by LedgerVoucherObject.
+                        // All other transactions will be taken care by FTI correction.
+                        transactionReversal_Ledger.createGeneralJournal(
+                            assetTrans.Voucher,
+                            assetTrans.TransDate,
+                            LedgerVoucher,
+                            true,
+                            false,
+                            reversalVoucher,
+                            0,
+                            0,
+                            isFTICorrection);
+
+                        // Set the reversalTraceNum which has been created in the transactionReversal_Ledger.createGeneralJournal
+                        reversalTraceNum = transactionReversal_Ledger.parmReversalTraceNum();
+                        reversalVoucher  = transactionReversal_Ledger.parmReversalVoucher();
+
+                        // Okay now reverse all related value model transactions.
+                        this.createAllAssetTransactions(assetTransOrig.Voucher, assetTransOrig.TransDate);
+
+                        // Post the ledger transactions.
+                        ledgerVoucher.end();
+
+                        // Submit the budget funds available check.
+                        this.submitBudget();
+
+                        transactionReversal_Ledger.postReversal();
+
+                        // Update the original transaction reversal transactions reversal flag.
+                        this.updateOriginal(assetTransOrig.TransDate, assetTransOrig.Voucher, isFTICorrection);
+
+                        TransactionLog::create(TransactionLogType::TransactionReversal, "@FixedAssets:AssetTransactionReversalLogMessage");
+
+                        // Record the history of this reversal if it is an asset transfer transaction,
+                        // and update the asset book's current default dimension as per reversal
+                        if (assetTransOrig.TransType == AssetTransType::AssetTransfer)
+                        {
+                            AssetTransferHistory assetTransferHistory;
+                            AssetTransferHistory assetTransferHistoryNew;
+
+                            if (AssetTransferHistoryCreatedDateTimeFlight::instance().isEnabled())
+                            {
+                                select firstonly FromDimension, ToDimension, TransferValue, TransferValueReportingCurrency from assetTransferHistory
+                                    order by assetTransferHistory.CreatedDateTime desc,
+                                        assetTransferHistory.RecId desc
+                                where assetTransferHistory.AssetId == assetTransOrig.AssetId
+                                   && assetTransferHistory.BookId == assetTransOrig.BookId;
+                            }
+                            else
+                            {
+                                select firstonly FromDimension, ToDimension, TransferValue, TransferValueReportingCurrency from assetTransferHistory
+                                    order by assetTransferHistory.RecId desc
+                                where assetTransferHistory.AssetId == assetTransOrig.AssetId
+                                   && assetTransferHistory.BookId == assetTransOrig.BookId;
+                            }
+
+                            assetTransferHistoryNew.AssetId                 = assetTransOrig.AssetId;
+                            assetTransferHistoryNew.BookId                  = assetTransOrig.BookId;
+                            assetTransferHistoryNew.FromDimension           = assetTransferHistory.ToDimension;
+                            assetTransferHistoryNew.ToDimension             = assetTransferHistory.FromDimension;
+                            assetTransferHistoryNew.TransferDate            = reversalDate;
+                            assetTransferHistoryNew.TransferValue           = assetTransferHistory.TransferValue;
+                            assetTransferHistoryNew.TransferValueReportingCurrency = assetTransferHistory.TransferValueReportingCurrency;
+                            assetTransferHistoryNew.Voucher                 = reversalVoucher;
+                            assetTransferHistoryNew.TransferSequenceNumber  = reversalVoucher;
+                            assetTransferHistoryNew.insert();
+
+                            // Update the current default dimension of this asset's value model
+                            assetBookToUpdate.DefaultDimension = assetTransferHistory.FromDimension;
+                            assetBookToUpdate.update();
+                        }
+
+                        AssetReversalRelatedVoucher::updateReversalInformation(assetTransOrig.Voucher, assetTransOrig.TransDate, reversalVoucher, reversalDate);
+
+                        this.reverseRelatedVouchers(assetTransOrig);
+
+                        ttscommit;
+                    }
+                    catch (Exception::Deadlock)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::Deadlock;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    catch (Exception::UpdateConflict)
+                    {
+                        if (appl.ttsLevel() == 0)
+                        {
+                            if (xSession::currentRetryCount() >= #RetryNum)
+                            {
+                                throw Exception::UpdateConflictNotRecovered;
+                            }
+                            else
+                            {
+                                retry;
+                            }
+                        }
+                        else
+                        {
+                            throw Exception::UpdateConflict;
+                        }
+                    }
+
+                    this.logResult();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reverseRelatedVouchers</Name>
+				<Source><![CDATA[
+    private void reverseRelatedVouchers(AssetTrans _assetTransOrig)
+    {
+        if (reversalRelationId)
+        {
+            AssetTrans assetTransNew;
+            AssetReversalRelatedVoucher assetReversalRelatedVoucher;
+
+            select firstonly assetTransNew
+                join assetReversalRelatedVoucher
+                where assetReversalRelatedVoucher.RelationId == reversalRelationId
+                    && assetTransNew.Voucher == assetReversalRelatedVoucher.Voucher
+                    && !assetReversalRelatedVoucher.ReversalVoucher;
+
+            this.reverseRelatedAssetTrans(assetTransNew);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reverseRelatedAssetTrans</Name>
+				<Source><![CDATA[
+    private void reverseRelatedAssetTrans(AssetTrans _assetTrans)
+    {
+        if (_assetTrans != null
+            && _assetTrans.RecId != 0)
+        {
+            TransactionReversal_Asset transactionReversal_Asset = TransactionReversal_Asset::construct();
+            Args args = new Args();
+
+            args.record(_assetTrans);
+            transactionReversal_Asset.parmReversalDate(this.parmReversalDate());
+            transactionReversal_Asset.parmIsRelatedVoucher(true);
+            transactionReversal_Asset.reversal(args);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logResult</Name>
+				<Source><![CDATA[
+    private void logResult()
+    {
+        if (TransactionReversalExecutionDetail::isReversingWithContract(this.parmContract()))
+        {
+            if (revoke)
+            {
+                info(strFmt("@FixedAssets:FA_TransactionReversalRevoked", assetTrans.Voucher, assetTrans.TransDate));
+            }
+            else
+            {
+                info(strFmt("@FixedAssets:FA_TransactionReversalSuccess", assetTrans.Voucher, assetTrans.TransDate));
+            }
+
+            reverseSuccessful = true;
+        }
+        else
+        {
+            // Let the user know we are finished with the revoke or reversal.
+            info(revoke ? "@SYS111555" : "@SYS111551");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeReversalDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the date of reversal when correction reversal date is set.
+    /// </summary>
+    protected void initializeReversalDate()
+    {
+        if (this.isCorrection())
+        {
+            reversalDate = correctionReversalDate;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerTransactionReversalForBookReversal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of the <c>TransactionReversal_Ledger</c> class for asset book reversal.
+    /// </summary>
+    /// <returns>
+    /// An instance of <c>TransactionReversal_Ledger</c> object.
+    /// </returns>
+    protected TransactionReversal_Ledger createLedgerTransactionReversalForBookReversal()
+    {
+        TransactionReversal_Ledger transactionReversal_Ledger = TransactionReversal_Ledger::construct();
+
+        transactionReversal_Ledger.parmContract(this.parmContract());
+        transactionReversal_Ledger.parmReversalDate(reversalDate);
+        transactionReversal_Ledger.parmReversalTraceNum(reversalTraceNum);
+        transactionReversal_Ledger.parmSysModule(SysModule::FixedAssets);
+
+        return transactionReversal_Ledger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldProceedWithReversal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines if the asset value model transactions should be reversed.
+    /// </summary>
+    /// <param name="_args">
+    ///    The currently selected asset transaction record.
+    /// </param>
+    /// <returns>
+    ///    true if the asset value model transactions should be reversed; otherwise, false.
+    /// </returns>
+    protected boolean shouldProceedWithReversal(Args _args)
+    {
+        return (this.isCorrection() || this.skipDialogPrompt(_args) || this.prompt());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>skipDialogPrompt</Name>
+				<Source><![CDATA[
+    protected boolean skipDialogPrompt(Args _args)
+    {
+        return super(_args) || this.parmIsRelatedVoucher();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAssetBookOrigReversal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the <c>lastdepreciationdate</c>, <c>LifeTimeRest</c>, <c>LastDepreciationDateExtraOrd</c>,
+    ///    <c>status</c>, <c>ReserveTransferDone</c>, <c>RevaluationDone</c>, and <c>RevaluedTransID</c> value
+    ///    model attributes for the transaction to reverse.
+    /// </summary>
+    /// <param name="_assetTrans">
+    ///    The value model transaction to create and insert.
+    /// </param>
+    /// <param name="_assetTransOrig">
+    ///    The original value model transaction to reverse.
+    /// </param>
+	/// <param name="_isSkipUpdateAssetBook">
+	///    Whether to skip the update of asset book.
+	/// </param>
+    /// <remarks>
+    ///    The method first finds the asset book to be updated based on the past transaction. This method
+    ///    updates the <c>LastDepreciationDate</c> and <c>LifeTimeRest</c> attributes for depreciation
+    ///    transactions. This method updates the <c>LastDepreciationDateExtraOrd</c> attribute for extra
+    ///    ordinary depreciation transactions. This method updates the <c>status</c> attribute for
+    ///    acquisition, disposal-sale, and disposal-scrap transactions. This method updates the
+    ///    <c>ReserveTransferDone</c> attribute for the <c>CapitalReserveTransfer</c> transactions. This
+    ///    method updates the <c>RevaluationDone</c> flag for the <c>Revaluation</c> transactions.
+    /// </remarks>
+	public void updateAssetBookOrigReversal(AssetTrans _assetTrans, AssetTrans _assetTransOrig
+	,boolean _isSkipUpdateAssetBook = false
+	)
+    {
+        AssetId     assetId = _assetTrans.AssetId;
+        AssetBookId bookId = _assetTrans.BookId;
+        AssetTrans  assetTransLast;
+        AssetTrans  assetTransReserve;
+        AssetTrans  assetRevalued;
+        AssetBook   assetBook;
+        AssetParameters assetParameters;
+        TransactionReversalTrans transactionReversalTrans;
+	    // <GJP>
+	    boolean               isAssetDocumentEnabled = AssetDocumentUtility_JP::isAssetDocumentEnabled();
+	    AssetDocumentTrans_JP documentTrans;
+	    AssetDocumentEntry_JP documentEntry;
+	    AssetDocumentTable_JP documentTable;
+	    // </GJP>
+
+        assetParameters = AssetParameters::find();
+
+        //Select AssetBook record for update
+        select firstonly forupdate LifeTimeRest, LastDepreciationDate, LastDepreciationDateExtraOrd, Status from assetBook
+            where assetBook.AssetId == assetId &&
+                  assetBook.BookId == bookId;
+
+        // Depreciation Transaction:
+        if (_assetTrans.TransType == AssetTransType::Depreciation)
+        {
+            // Increase the remaining periods as long as we aren't already at the max.
+            if (assetBook.needToUpdateLifeTimeWithDepreciationTime()
+                && assetBook.LifeTimeRest < assetBook.LifeTime)
+            {
+                assetBook.LifeTimeRest = assetBook.LifeTimeRest + this.getNumberOfPeriods(_assetTransOrig);
+            }
+
+            // Clear the current 'last' depreciation date
+            assetBook.LastDepreciationDate = dateNull();
+
+            //
+            // Find last non-reversed depreciation transaction so we can update the last depreciation date.
+            // Do not include the original transaction when checking (_assetTransOrig).
+            //
+            while select TransDate, RecId from assetTransLast order by TransDate desc where
+                assetTransLast.TransType == AssetTransType::Depreciation
+                && assetTransLast.AssetId == assetBook.AssetId
+                && assetTransLast.BookId == assetBook.BookId
+                && assetTransLast.RecId != _assetTransOrig.RecId
+            {
+                select firstonly transactionReversalTrans where
+                    (transactionReversalTrans.RefRecId == assetTransLast.RecId
+                    && transactionReversalTrans.RefTableId == assetTransLast.TableId);
+
+                if (!transactionReversalTrans
+                    || (transactionReversalTrans.Original == true && transactionReversalTrans.Reversed == false))
+                {
+                    assetBook.LastDepreciationDate = assetTransLast.TransDate;
+                    break;
+                }
+            }
+        }
+
+        // ExtraOrdinary Depreciation Transaction:
+	    if (_assetTrans.TransType == AssetTransType::ExtraordinaryDepreciation
+	    // <GJP>
+	        || _assetTrans.TransType == AssetTransType::SpecialDepReserve_JP
+	        || _assetTrans.TransType == AssetTransType::SpecialDepReserveAllocation_JP
+	    // </GJP>
+	    )
+	    {
+	        // <GJP>
+	        if (isAssetDocumentEnabled
+	            && AssetDocumentEntry_JP::find(AssetDocumentTrans_JP::findByReference(
+	                _assetTransOrig.TableId
+	                ,_assetTransOrig.RecId).RecId).type() == AssetDocumentType_JP::AssetAcceleratedDepreciation)
+	        {
+	            assetBook.LastDepreciationDateAccelerated_JP = dateNull();
+	            while select TransDate, RecId from assetTransLast order by TransDate desc where
+	                assetTransLast.TransType == AssetTransType::ExtraordinaryDepreciation
+	                && assetTransLast.AssetId == assetBook.AssetId
+	                && assetTransLast.BookId == assetBook.BookId
+	                && assetTransLast.RecId != _assetTransOrig.RecId
+	                join RecId from documentTrans
+	                    where documentTrans.RefTableId   == assetTransLast.TableId
+	                        && documentTrans.RefRecId    == assetTransLast.RecId
+	                join RecId from documentEntry
+	                    where documentEntry.RecId        == documentTrans.AssetDocumentEntry_JP
+	                join RecId from documentTable
+	                    where documentTable.RecId        == documentEntry.AssetDocumentTable_JP
+	                        && documentTable.Type        == AssetDocumentType_JP::AssetAcceleratedDepreciation
+	            {
+	                select firstOnly transactionReversalTrans
+	                    where transactionReversalTrans.RefRecId == assetTransLast.RecId
+                            && transactionReversalTrans.RefTableId == assetTransLast.TableId
+	                        && transactionReversalTrans.Reversed == true;
+	                if (!transactionReversalTrans)
+        {
+                        assetBook.LastDepreciationDateAccelerated_JP = assetTransLast.TransDate;
+                        break;
+                    }
+                }
+            }
+            // </GJP>
+
+            //Clear the current 'last' extraordinary depreciation date
+            assetBook.LastDepreciationDateExtraOrd = dateNull();
+
+            //Find last non-reversed depreciation transaction so we can update the last extra depreciation date
+            while select TransDate, RecId from assetTransLast order by TransDate desc where
+                // <GJP>
+                ( // </GJP>
+                assetTransLast.TransType == AssetTransType::ExtraordinaryDepreciation
+	            // <GJP>
+	                || assetTransLast.TransType == AssetTransType::SpecialDepReserve_JP
+	                || assetTransLast.TransType == AssetTransType::SpecialDepReserveAllocation_JP
+                ) // </GJP>
+                && assetTransLast.AssetId == assetBook.AssetId
+                && assetTransLast.BookId == assetBook.BookId
+                && assetTransLast.RecId != _assetTransOrig.RecId
+            {
+                select firstonly transactionReversalTrans where
+                    (transactionReversalTrans.RefRecId == assetTransLast.RecId
+                    && transactionReversalTrans.RefTableId == assetTransLast.TableId);
+
+                if (!transactionReversalTrans
+                    || (transactionReversalTrans.Original == true && transactionReversalTrans.Reversed == false))
+                {
+                    assetBook.LastDepreciationDateExtraOrd = assetTransLast.TransDate;
+                    break;
+                }
+            }
+        }
+
+        // <GJP>        
+        if (isAssetDocumentEnabled)
+        {
+            // Reduction Entry Transaction
+            RecId assetTransRecId = this.getAssetReductionEntryAssetTransRecId(_assetTransOrig.RecId, assetBook.AssetId, assetBook.BookId);
+            if (assetTransRecId)
+            {
+                this.setAssetDocumentReductionEntryStatus(assetTransRecId, assetBook.AssetId, assetBook.BookId);
+            }
+
+            this.updateAssetDepBookMap_JP(_assetTrans, _assetTransOrig, assetBook);
+        }
+        // </GJP>
+
+        // <GEEU>
+        if (_assetTrans.TransType == AssetTransType::PreAcquisition_CZ)
+        {
+            select firstonly RecId from assetTransLast where
+                assetTransLast.TransType == AssetTransType::PreAcquisition_CZ
+                && assetTransLast.AssetId == assetBook.AssetId
+                && assetTransLast.BookId == assetBook.BookId
+                && assetTransLast.RecId != _assetTransOrig.RecId
+            // Do not include ones that have been reversed
+                notexists join
+                    transactionReversalTrans
+                where
+                    transactionReversalTrans.RefRecId == assetTransLast.RecId
+                    && transactionReversalTrans.RefTableId == assetTransLast.TableId
+                    && (transactionReversalTrans.Reversed == true);
+
+            if (!assetTransLast.RecId)
+            {
+                assetBook.Status = AssetStatus::NoAcquisition;
+            }
+        }
+
+        // </GEEU>
+        // Acquisition Transaction:
+        if (_assetTrans.TransType == AssetTransType::Acquisition)
+        {
+            //
+            // Find if there is any more Acquisition transactions; if so do not reset the status.
+            // Do not include the original transaction when checking (_assetTransOrig).
+            //
+            select firstonly RecId from assetTransLast where
+                assetTransLast.TransType == AssetTransType::Acquisition
+                && assetTransLast.AssetId == assetBook.AssetId
+                && assetTransLast.BookId == assetBook.BookId
+                && assetTransLast.RecId != _assetTransOrig.RecId
+                // Do not include ones that have been reversed
+                notexists join
+                    transactionReversalTrans
+                where
+                    transactionReversalTrans.RefRecId == assetTransLast.RecId
+                    && transactionReversalTrans.RefTableId == assetTransLast.TableId
+                    && (transactionReversalTrans.Reversed == true);
+
+            if (assetTransLast.RecId)
+            {
+                assetBook.AcquisitionPrice -= -_assetTrans.AmountMST;
+                assetBook.AcquisitionPriceReportingCurrency -= -_assetTrans.ReportingCurrencyAmount;
+            }
+            else
+            {
+                //Set the status to Not Acquired if no non-reversed acquisitions exist
+                assetBook.Status = AssetStatus::NoAcquisition;
+                assetBook.AcquisitionPrice = 0;
+                assetBook.AcquisitionPriceReportingCurrency = 0;
+            }
+            
+            // <GEEU>
+            if (assetBook.Status == AssetStatus::NoAcquisition &&
+                AssetParameters::find().AllowPreAcquisition_CZ != AssetAllowPreAcquisition_CZ::No)
+            {
+                assetBook.Status = AssetStatus::Acquired_CZ;
+            }
+            // </GEEU>
+        }
+
+        // Acquisition Adj. Transaction:
+        // Transfer from reserve Transaction:
+        if (_assetTrans.TransType == AssetTransType::AcquisitionAdj
+            || _assetTrans.TransType == AssetTransType::CapitalReserveTransfer)
+        {
+	        if (!_isSkipUpdateAssetBook)
+	        {
+                assetBook.AcquisitionPrice -= -_assetTrans.AmountMST;
+                assetBook.AcquisitionPriceReportingCurrency -= -_assetTrans.ReportingCurrencyAmount;
+            }
+        }
+
+        // Disposal Sale Transaction:
+        if ((_assetTrans.TransType == AssetTransType::DisposalSale) && (assetBook.Status == AssetStatus::Sold))
+        {
+            assetBook.Status = AssetStatus::Open;
+            assetBook.DisposalDate = dateNull();
+            assetBook.SaleValue = 0;
+        }
+
+        // Disposal Scrap Transaction:
+        if  ((_assetTrans.TransType == AssetTransType::DisposalScrap) && (assetBook.Status == AssetStatus::Scrapped))
+        {
+            assetBook.Status = AssetStatus::Open;
+            assetBook.DisposalDate = dateNull();
+        }
+
+        assetBook.update();
+
+        // Capital Reserve Transfer:
+        if (_assetTrans.TransType == AssetTransType::CapitalReserveTransfer)
+        {
+            if (_assetTrans.ReserveTransferDone)
+            {
+                assetTransReserve = AssetTrans::find(_assetTrans.ReserveTransId, true);
+                assetTransReserve.ReserveTransferDone = false;
+                assetTransReserve.update();
+            }
+        }
+
+        //Check if the Legal Entity is in Spain and update revaluation flag and recId on the acq trans
+        if ((_assetTrans.TransType == AssetTransType::Revaluation) && SysCountryRegionCode::isLegalEntityInCountryRegion([#isoES]))
+        {
+            select firstonly forupdate RevaluationDone, RevaluedTransID from assetRevalued
+                where assetRevalued.RecId == _assetTrans.RevaluedTransID;
+
+            if (assetRevalued)
+            {
+                assetRevalued.RevaluationDone = false;
+                assetRevalued.RevaluedTransID = 0;
+                assetRevalued.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAssetBookOrigRevoke</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates value model attributes for the transaction being revoked.
+    /// </summary>
+    /// <param name="_assetTrans">
+    ///    The value model transaction to revoke.
+    /// </param>
+    /// <param name="_assetTransOrig">
+    ///    The original value model transaction to reverse.
+    /// </param>
+    /// <remarks>
+    ///    The method first finds the asset book to be updated based on the past transaction. This method
+    ///    updates the <c>LastDepreciationDate</c> and <c>LifeTimeRest</c> attributes for depreciation
+    ///    transactions. This method updates the <c>LastDepreciationDateExtraOrd</c> attribute for extra
+    ///    ordinary depreciation transactions. This method updates the status for acquisition, disposal-sale,
+    ///    and disposal-scrap transactions. This method updates the <c>ReserveTransferDone</c> attribute for
+    ///    the <c>CapitalReserveTransfer</c> transactions. This method updates the <c>RevaluationDone</c> flag
+    ///    for the <c>Revaluation</c> transactions.
+    /// </remarks>
+    public void updateAssetBookOrigRevoke(AssetTrans _assetTrans, AssetTrans _assetTransOrig)
+    {
+        AssetId     assetId = _assetTrans.AssetId;
+        AssetBookId bookId = _assetTrans.BookId;
+        AssetTrans  assetTransLast;
+        AssetTrans  assetTransReserve;
+        AssetTrans  assetRevalued;
+        AssetBook   assetBook;
+        TransactionReversalTrans transactionReversalTrans;
+	    // <GJP>
+	    boolean     isAssetDocumentEnabled = AssetDocumentUtility_JP::isAssetDocumentEnabled();
+	    // </GJP>
+
+        //Select AssetBook record for update
+        select firstonly forupdate LifeTimeRest, LastDepreciationDate, LastDepreciationDateExtraOrd, Status from assetBook
+            where assetBook.AssetId == assetId &&
+                  assetBook.BookId == bookId;
+
+        // Depreciation Transaction:
+        if (_assetTrans.TransType == AssetTransType::Depreciation)
+        {
+            // Decrease the remaining periods as long as we aren't already at the 0.
+            if (assetBook.needToUpdateLifeTimeWithDepreciationTime()
+                && assetBook.LifeTimeRest > 0)
+            {
+                assetBook.LifeTimeRest = assetBook.LifeTimeRest - this.getNumberOfPeriods(_assetTransOrig);
+            }
+
+            assetBook.LastDepreciationDate = _assetTrans.TransDate;
+        }
+
+        // ExtraOrdinary Depreciation Transaction:
+	    if (_assetTrans.TransType == AssetTransType::ExtraordinaryDepreciation
+	    // <GJP>
+	        || _assetTrans.TransType == AssetTransType::SpecialDepReserve_JP
+	        || _assetTrans.TransType == AssetTransType::SpecialDepReserveAllocation_JP
+	    // </GJP>
+	    )
+        {
+            //Clear the current 'last' extraordinary depreciation date
+            assetBook.LastDepreciationDateExtraOrd = dateNull();
+
+            //Find last non-reversed depreciation transaction  so we can update the last extra depreciation date
+            while select TransDate, RecId from assetTransLast order by TransDate desc where
+	            (assetTransLast.TransType == AssetTransType::ExtraordinaryDepreciation
+	            // <GJP>
+	                || assetTransLast.TransType == AssetTransType::SpecialDepReserve_JP
+	                || assetTransLast.TransType == AssetTransType::SpecialDepReserveAllocation_JP
+	            // </GJP>
+	            ) &&
+                assetTransLast.AssetId == assetBook.AssetId &&
+                assetTransLast.BookId == assetBook.BookId
+            {
+                select firstonly transactionReversalTrans
+                    where transactionReversalTrans.RefRecId == assetTransLast.RecId
+                        && transactionReversalTrans.RefTableId == assetTransLast.TableId
+                        && transactionReversalTrans.Reversed == true;
+
+                if (transactionReversalTrans)
+                {
+                    assetBook.LastDepreciationDateExtraOrd = assetTransLast.TransDate;
+                    break;
+                }
+            }
+        }
+
+        // <GJP>
+        if (isAssetDocumentEnabled)
+        {
+            this.updateAssetDepBookMap_JP(_assetTrans, _assetTransOrig, assetBook);
+        }
+	    // </GJP>
+
+        // <GEEU>
+        if  (_assetTrans.TransType == AssetTransType::PreAcquisition_CZ &&
+            assetBook.Status == AssetStatus::NoAcquisition)
+        {
+            assetBook.Status = AssetStatus::Acquired_CZ;
+        }
+        // </GEEU>
+
+        // Acquisition Transaction:
+        if (_assetTrans.TransType == AssetTransType::Acquisition)
+        {
+            if (assetBook.Status == AssetStatus::NoAcquisition
+                // <GEEU>
+                || assetBook.Status == AssetStatus::Acquired_CZ
+                // </GEEU>
+                )
+            {
+                assetBook.Status = AssetStatus::Open;
+            }
+
+            assetBook.AcquisitionPrice += _assetTrans.AmountMST;
+            assetBook.AcquisitionPriceReportingCurrency += _assetTrans.ReportingCurrencyAmount;
+        }
+
+        // Acquisition Adj. Transaction:
+        // Transfer from reserve Transaction:
+        if (_assetTrans.TransType == AssetTransType::AcquisitionAdj
+            || _assetTrans.TransType == AssetTransType::CapitalReserveTransfer)
+        {
+            assetBook.AcquisitionPrice += _assetTrans.AmountMST;
+            assetBook.AcquisitionPriceReportingCurrency += _assetTrans.ReportingCurrencyAmount;
+        }
+
+        // Disposal Sale Transaction:
+        if (_assetTrans.TransType == AssetTransType::DisposalSale)
+        {
+            assetBook.Status = AssetStatus::Sold;
+            assetBook.DisposalDate = _assetTrans.TransDate;
+            assetBook.SaleValue = _assetTrans.AmountCur;
+        }
+
+        // Disposal Scrap Transaction:
+        if (_assetTrans.TransType == AssetTransType::DisposalScrap)
+        {
+            assetBook.Status = AssetStatus::Scrapped;
+        }
+
+        assetBook.update();
+
+        // Capital Reserve Transfer:
+        if (_assetTrans.TransType == AssetTransType::CapitalReserveTransfer)
+        {
+            assetTransReserve = AssetTrans::find(_assetTrans.ReserveTransId, true);
+            assetTransReserve.ReserveTransferDone = true;
+            assetTransReserve.update();
+        }
+
+        //Check if the Legal Entity is in Spain and update revaluation flag and recId on the acq trans
+        if ((_assetTrans.TransType == AssetTransType::Revaluation) && SysCountryRegionCode::isLegalEntityInCountryRegion([#isoES]))
+        {
+            while select forupdate TransDate, RecId, RevaluationDone, RevaluedTransID from assetRevalued where
+                assetRevalued.TransType == AssetTransType::Acquisition &&
+                assetRevalued.AssetId == assetBook.AssetId &&
+                assetRevalued.BookId == assetBook.BookId
+            {
+                select firstonly transactionReversalTrans
+                    where transactionReversalTrans.RefRecId == assetRevalued.RecId
+                        && TransactionReversalTrans.RefTableId == assetRevalued.TableId
+                        && transactionReversalTrans.Reversed == true;
+
+                if (!transactionReversalTrans)
+                {
+                    assetRevalued.RevaluationDone = true;
+                    assetRevalued.RevaluedTransID = _assetTrans.RecId;
+                    assetRevalued.update();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAssetDepBookMap_JP</Name>
+				<Source><![CDATA[
+    /// <summary>
+	/// Updates the attributes of Value model or deprecaition book for the transaction being reversed.
+	/// </summary>
+	/// <param name="_assetDepTrans">
+	/// The reversing value model or depreciatio book transaction.
+	/// </param>
+	/// <param name="_assetDepTransOrig">
+	/// The original value model or depreciation book transaction.
+	/// </param>
+	/// <param name="_assetDepBookMap">
+	/// Instance of <C>AssetDepBookMap_JP</C>, the value model or depreciation to be updated
+	/// </param>
+	private void updateAssetDepBookMap_JP(AssetDepTransMap_JP _assetDepTrans, AssetDepTransMap_JP _assetDepTransOrig, AssetDepBookMap_JP _assetDepBookMap)
+	{
+	    AssetDepTransMap_JP         assetDepTransMap;
+	    AssetBookType               bookType;
+	    TransactionReversalTrans    transactionReversalTrans;
+	    bookType            = AssetDepCalculationHelper_JP::determineAssetBookType(_assetDepTrans.TableId);
+	    assetDepTransMap    = AssetDepTransMap_JP::getEmptyTableBuffer(bookType);
+	    // For additional deprecaition with direct off method
+	    if (_assetDepTrans.TransType == AssetTransType::ExtraordinaryDepreciation
+	        && _assetDepBookMap.depreciationExtProfile().Method == AssetDepreciationMethod::AdditionalDepreciation_JP
+	        && _assetDepBookMap.depreciationExtProfile().SpecialDepAccountingMethod_JP == AssetSpecialDepAccountingMethod_JP::DirectOff)
+	    {
+	        _assetDepBookMap.SpecialDepStartDate             = dateNull();
+	        _assetDepBookMap.LastDepreciationDateExtraOrd    = dateNull();
+	        select maxOf(TransDate) from assetDepTransMap
+	            where assetDepTransMap.TransType == AssetTransType::ExtraordinaryDepreciation
+	                && assetDepTransMap.AssetId == _assetDepBookMap.AssetId
+	                && assetDepTransMap.AssetBookId == _assetDepBookMap.AssetBookId
+	            notexists join transactionReversalTrans
+	                where transactionReversalTrans.RefRecId == assetDepTransMap.RecId
+                        && transactionReversalTrans.RefTableId == assetDepTransMap.TableId
+	                    && ((transactionReversalTrans.RefRecId != _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == true)
+	                        || (transactionReversalTrans.RefRecId == _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == false));
+	        if (assetDepTransMap)
+	        {
+	            _assetDepBookMap.LastDepreciationDateExtraOrd = assetDepTransMap.TransDate;
+	        }
+	        select minOf(TransDate) from assetDepTransMap
+	            where assetDepTransMap.TransType == AssetTransType::ExtraordinaryDepreciation
+	                && assetDepTransMap.AssetId == _assetDepBookMap.AssetId
+	                && assetDepTransMap.AssetBookId == _assetDepBookMap.AssetBookId
+	            notexists join transactionReversalTrans
+	                where transactionReversalTrans.RefRecId == assetDepTransMap.RecId
+                        && transactionReversalTrans.RefTableId == assetDepTransMap.TableId
+	                    && ((transactionReversalTrans.RefRecId != _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == true)
+	                        || (transactionReversalTrans.RefRecId == _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == false));
+	        if (assetDepTransMap)
+	        {
+	            _assetDepBookMap.SpecialDepStartDate = assetDepTransMap.TransDate;
+	        }
+	    }
+	    if (_assetDepTrans.TransType == AssetTransType::AdditionalDepReserve_JP)
+	    {
+	        // Clear the current special depreciation start date and last extraoridary depreciation date;
+	        _assetDepBookMap.SpecialDepStartDate             = dateNull();
+	        _assetDepBookMap.LastDepreciationDateExtraOrd    = dateNull();
+	        select maxOf(TransDate) from assetDepTransMap
+	            where assetDepTransMap.TransType == AssetTransType::AdditionalDepReserve_JP
+	                && assetDepTransMap.AssetId == _assetDepBookMap.AssetId
+	                && assetDepTransMap.AssetBookId == _assetDepBookMap.AssetBookId
+	            notexists join transactionReversalTrans
+	                where transactionReversalTrans.RefRecId == assetDepTransMap.RecId
+                        && transactionReversalTrans.RefTableId == assetDepTransMap.TableId
+	                    && ((transactionReversalTrans.RefRecId != _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == true)
+	                        || (transactionReversalTrans.RefRecId == _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == false));
+	        if (assetDepTransMap)
+	        {
+	            _assetDepBookMap.LastDepreciationDateExtraOrd = assetDepTransMap.TransDate;
+	        }
+	        select minOf(TransDate) from assetDepTransMap
+	            where assetDepTransMap.TransType == AssetTransType::AdditionalDepReserve_JP
+	                && assetDepTransMap.AssetId == _assetDepBookMap.AssetId
+	                && assetDepTransMap.AssetBookId == _assetDepBookMap.AssetBookId
+	            notexists join transactionReversalTrans
+	                where transactionReversalTrans.RefRecId == assetDepTransMap.RecId
+                        && transactionReversalTrans.RefTableId == assetDepTransMap.TableId
+	                    && ((transactionReversalTrans.RefRecId != _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == true)
+	                        || (transactionReversalTrans.RefRecId == _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == false));
+	        if (assetDepTransMap)
+	        {
+	            _assetDepBookMap.SpecialDepStartDate = assetDepTransMap.TransDate;
+	        }
+	    }
+	    if (_assetDepTrans.TransType == AssetTransType::AdditionalDepReserveAllocation_JP)
+	    {
+	        _assetDepBookMap.SpecialDepLastAllocationDate = dateNull();
+	        select maxOf(TransDate) from assetDepTransMap
+	            where assetDepTransMap.TransType == AssetTransType::AdditionalDepReserveAllocation_JP
+	                && assetDepTransMap.AssetId == _assetDepBookMap.AssetId
+	                && assetDepTransMap.AssetBookId == _assetDepBookMap.AssetBookId
+	            notexists join transactionReversalTrans
+	                where transactionReversalTrans.RefRecId == assetDepTransMap.RecId
+                        && transactionReversalTrans.RefTableId == assetDepTransMap.TableId
+	                    && ((transactionReversalTrans.RefRecId != _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == true)
+	                        || (transactionReversalTrans.RefRecId == _assetDepTransOrig.RecId
+	                            && transactionReversalTrans.Reversed == false));
+	        if (assetDepTransMap)
+	        {
+	            _assetDepBookMap.SpecialDepLastAllocationDate = assetDepTransMap.TransDate;
+	        }
+	        AssetDepDistribution_JP::reverseDepDistribution(_assetDepTransOrig.RecId, _assetDepTransOrig.TableId, _assetDepTrans.RecId, _assetDepTrans.TableId, revoke);
+	    }
+	}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOriginal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the original <c>TransactionReversalTrans</c> reversed flag for the value model transaction
+    ///    that matches the specified voucher and transaction date.
+    /// </summary>
+    /// <param name="_transDate">
+    ///    The transaction date.
+    /// </param>
+    /// <param name="_voucher">
+    ///    The voucher.
+    /// </param>
+    /// <param name="_excludeSubledgerJournalTransfers">
+    ///    The boolean value if true, excludes subledger transfer transactions; else includes all sub ledger transactions.
+    /// </param>
+    public void updateOriginal(
+        TransDate   _transDate,
+        Voucher     _voucher,
+        boolean     _excludeSubledgerJournalTransfers = false)
+    {
+        AssetTrans   assetTransLocal;
+
+        while select RecId from assetTransLocal
+            where assetTransLocal.Voucher   == _voucher
+               && assetTransLocal.TransDate == _transDate
+        {
+            TransactionReversalTrans::updateOriginal(tableNum(AssetTrans), assetTransLocal.RecId, !revoke);
+        }
+
+        super(_transDate, _voucher, _excludeSubledgerJournalTransfers);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateReversal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates all the asset transactions to guarantee that the transaction can be reversed or revoked.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher to validate all transactions.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date to validate all transactions.
+    /// </param>
+    /// <param name="_journalNumber">
+    ///    The journal number to validate all depreciation book transactions.
+    /// </param>
+    /// <param name="_journalLineNum">
+    ///    The journal line number to validate all depreciation book transactions.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specifies whether to validate a reversal or a revoke.
+    /// </param>
+    /// <returns>
+    ///    true if all called validation checks are passed; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    This routine calls methods to validate posting type, originate the journal location and status, and
+    ///    verify that the transaction is the last.
+    /// </remarks>
+    public boolean validateReversal(Voucher _voucher, TransDate _transDate,  AssetJournalId _journalNumber, LineNum _journalLineNum, boolean _revoke)
+    {
+        return this.validateVoucherAndRelatedVouchers(_voucher, _transDate, _journalNumber, _revoke);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateReversalFromNonFixedAssetModule</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates all the asset transactions to guarantee that the transaction can be reversed or revoked 
+    ///    executed from none fixed asset modules.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher to validate all transactions.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date to validate all transactions.
+    /// </param>
+    /// <param name="_revoke">
+    ///    A Boolean value that specifies whether to validate a reversal or a revoke.
+    /// </param>
+    /// <returns>
+    ///    true if all called validation checks are passed; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    This routine calls methods to validate posting type, originate the journal location and status, and
+    ///    verify that the transaction is the last.
+    /// </remarks>
+    public boolean validateReversalFromNonFixedAssetModule(Voucher _voucher, TransDate _transDate, boolean _revoke)
+    {
+        return this.validateVoucherAndRelatedVouchers(_voucher, _transDate, '', _revoke, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateVoucherAndRelatedVouchers</Name>
+				<Source><![CDATA[
+    private boolean validateVoucherAndRelatedVouchers(
+        Voucher _voucher,
+        TransDate _transDate,
+        AssetJournalId _journalNumber,
+        boolean _revoke,
+        boolean _isReversalFromAssetModule = true)
+    {
+        boolean isValid = true;        
+        
+        assetTransValidation = this.getAssetTransForValidation(_voucher, _transDate); // could be several AssetTrans for the same voucher
+
+        this.initRelatedVouchersManagerAndRelationId(_voucher, _transDate);
+        
+        if (reversalRelationId)
+        {
+            AssetReversalRelatedVoucher assetReversalRelatedVoucher;
+
+            while select Voucher, TransDate from assetReversalRelatedVoucher
+                where assetReversalRelatedVoucher.RelationId == reversalRelatedVoucherManager.getRelationId()
+                    && !assetReversalRelatedVoucher.ReversalVoucher
+            {
+                if (isValid)
+                {
+                    isValid = this.validateReversalConditions(
+                        assetReversalRelatedVoucher.Voucher,
+                        assetReversalRelatedVoucher.TransDate,
+                        _journalNumber,
+                        _revoke,
+                        _isReversalFromAssetModule);
+                }
+            }
+        }
+        else
+        {
+            isValid = this.validateReversalConditions(
+                _voucher,
+                _transDate,
+                _journalNumber,
+                _revoke,
+                _isReversalFromAssetModule);
+        }
+        
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAssetTransForValidation</Name>
+				<Source><![CDATA[
+    private AssetTrans getAssetTransForValidation(
+        Voucher _voucher,
+        TransDate _transDate)
+    {
+        AssetTrans assetTransLocal;
+
+        if (assetTrans.Voucher != _voucher)
+        {
+            assetTransLocal = AssetTrans::findByVoucher(_voucher, _transDate);
+        }
+        else
+        {
+            assetTransLocal = assetTrans;
+        }
+        
+        return assetTransLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRelatedVouchersManagerAndRelationId</Name>
+				<Source><![CDATA[
+    private void initRelatedVouchersManagerAndRelationId(
+        Voucher _voucher,
+        TransDate _transDate)
+    {
+        reversalRelatedVoucherManager = AssetReversalRelatedVoucherManager::newFromExistingVoucher(_voucher, _transDate);
+
+        if (reversalRelatedVoucherManager)
+        {
+            reversalRelationId = reversalRelatedVoucherManager.getRelationId();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateReversalConditions</Name>
+				<Source><![CDATA[
+    private boolean validateReversalConditions(
+        Voucher _voucher, 
+        TransDate _transDate,  
+        AssetJournalId _journalNumber,
+        boolean _revoke, 
+        boolean _isReversalFromAssetModule = true)
+    {
+        #DEFINE.NewLine('\n')
+        boolean isValid = true;
+        ErrorTolerance reversalTolerance = ErrorTolerance::Accept;
+        str errorMessg;
+        LedgerPostingType retTranType;
+        DialogButton dlgButton;
+
+        // Only continue and reverse if all of the transactions are only related to the Asset.
+        isValid = this.checkLedgerPostingTypeApplicable(_voucher, _transDate);
+
+        if (isValid)
+        {
+            [isValid, errorMessg] = this.isReversalAssetTransactionsSequential();
+            if (!isValid)
+            {
+                this.sendErrorMessage(errorMessg);
+            }
+        }
+
+        if (isValid)
+        {
+            [isValid, errorMessg] = this.doesAssetValidateNegativeNetBooksPass();
+            if (!isValid)
+            {
+                this.sendErrorMessage(errorMessg);
+            }
+        }
+
+        if (isValid)
+        {
+            // Check and see if the transaction has any vendor or customer transactions.  If so don't allow reversal
+            // and notify user that they must be reversed from AP or Ar
+            if (!this.isCorrection() && _isReversalFromAssetModule)
+            {
+                [isValid, errorMessg, retTranType] = this.checkVoucherPostingTypesApplicable(_voucher, _transDate);
+
+                // if using mass reversal feature then the AR plugin will reverse this. Causing an error here would result in
+                // AR not trying to reverse it or a bad message.  We still need to return false so that the 
+                // reversal framework knows that FA didn't reverse it.  
+                if (!isValid 
+                    && !TransactionReversalExecutionDetail::isReversingWithContract(this.parmContract()))
+                {
+                    this.sendErrorMessage(strFmt(errorMessg, retTranType));
+                }
+            }
+        }
+
+        if (isValid)
+        {
+            // check and see if the transaction and status are correct for the reversal.
+            [isValid, errorMessg] = this.checkAssetStatusApplicable(_voucher, _transDate, _journalNumber, 0, _revoke);
+            if (!isValid)
+            {
+                this.sendErrorMessage(errorMessg);
+            }
+        }
+        if (isValid)
+        {
+            [reversalTolerance, errorMessg] = this.canTransactionBeReversed(_voucher, _transDate, _journalNumber, 0, _revoke);
+            if (reversalTolerance == ErrorTolerance::Error)
+            {
+                isValid = false;
+                this.sendErrorMessage(errorMessg);
+            }
+            else if (reversalTolerance == ErrorTolerance::Warning)
+            {
+                // if we are in batch we can't prompt so treat all warnings as errors.
+                if (TransactionReversalExecutionDetail::isReversingWithContract(this.parmContract()))
+                {
+                    reversalTolerance = ErrorTolerance::Error;
+                    this.sendErrorMessage(errorMessg);
+                }
+                else if (this.parmIsFTICorrection())
+                {
+                    reversalTolerance = ErrorTolerance::Accept;
+                }
+                else
+                {
+                    errorMessg = errorMessg + #NewLine + "@SYS90447";
+
+                    //
+                    // Get user verification to reverse or revoke; otherwise return error.
+                    // Initial focus is on the Cancel button.
+                    //
+                    dlgButton = Box::okCancel(errorMessg, DialogButton::Cancel,"@SYS117083");
+
+                    if (dlgButton == DialogButton::Cancel)
+                    {
+                        isValid = false;
+                        checkFailed("@SYS117113");
+                    }
+                }
+            }
+        }
+        return isValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doesAssetValidateNegativeNetBooksPass</Name>
+				<Source><![CDATA[
+    private container doesAssetValidateNegativeNetBooksPass()
+    {
+        boolean isValid = true;
+        str errorMsg = '';
+        // there could be several books for the same voucher
+        AssetBook assetBook = AssetBook::find(assetTransValidation.AssetId, assetTransValidation.BookId);
+
+        if (assetBook.NegativeNetBookValue == NoYes::No)
+        {
+            AssetSumCalc_Trans assetSumCalc_Trans = AssetSumCalc_Trans::newAssetYear(
+                assetTransValidation.AssetId, assetTransValidation.BookId);
+            Amount amountMST = reversalRelationId
+                ? this.getRelatedVouchersTotalAmountMST() 
+                : assetTransValidation.AmountMST;
+
+            if ((assetSumCalc_Trans.netBookValue() - amountMST) < 0)
+            {
+                isValid = false;
+                errorMsg = strfmt("@FixedAssets:FA_ErrorMessage_NegativeNetBookValueDeleteTransactions", 
+                    assetTransValidation.AssetId,
+                    assetTransValidation.BookId);
+            }
+        }
+
+        return [isValid, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isReversalAssetTransactionsSequential</Name>
+				<Source><![CDATA[
+    private container isReversalAssetTransactionsSequential() // could be another trans for another date
+    {
+        boolean isValid = true;
+        str errorMsg = '';
+
+        if (this.isAssetTransTypeAcquisition()
+            && (this.hasOtherTransactionsForLaterDate()
+                || this.hasNonAcquisitionTransactionsForTheSameDate()))
+        {
+            isValid = false;
+            errorMsg = strfmt("@FixedAssets:FA_ErrorMessage_OtherTransactionExist", 
+                assetTransValidation.AssetId, 
+                assetTransValidation.BookId,
+                assetTransValidation.TransType);
+        }
+
+        return [isValid, errorMsg];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isAssetTransTypeAcquisition</Name>
+				<Source><![CDATA[
+    private boolean isAssetTransTypeAcquisition()
+    {
+        return (assetTransValidation.TransType == AssetTransType::Acquisition 
+            || assetTransValidation.TransType == AssetTransType::AcquisitionAdj);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOtherTransactionsForLaterDate</Name>
+				<Source><![CDATA[
+    private boolean hasOtherTransactionsForLaterDate()
+    {
+        AssetTrans assetTransLocal;
+
+        SysDaQueryExpression additionalWhereClause = new SysDaGreaterThanExpression(
+            new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransDate)),
+            new SysDaValueExpression(assetTransValidation.TransDate));
+
+        SysDaQueryObject queryObject = this.getAllAssetTransNotRelatedVouchersQuery(
+            assetTransLocal,
+            assetTransValidation,
+            assetTransValidation.RecId,
+            additionalWhereClause);
+
+        queryObject.joinClause(SysDaJoinKind::NotExistsJoin, this.transactionNotIncludedInReversalTrans(assetTransLocal));
+        
+        SysDaFindStatement findStatement = new SysDaFindStatement();
+        findStatement.find(new SysDaFindObject(queryObject));
+
+        return assetTransLocal.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasNonAcquisitionTransactionsForTheSameDate</Name>
+				<Source><![CDATA[
+    private boolean hasNonAcquisitionTransactionsForTheSameDate()
+    {
+        AssetTrans assetTransLocal;
+
+        SysDaQueryExpression additionalWhereClause = new SysDaAndExpression(
+            new SysDaEqualsExpression(
+                new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransDate)),
+                new SysDaValueExpression(assetTransValidation.TransDate)),
+            new SysDaAndExpression(
+                new SysDaNotEqualsExpression(
+                    new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                    new SysDaValueExpression(AssetTransType::Acquisition)),
+                new SysDaNotEqualsExpression(
+                    new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                    new SysDaValueExpression(AssetTransType::AcquisitionAdj))));
+
+        SysDaQueryObject queryObject = this.getAllAssetTransNotRelatedVouchersQuery(
+            assetTransLocal,
+            assetTransValidation,
+            assetTransValidation.RecId,
+            additionalWhereClause);
+
+        queryObject.joinClause(SysDaJoinKind::NotExistsJoin, this.transactionNotIncludedInReversalTrans(assetTransLocal));
+
+        SysDaFindStatement findStatement = new SysDaFindStatement();
+        findStatement.find(new SysDaFindObject(queryObject));
+
+        return assetTransLocal.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transactionNotIncludedInReversalTrans</Name>
+				<Source><![CDATA[
+    //Verify the transaction was not reversed before
+    private SysDaQueryObject transactionNotIncludedInReversalTrans(AssetTrans _assetTransLocal)
+    {
+        TransactionReversalTrans transactionReversalTransLocal;
+
+        SysDaQueryObject queryObject = new SysDaQueryObject(transactionReversalTransLocal);
+
+        queryObject.WhereClause(
+                new SysDaEqualsExpression(
+                    new SysDaFieldExpression(transactionReversalTransLocal, fieldStr(TransactionReversalTrans, RefTableId)),
+                    new SysDaValueExpression(tableNum(AssetTrans)))
+                .and(
+                    new SysDaEqualsExpression(
+                        new SysDaFieldExpression(transactionReversalTransLocal, fieldStr(TransactionReversalTrans, RefRecId)),
+                        new SysDaFieldExpression(_assetTransLocal, fieldStr(AssetTrans, RecId))))
+                .and(
+                    new SysDaEqualsExpression(
+                        new SysDaFieldExpression(transactionReversalTransLocal, fieldStr(TransactionReversalTrans, Reversed)),
+                        new SysDaValueExpression(true))));
+
+        return queryObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildNotRelatedVouchersExpression</Name>
+				<Source><![CDATA[
+    private SysDaBinaryExpression buildNotRelatedVouchersExpression(AssetTrans _assetTransLocal)
+    {
+        SysDaBinaryExpression notRelatedVouchersExpression;
+
+        Set relatedVouchers = reversalRelatedVoucherManager.getReversalRelatedVouchers();
+        SetEnumerator voucherSetEnumerator = relatedVouchers.getEnumerator();
+
+        while(voucherSetEnumerator.moveNext())
+        {
+            container voucherDate = voucherSetEnumerator.current();
+            Voucher voucher = conPeek(voucherDate, 1);
+
+            if (!notRelatedVouchersExpression)
+            {
+                notRelatedVouchersExpression = new SysDaNotEqualsExpression(
+                    new SysDaFieldExpression(_assetTransLocal, fieldStr(AssetTrans, Voucher)),
+                    new SysDaValueExpression(voucher));
+            }
+            else
+            {
+                notRelatedVouchersExpression = notRelatedVouchersExpression.and(
+                    new SysDaNotEqualsExpression(
+                        new SysDaFieldExpression(_assetTransLocal, fieldStr(AssetTrans, Voucher)),
+                        new SysDaValueExpression(voucher)));
+            }
+        }
+
+        return notRelatedVouchersExpression;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkValidAssetTranCalendar</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates that the new transaction date occurs in a valid asset calendar for all value model and
+    ///    depreciation books for the asset transactions that are related to the specified voucher and
+    ///    transaction date.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher that is used to look up all asset transactions and depreciation book transactions.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date that is related to the voucher that is used to look up all asset transactions
+    ///    and depreciation book transactions.
+    /// </param>
+    /// <param name="_journalNumber">
+    ///    The transaction journal number that is used to look up all stand-alone depreciation book
+    ///    transactions.
+    /// </param>
+    /// <param name="_journalLineNum">
+    ///    The transaction journal line number that is used to look up all stand-alone depreciation book
+    ///    transactions.
+    /// </param>
+    /// <param name="_newDate">
+    ///    The new transaction date to test whether an asset calendar period is stopped or closed.
+    /// </param>
+    /// <returns>
+    ///    A container with a Boolean and an <c>AssetCalendarId</c> value. The Boolean is set to true if the
+    ///    specified new transaction date does not occur in a closed or stopped period within any related
+    ///    asset calendar for all transactions, or if no asset calendars are found; otherwise, false. The
+    ///    <c>AssetCalendarId</c> value is the value of the <c>CalendarId</c> field of the failing period;
+    ///    otherwise, blank.
+    /// </returns>
+    /// <remarks>
+    ///    This routine first selects all value model <c>assetTrans</c> records to get the related calendar
+    ///    for each transaction. If a calendar is found for the transaction, the calendar is looked up to see
+    ///    whether the specified new transaction date falls in a closed period. If it does, this method
+    ///    returns false. The same sequence of events earlier occurs again to check against the depreciation
+    ///    book <c>assetDepBook</c> transactions. In both cases, if no calendar is found, true is returned.
+    /// </remarks>
+    public static container checkValidAssetTranCalendar(Voucher _voucher, TransDate _transDate,  AssetJournalId _journalNumber, LineNum _journalLineNum, TransDate _newDate )
+    {
+        // Set return to true as if no calendars are found then everything is fine.
+        boolean     isValid = true;
+
+        AssetTrans            bookTrans;
+
+        AssetBookTable        assetBookTable;
+        FiscalCalendarPeriod  fiscalCalendarPeriod;
+
+        FiscalCalendarRecId   calendarRecId;
+
+        bookTrans.selectLocked(false);
+        fiscalCalendarPeriod.selectLocked(false);
+
+        if (!(_voucher == ''))
+        {
+            // Find all asset trans records for the given voucher and transaction date and bring back the
+            // CalendarId from the value model.
+            while select RecId from bookTrans join FiscalCalendar from assetBookTable
+                    where
+                          bookTrans.BookId    == assetBookTable.BookId &&
+                          bookTrans.Voucher   == _voucher &&
+                          bookTrans.TransDate == _transDate
+            {
+                // If we have found a calendarId for the current transaction then process it otherwise
+                // go onto the next record.
+                if (assetBookTable.FiscalCalendar)
+                {
+                    // not checking the status, just checking that the date is valid.
+                    if (LedgerFiscalCalendar::findPeriodByPeriodCodeDate(assetBookTable.FiscalCalendar, _newDate) == null)
+                    {
+                        isValid = false;
+                        calendarRecId = assetBookTable.FiscalCalendar;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return [isValid, calendarRecId];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static ClassDescription description()
+    {
+        return "@SYS78542";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///   Reverses the current asset transaction.
+    /// </summary>
+    /// <param name="_args">
+    ///    The current transaction record to be reversed.
+    /// </param>
+    static void main(Args _args)
+    {
+        TransactionReversal_Asset   transactionReversal = TransactionReversal_Asset::construct();
+
+        transactionReversal.reversal(_args);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static TransactionReversal_Asset construct()
+    {
+        return new TransactionReversal_Asset();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        taxTransRecIdMap = new Map(Types::Int64, Types::Int64);
+       
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendErrorMessage</Name>
+				<Source><![CDATA[
+    private void sendErrorMessage(str _errorMessg)
+    {
+        // When reversing with mass reversals throw an exception
+        if (TransactionReversalExecutionDetail::isReversingWithContract(this.parmContract()))
+        {
+            throw Error(_errorMessg);
+        }
+        else
+        {
+            checkFailed(_errorMessg);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsRelatedVoucher</Name>
+				<Source><![CDATA[
+    private boolean parmIsRelatedVoucher(boolean _isRelatedVoucher = isRelatedVoucher)
+    {
+        isRelatedVoucher = _isRelatedVoucher;
+        
+        return isRelatedVoucher;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRelatedVouchersTotalAmountMST</Name>
+				<Source><![CDATA[
+    private Amount getRelatedVouchersTotalAmountMST()
+    {
+        AssetTrans assetTransLocal;
+        AssetReversalRelatedVoucher assetReversalRelatedVoucher;
+
+        select sum(AmountMST) from assetTransLocal
+            where assetTransLocal.AssetId == assetTransValidation.AssetId
+                && assetTransLocal.BookId == assetTransValidation.BookId
+            join assetReversalRelatedVoucher
+                where assetReversalRelatedVoucher.RelationId == reversalRelationId
+                    && assetReversalRelatedVoucher.Voucher == assetTransLocal.Voucher
+                    && assetReversalRelatedVoucher.TransDate == assetTransLocal.TransDate;
+
+        return assetTransLocal.AmountMST;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOtherNonReversedAcquisition</Name>
+				<Source><![CDATA[
+    private boolean hasOtherNonReversedAcquisition(
+        AssetTrans _assetTrans,
+        RefRecId _refRecId)
+    {
+        AssetTrans assetTransLocal;
+
+        SysDaQueryExpression additionalWhereClause = new SysDaEqualsExpression(
+            new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+            new SysDaValueExpression(AssetTransType::Acquisition));
+
+        SysDaQueryObject queryObject = this.getAllAssetTransNotRelatedVouchersQuery(
+            assetTransLocal,
+            _assetTrans,
+            _refRecId,
+            additionalWhereClause);
+
+        queryObject.joinClause(SysDaJoinKind::NotExistsJoin, this.transactionNotIncludedInReversalTrans(assetTransLocal));
+
+        SysDaFindStatement findStatement = new SysDaFindStatement();
+        findStatement.find(new SysDaFindObject(queryObject));
+
+        return assetTransLocal.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOtherNonReversedTransaction</Name>
+				<Source><![CDATA[
+    private boolean hasOtherNonReversedTransaction(
+        AssetTrans _assetTrans,
+        RefRecId _refRecId)
+    {
+        AssetTrans assetTransLocal;
+
+        SysDaQueryObject queryObject = this.getAllAssetTransNotRelatedVouchersQuery(
+            assetTransLocal, 
+            _assetTrans, 
+            _refRecId);
+
+        queryObject.joinClause(SysDaJoinKind::NotExistsJoin, this.transactionNotIncludedInReversalTrans(assetTransLocal));
+
+        SysDaFindStatement findStatement = new SysDaFindStatement();
+        findStatement.find(new SysDaFindObject(queryObject));
+
+        return assetTransLocal.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAllAssetTransNotRelatedVouchersQuery</Name>
+				<Source><![CDATA[
+    private SysDaQueryObject getAllAssetTransNotRelatedVouchersQuery(
+        AssetTrans _assetTransLocal,
+        AssetTrans _assetTrans,
+        RefRecId _refRecId,
+        SysDaQueryExpression _additionalWhereClause = null)
+    {
+        SysDaQueryObject queryObject = new SysDaQueryObject(_assetTransLocal);
+        queryObject.firstOnlyHint = true;
+
+        queryObject.projection()
+            .add(fieldStr(AssetTrans, RecId))
+            .add(fieldStr(AssetTrans, TransType));
+                
+        SysDaQueryExpression whereClause = this.buildWhereClauseForAllAssetTrans(
+            _assetTransLocal, 
+            _assetTrans, 
+            _refRecId,
+            _additionalWhereClause);
+
+        queryObject.WhereClause(whereClause);
+
+        return queryObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWhereClauseForAllAssetTrans</Name>
+				<Source><![CDATA[
+    private SysDaQueryExpression buildWhereClauseForAllAssetTrans(
+        AssetTrans _assetTransLocal,
+        AssetTrans _assetTrans,
+        RefRecId _refRecId,
+        SysDaQueryExpression _additionalWhereClause = null)
+    {
+        SysDaQueryExpression whereClause = new SysDaEqualsExpression(
+                new SysDaFieldExpression(_assetTransLocal, fieldStr(AssetTrans, BookId)),
+                new SysDaValueExpression(_assetTrans.BookId))
+            .and(new SysDaEqualsExpression(
+                new SysDaFieldExpression(_assetTransLocal, fieldStr(AssetTrans, AssetId)),
+                new SysDaValueExpression(_assetTrans.AssetId)))
+            .and(new SysDaNotEqualsExpression(
+                new SysDaFieldExpression(_assetTransLocal, fieldStr(AssetTrans, RecId)),
+                new SysDaValueExpression(_refRecId)));
+
+        if (reversalRelationId)
+        {
+            SysDaBinaryExpression notRelatedVouchersExpression = this.buildNotRelatedVouchersExpression(_assetTransLocal);
+            whereClause = whereClause.and(notRelatedVouchersExpression);
+        }        
+        
+        if (_additionalWhereClause)
+        {            
+            whereClause = whereClause.and(_additionalWhereClause);
+        }
+
+        return whereClause;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOtherNonReversedRevaluation</Name>
+				<Source><![CDATA[
+    private boolean hasOtherNonReversedRevaluation(
+        AssetTrans _assetTrans,
+        RefRecId _refRecId,
+        TransDate _assetTransDate)
+    {
+        AssetTrans assetTransLocal;
+
+        SysDaQueryExpression additionalWhereClause = new SysDaEqualsExpression(
+                new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                new SysDaValueExpression(AssetTransType::Revaluation))
+            .and(new SysDaGreaterThanOrEqualsExpression(
+                new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransDate)),
+                new SysDaValueExpression(_assetTransDate)));
+
+        SysDaQueryObject queryObject = this.getAllAssetTransNotRelatedVouchersQuery(
+            assetTransLocal,
+            _assetTrans,
+            _refRecId,
+            additionalWhereClause);
+
+        queryObject.joinClause(SysDaJoinKind::NotExistsJoin, this.transactionNotIncludedInReversalTrans(assetTransLocal));
+
+        SysDaFindStatement findStatement = new SysDaFindStatement();
+        findStatement.find(new SysDaFindObject(queryObject));
+
+        return assetTransLocal.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOtherNonReversedDisposal</Name>
+				<Source><![CDATA[
+    private AssetTrans getOtherNonReversedDisposal(
+        AssetTrans _assetTrans,
+        RefRecId _refRecId,
+        TransDate _assetTransDate)
+    {
+        AssetTrans assetTransLocal;
+
+        SysDaQueryExpression additionalWhereClause = new SysDaGreaterThanOrEqualsExpression(
+                new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransDate)),
+                new SysDaValueExpression(_assetTransDate))
+            .and(new SysDaOrExpression(
+                new SysDaEqualsExpression(
+                    new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                    new SysDaValueExpression(AssetTransType::DisposalSale)),
+                new SysDaEqualsExpression(
+                    new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                    new SysDaValueExpression(AssetTransType::DisposalScrap))));
+
+        SysDaQueryObject queryObject = this.getAllAssetTransNotRelatedVouchersQuery(
+            assetTransLocal,
+            _assetTrans,
+            _refRecId,
+            additionalWhereClause);
+
+        queryObject.joinClause(SysDaJoinKind::NotExistsJoin, this.transactionNotIncludedInReversalTrans(assetTransLocal));
+
+        SysDaFindStatement findStatement = new SysDaFindStatement();
+        findStatement.find(new SysDaFindObject(queryObject));
+
+        return assetTransLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOtherNonReversedDepreciation</Name>
+				<Source><![CDATA[
+        private AssetTrans getOtherNonReversedDepreciation(
+        AssetTrans _assetTrans,
+        RefRecId _refRecId,
+        TransDate _assetTransDate)
+    {
+        AssetTrans assetTransLocal;
+
+        SysDaQueryExpression additionalWhereClause = new SysDaGreaterThanOrEqualsExpression(
+                new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransDate)),
+                new SysDaValueExpression(_assetTransDate))
+            .and(new SysDaOrExpression(
+                new SysDaEqualsExpression(
+                    new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                    new SysDaValueExpression(AssetTransType::Depreciation)),
+                new SysDaEqualsExpression(
+                    new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                    new SysDaValueExpression(AssetTransType::BonusDepreciation)))
+                .or(
+                    new SysDaEqualsExpression(
+                        new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                        new SysDaValueExpression(AssetTransType::ExtraordinaryDepreciation))));
+
+        SysDaQueryObject queryObject = this.getAllAssetTransNotRelatedVouchersQuery(
+            assetTransLocal,
+            _assetTrans,
+            _refRecId,
+            additionalWhereClause);
+
+        queryObject.joinClause(SysDaJoinKind::NotExistsJoin, this.transactionNotIncludedInReversalTrans(assetTransLocal));
+
+        SysDaFindStatement findStatement = new SysDaFindStatement();
+        findStatement.find(new SysDaFindObject(queryObject));
+
+        return assetTransLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOtherNonReversedTransfer</Name>
+				<Source><![CDATA[
+    private boolean hasOtherNonReversedTransfer(
+        AssetTrans _assetTrans,
+        RefRecId _refRecId,
+        TransDate _assetTransDate)
+    {
+        AssetTrans assetTransLocal;
+
+        SysDaQueryExpression additionalWhereClause = new SysDaEqualsExpression(
+                new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransType)),
+                new SysDaValueExpression(AssetTransType::AssetTransfer))
+            .and(new SysDaOrExpression(
+                new SysDaGreaterThanExpression(
+                    new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransDate)),
+                    new SysDaValueExpression(_assetTransDate)),
+                new SysDaAndExpression(
+                    new SysDaEqualsExpression(
+                        new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, TransDate)),
+                        new SysDaValueExpression(_assetTransDate)),
+                    new SysDaGreaterThanExpression(
+                        new SysDaFieldExpression(assetTransLocal, fieldStr(AssetTrans, RecId)),
+                        new SysDaValueExpression(_assetTrans.RecId)))));
+
+        SysDaQueryObject queryObject = this.getAllAssetTransNotRelatedVouchersQuery(
+            assetTransLocal,
+            _assetTrans,
+            _refRecId,
+            additionalWhereClause);
+
+        queryObject.joinClause(SysDaJoinKind::NotExistsJoin, this.transactionNotIncludedInReversalTrans(assetTransLocal));
+
+        SysDaFindStatement findStatement = new SysDaFindStatement();
+        findStatement.find(new SysDaFindObject(queryObject));
+
+        return assetTransLocal.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAssetReductionEntryAssetTransRecId</Name>
+				<Source><![CDATA[
+    private RecId getAssetReductionEntryAssetTransRecId(RecId _recId, AssetId _assetId, AssetBookId _bookId)
+    {
+        AssetTrans assetTransReductionEntry;
+        AssetDocumentTrans_JP documentTrans;
+        AssetDocumentEntry_JP documentEntry;
+        AssetDocumentTable_JP documentTable;
+
+        select firstonly RecId from assetTransReductionEntry
+            where assetTransReductionEntry.AssetId == _assetId
+                && assetTransReductionEntry.BookId == _bookId
+                && assetTransReductionEntry.RecId == _recId
+                exists join RecId from documentTrans
+                    where documentTrans.RefTableId == assetTransReductionEntry.TableId
+                        && documentTrans.RefRecId == assetTransReductionEntry.RecId
+                exists join RecId from documentEntry
+                    where documentEntry.RecId == documentTrans.AssetDocumentEntry_JP
+                exists join RecId from documentTable
+                    where documentTable.RecId == documentEntry.AssetDocumentTable_JP
+                        && (documentTable.Type == AssetDocumentType_JP::AssetReductionEntry_DirectOff
+                            || documentTable.Type == AssetDocumentType_JP::AssetReductionEntry_Reserve);
+
+        return assetTransReductionEntry.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setAssetDocumentReductionEntryStatus</Name>
+				<Source><![CDATA[
+    private void setAssetDocumentReductionEntryStatus(RefRecId _assetTransRecId, AssetId _assetId, AssetBookId _bookId)
+    {
+        TransactionReversalTrans transactionReversalTrans;
+
+        select firstOnly RecId from transactionReversalTrans
+                    where transactionReversalTrans.RefRecId == _assetTransRecId
+                        && transactionReversalTrans.RefTableId == tablenum(AssetTrans)
+                        && transactionReversalTrans.Original == true
+                        && transactionReversalTrans.Reversed == false;
+
+        if (transactionReversalTrans.RecId)
+        {
+            AssetDocumentReductionEntry_JP document = AssetReductionEntryManager_JP::getAssetReductionEntryDocByAssetBook(_assetId, _bookId);
+                    
+            if (document != null && document.parmReductionEntryTable().Status == AssetDocumentReductionEntryStatus_JP::Posted)
+            {
+                document.updateReductionEntryStatus(AssetDocumentReductionEntryStatus_JP::NotPost);
+            }
+        }   
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

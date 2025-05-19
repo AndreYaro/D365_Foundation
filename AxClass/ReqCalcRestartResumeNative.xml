@@ -1,0 +1,355 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqCalcRestartResumeNative</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Handles restart or resume of master planning batch runs. 
+/// Runs that have passed the PreCoverage phase will be resumed, otherwise they will be restarted.
+/// </summary>
+internal final class ReqCalcRestartResumeNative
+{
+    private Batch currentBatchTask;
+    private ReqProcessId processId;
+    private ReqCalcUpdate reqCalcUpdate;
+    private boolean isResumed;
+    private container reqProcessListParameters;
+    private ReqProcessId recoveredProcessId;
+    private boolean resumeCalled;
+    private boolean restartCalled;
+    private ReqProcessStatus reqProcessListStatus;
+    private ReqInstrumentationLogger reqInstrumentationLogger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static ReqCalcRestartResumeNative construct(
+        ReqProcessId _processId,
+        ReqCalcUpdate _reqCalcUpdate,
+        Batch _currentBatchTask,
+        ReqInstrumentationLogger _reqInstrumentationLogger)
+    {
+        ReqCalcRestartResumeNative restartResume = new ReqCalcRestartResumeNative();
+
+        restartResume.setProcessId(_processId);
+        restartResume.setReqCalcUpdate(_reqCalcUpdate);
+        restartResume.setCurrentBatch(_currentBatchTask);
+        restartResume.setReqInstrumentationLogger(_reqInstrumentationLogger);
+       
+        return restartResume;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resume</Name>
+				<Source><![CDATA[
+    private boolean resume()
+    {
+        boolean resumedRecoveredProcess;
+        resumeCalled = true;
+        int infologLineTry = infologLine();
+
+        using (var activity = reqInstrumentationLogger.restartResume().resume())
+        {
+            try
+            {
+                reqInstrumentationLogger.logProcessInformation(recoveredProcessId, currentBatchTask);
+
+                ReqProcessThreadList reqProcessThreadList;
+                select firstonly reqProcessThreadList
+                    where reqProcessThreadList.BatchTaskRecId == currentBatchTask.RecId
+                        && reqProcessThreadList.ProcessId == recoveredProcessId;
+
+                if (reqProcessThreadList.RecId)
+                {
+                    reqInstrumentationLogger.logRecoveredReqProcessThreadListInformation('Recovered reqProcessThreadList record.', reqProcessThreadList.RecId);
+
+                    var threadId = reqProcessThreadList.ThreadId;
+                    ReqCalcTaskController::resetAssignedNotCompletedBundlesProcessThread(recoveredProcessId, threadId);
+                    ReqProcessThreadList::deleteForThread(threadId, recoveredProcessId);
+                    resumedRecoveredProcess = true;
+                }
+            }
+            catch (Exception::TransientSqlConnectionError)
+            {
+                if (ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError())
+                {
+                    retry;
+                }
+                else
+                {
+                    throw;
+                }
+            }
+            catch (Exception::Error)
+            {
+                if (this.retryExceptionError(infologLineTry))
+                {
+                    retry;
+                }
+            }
+        }
+        return resumedRecoveredProcess;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restart</Name>
+				<Source><![CDATA[
+    private void restart()
+    {
+        int infologLineTry = infologLine();
+
+        using (var activity = reqInstrumentationLogger.restartResume().restart())
+        {
+            try
+            {
+                reqInstrumentationLogger.logProcessInformation(recoveredProcessId, currentBatchTask);
+
+                restartCalled = true;
+                ReqTransCache::cancelFailedProcess(recoveredProcessId);
+                ReqCalcFailureRecovery::construct(recoveredProcessId).runOperation();
+            }
+            catch (Exception::TransientSqlConnectionError)
+            {
+                if (ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError())
+                {
+                    retry;
+                }
+                else
+                {
+                    throw;
+                }
+            }
+            catch (Exception::Error)
+            {
+                if (this.retryExceptionError(infologLineTry))
+                {
+                    retry;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recoverReqProcessList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the reqProcessList record of the MRP run we are trying to recover filtering by the RecId 
+    /// of the currentBatchTask. If the record is found, then we extract processId, Status and Parameters,
+    /// which will be necessary for the recovery of the run.
+    /// </summary>
+    public void recoverReqProcessList()
+    {
+        ReqProcessList recoveredReqProcessList;
+
+        using (var activity = reqInstrumentationLogger.restartResume().recoverReqProcessList())
+        {
+            select firstonly recoveredReqProcessList
+                order by CreatedDateTime desc
+                where recoveredReqProcessList.MainThreadBatchTaskRecId == currentBatchTask.RecId;
+
+            if (recoveredReqProcessList.RecId)
+            {
+                reqInstrumentationLogger.logInformation('Found reqProcessList record of the recovered MRP batch job.');
+
+                recoveredProcessId = recoveredReqProcessList.ProcessId;
+                reqProcessListStatus = recoveredReqProcessList.Status;
+                reqProcessListParameters = recoveredReqProcessList.Parameters;
+            }
+            else
+            {
+                reqInstrumentationLogger.logInformation('Did not retrieve the reqProcessList record of the recovered MRP batch job.');
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restartResumeMainThread</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the resume or restart for main thread if the maximum number of restart/resume attempts has not been exceeded.
+    /// </summary>
+    /// <returns>
+    /// True if we manage to restart or resume the process. Otherwise False.
+    /// </returns>
+    public boolean restartResumeMainThread()
+    {
+        // The main thread should attempt to recover from batch restart 5 times.
+        // If this number is exceeded then, on the last two batch restarts,
+        // attempts will be made to fail the job and perform the necessary cleanup.
+        var maximumRestartResumeAttempts = ReqCalcScheduleItemTable::ThreadRetriesOnFailure - 2;
+
+        if (currentBatchTask.retryCount > maximumRestartResumeAttempts)
+        {
+            reqInstrumentationLogger.logBatchRetryDetails('Maximum restart resume attempts exceeded.', currentBatchTask, maximumRestartResumeAttempts);
+            return false;
+        }
+        
+        if (!recoveredProcessId)
+        {
+            reqInstrumentationLogger.logInformation('Main thread failed to recover as processId of the interrupted execution was not found.');
+
+            return false;
+        }
+
+        if (this.mustUseResume())
+        {
+            // Resume process
+            isResumed = this.resume();
+        }
+        else
+        {
+            // Restart process
+            this.restart();
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resumeChildThread</Name>
+				<Source><![CDATA[
+    public boolean resumeChildThread()
+    {
+        recoveredProcessId = processId;
+        isResumed = this.resume();
+        return isResumed;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retryExceptionError</Name>
+				<Source><![CDATA[
+    private boolean retryExceptionError(int _infologLineTry)
+    {
+        var shouldRetry = ReqTransientSqlConnectionErrorHandlingHelper::isExceptionErrorCausedBySQLError(_infologLineTry)
+            && ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError();
+
+        return shouldRetry;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustUseResume</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// We only want to resume if we have started processing taskBundles, which starts in Coverage phase.
+    /// Up to PreCoverage phase, no significant work has been completed, so we can simply restart the run.
+    /// </summary>
+    /// <returns>
+    /// True if we must resume the process. Otherwise False.
+    /// </returns>
+    private boolean mustUseResume()
+    {
+        return (reqCalcUpdate == ReqCalcUpdate::Regeneration && reqProcessListStatus >= ReqProcessStatus::PreCoverage);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setProcessId</Name>
+				<Source><![CDATA[
+    private void setProcessId(ReqProcessId _processId)
+    {
+        processId = _processId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCurrentBatch</Name>
+				<Source><![CDATA[
+    private void setCurrentBatch(Batch _batch)
+    {
+        currentBatchTask = _batch;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setReqCalcUpdate</Name>
+				<Source><![CDATA[
+    private void setReqCalcUpdate(ReqCalcUpdate _reqCalcUpdate)
+    {
+        reqCalcUpdate = _reqCalcUpdate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setReqInstrumentationLogger</Name>
+				<Source><![CDATA[
+    private void setReqInstrumentationLogger(ReqInstrumentationLogger _reqInstrumentationLogger)
+    {
+        reqInstrumentationLogger = _reqInstrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReqProcessListParameters</Name>
+				<Source><![CDATA[
+    public container getReqProcessListParameters()
+    {
+        return reqProcessListParameters;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRecoveredProcessId</Name>
+				<Source><![CDATA[
+    public ReqProcessId getRecoveredProcessId()
+    {
+        return recoveredProcessId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getResumeCalled</Name>
+				<Source><![CDATA[
+    public boolean getResumeCalled()
+    {
+        return resumeCalled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRestartCalled</Name>
+				<Source><![CDATA[
+    public boolean getRestartCalled()
+    {
+        return restartCalled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getIsResumed</Name>
+				<Source><![CDATA[
+    public boolean getIsResumed()
+    {
+        return isResumed;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

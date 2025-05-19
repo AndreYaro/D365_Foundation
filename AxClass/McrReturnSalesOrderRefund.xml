@@ -1,0 +1,1143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>McrReturnSalesOrderRefund</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+/// <summary>
+/// The <c>MCRReturnSalesOrderRefund</c> handles the sales order refund functionality for returns for
+/// multi-channel retail.
+/// </summary>
+class McrReturnSalesOrderRefund
+{
+    SalesTable          salesTableRefundedFrom;    // Order the refund is for.
+    SalesTable          salesTableRefundedTo;      // Order the refund will go on.
+    container           allowableRefundPaymMethodTypes;
+    MCRCustPaymTable    mcrCustPaymTableTmp;
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>allowablePaymentMethodTypes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Returns a container of payment methods that are allowed to be used on a return.
+    /// </summary>
+    /// <returns>
+    /// A container of payment methods that are allowed to be used on a return.
+    /// </returns>
+    /// <remarks>
+    ///     If the original payment method was
+    ///     cash or refund check, then the user can create payment methods for refund check.
+    ///     If the original payment method was credit card, then the user can refund to the credit card.
+    ///     If the original payment method was gift cert. Then the user can refund to the gift cert.
+    ///     On account is always allowed.
+    /// </remarks>
+    container allowablePaymentMethodTypes()
+    {
+        MCRCustPaymTable mcrCustPaymTable;
+        MCRCustPaymType  mcrCustPaymType;
+        SalesTable       salesTable;
+
+        // On account is always allowed to be refunded to regardless of how
+        // the customer paid.
+        allowableRefundPaymMethodTypes += MCRCustPaymType::OnAccount;
+
+        while select RecId from salesTable
+            where salesTable.SalesId == salesTableRefundedFrom.SalesId
+            join CustPaymType from mcrCustPaymTable
+                where mcrCustPaymTable.RefRecId == salesTable.RecId
+                   && mcrCustPaymTable.RefTableId == salesTable.TableId
+        {
+            mcrCustPaymType = mcrCustPaymTable.CustPaymType;
+            if (mcrCustPaymType == MCRCustPaymType::Cash ||
+               mcrCustPaymType == MCRCustPaymType::Check )
+            {
+                mcrCustPaymType = MCRCustPaymType::RefundCheck;
+            }
+
+            if (!conFind(allowableRefundPaymMethodTypes, mcrCustPaymType))
+            {
+                allowableRefundPaymMethodTypes += mcrCustPaymType;
+
+                // Since there are only 4 allowable refund method of payment types
+                // (Credit Card, Refund Check, gift cert & On Account) break out of the loop
+                // once all 4 have been found.
+                if (conLen(allowableRefundPaymMethodTypes) == 4) break;
+            }
+        }
+
+        return allowableRefundPaymMethodTypes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcPreviousRefundAmounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines what amounts were previously refunded
+    ///     for a given sales order and to which payment methods
+    ///     and then loads the results in a temporary <c>MCRCustPaymTable</c> buffer.
+    /// </summary>
+    /// <returns>
+    /// A <c>MCRCustPaymTable</c> table buffer containing what amounts were previously refunded
+    ///     for a given sales order and to which payment methods.
+    /// </returns>
+    protected MCRCustPaymTable calcPreviousRefundAmounts()
+    {
+        MCRCustPaymTable        custPaymTable;
+        SalesTable              returnSalesTable;
+        MCRReturnSalesTable     mcrReturnSalesTable;
+        // Make it a temp table
+        mcrCustPaymTableTmp.setTmp();
+
+        // Loop over all returns for the from sales order except the current one being processed.
+        while select SalesId from returnSalesTable
+            where returnSalesTable.SalesId != salesTableRefundedTo.SalesId
+            join custPaymTable
+            where custPaymTable.RefRecId == returnSalesTable.RecId
+                && custPaymTable.RefTableId == returnSalesTable.TableId
+                && custPaymTable.IsPlanRefund == NoYes::No
+            exists join mcrReturnSalesTable
+            where mcrReturnSalesTable.SalesTable == returnSalesTable.RecId
+                && mcrReturnSalesTable.OriginalSalesId == salesTableRefundedFrom.SalesId
+        {
+            // Load payment records for each return into the temp MCRCustPaymTable.
+            // Do not pick up refunds for installment plans.
+            // Check if already created refund for this pay method.
+            select mcrCustPaymTableTmp
+               where mcrCustPaymTableTmp.TenderTypeId == custPaymTable.TenderTypeId
+                    && mcrCustPaymTableTmp.PaymInfoRecId == custPaymTable.PaymInfoRecId
+                    && mcrCustPaymTableTmp.PaymInfoTableId == custPaymTable.PaymInfoTableId;
+
+            // If it already exists on another return add the amount & update the temp table.
+            if (mcrCustPaymTableTmp)
+            {
+                mcrCustPaymTableTmp.Amount += custPaymTable.Amount;
+                mcrCustPaymTableTmp.update();
+            }
+            else
+            {
+                mcrCustPaymTableTmp.data(custPaymTable);
+                mcrCustPaymTableTmp.insert();
+            }
+        }
+
+        return mcrCustPaymTableTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCredit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates a credit on the order that the refund is going on based
+    ///     on the credit amount passed.
+    /// </summary>
+    /// <param name="_creditAmount">
+    /// The amount the credit should be created for.
+    /// </param>
+    /// <param name="_mcrAdvanceCredit">
+    /// Indicates whether the credit should be advanced; optional.
+    /// </param>
+    /// <param name="_salesIdExchange">
+    /// The sales ID of the exchange order; optional.
+    /// </param>
+    /// <remarks>
+    /// If advance credit is 'Yes' then
+    ///     the system will create the credit to a refund check otherwise,
+    ///     it will create it to an on account paym method.
+    /// </remarks>
+    void createCredit(AmountCur         _creditAmount,
+                      MCRAdvanceCredit  _mcrAdvanceCredit = NoYes::No,
+                      SalesId           _salesIdExchange = '')
+    {
+        LineNum                     lineNum = 0;
+        MCRCustPaymTable            mcrCustPaymTbleMaxLineNum;
+        MCRRetailStoreTenderTypeId  paymMode;
+        MCRCustPaymType             refundPaymType;
+
+        select maxof(LineNum) from mcrCustPaymTbleMaxLineNum
+            where mcrCustPaymTbleMaxLineNum.RefRecId == salesTableRefundedTo.RecId &&
+                    mcrCustPaymTbleMaxLineNum.RefTableId == salesTableRefundedTo.TableId;
+        ttsbegin;
+
+        // Attempt to find a payment record to add the credit amount to.
+        if (_mcrAdvanceCredit)
+        {
+            paymMode = MCRRefundMethodsTable::findCheckRefund(salesTableRefundedTo.CurrencyCode).TenderTypeId;
+            refundPaymType = MCRCustPaymType::RefundCheck;
+        }
+        else
+        {
+            paymMode = McrReturnSalesOrderRefund::getRetailTenderType(salesTableRefundedTo.mcrReturnSalesTable().ApplyCreditToExchange);
+
+            // The supported functions during returns are: Normal, Refund Check and On Account
+            // All other standard call center payment types are linked refunded or refunded as On Account
+            RetailTenderFunction defaultFunction = RetailTenderTypeTable::find(paymMode).defaultFunction;
+
+            switch(defaultFunction)
+            {
+                case RetailTenderFunction::Normal:
+                    refundPaymType = MCRCustPaymType::Cash;
+                    break;
+                case RetailTenderFunction::Check:
+                    refundPaymType = MCRCustPaymType::RefundCheck;
+                    break;
+                default:
+                    refundPaymType = MCRCustPaymType::OnAccount;
+                    break;
+            }
+
+        }
+
+        MCRCustPaymTable mcrCustPaymTableRefundTo;
+
+        mcrCustPaymTableRefundTo.TenderTypeId = paymMode;
+        mcrCustPaymTableRefundTo.LineNum = lineNum + 1;
+        mcrCustPaymTableRefundTo.CustAccount = salesTableRefundedTo.InvoiceAccount;
+        mcrCustPaymTableRefundTo.RefRecId = salesTableRefundedTo.RecId;
+        mcrCustPaymTableRefundTo.RefTableId = salesTableRefundedTo.TableId;
+        mcrCustPaymTableRefundTo.CustPaymType = refundPaymType;
+        mcrCustPaymTableRefundTo.initFromRefTrans();
+
+        // When a user adds charges after the return order payment has been created. In this case, we are creating a new payment record
+        // with the charges added after the payment. The charge amount can be positive or negative. Hence, removed abs() funtion.
+        if(RetailPaymentsSupportPositiveChargesOnReturnOrderFlight::instance().isEnabled())
+        {
+            mcrCustPaymTableRefundTo.Amount = _creditAmount;
+        }
+        else
+        {
+            mcrCustPaymTableRefundTo.Amount = -abs(_creditAmount);
+        }
+
+        if (_mcrAdvanceCredit)
+        {
+            mcrCustPaymTableRefundTo.IsPrepay = NoYes::Yes;
+        }
+
+        if (mcrCustPaymTableRefundTo.validateWrite())
+        {
+            mcrCustPaymTableRefundTo.insert();
+        }
+        else
+        {
+            throw error("@SYS104318");
+        }
+
+        // Create offsetting record for exchange order if its passed.
+        if (_salesIdExchange)
+        {
+            MCRReturnSalesOrderRefund::createExchangeCredit(abs(_creditAmount), _salesIdExchange);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustPaymTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates a refund payment record.
+    /// </summary>
+    /// <param name="_amount">
+    /// The amount to create the refund payment for.
+    /// </param>
+    /// <param name="_mcrCustPaymType">
+    /// The payment type of the refund to be created.
+    /// </param>
+    /// <param name="_mcrAdvanceCredit">
+    /// Indicates whether the refund is an advance credit.
+    /// </param>
+    /// <param name="_mcrCustPaymTableRefundFrom">
+    ///     The payment record to copy information from when creating the new payment record.
+    /// </param>
+    /// <param name="_mcrCustPaymTableRefundTo">
+    /// The new payment record to populate.
+    /// </param>
+    void createCustPaymTable(AmountCur           _amount,
+                             MCRCustPaymType     _mcrCustPaymType,
+                             MCRAdvanceCredit    _mcrAdvanceCredit,
+                             MCRCustPaymTable    _mcrCustPaymTableRefundFrom,
+                             MCRCustPaymTable    _mcrCustPaymTableRefundTo)
+    {
+        MCRCustPaymTable    mcrCustPaymTable;
+        SalesTable          salesTable;
+        // System only allows 1 on account so if an on account already exists
+        // add the new amount and update the record otherwise, create a new
+        // payment record.
+        if (_mcrCustPaymType == MCRCustPaymType::OnAccount)
+        {
+            select RecId from salesTable
+                where salesTable.SalesId == salesTableRefundedTo.SalesId
+                exists join forupdate mcrCustPaymTable
+                    where mcrCustPaymTable.RefRecId == salesTable.RecId
+                       && mcrCustPaymTable.RefTableId == salesTable.TableId
+                       && mcrCustPaymTable.CustPaymType == MCRCustPaymType::OnAccount;
+        }
+
+        if (mcrCustPaymTable)
+        {
+            mcrCustPaymTable.Amount += _amount;
+            if (mcrCustPaymTable.validateWrite())
+            {
+                mcrCustPaymTable.update();
+            }
+            else
+            {
+                throw error("@SYS21628");
+            }
+        }
+        else
+        {
+            _mcrCustPaymTableRefundTo.Amount = _amount;
+            _mcrCustPaymTableRefundTo.CustAccount = salesTableRefundedTo.InvoiceAccount;
+            _mcrCustPaymTableRefundTo.RefRecId = salesTableRefundedTo.RecId;
+            _mcrCustPaymTableRefundTo.RefTableId = salesTableRefundedTo.TableId;
+            _mcrCustPaymTableRefundTo.PaymInfoRecId = _mcrCustPaymTableRefundFrom.PaymInfoRecId;
+            _mcrCustPaymTableRefundTo.PaymInfoTableId = _mcrCustPaymTableRefundFrom.PaymInfoTableId;
+            _mcrCustPaymTableRefundTo.OrigRefundRecID = _mcrCustPaymTableRefundFrom.RecId;
+            _mcrCustPaymTableRefundTo.CustPaymType = _mcrCustPaymType;
+            _mcrCustPaymTableRefundTo.Channel = _mcrCustPaymTableRefundFrom.Channel;
+            _mcrCustPaymTableRefundTo.initFromRefTrans();
+
+            if (_mcrAdvanceCredit
+                && _mcrCustPaymTableRefundTo.CustPaymType != MCRCustPaymType::OnAccount)
+            {
+                _mcrCustPaymTableRefundTo.IsPrepay = NoYes::Yes;
+            }
+
+            // Call validate write before inserting the record into the
+            // cust paym table to ensure that the record is valid.
+            if (_mcrCustPaymTableRefundTo.validateWrite())
+            {
+                _mcrCustPaymTableRefundTo.insert();
+            }
+            else
+            {
+                throw error("@SYS21628");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRefund</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Generates refund payment records based
+    ///     on the original payment methods used to pay for the
+    ///     goods being returned.
+    /// </summary>
+    /// <param name="_refundAmount">
+    /// The amount to refund.
+    /// </param>
+    /// <remarks>
+    /// Intentionally follows the
+    ///     hierarchy of refunding to
+    ///     1. On Account
+    ///     2. Credit Card
+    ///     3. Gift Cert.
+    ///     4. Loyalty card.
+    ///     5. Refund Check (cash or check were original pay methods).
+    ///     6. If over refunding puts the remaining back to on account or refund check.
+    /// </remarks>
+    void createRefund(AmountCur _refundAmount)
+    {
+        AmountCur               refundedAmount = 0;
+        MCRAdvanceCredit        mcrAdvanceCredit;
+        MCRCustPaymTable        mcrCustPaymTable;
+        MCRReturnSalesTable     mcrReturnSalesTableRefundedTo = salesTableRefundedTo.mcrReturnSalesTable();
+
+        select sum(Amount) from mcrCustPaymTable
+            where mcrCustPaymTable.RefTableId == salesTableRefundedTo.TableId
+               && mcrCustPaymTable.RefRecId == salesTableRefundedTo.RecId;
+
+        refundedAmount = mcrCustPaymTable.Amount;
+
+        ttsbegin;
+        // It is possible that the usere has entered a return that was not
+        // against a SO in the system.  In this instance just credit everything
+        // back to on acct or to a refund check (depending on whether or not we
+        // are advancing credit and return out of the method.
+        if (salesTableRefundedFrom.RecId == 0)
+        {
+            this.createCredit(_refundAmount - refundedAmount, mcrReturnSalesTableRefundedTo.AdvanceCredit);
+            ttscommit;
+            return;
+        }
+
+        this.calcPreviousRefundAmounts();
+
+        mcrAdvanceCredit = mcrReturnSalesTableRefundedTo.AdvanceCredit;
+        // Create credit for on account if not advancing credit on the return
+        if (!mcrAdvanceCredit)
+        {
+            refundedAmount += this.createRefundOnAccount(_refundAmount - refundedAmount, mcrAdvanceCredit);
+        }
+
+        // Create credit to credit cards.
+        if (refundedAmount > _refundAmount)
+        {
+            refundedAmount += this.createRefundCreditCard(_refundAmount - refundedAmount, mcrAdvanceCredit);
+            eventSource.EventWritePaymentsCreateRefundTenderType(mcrCustPaymTable.RefRecId, mcrCustPaymTable.TenderTypeId);
+        }
+
+        // Create credit to gift certificate.
+        if (refundedAmount > _refundAmount)
+        {
+            refundedAmount += this.createRefundGiftCard(_refundAmount - refundedAmount, mcrAdvanceCredit);
+            eventSource.EventWritePaymentsCreateRefundTenderType(mcrCustPaymTable.RefRecId, mcrCustPaymTable.TenderTypeId);
+        }
+
+        // Create credit to loyalty card.
+        if (refundedAmount > _refundAmount)
+        {
+            refundedAmount += this.createRefundLoyaltyCard(_refundAmount - refundedAmount, mcrAdvanceCredit);
+            eventSource.EventWritePaymentsCreateRefundTenderType(mcrCustPaymTable.RefRecId, mcrCustPaymTable.TenderTypeId);
+        }
+
+        // Create credit to refund check for GC, cash and/or check.
+        if (refundedAmount > _refundAmount)
+        {
+            refundedAmount += this.createRefundCheck(_refundAmount - refundedAmount, mcrAdvanceCredit);
+            eventSource.EventWritePaymentsCreateRefundTenderType(mcrCustPaymTable.RefRecId, mcrCustPaymTable.TenderTypeId);
+        }
+
+        // If all of the original orders payment methods have been refunded put the rest on account
+        // or to the refund check depending on whether or not we are advancing credit to the customer.
+        if (refundedAmount > _refundAmount)
+        {
+            this.createCredit(_refundAmount - refundedAmount, mcrAdvanceCredit);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRefundCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Generates payment record for refund checks.
+    /// </summary>
+    /// <param name="_refundAmount">
+    /// The amount to refund.
+    /// </param>
+    /// <param name="_mcrAdvanceCredit">
+    /// Indicates that the payment is an advance credit.
+    /// </param>
+    /// <returns>
+    /// The amount refunded.
+    /// </returns>
+    protected AmountCur createRefundCheck(AmountCur         _refundAmount,
+                                          MCRAdvanceCredit  _mcrAdvanceCredit)
+    {
+        MCRCustPaymTable     custPaymTableRefundFrom;
+        MCRCustPaymTable     custPaymTableRefundTo;
+        MCRCustPaymTable     custPaymTableRefundFromCopy;
+
+        AmountCur           refundedAmount = 0;
+        AmountCur           postedAmount = 0;
+        AmountCur           prevRefundedAmount = 0;
+        AmountCur           amount = 0;
+
+        ttsbegin;
+
+        while select custPaymTableRefundFrom
+            where   custPaymTableRefundFrom.RefRecId == salesTableRefundedFrom.RecId &&
+                    custPaymTableRefundFrom.RefTableId == salesTableRefundedFrom.TableId &&
+                    (custPaymTableRefundFrom.CustPaymType == MCRCustPaymType::Cash ||
+                     custPaymTableRefundFrom.CustPaymType == MCRCustPaymType::Check)
+        {
+            // Get posted amount for the order we creating the refund for.  This is the most
+            // we can refund for this payment.
+            postedAmount += custPaymTableRefundFrom.getPostedAmount();
+            // custPaymTableRefundFrom gets cleared when the while select fails so
+            // make a copy and copy it back after the loop ends.
+            custPaymTableRefundFromCopy.data(custPaymTableRefundFrom);
+        }
+        custPaymTableRefundFrom.data(custPaymTableRefundFromCopy);
+
+        // Get any amount that was previously been refunded to this payment record.
+        prevRefundedAmount = this.previousRefundedAmount(custPaymTableRefundFrom);
+
+        // If this customer payment is already refunded in full then set the posted
+        // amount to 0 because there is nothing else to refund to for these payment
+        // methods.
+        if (postedAmount + prevRefundedAmount <= 0 )
+        {
+            postedAmount = 0;
+        }
+        else // reduce the posted amount by whatever has previously been refunded.
+        {
+            postedAmount += prevRefundedAmount;
+        }
+
+        // If the posted amount for the current customer payment plus the
+        // the amount already refunded for this transactions is greater
+        // than the amount we need to refund then set the Amount to refund
+        // equal to whatever is left to be refunded.  In other words, we
+        // dont need to refund the full posted amount of this payment.
+        if (abs(amount) + postedAmount > abs(_refundAmount))
+        {
+            amount = _refundAmount;
+        }
+        else // refund the full posted amount of this payment.
+        {
+            amount += -postedAmount;
+        }
+
+        if (amount < 0)
+        {
+            refundedAmount = amount;
+
+            custPaymTableRefundTo.clear();
+            // Changed how the payment mode is determined,
+            // this new table handles multiple currencies
+            // in one company.
+            custPaymTableRefundTo.TenderTypeId = MCRRefundMethodsTable::findCheckRefund(salesTableRefundedTo.CurrencyCode).TenderTypeId;
+
+            this.createCustPaymTable(amount,
+                                     MCRCustPaymType::RefundCheck,
+                                     _mcrAdvanceCredit,
+                                     custPaymTableRefundFrom,
+                                     custPaymTableRefundTo);
+        }
+
+        ttscommit;
+
+        return refundedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRefundCreditCard</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Generates payment record for credit cards.
+    /// </summary>
+    /// <param name="_refundAmount">
+    /// The amount to refund.
+    /// </param>
+    /// <param name="_mcrAdvanceCredit">
+    /// Indicates that the payment is an advance credit.
+    /// </param>
+    /// <returns>
+    /// The amount refunded.
+    /// </returns>
+    protected AmountCur createRefundCreditCard(AmountCur _refundAmount, MCRAdvanceCredit _mcrAdvanceCredit)
+    {
+        CreditCardAuthTrans creditCardAuthTransRefundTo;
+        MCRCustPaymTable    custPaymTableRefundFrom;
+        MCRCustPaymTable    custPaymTableRefundTo;
+
+        AmountCur           refundedAmount = 0;
+        AmountCur           postedAmount = 0;
+        AmountCur           prevRefundedAmount = 0;
+        AmountCur           amount = 0;
+
+        ttsbegin;
+
+        while select custPaymTableRefundFrom
+            where   custPaymTableRefundFrom.RefRecId == salesTableRefundedFrom.RecId &&
+                    custPaymTableRefundFrom.RefTableId == salesTableRefundedFrom.TableId &&
+                    custPaymTableRefundFrom.CustPaymType == MCRCustPaymType::CreditCard
+        {
+            // Get posted amount for the order we creating the refund for.  This is the most
+            // we can refund for this payment.
+            postedAmount = custPaymTableRefundFrom.getPostedAmount();
+
+            boolean isRefundsOverMultipleCaptureEnabled = RetailTransactionPaymentsHelper::isRefundsOverMultipleCapturesEnabled();
+
+            // Calculate previous refunded amount
+            if(isRefundsOverMultipleCaptureEnabled)
+            {
+                prevRefundedAmount = 0;
+
+                // Payment which are already refunded.
+                while select custPaymTableRefundTo
+                where custPaymTableRefundTo.OrigRefundRecID == custPaymTableRefundFrom.RecId &&
+                      custPaymTableRefundTo.CustPaymType == MCRCustPaymType::CreditCard &&
+                      (custPaymTableRefundTo.Status == MCRCustPaymStatus::Paid ||
+                       custPaymTableRefundTo.Status == MCRCustPaymStatus::Posted
+                      )
+                {
+                    prevRefundedAmount += MCRCustPaymTable::getCreditCardRefundedAmount(custPaymTableRefundTo);
+                }
+
+                // Payment which are pending to be refunded but linked to same original payment
+                // Such types of payments need to be taken into account as they are already created and stamped with OrigRefundRecid but are pending to be authorized or refunded.
+                while select custPaymTableRefundTo
+                    where   custPaymTableRefundTo.OrigRefundRecID == custPaymTableRefundFrom.RecId &&
+                            custPaymTableRefundTo.CustPaymType == MCRCustPaymType::CreditCard &&
+                            custPaymTableRefundTo.Status == MCRCustPaymStatus::Authorized
+                {
+                    prevRefundedAmount += custPaymTableRefundTo.Amount;
+                }
+            }
+            else
+            {
+                // Get any amount that was previously been refunded to this payment record.
+                prevRefundedAmount = this.previousRefundedAmount(custPaymTableRefundFrom);
+            }
+
+            // If this customer payment is already refunded continue on to the
+            // next record.
+            if (postedAmount + prevRefundedAmount <= 0 )
+            {
+                continue;
+            }
+
+            // Reduce the posted amount by whatever has already been refunded back
+            // to it.
+            postedAmount += prevRefundedAmount;
+
+            // If the posted amount for the current customer payment plus the
+            // the amount already refunded for this transactions is greater
+            // than the amount we need to refund then set the Amount to refund
+            // equal to whatever is left to be refunded.  In other words, we
+            // dont need to refund the full posted amount of this payment.
+            if (abs(refundedAmount) + postedAmount > abs(_refundAmount))
+            {
+                amount = _refundAmount - refundedAmount;
+            }
+            else // refund the full posted amount of this payment.
+            {
+                amount = -postedAmount;
+            }
+
+            // Keep track of the total amount refund for this transaction.
+            refundedAmount += amount;
+
+            // Create customer payment record for the refund.
+            custPaymTableRefundTo.clear();
+            custPaymTableRefundTo.TenderTypeId = custPaymTableRefundFrom.TenderTypeId;
+            custPaymTableRefundTo.CardTypeId = custPaymTableRefundFrom.CardTypeId;
+            custPaymTableRefundTo.OrigRefundRecID = custPaymTableRefundFrom.RecId;
+            this.createCustPaymTable(amount, MCRCustPaymType::CreditCard, _mcrAdvanceCredit,
+                                     custPaymTableRefundFrom, custPaymTableRefundTo);
+
+            // If full amount refunded quit processing.
+            if (refundedAmount == _refundAmount)
+            {
+                break;
+            }
+        }
+
+        ttscommit;
+
+        return refundedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRefundGiftCard</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Generates payment record for gift certs.
+    /// </summary>
+    /// <param name="_refundAmount">
+    /// The amount to refund.
+    /// </param>
+    /// <param name="_mcrAdvanceCredit">
+    /// Indicates that the payment is an advance credit.
+    /// </param>
+    /// <returns>
+    /// The amount refunded.
+    /// </returns>
+    protected AmountCur createRefundGiftCard(AmountCur _refundAmount, MCRAdvanceCredit _mcrAdvanceCredit)
+    {
+        MCRCustPaymTable            custPaymTableRefundFrom;
+        MCRCustPaymTable            custPaymTableRefundTo;
+        RetailGiftCardTransactions  retailGiftCardTransactions;
+        RetailGiftCardId            cardNumberFrom;
+        AmountCur                   refundedAmount = 0;
+        AmountCur                   postedAmount = 0;
+        AmountCur                   prevRefundedAmount = 0;
+        AmountCur                   amount = 0;
+        AmountCur                   giftCertBalance;
+        AmountCur                   totalRefundAmt;
+
+        ttsbegin;
+        while select forupdate custPaymTableRefundFrom
+            where   custPaymTableRefundFrom.RefRecId == salesTableRefundedFrom.RecId &&
+                    custPaymTableRefundFrom.RefTableId == salesTableRefundedFrom.TableId &&
+                    custPaymTableRefundFrom.CustPaymType == MCRCustPaymType::GiftCard
+        {
+            // Get posted amount for the order we creating the refund for.  This is the most
+            // we can refund for this payment.
+
+            postedAmount = custPaymTableRefundFrom.getPostedAmount();
+            cardNumberFrom = custPaymTableRefundFrom.getGiftCardNumber();
+
+            // If the posted amount for the current customer payment plus the
+            // the amount already refunded for this transactions is greater
+            // than the amount we need to refund then set the Amount to refund
+            // equal to whatever is left to be refunded.  In other words, we
+            // dont need to refund the full posted amount of this payment.
+            if (abs(refundedAmount) + postedAmount > abs(_refundAmount))
+            {
+                amount = _refundAmount - refundedAmount;
+            }
+            else // refund the full posted amount of this payment.
+            {
+                amount = -postedAmount;
+            }
+
+            // Keep track of the total amount refund for this transaction.
+            refundedAmount += amount;
+
+            // If external gift card then display message
+            if (custPaymTableRefundFrom.isExternalGiftCardPayment())
+            {
+                warning(strFmt('@Retail:RefundCannotBeAppliedExternalGiftCard', custPaymTableRefundFrom.CurrencyCode, refundedAmount));
+                refundedAmount = 0;
+            }
+            else
+            {
+                // retrieve the giftcert record and check to see if the
+                // card has available balance that can be use in case the paymAdjType is
+                // a charge. adjust for the amount that is available on the gift cert
+                // put the remainder "On_Acct"
+                giftCertBalance = custPaymTableRefundFrom.getGiftCardAvailableBalance();
+
+                select firstonly Amount from retailGiftCardTransactions
+                where retailGiftCardTransactions.CardNumber == cardNumberFrom
+                    && retailGiftCardTransactions.Operation == RetailGiftCardOperation::Issue;
+
+                // Cannot refund more than the total value of the gift cert
+                totalRefundAmt = giftCertBalance + abs(amount);
+
+                if (totalRefundAmt <= retailGiftCardTransactions.Amount)
+                {
+                    custPaymTableRefundTo.clear();
+                    // use the custpaymtype from the refund from record.
+                    custPaymTableRefundTo.TenderTypeId = custPaymTableRefundFrom.TenderTypeId;
+                    custPaymTableRefundTo.CardTypeId = custPaymTableRefundFrom.CardTypeId;
+                    custPaymTableRefundTo.IsPrepay = NoYes::Yes;
+                    // Do not hard code the custpaymtype, use the one in the refund to record.
+                    this.createCustPaymTable(amount, custPaymTableRefundFrom.CustPaymType, _mcrAdvanceCredit,
+                                        custPaymTableRefundFrom, custPaymTableRefundTo);
+                }
+                // If full amount refunded quit processing.
+                if (refundedAmount == _refundAmount)
+                {
+                    break;
+                }
+            }
+        }
+        ttscommit;
+
+        return refundedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRefundLoyaltyCard</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates payment record for loyalty card.
+    /// </summary>
+    /// <param name="_refundAmount">
+    /// The amount to refund.
+    /// </param>
+    /// <param name="_mcrAdvanceCredit">
+    /// Indicates that the payment is an advance credit.
+    /// </param>
+    /// <returns>
+    /// The amount refunded.
+    /// </returns>
+    protected AmountCur createRefundLoyaltyCard(AmountCur _refundAmount, MCRAdvanceCredit _mcrAdvanceCredit)
+    {
+        MCRCustPaymTable            custPaymTableRefundFrom;
+        MCRCustPaymTable            custPaymTableRefundTo;
+        RetailLoyaltyCardId         cardNumberFrom;
+        AmountCur                   refundedAmount = 0;
+        AmountCur                   postedAmount = 0;
+        AmountCur                   amount = 0;
+
+        ttsbegin;
+        while select forupdate custPaymTableRefundFrom
+            where   custPaymTableRefundFrom.RefRecId == salesTableRefundedFrom.RecId &&
+                    custPaymTableRefundFrom.RefTableId == salesTableRefundedFrom.TableId &&
+                    custPaymTableRefundFrom.CustPaymType == MCRCustPaymType::LoyaltyCard
+        {
+            // Get posted amount for the order we creating the refund for.  This is the most
+            // we can refund for this payment.
+
+            postedAmount = custPaymTableRefundFrom.getPostedAmount();
+            cardNumberFrom = custPaymTableRefundFrom.getLoyaltyCardNumber();
+
+            // If the posted amount for the current customer payment plus the
+            // the amount already refunded for this transactions is greater
+            // than the amount we need to refund then set the Amount to refund
+            // equal to whatever is left to be refunded.  In other words, we
+            // dont need to refund the full posted amount of this payment.
+            if (abs(refundedAmount) + postedAmount > abs(_refundAmount))
+            {
+                amount = _refundAmount - refundedAmount;
+            }
+            else // refund the full posted amount of this payment.
+            {
+                amount = -postedAmount;
+            }
+
+            // Keep track of the total amount refund for this transaction.
+            refundedAmount += amount;
+
+            custPaymTableRefundTo.clear();
+            // use the custpaymtype from the refund from record.
+            custPaymTableRefundTo.TenderTypeId = custPaymTableRefundFrom.TenderTypeId;
+            custPaymTableRefundTo.CardTypeId = custPaymTableRefundFrom.CardTypeId;
+            custPaymTableRefundTo.IsPrepay = NoYes::Yes;
+
+            // Do not hard code the custpaymtype, use the one in the refund to record.
+            this.createCustPaymTable(amount, custPaymTableRefundFrom.CustPaymType, _mcrAdvanceCredit,
+                                    custPaymTableRefundFrom, custPaymTableRefundTo);
+
+            // If full amount refunded quit processing.
+            if (refundedAmount == _refundAmount)
+            {
+                break;
+            }
+        }
+        ttscommit;
+
+        return refundedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRefundOnAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Generates payment record for on account.
+    /// </summary>
+    /// <param name="_refundAmount">
+    /// The amount to refund.
+    /// </param>
+    /// <param name="_mcrAdvanceCredit">
+    /// Indicates that the payment is an advance credit.
+    /// </param>
+    /// <returns>
+    /// The amount refunded.
+    /// </returns>
+    protected AmountCur createRefundOnAccount(AmountCur _refundAmount, MCRAdvanceCredit _mcrAdvanceCredit)
+    {
+        MCRCustPaymTable    custPaymTableRefundFrom;
+        MCRCustPaymTable    custPaymTableRefundTo;
+        AmountCur           refundedAmount = 0;
+        AmountCur           postedAmount = 0;
+        AmountCur           prevRefundedAmount = 0;
+        AmountCur           amount = 0;
+
+        ttsbegin;
+        while select custPaymTableRefundFrom
+            where   custPaymTableRefundFrom.RefRecId == salesTableRefundedFrom.RecId &&
+                    custPaymTableRefundFrom.RefTableId == salesTableRefundedFrom.TableId &&
+                    custPaymTableRefundFrom.CustPaymType == MCRCustPaymType::OnAccount
+        {
+            // Get posted amount for the order we creating the refund for.  This is the most
+            // we can refund for this payment.
+
+            postedAmount = custPaymTableRefundFrom.getPostedAmount();
+
+            // Get any amount that was previously been refunded to this payment record.
+            prevRefundedAmount = this.previousRefundedAmount(custPaymTableRefundFrom);
+
+            // If this customer payment is already refunded continue on to the
+            // next record.
+            if (postedAmount + prevRefundedAmount <= 0 )
+            {
+                continue;
+            }
+
+            // Reduce the posted amount by whatever has already been refunded back
+            // to it.
+            postedAmount += prevRefundedAmount;
+
+            // If the posted amount for the current customer payment plus the
+            // the amount already refunded for this transactions is greater
+            // than the amount we need to refund then set the Amount to refund
+            // equal to whatever is left to be refunded.  In other words, we
+            // dont need to refund the full posted amount of this payment.
+            if (abs(refundedAmount) + postedAmount > abs(_refundAmount))
+            {
+                amount = _refundAmount - refundedAmount;
+            }
+            else // refund the full posted amount of this payment.
+            {
+                amount = -postedAmount;
+            }
+
+            // Keep track of the total amount refund for this transaction.
+            refundedAmount += amount;
+
+            // Create customer payment record for the refund.
+            custPaymTableRefundTo.clear();
+            custPaymTableRefundTo.TenderTypeId = custPaymTableRefundFrom.TenderTypeId;
+            this.createCustPaymTable(amount, MCRCustPaymType::OnAccount, _mcrAdvanceCredit,
+                                     custPaymTableRefundFrom, custPaymTableRefundTo);
+
+            // If full amount refunded quit processing.
+            if (refundedAmount == _refundAmount)
+            {
+                break;
+            }
+        }
+        ttscommit;
+
+        return refundedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasInvalidPaymentMethods</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Returns true if the sales order the refund is
+    ///     on contains invalid methods of payment.
+    /// </summary>
+    /// <param name="_allowableRefundPaymMethodTypes">
+    /// A container containing the allowable refund payment methods.
+    /// </param>
+    /// <returns>
+    /// true if the sales order the refund is
+    ///     on contains invalid methods of payment; otherwise false.
+    /// </returns>
+    boolean hasInvalidPaymentMethods(container _allowableRefundPaymMethodTypes = allowableRefundPaymMethodTypes)
+    {
+        boolean             ret = true;
+        int                 conlength;
+        MCRCustPaymTable    custPaymTable;
+        SalesTable          salesTable;
+
+        if (!conLen(_allowableRefundPaymMethodTypes))
+        {
+            this.allowablePaymentMethodTypes();
+        }
+        else
+        {
+            allowableRefundPaymMethodTypes = _allowableRefundPaymMethodTypes;
+        }
+
+        conlength = conLen(allowableRefundPaymMethodTypes);
+
+        // Select all negative payment amounts.
+        while select RecId from salesTable
+            where salesTable.SalesId == salesTableRefundedTo.SalesId
+                join  Amount,CustPaymType from  custPaymTable
+            where custPaymTable.RefRecId == salesTable.RecId &&
+                    custPaymTable.Amount < 0
+        {
+            if (conFind(allowableRefundPaymMethodTypes, custPaymTable.CustPaymType))
+            {
+                ret = false;
+                continue;
+            }
+            else
+            {
+                ret = true;   // invalid payment methods exist.
+                break;
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Initializes the <c>MCRReturnSalesOrderRefund</c> class.
+    /// </summary>
+    /// <param name="_salesTableRefundedFrom">
+    /// The original sales order.
+    /// </param>
+    /// <param name="_salesTableRefundedTo">
+    /// The sales order the refund is applied to.
+    /// </param>
+    void new(SalesTable _salesTableRefundedFrom, SalesTable _salesTableRefundedTo = _salesTableRefundedFrom)
+    {
+        salesTableRefundedFrom = _salesTableRefundedFrom ;
+        salesTableRefundedTo   = _salesTableRefundedTo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>previousRefundedAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Retrieves and passes back the amount previously refunded for a given
+    ///     payment method on an order.
+    /// </summary>
+    /// <param name="_mcrCustPaymTable">
+    /// The payment method on the order.
+    /// </param>
+    /// <returns>
+    /// The amount previously refunded for a given
+    ///     payment method on an order.
+    /// </returns>
+    protected AmountCur previousRefundedAmount(MCRCustPaymTable _mcrCustPaymTable)
+    {
+        MCRCustPaymType  mcrCustPaymType;
+
+        if (_mcrCustPaymTable.CustPaymType == MCRCustPaymType::OnAccount)
+        {
+            mcrCustPaymType = MCRCustPaymType::OnAccount;
+        }
+        else if (_mcrCustPaymTable.CustPaymType == MCRCustPaymType::CreditCard)
+        {
+            mcrCustPaymType = MCRCustPaymType::CreditCard;
+        }
+        else
+        {
+            mcrCustPaymType = MCRCustPaymType::RefundCheck;
+        }
+
+        select sum(PostedAmount) from mcrCustPaymTableTmp
+            where mcrCustPaymTableTmp.CustPaymType == mcrCustPaymType &&
+                  mcrCustPaymTableTmp.PaymInfoRecId == _mcrCustPaymTable.PaymInfoRecId &&
+                  mcrCustPaymTableTmp.PaymInfoTableId == _mcrCustPaymTable.PaymInfoTableId;
+
+        return mcrCustPaymTableTmp.PostedAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createExchangeCredit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Creates an exchange credit payment record.
+    /// </summary>
+    /// <param name="_creditAmount">
+    /// The amount to credit.
+    /// </param>
+    /// <param name="_salesIdExchange">
+    /// The sales order ID of the exchange.
+    /// </param>
+    public static void createExchangeCredit(AmountCur _creditAmount, SalesId _salesIdExchange = '')
+    {
+        LineNum             lineNum = 0;
+        MCRCustPaymTable    mcrCustPaymTbleMaxLineNum;
+        MCRCustPaymTable    mcrCustPaymTableExchange;
+        SalesTable          salesTableExchange;
+        SalesTable          salesTable;
+        RetailTenderTypeId  retailTenderTypeId;
+        MCRCustPaymType     refundPaymType;
+
+        salesTableExchange = SalesTable::find(_salesIdExchange);
+        retailTenderTypeId = McrReturnSalesOrderRefund::getRetailTenderType(SalesTable::mcrFindReturnByExchId(_salesIdExchange).mcrReturnSalesTable().ApplyCreditToExchange);
+
+        select salesTable
+            where salesTable.SalesId == salesTableExchange.SalesId
+            join forupdate mcrCustPaymTableExchange
+                where mcrCustPaymTableExchange.RefRecId == salesTable.RecId
+                && mcrCustPaymTableExchange.RefTableId == salesTable.TableId
+                && mcrCustPaymTableExchange.TenderTypeId == retailTenderTypeId;
+
+        if (mcrCustPaymTableExchange)
+        {
+            mcrCustPaymTableExchange.Amount = _creditAmount;
+
+            if (mcrCustPaymTableExchange.validateWrite())
+            {
+                mcrCustPaymTableExchange.update();
+            }
+            else
+            {
+                throw error("@SYS104318");
+            }
+        }
+        else
+        {
+            select maxof(LineNum) from mcrCustPaymTbleMaxLineNum
+                            where mcrCustPaymTbleMaxLineNum.RefRecId == salesTableExchange.RecId &&
+                                  mcrCustPaymTbleMaxLineNum.RefTableId == salesTableExchange.TableId;
+
+            // The supported functions during returns are: Normal, Refund Check and On Account
+            // All other standard call center payment types are linked refunded or refunded as On Account
+            RetailTenderFunction defaultFunction = RetailTenderTypeTable::find(retailTenderTypeId).defaultFunction;
+
+            switch(defaultFunction)
+            {
+                case RetailTenderFunction::Normal:
+                    refundPaymType = MCRCustPaymType::Cash;
+                    break;
+                case RetailTenderFunction::Check:
+                    refundPaymType = MCRCustPaymType::RefundCheck;
+                    break;
+                default:
+                    refundPaymType = MCRCustPaymType::OnAccount;
+                    break;
+            }
+
+            mcrCustPaymTableExchange.CustPaymType = refundPaymType;
+            mcrCustPaymTableExchange.TenderTypeId = retailTenderTypeId;
+            mcrCustPaymTableExchange.Amount = _creditAmount;
+            mcrCustPaymTableExchange.LineNum = lineNum + 1;
+            mcrCustPaymTableExchange.CustAccount = salesTableExchange.InvoiceAccount;
+            mcrCustPaymTableExchange.RefRecId = salesTableExchange.RecId;
+            mcrCustPaymTableExchange.RefTableId = salesTableExchange.TableId;
+            mcrCustPaymTableExchange.initFromRefTrans();
+
+            if (mcrCustPaymTableExchange.validateWrite())
+            {
+                mcrCustPaymTableExchange.insert();
+            }
+            else
+            {
+                throw error("@SYS104318");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRetailTenderType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the payment method from MCROrderParameters based on the passed parameter.
+    /// </summary>
+    /// <param name = "_mcrApplyCreditToExchange">Indicates that Apply credids to exchange is applied.</param>
+    /// <returns>The payment method.</returns>
+    private static RetailTenderTypeId getRetailTenderType(MCRApplyCreditToExchange _mcrApplyCreditToExchange)
+    {
+        RetailTenderTypeId retailTenderTypeId;
+        MCROrderParameters mcrOrderParameters = MCROrderParameters::find();
+
+        if (_mcrApplyCreditToExchange && mcrOrderParameters.MCRApplyCreditsPaymMode)
+        {
+            retailTenderTypeId = mcrOrderParameters.MCRApplyCreditsPaymMode;
+        }
+        else
+        {
+            retailTenderTypeId = mcrOrderParameters.MCRReturnCreditPaymMode;
+        }
+
+        return retailTenderTypeId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

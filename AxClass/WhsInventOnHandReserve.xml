@@ -1,0 +1,1869 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsInventOnHandReserve</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WhsInventOnHandReserve</c> class is used to reserve inventory items.
+/// </summary>
+public class WhsInventOnHandReserve extends InventOnHandReserveBase
+{
+    InventMovement                      movement;
+    InventDim                           inventDimCriteria;
+    InventTransSum                      transSumBuffer; //for the entire movement
+    InventTransSum                      transSumLine;   //for specific dimensions
+    List                                hierarchyList;
+    date                                checkDate;
+    boolean                             overrideFEFO;
+    boolean                             isBatchAboveLocation;
+    InventDimParm                       batchInventDimParm;  // InventDimParm representing batch level, used for filtering out batches that don't meet shelf life criteria
+    InventOnHandQueryWHSStandard        onHandQuery;
+    private boolean                     canUseFlexibleWarehouseLevelDimensionReservation;
+    
+    private InventHandlingQty quantityToReserve;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>isCWItem</Name>
+				<Source><![CDATA[
+    private boolean isCWItem()
+    {
+        if (movement)
+        {
+            return this.movement().pdsCWItem();
+        }
+
+        return false; 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustReservationLevel</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adjust the form query hierarchy level range based on the _inventDimParm.
+    /// </summary>
+    /// <param name="_formQuery">
+    /// The form query.
+    /// </param>
+    /// <param name="_inventDimParmVisible">
+    /// The InventDimParm which shows which invent dimensions are checked.
+    /// </param>
+    public void adjustReservationLevel(Query _formQuery, InventDimParm _inventDimParmVisible)
+    {
+        if (isBatchAboveLocation
+            || (this.mustUseFlexibleWarehouseLevelDimensionReservation()
+            && WHSReservationHierarchyElementPolicyProvider::singleton().isReservationOnDemandOrderEnabled(this.movement().inventTable().whsReservationHierarchy(), fieldNum(InventDim, inventBatchId))))
+        {
+            var inventDimParmToConsider = InventDimParm::orParms(inventDimCriteria.toDimParm(), _inventDimParmVisible);
+            var deepestSpecifiedLevel = onHandQuery.parmHierarchyProvider().deepestLevelFromInventDimParm(inventDimParmToConsider);
+            var batchHierarchyLevel = isBatchAboveLocation ? onHandQuery.parmHierarchyProvider().batchLevelAboveLocation() : onHandQuery.parmHierarchyProvider().parmHierarchyProvider().getDimLevel(this.movement().inventTable(), fieldNum(InventDim, inventBatchId));
+               
+            if (WhsInventOnHandReserveExpandToBatchV2Flight::instance().isEnabled())
+            {
+                //For flex we will at least filter until batch
+                if (!isBatchAboveLocation)
+                {
+                    onHandQuery.setReservationLevelRange(max(batchHierarchyLevel, deepestSpecifiedLevel));
+                }
+                else
+                {
+                    //we filter until the selected parms, otherwise we will not show anything if batch is not displayed
+                    onHandQuery.setReservationLevelRange(deepestSpecifiedLevel);
+                }
+            }
+            else
+            {
+                onHandQuery.setReservationLevelRange(max(batchHierarchyLevel, deepestSpecifiedLevel));                
+            }
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initOnHandQuery</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    protected void initOnHandQuery(Query _formQuery)
+    {
+        onHandQuery = InventOnHandQueryWHSStandard::newFromQuery(_formQuery);
+        onHandQuery.parmInventTable(this.movement().inventTable());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAdvancedCriteria</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Modifies the form query to take into account additional movement-specific criteria.
+    /// </summary>
+    /// <param name="_formQuery">
+    /// The form query.
+    /// </param>
+    /// <param name="_inventDimParmVisible">
+    /// The InventDimParm which shows which invent dimensions are checked.
+    /// </param>
+    public void addAdvancedCriteria(Query _formQuery, InventDimParm _inventDimParmVisible)
+    {
+        if (isBatchAboveLocation || this.mustUseFlexibleWarehouseLevelDimensionReservation())
+        {
+            this.initOnHandQuery(_formQuery);
+            this.adjustReservationLevel(_formQuery, _inventDimParmVisible);
+            InventOnHandCriteria criteria = InventReservationCriteriaBuilder::newMovement(movement).buildCriteria();
+            criteria.applyToOnHandQuery(onHandQuery);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canChangeReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///   Check if the reservation on the inventory dimensions can be changed for the specified quantity.
+    /// </summary>
+    /// <param name="_inventDim">
+    ///   The inventDim value to be reserved.
+    /// </param>
+    /// <param name="_qtyToChange">
+    ///   The quantity of reservation change.
+    /// </param>
+    /// <returns>
+    ///   True if the reservation can be changed; Otherwise, false.
+    /// </returns>
+    public boolean canChangeReservation(InventDim _inventDim, Qty _qtyToChange)
+    {
+        boolean ret = _qtyToChange != 0;
+
+        if (_qtyToChange < 0 && !this.mustUseFlexibleWarehouseLevelDimensionReservation())
+        {
+            if (this.isInventRemainQtyGreaterThanReservation(_inventDim, this.quantityToReserve))
+            {
+                ret = checkFailed("@WAX:ReservationsCannotBeRemoved");
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isInventRemainQtyGreaterThanReservation</Name>
+				<Source><![CDATA[
+    private boolean isInventRemainQtyGreaterThanReservation(InventDim _inventDim, InventHandlingQty _qtyToReserve)
+    {
+        WHSWorkLine         workLine;
+        WHSWorkInventTrans  workInventTrans;
+        WHSWorkTable        workTable;
+        InventDim           inventDim;
+        InventDim           inventDimWithoutBelowLocation;
+        InventDimParm       inventDimParam;
+
+        inventDimWithoutBelowLocation.data(_inventDim);
+        inventDimWithoutBelowLocation.clearBelowLocationDim(movement.itemId());
+        inventDimParam.initFromInventDim(inventDimWithoutBelowLocation);
+
+        select sum (InventQtyRemain) from workLine
+            #InventDimExistsJoinNoField(workLine.InventDimId, inventDim, inventDimWithoutBelowLocation, inventDimParam)
+            exists join workInventTrans
+                where workInventTrans.InventTransIdParent == movement.transId()
+                    && workInventTrans.WorkId             == workLine.WorkId
+                    && workInventTrans.LineNum            == workLine.LineNum
+            exists join workTable
+                where workTable.WorkId       == workInventTrans.WorkId
+                    && workTable.WorkStatus  != WHSWorkStatus::Closed
+                    && workTable.WorkStatus  != WHSWorkStatus::Cancelled
+                    && workTable.WorkStatus  != WHSWorkStatus::Combined;
+
+        if (movement is InventMov_ProdLine)
+        {
+            WHSInventQtyRemain qtyRemain = workLine.InventQtyRemain;
+            WHSWorkFrozen workFrozen;
+            WHSWorkTable  connectedWork;
+
+            select sum(Qty) from workFrozen
+                where workFrozen.InventTransId == movement.transId()
+                #InventDimExistsJoinNoField(workFrozen.FrozenWorkInventDimId, inventDim, inventDimWithoutBelowLocation, inventDimParam)
+                exists join connectedWork
+                    where connectedWork.WorkId == workFrozen.WorkId
+                        && connectedWork.WorkStatus  != WHSWorkStatus::Closed
+                        && connectedWork.WorkStatus  != WHSWorkStatus::Cancelled
+                        && connectedWork.WorkStatus  != WHSWorkStatus::Combined;
+
+            qtyRemain += workFrozen.Qty;
+
+            if (workFrozen.Qty)
+            {
+                warning(strFmt("@WAX:ConnectedFrozenWork", movement.itemId(), movement.transId()));
+            }
+
+            return qtyRemain > _qtyToReserve;
+        }
+                
+        if (WHSCheckIfPackingWorkExistsWhenRemovingReservationFlight::instance().isEnabled())
+        {
+            WHSInventQtyRemain qtyRemain = workLine.InventQtyRemain;
+
+            WHSWorkLine workLinePackingWork;
+
+            select sum (InventQtyRemain) from workLinePackingWork
+                where workLinePackingWork.InventTransId == movement.transId()
+                    && workLinePackingWork.WorkType == WHSWorkType::Pick
+                    && workLinePackingWork.WorkStatus == WHSWorkStatus::Open
+            #InventDimExistsJoinNoField(workLinePackingWork.InventDimId, inventDim, inventDimWithoutBelowLocation, inventDimParam)
+            exists join workTable
+                where workTable.WorkId       == workLinePackingWork.WorkId
+                    && workTable.WorkStatus  == WHSWorkStatus::Open
+                    && workTable.WorkTransType == WHSWorkTransType::Packing;
+
+
+            qtyRemain += workLinePackingWork.InventQtyRemain;
+                    
+            return qtyRemain > _qtyToReserve;
+        }
+
+
+        return workLine.InventQtyRemain > _qtyToReserve;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>changeReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Changes the reservation based on specified parameters.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The inventDim value to be reserved.
+    /// </param>
+    /// <param name="_qtyToReserve">
+    /// The qty in the invent unit to be reserved.
+    /// </param>
+    /// <remarks>
+    /// The qty represents the total amount that will be reserved for the inventDim specified.
+    /// If the qty is less than the current reserved amount then it will result in a decrease in reservation.
+    /// </remarks>
+    [SysObsolete('Method is obsoleted to support catch weight items. Callers should redirect their calls to the changeHandlingQuantityReservation method. Extenders should move their logic to wrap or override the changeHandlingQtyReservation method.', false, 30\9\2019)]
+    public void changeReservation(InventDim _inventDim, InventQty _qtyToReserve)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), this.movement().itemId());
+        
+        this.changeHandlingQtyReservation(_inventDim, _qtyToReserve, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>changeHandlingQuantityReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Changes the reservation based on specified parameters.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The inventDim value to be reserved.
+    /// </param>
+    /// <param name="_qtyToReserve">
+    /// The quantity in the handling unit to be reserved.
+    /// </param>
+    /// <remarks>
+    /// The qty represents the total amount that will be reserved for the inventDim specified.
+    /// If the qty is less than the current reserved amount then it will result in a decrease in reservation.
+    /// </remarks>
+    final protected void changeHandlingQuantityReservation(
+        InventDim           _inventDim,
+        InventHandlingQty   _qtyToReserve)
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightItemLogic(funcName(), this.movement().itemId()))
+        {
+            this.changeHandlingQtyReservation(_inventDim, _qtyToReserve, true);
+        }
+        else
+        {
+            this.changeReservation(_inventDim, _qtyToReserve);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>changeHandlingQtyReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Changes the reservation based on specified parameters.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The inventDim value to be reserved.
+    /// </param>
+    /// <param name="_qtyToReserve">
+    /// The quantity in the handling unit to be reserved.
+    /// </param>
+    /// <param name="_isCWItem">
+    /// Boolean describing whether the reservation is changed for a catch weight item.
+    /// </param>
+    /// <remarks>
+    /// The method is an extension and is not meant to be called directly. Callers should call the changeHandlingQuantityReservation method.
+    /// </remarks>
+    [Wrappable(true)]
+    protected void changeHandlingQtyReservation(
+        InventDim           _inventDim, 
+        InventHandlingQty   _qtyToReserve,
+        boolean             _isCWItem)
+    {
+        InventDimParm           inventDimParm;
+        InventDim               reserveDimCriteria; // The dimension criteria that will be used when reserving.
+        
+        if (_qtyToReserve < 0)
+        {
+            error("@SYS4200");
+            return;
+        }
+
+        InventHandlingQty preReserveNow;
+        InventHandlingQty actualToReserve;
+
+        if (_isCWItem)
+        {
+            preReserveNow = this.onhandReservedInventHandlingQty(_inventDim, inventDimFormSetup.parmDimParmVisibleGrid().data());
+            actualToReserve = this.calculateActualInventHandlingQtyToReserve(_qtyToReserve, preReserveNow);
+        }
+        else
+        {
+            preReserveNow = this.onhandReservedInvent(_inventDim, inventDimFormSetup.parmDimParmVisibleGrid().data());        
+            actualToReserve = this.calculateActualInventQtyToReserve(_qtyToReserve, preReserveNow);
+        }
+
+        this.quantityToReserve = _qtyToReserve;
+
+        // Make sure reservation has changed.
+        if (this.canChangeReservation(_inventDim, actualToReserve))
+        {
+            reserveDimCriteria = InventDim::findOrCreate(_inventDim);
+
+            // inventDimParm will be passed in to represent dimensions that must match when looking for inventTrans to reserve.  InventDimCriteria currently holds dimensions of the movement.
+            if (actualToReserve > 0)
+            {
+                inventDimParm.initFromInventDim(inventDimCriteria);
+                // Reserve dim criteria should be the most specific criteria provided by inventDimCriteria of the movement and the passed in inventDim selected in the form.
+                reserveDimCriteria.copyDimParmDim(movement.inventDimGroupSetup(), inventDimCriteria, inventDimParm);
+                reserveDimCriteria = InventDim::findOrCreate(reserveDimCriteria);
+            }
+            else
+            {
+                inventDimParm.initFromInventDim(_inventDim);
+            }
+
+            PdsCWInventQty  cwActualToReserve;
+            if (_isCWItem)
+            {
+                // Up to this point actualToReserve has been holding CW qty values.
+                // Now calculate actualToReserve as the min weight based on the CW value.
+                cwActualToReserve = actualToReserve;
+                actualToReserve = WHSInvent::defaultCatchWeightReserveQuantity(movement.itemId(), cwActualToReserve);
+            }
+
+            PmfQtyDataCarrier qtyDataCarrier = this.pdsCheckSameLotQuantities(reserveDimCriteria, actualToReserve, cwActualToReserve);
+            
+            if (qtyDataCarrier)
+            {
+                actualToReserve = qtyDataCarrier.parmInventQty();
+                cwActualToReserve = qtyDataCarrier.parmCwQty();
+
+                InventUpd_Reservation::updateReserveFromForm(this.movementBufferForReservation(),
+                                                            reserveDimCriteria,
+                                                            inventDimParm,
+                                                            actualToReserve,
+                                                            this.getInventMovSubType(),
+                                                            cwActualToReserve);
+
+                transSumBuffer.reset();
+                transSumLine.reset();
+                movement.transIdSum().clearTotals();
+            }
+
+            this.splitCallerByInventTrans();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateActualInventQtyToReserve</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates an inventory quantity to reserve.
+    /// </summary>
+    /// <param name = "_qtyToReserve">An inventory quantity requested to reserve.</param>
+    /// <param name = "_reservedOnhand">An inventory quantity that is already reserved.</param>
+    /// <returns>An inventory quantity left to reserve in order to fulfill the request.</returns>
+    protected InventQty calculateActualInventQtyToReserve(InventQty _qtyToReserve, InventQty _reservedOnhand)
+    {
+        return this.calculateActualInventHandlingQtyToReserve(_qtyToReserve, _reservedOnhand);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateActualInventHandlingQtyToReserve</Name>
+				<Source><![CDATA[
+    private InventHandlingQty calculateActualInventHandlingQtyToReserve(InventHandlingQty _qtyToReserve, InventHandlingQty _reservedOnhand)
+    {
+        InventHandlingQty actualToReserve = _qtyToReserve - _reservedOnhand;
+
+        if (this.mustUseFlexibleWarehouseLevelDimensionReservation())
+        {
+            actualToReserve = min(actualToReserve, this.getHandlingQtyMaximumToReserveFlexible());
+        }
+        else
+        {
+            actualToReserve = min(actualToReserve, this.getHandlingQtyOnOrderLot());
+        }
+        
+        return actualToReserve;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBatchLevelInventDimParm</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets an inventDimParm that represents all fields in the reservation hierarchy up to batch level.
+    /// </summary>
+    /// <returns>
+    /// An inventDimParm.
+    /// </returns>
+    /// <remarks>
+    /// This value is found and cached during setMovement method.
+    /// </remarks>
+    public InventDimParm getBatchLevelInventDimParm()
+    {
+        return batchInventDimParm;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCheckDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the expiry check date of the movement buffer.
+    /// </summary>
+    /// <returns>
+    /// The expiry check date.
+    /// </returns>
+    public date getCheckDate()
+    {
+        return checkDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getIsBatchAboveLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if batch is above location in the reservation hierarchy.
+    /// </summary>
+    /// <returns>
+    /// A Boolean that determines if batch is above location in the reservation hiearchy.
+    /// </returns>
+    /// <remarks>
+    /// This value is found and cached during setMovement method.
+    /// </remarks>
+    public boolean getIsBatchAboveLocation()
+    {
+        return isBatchAboveLocation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getItemId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the itemId of the movement buffer.
+    /// </summary>
+    /// <returns>
+    /// Item Id of the movement.
+    /// </returns>
+    public ItemId getItemId()
+    {
+        return movement.itemId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOnOrderLot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the on order quantity for the movement.
+    /// </summary>
+    /// <returns>
+    /// An inventory quantity.
+    /// </returns>
+    public InventQty getOnOrderLot()
+    {
+        if (!movement)
+        {
+            return 0;
+        }
+
+        return -transSumBuffer.originOnOrder(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCWOnOrderLot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the on order quantity for the movement.
+    /// </summary>
+    /// <returns>
+    /// The on order catch weight quantity specified in the item's handling unit.
+    /// </returns>
+    [Hookable(false)]
+    internal InventHandlingQty getCWOnOrderLot()
+    {
+        if (!movement)
+        {
+            return 0;
+        }
+            
+        return -transSumBuffer.pdsCWidOnOrder(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getHandlingQtyOnOrderLot</Name>
+				<Source><![CDATA[
+    private InventHandlingQty getHandlingQtyOnOrderLot()
+    {
+        if (!this.movement())
+        {
+            return 0;
+        }
+        
+        if (this.isCWItem())
+        {
+            return this.getCWOnOrderLot();
+        }
+
+        return this.getOnOrderLot();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOverrideFEFO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the boolean indicating if the movement should use FEFO logic.
+    /// </summary>
+    /// <returns>
+    /// The boolean value indicating if the movement should use FEFO logic.
+    /// </returns>
+    public boolean getOverrideFEFO()
+    {
+        return overrideFEFO;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReservedOrderedLot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the reserved ordered quantity for the movement.
+    /// </summary>
+    /// <returns>
+    /// An inventory quantity.
+    /// </returns>
+    public InventQty getReservedOrderedLot()
+    {
+        if (!movement)
+        {
+            return 0;
+        }
+
+        return -transSumBuffer.originReservOrdered(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCWReservedOrderedLot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the reserved ordered quantity for the movement.
+    /// </summary>
+    /// <returns>
+    /// The reserved ordered catch weight quantity in the item's handling unit.
+    /// </returns>
+    [Hookable(false)]
+    internal InventHandlingQty getCWReservedOrderedLot()
+    {
+        if (!movement)
+        {
+            return 0;
+        }
+
+        return -transSumBuffer.pdsCWidReservOrdered(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReservedPhysicalLot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the reserved physical quantity for the movement.
+    /// </summary>
+    /// <returns>
+    /// An inventory quantity.
+    /// </returns>
+    public InventQty getReservedPhysicalLot()
+    {
+        if (!movement)
+        {
+            return 0;
+        }
+
+        return -transSumBuffer.originReservPhysical(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCWReservedPhysicalLot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the reserved physical quantity for the movement.
+    /// </summary>
+    /// <returns>
+    /// The reserved physical catch weight quantity in the item's handling unit.
+    /// </returns>
+    [Hookable(false)]
+    internal InventHandlingQty getCWReservedPhysicalLot()
+    {
+        if (!movement)
+        {
+            return 0;
+        }
+            
+        return -transSumBuffer.pdsCWidReservPhysical(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCallerArgs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the reservation form <c>Args</c> reference
+    /// Initializes internal object state based on caller context.
+    /// </summary>
+    /// <param name = "_args">The <c>Args</c> class instance to set.</param>
+    /// <returns>The saved <c>Args</c> class instance.</returns>
+    public Args parmCallerArgs(Args _args = onHandReserveFormArgs)
+    {
+        if (!prmIsDefault(_args))
+        {
+            onHandReserveFormArgs = super(_args);
+
+            this.initializeFromContext();
+        }
+        return onHandReserveFormArgs;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeFromContext</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a new instance of the <c>WHSInventOnHandReserve</c> class based on caller context.
+    /// </summary>
+    private void initializeFromContext()
+    {
+        transSumBuffer = InventTransSum::newChildType();
+        transSumLine   = InventTransSum::newChildTypeInventDim();
+
+        this.setMovement();
+
+        WHSReservationHierarchyLevelStrategy reservationHierarchyLevelStrategy = WHSReservationHierarchyLevelStrategyTypesProvider::newFromParameters(movement, inventDimCriteria).newPrimaryStrategy(true);
+
+        hierarchyList = reservationHierarchyLevelStrategy.getReservableHierarchyListTopDown();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initInventDimParmVisible</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the visible dimensions fields so that all dimensions above and include the deepest primary stocking dimension are visible.
+    /// </summary>
+    /// <param name="_inventDimParm">
+    /// The <c>InventDimParm</c> that controls which dimension fields are visible.
+    /// </param>
+    public void initInventDimParmVisible(InventDimParm  _inventDimParm)
+    {
+        WHSReservationHierarchyLevel        level;
+        InventDimParm                       inventDimParmPrimary;
+        ListEnumerator                      le;
+        WHSReservationHierarchyElementData  hierarchyElementData;
+        InventDimParm                       inventDimParmProductDimension;
+
+        // Enable all dimensions that are active primary stocking dimensions.
+        this.movement().inventDimGroupSetup().inventDimParmActivePrimaryDimension(inventDimParmPrimary);
+        this.movement().inventDimGroupSetup().inventDimParmActiveProductDimension(inventDimParmProductDimension);
+        inventDimParmProductDimension.ItemIdFlag = NoYes::No;
+
+        // Enabled all dimensions above the lowest enabled primary dimension.
+        level = WHSReservationHierarchyInventDimUtil::deepestLevelFromInventDimParm(hierarchyList, inventDimParmPrimary);
+        le = hierarchyList.getEnumerator();
+
+        while (le.moveNext())
+        {
+            hierarchyElementData = le.current();
+
+            if (hierarchyElementData.parmLevel() > level)
+            {
+                break;
+            }
+
+            _inventDimParm.(InventDim::dim2dimParm(hierarchyElementData.parmDimensionFieldId())) = NoYes::Yes;
+        }
+
+        if (inventDimCriteria.InventStatusId)
+        {
+            _inventDimParm.InventStatusFlag = NoYes::Yes;
+        }
+
+        _inventDimParm.data(InventDimParm::orParms(_inventDimParm, inventDimParmProductDimension));
+
+        // if batch is above or flex is used we always expand to batch to show batches
+        if (_inventDimParm.InventBatchIdFlag == NoYes::No
+            && WhsInventOnHandReserveExpandToBatchV2Flight::instance().isEnabled()
+            && (this.getIsBatchAboveLocation()
+                || (this.mustUseFlexibleWarehouseLevelDimensionReservation()
+                && WHSReservationHierarchyElementPolicyProvider::singleton().isReservationOnDemandOrderEnabled(this.movement().inventTable().whsReservationHierarchy(), fieldNum(InventDim, inventBatchId)))))
+        {
+            _inventDimParm.InventBatchIdFlag = NoYes::Yes;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>movement</Name>
+				<Source><![CDATA[
+    public InventMovement movement()
+    {
+        return movement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>movementBufferForReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Selects a buffer to use for reservation for the current movement.
+    /// </summary>
+    /// <returns>
+    /// A buffer.
+    /// </returns>
+    protected Common movementBufferForReservation()
+    {
+        Common reserveBuffer;
+
+        if (this.mustUseFlexibleWarehouseLevelDimensionReservation())
+        {
+            InventMov_WHSOrderCommittedReservation orderCommittedReservationMovement = movement.whsOrderCommittedReservationMovement(true);
+
+            reserveBuffer = orderCommittedReservationMovement.buffer();
+        }
+        else
+        {
+            if (movement.childBuffer().RecId)
+            {
+                reserveBuffer = movement.childBuffer();
+            }
+            else
+            {
+                reserveBuffer = movement.buffer();
+            }
+        }
+
+        return reserveBuffer;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onhandReservedInvent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the total reserved quantity for the specified set of parameters.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The specification of the inventory dimensions to include in the search.
+    /// </param>
+    /// <param name="_inventDimParm">
+    /// The specification of which inventory dimensions to include in the search.
+    /// </param>
+    /// <returns>
+    /// An inventory quantity.
+    /// </returns>
+    public InventQty onhandReservedInvent(
+        InventDim           _inventDim,
+        InventDimParm       _inventDimParm)
+    {
+        if (this.mustUseFlexibleWarehouseLevelDimensionReservation())
+        {
+            InventMov_WHSOrderCommittedReservation orderCommittedReservationMovement = movement.whsOrderCommittedReservationMovement(true);
+
+            return -transSumLine.originReserved(orderCommittedReservationMovement.inventTransOriginId(), orderCommittedReservationMovement.transChildType(), orderCommittedReservationMovement.transChildRefId(), _inventDim, _inventDimParm);
+        }
+
+        return -transSumLine.originReserved(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId(), _inventDim, _inventDimParm);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onhandCWReservedInvent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the total reserved quantity for the specified set of parameters.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The specification of the inventory dimensions to include in the search.
+    /// </param>
+    /// <param name="_inventDimParm">
+    /// The specification of which inventory dimensions to include in the search.
+    /// </param>
+    /// <returns>
+    /// The reserved inventory catch weight quantity in the item's handling unit.
+    /// </returns>
+    [Hookable(false)]
+    internal InventHandlingQty onhandCWReservedInvent(
+        InventDim           _inventDim,
+        InventDimParm       _inventDimParm)
+    {
+        return -transSumLine.pdsCWidReserved(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId(), _inventDim, _inventDimParm);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onhandReservedInventHandlingQty</Name>
+				<Source><![CDATA[
+    private InventHandlingQty onhandReservedInventHandlingQty(
+        InventDim           _inventDim,
+        InventDimParm       _inventDimParm)
+    {
+        if (this.isCWItem())
+        {
+            return this.onhandCWReservedInvent(_inventDim, _inventDimParm);
+        }
+        
+        return this.onhandReservedInvent(_inventDim, _inventDimParm);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmHierarchyList</Name>
+				<Source><![CDATA[
+    public List parmHierarchyList(List _hierarchyList = hierarchyList)
+    {
+        hierarchyList = _hierarchyList;
+
+        return hierarchyList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventDimCriteria</Name>
+				<Source><![CDATA[
+    public InventDim parmInventDimCriteria(InventDim _inventDimCriteria = inventDimCriteria)
+    {
+        inventDimCriteria = _inventDimCriteria;
+
+        return inventDimCriteria;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>qtyReleasedWithOpenWork</Name>
+				<Source><![CDATA[
+    private InventQty qtyReleasedWithOpenWork()
+    {
+        WHSLoadLine loadLine;
+
+        select sum(PickedQty), sum(WorkCreatedQty) from loadLine
+            where loadLine.InventTransId == movement.transId()
+            &&    loadLine.inventTransType == movement.transType();
+
+        return loadLine.WorkCreatedQty - loadLine.PickedQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeExistingReservations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes existing reservations for the current movement.
+    /// </summary>
+    protected void removeExistingReservations()
+    {
+        InventDim       inventDim;
+        InventDimParm   inventDimParm;
+        
+        inventDim.data(movement.inventdim());
+        inventDimParm.initFromInventDim(inventDim);
+
+        InventHandlingQty existingReservation;
+        
+        if (this.mustUseFlexibleWarehouseLevelDimensionReservation())
+        {
+            existingReservation = this.onhandReservedInventHandlingQty(inventDim, inventDimParm.data());
+        }
+        else
+        {
+            existingReservation = this.onhandReservedInventHandlingQty(inventDim, inventDimFormSetup.parmDimParmVisibleGrid().data());
+        }
+
+        if (existingReservation > 0)
+        {
+            InventHandlingQty unreserveQuantity;
+            
+            if (this.mustUseFlexibleWarehouseLevelDimensionReservation())
+            {
+                unreserveQuantity = existingReservation;
+            }
+            else
+            {
+                //we should not try and un-reserve quantities for which we have created work
+                unreserveQuantity = existingReservation - this.qtyReleasedWithOpenWork();
+            }
+
+            // Up to this point unreserveQuantity has been holding handling qty values
+            // For CW items we need to calculate inventory un-reserve qty as min weight for CW qty.
+            PdsCWInventQty  cwUnReserveQuantity;
+            if (this.isCWItem())
+            {
+                cwUnReserveQuantity = unreserveQuantity;
+                unreserveQuantity = WhsInvent::defaultCatchWeightReserveQuantity(movement.itemId(), cwUnReserveQuantity);
+            }
+
+            InventUpd_Reservation::updateReserveFromForm(
+                                                    this.movementBufferForReservation(),
+                                                    inventDim,
+                                                    inventDimParm,
+                                                    -unreserveQuantity,
+                                                    this.getInventMovSubType(),
+                                                    -cwUnReserveQuantity);
+
+            transSumBuffer.reset();
+            transSumLine.reset();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveNow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Returns the quantity that is reserved in the invent unit.
+    /// </summary>
+    /// <param name="_set">
+    ///    true if the quantity passed in <paramref name="_reserveNow" /> is reserved; otherwise, false.
+    /// </param>
+    /// <param name="_whsInventReserve">
+    ///    An <c>WHSInventReserve</c> record required to determine the quantity reserved.
+    /// </param>
+    /// <param name="_reserveNow">
+    ///    The quantity that is reserved in the invent unit.
+    /// </param>
+    /// <returns>
+    ///    The quantity that is reserved in the invent unit.
+    /// </returns>
+    [SysObsolete('Method is obsoleted to support catch weight items. Callers should redirect their calls to the reserveHandlingQuantityNow method. Extenders should move their logic to wrap or override the reserveQuantityNow method.', false, 30\9\2019)]
+    public InventQty reserveNow(
+        boolean             _set,
+        WHSInventReserve    _whsInventReserve,
+        InventQty           _reserveNow)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), this.movement().itemId());
+        
+        return this.reserveQuantityNow(_set, _whsInventReserve, _reserveNow, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveHandlingQuantityNow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns or retrieves the handling quantity that is reserved in the handling unit.
+    /// </summary>
+    /// <param name="_set">
+    /// true if the quantity passed in <paramref name="_reserveNow" /> is reserved; otherwise, false.
+    /// </param>
+    /// <param name="_whsInventReserve">
+    /// A <c>WHSInventReserve</c> record required to determine the reserved quantity.
+    /// </param>
+    /// <param name="_reserveNow">
+    /// A handling quantity to be reserved in the handling unit.
+    /// </param>
+    /// <returns>
+    /// The handling quantity that is reserved in the handling unit.
+    /// </returns>
+    [Hookable(false)]
+    public InventHandlingQty reserveHandlingQuantityNow(
+        boolean             _set,
+        WHSInventReserve    _whsInventReserve,
+        InventHandlingQty   _reserveNow)
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightItemLogic(funcName(), this.movement().itemId()))
+        {
+            return this.reserveQuantityNow(_set, _whsInventReserve, _reserveNow, true);    
+        }
+
+        return this.reserveNow(_set, _whsInventReserve, _reserveNow);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveQuantityNow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns or retrieves the handling quantity that is reserved in the handling unit.
+    /// </summary>
+    /// <param name="_set">
+    /// true if the quantity passed in <paramref name="_reserveNow" /> is reserved; otherwise, false.
+    /// </param>
+    /// <param name="_whsInventReserve">
+    /// A <c>WHSInventReserve</c> record required to determine the quantity reserved.
+    /// </param>
+    /// <param name="_reserveNow">
+    /// A handling quantity to be reserved in the handling unit.
+    /// </param>
+    /// <returns>
+    /// The handling quantity that is reserved in the handling unit.
+    /// </returns>    
+    /// <remarks>
+    /// The method is an extension and is not meant to be called directly. Callers should call the reserveHandlingQuantityNow method.
+    /// </remarks>
+    [Wrappable(true)]
+    protected InventHandlingQty reserveQuantityNow(
+        boolean             _set,
+        WHSInventReserve    _whsInventReserve,
+        InventHandlingQty   _reserveNow,
+        boolean             _isCWItem)
+    {
+        InventDim   inventDim = InventDim::find(_whsInventReserve.InventDimId);
+
+        if (_set)
+        {
+            this.changeHandlingQuantityReservation(inventDim, _reserveNow);
+
+            if (inventDimFormSetup.parmCallingElement())
+            { 
+                this.updateFormCache(_whsInventReserve, inventDim);
+            }
+        }
+
+        InventQty qty = this.onhandReservedInventHandlingQty(inventDim, inventDimFormSetup.parmDimParmVisibleGrid().data());
+        
+        return qty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFormCache</Name>
+				<Source><![CDATA[
+    private void updateFormCache(WHSInventReserve _whsInventReserve, InventDim _inventDim)
+    {
+        const int MarkRecordFlag = 1;
+        
+        // Fields might not have been selected on the specified buffers, or might have been updated since selection
+        _inventDim.checkInvalidFieldAccess(false);
+        
+        InventOnHandQty inventOnHandQty = InventOnHandQty::newParameters(_whsInventReserve.ItemId, _inventDim, inventDimFormSetup.parmDimParmVisibleGrid().data());
+        
+        FormDataSource formInventReserve = FormDataUtil::getFormDataSource(_whsInventReserve);
+        if (formInventReserve)
+        {
+            formInventReserve.mark(MarkRecordFlag);
+
+            WHSInventReserve cacheInventReserve = formInventReserve.getFirst(MarkRecordFlag);
+
+            cacheInventReserve.AvailPhysical    = inventOnHandQty.availPhysical();
+            cacheInventReserve.AvailOrdered     = inventOnHandQty.availOrdered();
+            cacheInventReserve.ReservPhysical   = inventOnHandQty.reservPhysical();
+            cacheInventReserve.ReservOrdered    = inventOnHandQty.reservOrdered();
+
+            cacheInventReserve.CWAvailPhysical  = inventOnHandQty.pdsCWAvailPhysical();
+            cacheInventReserve.CWAvailOrdered   = inventOnHandQty.pdsCWAvailOrdered();
+            cacheInventReserve.CWReservPhysical = inventOnHandQty.pdsCWReservPhysical();
+            cacheInventReserve.CWReservOrdered  = inventOnHandQty.pdsCWReservOrdered();
+
+            _whsInventReserve.AvailPhysical     = cacheInventReserve.AvailPhysical;
+            _whsInventReserve.AvailOrdered      = cacheInventReserve.AvailOrdered;
+            _whsInventReserve.ReservPhysical    = cacheInventReserve.ReservPhysical;
+            _whsInventReserve.ReservOrdered     = cacheInventReserve.ReservOrdered;
+
+            _whsInventReserve.CWAvailPhysical   = cacheInventReserve.CWAvailPhysical;
+            _whsInventReserve.CWAvailOrdered    = cacheInventReserve.CWAvailOrdered;
+            _whsInventReserve.CWReservPhysical  = cacheInventReserve.CWReservPhysical;
+            _whsInventReserve.CWReservOrdered   = cacheInventReserve.CWReservOrdered;
+        
+            formInventReserve.mark(0);
+            formInventReserve.reread();
+            formInventReserve.refresh(); 
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitCallerByInventTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    This is used to call back to caller in case the caller must be split based on changes to the
+    ///    <c>InventTrans</c> table.
+    /// </summary>
+    private void splitCallerByInventTrans()
+    {
+        if (onHandReserveFormCallerRecord.TableId == tableNum(WMSOrderTrans))
+        {
+            WMSOrderTrans wmsOrderTrans = onHandReserveFormCallerRecord as wmsOrderTrans;
+            wmsOrderTrans.splitByInventTrans();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setMovement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the movement buffer and related global values based on the reservation form <c>Args</c>.
+    /// </summary>
+    /// <exception cref="Exception::Error">
+    /// No movement was found based on the arguments.
+    /// </exception>
+    protected void setMovement()
+    {
+        this.constructMovement();
+
+        if (!movement)
+        {
+            throw error("@SYS79582");
+        }
+
+        inventDimCriteria = movement.inventdim();
+        isBatchAboveLocation = WHSReservationHierarchyInventDimUtil::isBatchAboveLocation(movement.inventTable());
+        // Only when batch is above location do we worry about filtering batches for shelf life criteria.
+        if (isBatchAboveLocation)
+        {
+            batchInventDimParm = WHSReservationHierarchyInventDimUtil::initInventDimParmBatchAndAbove(movement.inventTable());
+            if (movement.inventTable().pdsIsShelfLifeCapable())
+            {
+                checkDate = movement.getExpiryCheckDate();
+                overrideFEFO = movement.pdsOverrideFEFO();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructMovement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs an instance of the movement buffer based on the reservation form <c>Args</c>.
+    /// </summary>
+    protected void constructMovement()
+    {
+        switch (onHandReserveFormCallerRecord.TableId)
+        {
+            case tableNum(ReqTrans):
+                ReqTrans reqTrans = onHandReserveFormCallerRecord as ReqTrans;
+                movement = InventMov_Virtuel::newReqTransOnHand(reqTrans);
+                break;
+
+            case tableNum(InventTrans):
+                InventTrans inventTrans = onHandReserveFormCallerRecord as InventTrans;
+                if (inventTrans.isUpdatedEstimated())
+                {
+                    movement = inventTrans.inventMovement();
+                }
+                break;
+
+            case tableNum(InventQuarantineOrder):
+                InventQuarantineOrder inventQuarantineOrder = onHandReserveFormCallerRecord as InventQuarantineOrder;
+                movement = InventMovement::constructNoThrow(inventQuarantineOrder, inventQuarantineOrder.getInventMovSubType(InventDirection::Issue));
+                break;
+
+            default:
+                movement = InventMovement::constructFromArgs(onHandReserveFormArgs);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReserveLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Reserves the most possible for the order line.
+    /// </summary>
+    /// <param name="_inventReserve">
+    ///    A <c>WHSInventReserve</c> record that is required to do the reservation.
+    /// </param>
+    /// <param name="_inventDim">
+    /// The inventory dimensions on which the reservation should be done.
+    /// </param>
+    public void updateReserveLine(
+        WHSInventReserve  _inventReserve,
+        InventDim _inventDim = _inventReserve.joinChild()
+        )
+    {
+        InventQty qtyToReserve;
+
+        if (this.mustUseFlexibleWarehouseLevelDimensionReservation())
+        {
+            qtyToReserve = this.getHandlingQtyMaximumToReserveFlexible();
+
+            InventDimParm inventDimParm;
+            inventDimParm.initFromInventDim(_inventDim);
+
+            qtyToReserve = min(qtyToReserve, this.onhandAvailReservationInventFlexible(_inventDim, inventDimParm));
+        }
+        else
+        {
+            qtyToReserve = this.getHandlingQtyOnOrderLot();
+        }
+
+        PdsCWInventQty  cwQtyToReserve;
+        boolean isCWItem = this.isCWItem();
+        
+        if (isCWItem)
+        {
+            // Up to this point qtyToReserve has been holding CW qty values
+            // Now calculate qtyToReserve as min weight for CW qty.
+            cwQtyToReserve = qtyToReserve;
+            qtyToReserve = WhsInvent::defaultCatchWeightReserveQuantity(movement.itemId(), cwQtyToReserve);
+        }
+        else
+        {
+            qtyToReserve = min(qtyToReserve, InventParameters::find().ReserveOnOrdered ? _inventReserve.AvailOrdered : _inventReserve.AvailPhysical);
+        }
+
+        PmfQtyDataCarrier sameLotCheckQuantities = this.pdsCheckSameLotQuantities(_inventDim, qtyToReserve, cwQtyToReserve);
+
+        if (sameLotCheckQuantities)
+        {
+            qtyToReserve = sameLotCheckQuantities.parmInventQty();
+            cwQtyToReserve = sameLotCheckQuantities.parmCwQty();
+
+
+            if (isCWItem ? (cwQtyToReserve > 0) : (qtyToReserve > 0))
+            {            
+                this.updateReserveQuantitiesNow(_inventReserve, _inventDim, qtyToReserve, cwQtyToReserve);
+            }
+        }
+
+        this.splitCallerByInventTrans();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReserveLot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Reserves the whole quantity for the order line.
+    /// </summary>
+    /// <param name="_tmpPdsBatchAttribSelect">
+    /// Batch attribute selection criteria used for reservation; optional.
+    /// </param>
+    public void updateReserveLot(TmpPdsBatchAttribSelect _tmpPdsBatchAttribSelect = null)
+    {
+        InventQty                   qtyToReserve;
+        InventDim                   inventDimToReserveOn;
+        
+        if (!movement)
+        {
+            return;
+        }
+
+        // Remove already existing reservations to allow for reservation strategies to be used again
+        this.removeExistingReservations();
+
+        inventDimToReserveOn.data(movement.inventdim());
+
+        if (this.mustUseFlexibleWarehouseLevelDimensionReservation())
+        {
+            qtyToReserve = this.getHandlingQtyMaximumToReserveFlexible();
+        }
+        else
+        {
+            qtyToReserve = this.getHandlingQtyOnOrderLot();
+        }
+
+        PdsCWInventQty  cwQtyToReserve;
+        boolean         isCWItem = this.isCWItem();
+        if (isCWItem)
+        {
+            // Up to this point qtyToReserve has been holding CW qty values
+            // Now calculate qtyToReserve as min weight for CW qty.
+            cwQtyToReserve = qtyToReserve;
+            qtyToReserve = WHSinvent::defaultCatchWeightReserveQuantity(movement.itemId(), cwQtyToReserve);
+        }
+
+        PmfQtyDataCarrier sameLotCheckQuantities = this.pdsCheckSameLotQuantities(inventDimToReserveOn, qtyToReserve, cwQtyToReserve);
+        if (sameLotCheckQuantities)
+        {
+            qtyToReserve = sameLotCheckQuantities.parmInventQty();
+            cwQtyToReserve = sameLotCheckQuantities.parmCwQty();
+
+            this.updateReserveMovementQuantities(qtyToReserve, cwQtyToReserve, _tmpPdsBatchAttribSelect);
+        }
+
+        this.splitCallerByInventTrans();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReserveMovementBuffer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the reservation for the current movement's buffer.
+    /// </summary>
+    /// <param name="_qtyToReserve">
+    /// Quantity to reserve.
+    /// </param>
+    /// <param name="_tmpPdsBatchAttribSelect">
+    /// Batch attribute selection criteria used for reservation; optional.
+    /// </param>
+    [SysObsolete('Method is obsoleted to support catch weight items. Please file an extensibility request if access is required.', false, 30\9\2019)]
+    protected void updateReserveMovementBuffer(InventQty _qtyToReserve, TmpPdsBatchAttribSelect _tmpPdsBatchAttribSelect = null)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), this.movement().itemId());
+        
+        this.updateReserveQuantitiesMovementBuffer(_qtyToReserve, 0, _tmpPdsBatchAttribSelect);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReserveMovementQuantities</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal protected void updateReserveMovementQuantities(
+        InventQty                   _qtyToReserve,
+        PdsCWInventQty              _cwQtyToReserve,
+        TmpPdsBatchAttribSelect     _tmpPdsBatchAttribSelect)
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightQuantityLogic(funcName(), this.movement().itemId(), _cwQtyToReserve))
+        {
+            this.updateReserveQuantitiesMovementBuffer(_qtyToReserve, _cwQtyToReserve, _tmpPdsBatchAttribSelect);
+        }
+        else
+        {
+            this.updateReserveMovementBuffer(_qtyToReserve, _tmpPdsBatchAttribSelect);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReserveQuantitiesMovementBuffer</Name>
+				<Source><![CDATA[
+    private void updateReserveQuantitiesMovementBuffer(
+        InventQty                   _qtyToReserve, 
+        PdsCWInventQty              _cwQtyToReserve,
+        TmpPdsBatchAttribSelect     _tmpPdsBatchAttribSelect)
+    {
+        WHSCatchWeightTelemetryLogger::logCatchWeightConflictingQuantities(funcName(), this.movement().itemId(), _cwQtyToReserve, _qtyToReserve);
+
+        TmpPdsBatchAttribSelect     tmpPdsBatchAttribSelect;
+
+        tmpPdsBatchAttribSelect.setTmpData(_tmpPdsBatchAttribSelect);
+        select firstonly tmpPdsBatchAttribSelect;
+
+        InventUpd_Reservation::updateReserveBuffer(this.movementBufferForReservation(),
+                                                    -_qtyToReserve, // passed in value must be in orignal trans sign
+                                                    this.getInventMovSubType(),
+                                                    -_cwQtyToReserve,
+                                                    tmpPdsBatchAttribSelect ? true : false,
+                                                    _tmpPdsBatchAttribSelect);
+
+        transSumBuffer.reset();
+        transSumLine.reset();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReserveNow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Reserves the quantity that is specified in the <c>reserveNow</c> parameter.
+    /// </summary>
+    /// <param name="_inventReserve">
+    ///    A <c>WHSInventReserve</c> record that is required for performance reasons.
+    /// </param>
+    /// <param name="_inventDim">
+    ///    The inventory dimensions on which the reservation should be done.
+    /// </param>
+    /// <param name="_reserveNow">
+    ///    The quantity that should be reserved. This quantity should be in the inventory unit of measure.
+    /// </param>
+    /// <exception cref="M:Exception::UpdateConflict">
+    ///    The record was updated by another user. Therefore, an update conflict occurred.
+    /// </exception>
+    /// <exception cref="M:Exception::UpdateConflictNotRecovered">
+    ///    The method could not recover from an update conflict.
+    /// </exception>
+    [SysObsolete('Method is obsoleted to support catch weight items. Please file an extensibility request if access is required.', false, 30\9\2019)]
+    public void updateReserveNow(
+        WHSInventReserve    _inventReserve,
+        InventDim           _inventDim,
+        InventQty           _reserveNow)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), this.movement().itemId());
+        
+        this.updateReserveNowQuantities(_inventReserve, _inventDim, _reserveNow, 0, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReserveQuantitiesNow</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal protected void updateReserveQuantitiesNow(
+        WHSInventReserve    _inventReserve,
+        InventDim           _inventDim,
+        InventQty           _reserveNowQty,
+        PDSCWInventQty      _reserveNowCWQty)
+    {
+        if (this.isCWItem())
+        {
+            this.updateReserveNowQuantities(_inventReserve, _inventDim, _reserveNowQty, _reserveNowCWQty, true);
+        }
+        else 
+        {
+            this.updateReserveNow(_inventReserve, _inventDim, _reserveNowQty);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReserveNowQuantities</Name>
+				<Source><![CDATA[
+    private void updateReserveNowQuantities(
+        WHSInventReserve    _inventReserve,
+        InventDim           _inventDim,
+        InventQty           _reserveNowQty,
+        PDSCWInventQty      _reserveNowCWQty,
+        boolean             _isCWItem)
+    {
+        #OCCRetryCount
+
+        if (_reserveNowQty < 0
+            || _reserveNowCWQty < 0)
+        {
+            error("@SYS4200");
+            return;
+        }
+
+        if (!movement)
+        {
+            return;
+        }
+
+        // Fields might not have been selected on the specified buffers, or might have been updated since selection
+        _inventDim.checkInvalidFieldAccess(false);
+
+        try
+        {
+            InventUpd_Reservation::updateReserveFromForm(this.movementBufferForReservation(),
+                                                         _inventDim,
+                                                         inventDimFormSetup.parmDimParmVisibleGrid().data(),
+                                                         _reserveNowQty,
+                                                         this.getInventMovSubType(),
+                                                         _reserveNowCWQty);
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw;
+            }
+        }
+
+        // If the reserved quantity had been changed we should clear cashes where it could be stored
+        transSumBuffer.reset();
+        transSumLine.reset();
+        movement.transIdSum().clearTotals();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateBatchReserve</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the batch of the <c>WHSInventReserve</c> record is available for reservation.
+    /// </summary>
+    /// <param name="_args">
+    /// The passed in <c>Args</c> that contain the passed in record buffer.
+    /// </param>
+    /// <param name="_whsInventReserve">
+    /// The <c>WHSInventReserve</c> record that has the batch to be validated.
+    /// </param>
+    /// <returns>
+    /// true if the batch can be reserved; otherwise, false.
+    /// </returns>
+    public boolean validateBatchReserve(Args _args, WHSInventReserve  _whsInventReserve)
+    {
+        PdsBatchDispCheck_Reserve   pdsCheckReserve;
+        InventTrans                 localInventTrans;
+        boolean                     ret;
+
+        // Init InventTrans from InventSum and use as basis for batch validation
+        localInventTrans.ItemId = _whsInventReserve.ItemId;
+        localInventTrans.InventDimId = _whsInventReserve.InventDimId;
+
+        pdsCheckReserve = PdsBatchDispCheck_Reserve::construct();
+        ret = pdsCheckReserve.validateTransCheck(localInventTrans,
+                                                 _args.record());
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateHierarchyNoHoles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the dimensions chosen to be display represent a hierarchy with no holes.
+    /// </summary>
+    /// <param name="_inventDimParm">
+    /// An <c>InventDimParm</c> that represents the fields chosen by the useer to be displayed.
+    /// </param>
+    /// <returns>
+    /// true if the dimensions selected represent a hierarchy with no holes; otherwise, false
+    /// </returns>
+    /// <remarks>
+    /// The hiearchyList holds the hierarchy, sorted TopDown, for the item being reserved.
+    /// </remarks>
+    public boolean validateHierarchyNoHoles(InventDimParm   _inventDimParm)
+    {
+        WHSReservationHierarchyElementData  hierarchyElementData;
+        boolean                             foundUnchecked;
+        ListEnumerator                      le;
+        FieldId                             parmFieldId;
+        FieldId                             dimFieldId;
+        boolean                             ret = true;
+
+        le = hierarchyList.getEnumerator();
+
+        while (le.moveNext() && ret)
+        {
+            hierarchyElementData = le.current();
+            dimFieldId = hierarchyElementData.parmDimensionFieldId();
+            parmFieldId = InventDim::dim2dimParm(dimFieldId);
+
+            if (foundUnchecked && _inventDimParm.(parmFieldId) == NoYes::Yes)
+            {
+                ret = checkFailed("@WAX4782");
+            }
+
+            // Take exceptions to the no hole rule into consideration, e.g. we allow license plate to be blank no matter what.
+            if (_inventDimParm.(parmFieldId) == NoYes::No && !WHSReservationHierarchyInventDimUtil::isFieldAllowedBlankInMiddleOfHierarchy(dimFieldId))
+            {
+                foundUnchecked = true;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCanUseFlexibleWarehouseLevelDimensionReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This parameter enables or disables the flexible warehouse-level dimension reservation.
+    /// If this parameter is enabled, an inventory movement should also support flexible reservation.
+    /// </summary>
+    /// <param name = "_canUseFlexibleWarehouseLevelDimensionReservation">Parameter to enable or disable the flexible warehouse-level dimension reservation.</param>
+    /// <returns>True if flexible warehouse-level dimension reservation is enabled; otherwise, false</returns>
+    public boolean parmCanUseFlexibleWarehouseLevelDimensionReservation(boolean _canUseFlexibleWarehouseLevelDimensionReservation = canUseFlexibleWarehouseLevelDimensionReservation)
+    {
+        canUseFlexibleWarehouseLevelDimensionReservation = _canUseFlexibleWarehouseLevelDimensionReservation;
+
+        return canUseFlexibleWarehouseLevelDimensionReservation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustUseFlexibleWarehouseLevelDimensionReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether flexible warehouse level dimension reservation must be used
+    /// </summary>
+    /// <param name="_movement">
+    /// An <c>InventMovement</c> instance.
+    /// </param>
+    /// <returns>
+    /// True if flexible warehouse level dimension reservation must be used; Otherwise, false.
+    /// </returns>
+    internal boolean mustUseFlexibleWarehouseLevelDimensionReservation(InventMovement _movement = this.movement())
+    {
+        return canUseFlexibleWarehouseLevelDimensionReservation && _movement && _movement.canUseFlexibleWarehouseLevelDimensionReservation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getHandlingQtyMaximumToReserveFlexible</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the maximum quantity which can be reserved for the current order committed reservation entity.
+    /// The returns value mimics the ordered quantity for an origin line (i.e. sales order line) but it is calculated for an order committed reservation entity.
+    /// The quantity is calculated for a whole origin line / order committed reservation entity.
+    /// </summary>
+    /// <returns>
+    /// The quantity in the inventory unit.
+    /// </returns>
+    [Hookable(false)]
+    public InventHandlingQty getHandlingQtyMaximumToReserveFlexible()
+    {
+        if (!this.movement())
+        {
+            return 0;
+        }
+
+        if (this.isCWItem())
+        {
+            throw error("@WAX:Error_WHSCWOnHandNotSupported");
+        }
+
+        InventMov_WHSOrderCommittedReservation orderCommittedReservationMovement = movement.whsOrderCommittedReservationMovement(true);
+        InventQty estimatedIssue = -movement.transIdSum(true).estimatedIssue();
+        InventQty reservedFlexible = -transSumBuffer.originReserved(orderCommittedReservationMovement.inventTransOriginId(), orderCommittedReservationMovement.transChildType(), orderCommittedReservationMovement.transChildRefId());
+        InventQty releasedWithOpenWorkQty = WHSOrderCommittedReservationFacade::getReleasedWithOpenWorkQty(movement);
+
+        return estimatedIssue - reservedFlexible - releasedWithOpenWorkQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onhandAvailReservationInventFlexible</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the quantity available for flexible reservation for the specified set of parameters.
+    /// The returns value mimics the avaliable for reservation quantity for an origin line (i.e. sales order line) but it is calculated for an order committed reservation entity.
+    /// The quantity is calculated for a particular dimesions.
+    /// The dimensions can have holes.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The specification of the inventory dimensions to include in the search.
+    /// </param>
+    /// <param name="_inventDimParm">
+    /// The specification of which inventory dimensions to include in the search.
+    /// </param>
+    /// <returns>
+    /// The quantity in the inventory unit.
+    /// </returns>
+    [Hookable(false)]
+    public InventQty onhandAvailReservationInventFlexible(
+        InventDim     _inventDim,
+        InventDimParm _inventDimParm)
+    {
+        if (!this.movement())
+        {
+            return 0;
+        }
+
+        if (this.isCWItem())
+        {
+            throw error("@WAX:Error_WHSCWOnHandNotSupported");
+        }
+        
+        InventMov_WHSOrderCommittedReservation orderCommittedReservationMovement = movement.whsOrderCommittedReservationMovement(true);
+        InventOnhand inventOnhand = InventOnhand::newParameters(movement.itemId(), _inventDim, _inventDimParm);
+        InventQty    physicalInvent = inventOnhand.physicalInvent();
+        InventQty    reservPhysical = inventOnhand.reservPhysical();
+        InventQty    availReservation = inventOnhand.availReservation(NoYes::No);
+        InventQty    totalOriginReserved = -transSumBuffer.originReservPhysical(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId());
+        InventQty    totalReleasedWithOpenWorkQty = WHSOrderCommittedReservationFacade::getReleasedWithOpenWorkQty(movement);
+        InventQty    totalReservedFlexible = -transSumBuffer.originReserved(orderCommittedReservationMovement.inventTransOriginId(), orderCommittedReservationMovement.transChildType(), orderCommittedReservationMovement.transChildRefId());
+
+        return min(physicalInvent - reservPhysical, availReservation + totalOriginReserved - totalReservedFlexible - totalReleasedWithOpenWorkQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInventMovSubType</Name>
+				<Source><![CDATA[
+    protected InventMovSubType getInventMovSubType(InventMovement _movement = this.movement())
+    {
+        if (this.mustUseFlexibleWarehouseLevelDimensionReservation(_movement))
+        {
+            return InventMovSubType::None;
+        }
+
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static WHSInventOnHandReserve construct()
+    {
+        return new WHSInventOnHandReserve();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromFormRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of the <c>WHSInventOnHandReserve</c> class based on the reservation form instance.
+    /// </summary>
+    /// <param name="_onHandReserveFormRun">
+    /// The reservation form.
+    /// </param>
+    /// <returns>
+    /// A new instance of the <c>WHSInventOnHandReserve</c> class.
+    /// </returns>
+    public static WHSInventOnHandReserve newFromFormRun(FormRun _onHandReserveFormRun)
+    {
+        WHSInventOnHandReserve reserve = WHSInventOnHandReserve::construct();
+
+        reserve.parmFormRun(_onHandReserveFormRun);
+
+        return reserve;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onHandQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns an instance of the <c>InventOnHandQueryWHSStandard</c> class with the form query.
+    /// </summary>
+    /// <returns>
+    /// An instance of the <c>InventOnHandQueryWHSStandard</c> class with the form query.
+    /// </returns>
+    [Hookable(false)]
+    public InventOnHandQueryWHSStandard onHandQuery()
+    {
+        return onHandQuery;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>includeReservedQuantityQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds ranges to the query build data source.
+    /// If the movement we are currently working with has reserved qty it is possible that it is reserving the full amount for a dimension set. Making availOrdered 0.
+    /// To avoid omitting these lines we must also include any WHSInventReserve Lines that have reserved quantity.
+    /// </summary>
+    /// <param name = "_qbr">
+    /// The query build data source.
+    /// </param>
+    /// <param name = "_hasReservedQuantity">
+    /// A boolean indicating whether the movement has reserved quantity.
+    /// </param>
+    internal static void includeReservedQuantityQuery(QueryBuildRange _qbr, boolean _hasReservedQuantity)
+    {
+        if (_hasReservedQuantity)
+        {
+            _qbr.value(strFmt('(%1.%2 > 0) || (%1.%3 > 0) || (%1.%4 > 0)',
+                        tableStr(WHSInventReserve),
+                        fieldStr(WHSInventReserve, AvailOrdered),
+                        fieldStr(WHSInventReserve, ReservPhysical),
+                        fieldStr(WHSInventReserve, ReservOrdered)));
+        }
+        else
+        {
+            _qbr.value(strFmt('(%1.%2 > 0)',
+                        tableStr(WHSInventReserve),
+                        fieldStr(WHSInventReserve, AvailOrdered)));
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

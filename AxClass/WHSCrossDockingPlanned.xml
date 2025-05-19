@@ -1,0 +1,1719 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSCrossDockingPlanned</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Contains the logic for planned cross docking.
+/// </summary>
+public final class WHSCrossDockingPlanned extends WHSCrossDocking
+{
+    private Common              commonDemand;
+    private InventHandlingQty   qtyToCrossDock;
+    private InventHandlingQty	preMarkedQty;
+    private InventHandlingQty   consumedPreMarked;  // Amount of premarked quantity that is being consumed by the current loadLine
+    private WHSLicensePlateId   registeredLP;
+    private WMSLocationId       wMSLocationId;
+    private InventDim           parmInventDim;
+    private Map                 mapSupply;
+    private UnknownNoYes        inventDimHasBlankValuesAboveLocationExist = UnknownNoYes::Unknown;
+
+    private boolean             isUseSupplySourceTypeFlightEnabled = WhsCrossDockingPlannedUseSupplySourceTypeV2Flight::instance().isEnabled();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>crossDock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes cross docking.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// The load line demand used in cross docking.
+    /// </param>
+    /// <returns>
+    /// Returns true if the cross docking executes correctly, otherwise; false.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Invalid record.
+    /// </exception>
+    [Hookable(false)]
+    internal static boolean crossDock(WHSLoadLine _loadLine)
+    {
+        boolean ret;
+    
+        if (_loadLine.canBeUsedForPlannedCrossDock())
+        {
+            if (WHSCrossDockingPlannedLateCheckDimensionsHoleV2Flight::instance().isEnabled())
+            {
+                ret = WHSCrossDockingPlanned::newFromCommon(_loadLine).execute();
+            }
+            else
+            {
+                // Prevent planning cross docking for loadLines that have unknown dimension above location in the hierarchy.
+                if (WhsReservationHierarchyInventDimUtil::inventDimHasBlankValues(_loadLine.inventDim(), WhsReservationHierarchyProvider::construct().getDimListAboveLocationFromInventTable(_loadLine.inventTable(), WHSReservationHierarchySortOrder::BottomUp)))
+                {
+                    ret = checkFailed(strFmt("@WAX:CrossDockAboveLocationDimensionFailure", _loadLine.ItemId));
+                }
+                else
+                {
+                    ret = WHSCrossDockingPlanned::newFromCommon(_loadLine).execute();
+                }
+            }
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelPlannedCrossDocking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancels planned cross docking.
+    /// </summary>
+    /// <param name="_common">
+    /// The record used to find the cross docking records.
+    /// </param>
+    /// <param name="_showInfo">
+    /// Shows message or warning depending on completion of method if true.
+    /// </param>
+    [Hookable(false)]
+    internal static void cancelPlannedCrossDocking(
+        Common  _common, 
+        boolean _showInfo)
+    {
+        WHSLoadLine             loadLine;
+        WHSCrossDockLoadLine    crossDockLoadLine;
+        boolean                 cancelled;
+    
+        switch (_common.TableId)
+        {
+            case tableNum(WHSLoadLine):
+                WHSLoadLineRefRecId loadLineRecId = _common.(fieldNum(WHSLoadLine, RecId));
+    
+                while select RecId from crossDockLoadLine
+                    where crossDockLoadLine.LoadLineRecId == loadLineRecId
+                {
+                    cancelled = WHSCrossDockLoadLine::cancelPlannedCrossDocking(crossDockLoadLine.RecId) || cancelled;
+                }
+                break;
+    
+            case tableNum(WHSLoadTable):
+                WHSLoadId loadId = _common.(fieldNum(WHSLoadTable, LoadId));
+    
+                while select RecId from crossDockLoadLine
+                    exists join loadLine
+                    where loadLine.RecId    == crossDockLoadLine.LoadLineRecId
+                    &&    loadLine.LoadId   == loadId
+                {
+                    cancelled = WHSCrossDockLoadLine::cancelPlannedCrossDocking(crossDockLoadLine.RecId) || cancelled;
+                }
+                break;
+    
+            case tableNum(WHSShipmentTable):
+                WHSShipmentId shipmentId = _common.(fieldNum(WHSShipmentTable, ShipmentId));
+    
+                while select RecId from crossDockLoadLine
+                    exists join loadLine
+                    where loadLine.RecId        == crossDockLoadLine.LoadLineRecId
+                    &&    loadLine.ShipmentId   == shipmentId
+                {
+                    cancelled = WHSCrossDockLoadLine::cancelPlannedCrossDocking(crossDockLoadLine.RecId) || cancelled;
+                }
+                break;
+    
+            default:
+                throw error("@WAX:PlannedCrossDockingCancelError");
+        }
+    
+        if (_showInfo)
+        {
+            if (cancelled)
+            {
+                info("@WAX:PlannedCrossDockingCancelled");
+            }
+            else
+            {
+                warning("@WAX:PlannedCrossDockingCancelFail");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the needed quantities including quantity to mark
+    /// </summary>
+    private void calculateQuantities()
+    {
+        switch (commonDemand.TableId)
+        {
+            case tableNum(WHSLoadLine):
+                this.calculateLoadLineQuantities(commonDemand as WHSLoadLine);
+                break;
+    
+            case tableNum(InventTrans):
+                // Don't need to calculate quantity buckets
+                break;
+    
+            default:
+                Error::wrongUseOfFunction(funcName());
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateLoadLineQuantities</Name>
+				<Source><![CDATA[
+    private void calculateLoadLineQuantities(WHSLoadLine _loadLine)
+    {
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().calculateLoadLineQuantities())
+        {
+            this.instrumentationLogger().logRecordInformation(_loadLine);
+
+            if (appl.ttsLevel() == 0)
+            {
+                throw error(strFmt("@SCM:TransactionExpected", funcName()));
+            }
+
+            if (_loadLine.inventTable().ItemType == ItemType::Service)
+            {
+                // Service Items don't need to be cross docked.
+                _loadLine.CrossDockEvaluatedQuantity = _loadLine.InventQty;
+                    
+                _loadLine.update();
+
+            }
+            else
+            {
+                InventHandlingQty   crossDockLoadLineQty;         // Already marked quantity
+                InventHandlingQty   crossDockConsumedQty;         // Consumed quantity
+                InventHandlingQty   qtyToEval;                    // Amount of the loadLine that needs to be evaluated
+                InventHandlingQty   consumedPhysicalReservedQty;  // Amount physical reserved amount on the order that is being consumed
+                InventHandlingQty physicalReservedPickedDeliveredQty;
+
+                qtyToEval                   = _loadLine.InventQty - (_loadLine.CrossDockReservedPhysical + _loadLine.CrossDockQuantity);
+                crossDockConsumedQty        = _loadLine.calculateCrossDockConsumedQuantity();
+                crossDockLoadLineQty        = _loadLine.sumCrossDockLoadLineQuantity();
+                
+                // if there are holes then we should not try to include this since the reserved quantity could be included from other loadLines for the same inventTransId
+                if (!WHSCrossDockingPlannedCalculateLoadLineQtyCheckInventDimBlankValueFlight::instance().isEnabled()
+                    || !WhsReservationHierarchyInventDimUtil::inventDimHasBlankValues(_loadLine.inventDim(), WhsReservationHierarchyProvider::construct().getDimListAboveLocationFromInventTable(_loadLine.inventTable(), WHSReservationHierarchySortOrder::BottomUp)))
+                {
+                    physicalReservedPickedDeliveredQty = WHSInvent::getResPhyPickedDeliveredQty(_loadLine.InventTransId, _loadLine.InventDimId);
+                }
+
+                if (crossDockConsumedQty > physicalReservedPickedDeliveredQty)
+                {
+                    consumedPhysicalReservedQty = min(qtyToEval, physicalReservedPickedDeliveredQty);
+                }
+                else
+                {
+                    consumedPhysicalReservedQty = min(qtyToEval, physicalReservedPickedDeliveredQty - crossDockConsumedQty);
+                }
+
+                consumedPreMarked               = min(qtyToEval - consumedPhysicalReservedQty, abs(WHSInvent::calculateOpenMarkedQuantity(_loadLine.InventTransId, _loadLine.InventDimId)) - crossDockLoadLineQty);
+                qtyToCrossDock                  = max(0, qtyToEval - consumedPhysicalReservedQty - consumedPreMarked);    
+                qtyToCrossDock                  = min(_loadLine.InventQty, qtyToCrossDock);
+
+                // Update the evalated and cdPhysRes buckets.
+                _loadLine.CrossDockEvaluatedQuantity = _loadLine.CrossDockReservedPhysical + _loadLine.CrossDockQuantity + qtyToEval;
+                _loadLine.CrossDockReservedPhysical += consumedPhysicalReservedQty;
+
+                _loadLine.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCrossDockingWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create cross docking work.
+    /// </summary>
+    /// <param name="_qty">
+    /// The quantity that needs work.
+    /// </param>
+    /// <param name="_sourceTransType">
+    /// The source invent trans type.
+    /// </param>
+    /// <returns>
+    /// Returns true if all work was created, otherwise; false.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// A critical error has occurred in function %1.
+    /// </exception>    
+    public boolean createCrossDockingWork(
+        InventHandlingQty	_qty, 
+        InventTransType		_sourceTransType)
+    {
+        InventTrans         inventTransIssue;
+        InventTransOrigin   inventTransOriginIssue;
+        InventHandlingQty   runningQty;
+        boolean             allWorkCreated;
+    
+        ttsbegin;
+    
+        // The class must be initialized with a inventTransIssue record.
+        if (commonDemand.TableId == tableNum(InventTrans))
+        {
+            inventTransIssue = commonDemand;
+            inventTransOriginIssue = InventTransOrigin::find(inventTransIssue.InventTransOrigin);
+        }
+    
+        if (inventTransIssue.direction() != InventDirection::Issue)
+        {
+            throw error(strfmt("@SYS19378", funcname()));
+        }
+    
+        WHSCrossDockTemplate crossDockTemplate;
+
+        // Find Planned Cross Docking Template to validate
+        while select crossDockTemplate
+            order by SequenceNumber
+            where crossDockTemplate.DemandReleasePolicy == WHSCrossDockDemandReleasePolicy::BeforeSupplyReceipt
+            &&     ((crossDockTemplate.WarehouseGroupAll == whsWarehouseGroupAll::Warehouse && crossDockTemplate.InventLocationId == inventDim.InventLocationId)
+                    || crossDockTemplate.WarehouseGroupAll == WhsWarehouseGroupAll::Group
+                    || crossDockTemplate.WarehouseGroupAll == WhsWarehouseGroupAll::All)
+        {
+            if (crossDockTemplate.WarehouseGroupAll == WhsWarehouseGroupAll::Group
+                && !WhsWarehouseGroup::containsWarehouse(crossDockTemplate.WarehouseGroupId, inventDim.InventLocationId))
+            {
+                continue;
+            }
+
+            if (!this.checkTemplateFilter(crossDockTemplate.PackedQueryRun))
+            {
+                continue;
+            }
+    
+            runningQty = _qty;
+    
+            WHSTmpPlannedCrossDocking tmpCrossDocking = WHSTmpPlannedCrossDocking::populatePlannedCrossDocking(inventTransIssue);
+    
+            allWorkCreated = this.createWork(tmpCrossDocking,
+                                            inventTransOriginIssue.InventTransId,
+                                            _sourceTransType,
+                                            crossDockTemplate,
+                                            runningQty);
+            break;
+        }
+    
+        ttscommit;
+    
+        return allWorkCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create work based on cross docking.
+    /// </summary>
+    /// <param name="_tmpCrossDocking">
+    /// Cross docking record used to create work.
+    /// </param>
+    /// <param name="_inventTransOriginIssueInventTransId">
+    /// Invent trans id used to find cross dock demand.
+    /// </param>
+    /// <param name="_sourceTransType">
+    /// Invent trans type for the source.
+    /// </param>
+    /// <param name="_crossDockTemplate">
+    /// The template used in cross docking.
+    /// </param>
+    /// <param name="_runningQty">
+    /// The quantity used to create work.
+    /// </param>
+    /// <returns>
+    /// Returns true if all work was created, otherwise; false.
+    /// </returns>
+    private boolean createWork(
+        WHSTmpPlannedCrossDocking   _tmpCrossDocking,
+        InventTransId               _inventTransOriginIssueInventTransId,
+        InventTransType             _sourceTransType,
+        WHSCrossDockTemplate        _crossDockTemplate,
+        Qty                         _runningQty)
+    {
+        InventQty runningQty = _runningQty;
+        boolean   allWorkCreated;
+    
+        ttsbegin;
+    
+        WHSCrossDockLoadLine crossDockLoadLine;
+        WHSLoadLine          loadLine;
+
+        WHSWorkCreateId workCreateId = WHSWorkTable::findCrossDockWorkBuildId(parmInventDim.LicensePlateId);
+    
+        // Loop over loadLines tied to the inventTransIssue to validate that cross docking can still be applied
+        // Order by the expected ship datetime of the demand source.
+        while select DemandSourceShipDateTime from _tmpCrossDocking
+            order by _tmpCrossDocking.DemandSourceShipDateTime
+            join forUpdate crossDockLoadLine
+                where crossDockLoadLine.RecId                         == _tmpCrossDocking.CrossDockLoadLineRecId
+                &&    crossDockLoadLine.InventTransIdDemand           == _inventTransOriginIssueInventTransId
+                &&    crossDockLoadLine.InventHandlingQtyRemain        > 0
+                join loadLine
+                    where loadLine.RecId == crossDockLoadLine.LoadLineRecId
+        {
+            InventQty tmpQty = min(runningQty, crossDockLoadLine.InventHandlingQtyRemain);
+    
+            runningQty -= tmpQty;
+
+            crossDockLoadLine.InventHandlingQtyRemain -= tmpQty;
+            crossDockLoadLine.update();
+                
+            // create cross dock work
+            WHSWorkCreateCrossDocking workCreate = WHSWorkCreateCrossDocking::newFromParms(loadLine, workCreateId);
+            workCreate.parmCrossDockLoadLine(crossDockLoadLine);
+            workCreate.parmCrossDockingQuantity(tmpQty);
+            workCreate.parmCrossDockTemplate(_crossDockTemplate);
+            workCreate.parmWorkTemplateCode(_crossDockTemplate.WorkTemplateCode);
+            workCreate.parmSourceTransType(_sourceTransType);
+            workCreate.parmRegisteredInventDim(parmInventDim);
+            workCreate.parmTargetLicensePlateId(parmInventDim.LicensePlateId);
+            workCreate.parmStartLocationId(parmInventDim.wMSLocationId);
+            workCreateId = workCreate.createWork();
+    
+            if (runningQty <= 0)
+            {
+                allWorkCreated = true;
+                break;
+            }
+        }
+    
+        ttscommit;
+    
+        return allWorkCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Execute cross dock planning.
+    /// </summary>
+    /// <returns>
+    /// Returns true if cross docking completes, otherwise; false.
+    /// </returns>
+    [Hookable(false)]
+    internal final boolean execute()
+    {
+        if (consumedPreMarked == 0 &&
+            qtyToCrossDock <= 0)
+        {
+            //Nothing to do
+            return true;
+        }
+
+        // Cross docking is not supported for Catch weight items
+        // Values set on loadLine during setGlobals is still needed for other validation to pass.
+        if (PdsGlobal::pdsIsCWItem(itemId))
+        {
+            return true;
+        }
+
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().crossDock())
+        {
+            InventLocation inventLocation = InventLocation::find(inventDim.InventLocationId);
+
+            this.instrumentationLogger().logRecordInformation(inventLocation);
+
+            ttsbegin;
+    
+            WHSCrossDockTemplate    crossDockTemplate;
+            boolean                 foundTemplate;
+            boolean                 ret = true;
+            int                     templateCount;
+
+            boolean lateCheckDimensionsHoleFlightEnabled = WHSCrossDockingPlannedLateCheckDimensionsHoleV2Flight::instance().isEnabled();
+            boolean errorOutTransactionFlightEnabled = WHSCrossDockingPlannedErrorOutTransactionFlight::instance().isEnabled();
+            boolean isCrossDockingPlannedDimensionsAboveLocationAreMissing;
+
+            while select crossDockTemplate
+                order by SequenceNumber
+                where crossDockTemplate.DemandReleasePolicy == WHSCrossDockDemandReleasePolicy::BeforeSupplyReceipt
+                &&    ((crossDockTemplate.WarehouseGroupAll == whsWarehouseGroupAll::Warehouse && crossDockTemplate.InventLocationId == inventLocation.InventLocationId)
+                    || crossDockTemplate.WarehouseGroupAll == WhsWarehouseGroupAll::Group
+                    || crossDockTemplate.WarehouseGroupAll == WhsWarehouseGroupAll::All)
+            {
+                if (crossDockTemplate.WarehouseGroupAll == WhsWarehouseGroupAll::Group
+                && !WhsWarehouseGroup::containsWarehouse(crossDockTemplate.WarehouseGroupId, inventLocation.InventLocationId))
+                {
+                    continue;
+                }
+
+                if (lateCheckDimensionsHoleFlightEnabled 
+                    && this.checkAllDimensionsAboveLocationFilled()
+                    && this.preventCrossDockWhenDimensionsAboveLocationAreMissing())
+                {
+                    if (errorOutTransactionFlightEnabled)
+                    {
+                        isCrossDockingPlannedDimensionsAboveLocationAreMissing = true;
+
+                        // Prevent planning cross docking for order lines that have unknown dimension above location in the hierarchy.
+                        ret = checkFailed(strFmt("@WAX:CrossDockAboveLocationDimensionFailure", itemId));
+                        break;
+                    }
+                    else
+                    {
+                        // Prevent planning cross docking for order lines that have unknown dimension above location in the hierarchy.
+                        return checkFailed(strFmt("@WAX:CrossDockAboveLocationDimensionFailure", itemId));
+                    }
+                }                
+
+                templateCount++;
+
+                this.instrumentationLogger().logRecordInformation(crossDockTemplate);
+
+                if (!this.checkTemplateFilter(crossDockTemplate.PackedQueryRun)
+                    || !this.validateQty(crossDockTemplate))
+                {
+                    continue;
+                }
+    
+                foundTemplate = true;
+    
+                // Pre marked quantity must be processed for loadLines
+                if (consumedPreMarked)
+                {
+                    crossDockPlanned = true;
+                    ret = this.planCrossDockingFromMarking(crossDockTemplate);
+                }
+    
+                if (qtyToCrossDock > 0)
+                {
+                    crossDockPlanned = true;
+                    this.planCrossDockingFromSupplySources(crossDockTemplate);
+                }
+
+                break;
+
+            }
+    
+            if (qtyToCrossDock > 0 && !isCrossDockingPlannedDimensionsAboveLocationAreMissing)
+            {
+                if (!foundTemplate)
+                {
+                    // Display error related to template validation.
+                    this.displayErrors();
+                } 
+                else
+                {
+                    // Only show cross docking error message if we actually found a template
+                    // The false return will still create other appropriate error messages.
+                    warning("@WAX:CrossDockQuantityRemainWarning");
+                }
+
+                ret = false;
+
+            }
+    
+            ttscommit;
+
+            this.instrumentationLogger().plannedCrossDocking().crossDocked(activityContext, ret, foundTemplate, templateCount);
+
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preventCrossDockWhenDimensionsAboveLocationAreMissing</Name>
+				<Source><![CDATA[
+    protected boolean preventCrossDockWhenDimensionsAboveLocationAreMissing()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planCrossDockingFromSupplySources</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Plans cross docking based on supply sources.
+    /// </summary>
+    /// <param name="_crossDockTemplate">
+    /// The template used to find the supply source.
+    /// </param>
+    private void planCrossDockingFromSupplySources(WHSCrossDockTemplate _crossDockTemplate)
+    {
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().planCrossDockingFromSupplySources())
+        {
+            int supplySourceCount;
+
+            WHSCrossDockTemplateSupplySource  crossDockTemplateSupplySource;
+    
+            // Loop through the valid Supply Sources.
+            while select SupplySource, PackedQueryRun from crossDockTemplateSupplySource
+                order by crossDockTemplateSupplySource.SequenceNumber
+                where crossDockTemplateSupplySource.CrossDockTemplateId == _crossDockTemplate.CrossDockTemplateId
+            {
+                supplySourceCount++;
+                this.instrumentationLogger().logRecordInformation(crossDockTemplateSupplySource);
+
+                if (isUseSupplySourceTypeFlightEnabled)
+                {
+                    this.planCrossDockingFromSupplySource(_crossDockTemplate, crossDockTemplateSupplySource);
+                }
+                else
+                {
+                    switch (crossDockTemplateSupplySource.SupplySource)
+                    {
+                        case WHSCrossDockSupplySource::PurchaseOrder:
+                            this.planCrossDockingFromPurchaseOrder(_crossDockTemplate, crossDockTemplateSupplySource);
+                            break;
+    
+                        case WHSCrossDockSupplySource::ProductionOrder:
+                            this.planCrossDockingFromProductionOrder(_crossDockTemplate, crossDockTemplateSupplySource);
+                            break;
+    
+                        case WHSCrossDockSupplySource::TransferOrderReceipt:
+                            this.planCrossDockingFromTransferOrder(_crossDockTemplate, crossDockTemplateSupplySource);
+                            break;
+                    }
+                }
+    
+                if (qtyToCrossDock == 0)
+                {
+                    break;
+                }
+            }
+    
+            int plannedCount;
+
+            if (qtyToCrossDock > 0)
+            {
+                warning(strfmt("@WAX:NoCrossDockSupplyFound", qtyToCrossDock, itemId));
+            }
+            else
+            {
+                plannedCount = this.createCrossDockingOfSupply();
+            }
+
+            this.instrumentationLogger().plannedCrossDocking().plannedCrossDockingFromSupplySources(activityContext, supplySourceCount, plannedCount, qtyToCrossDock > 0);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planCrossDockingFromSupplySource</Name>
+				<Source><![CDATA[
+    private void planCrossDockingFromSupplySource(
+        WHSCrossDockTemplate                _crossDockTemplate,
+        WHSCrossDockTemplateSupplySource    _crossDockTemplateSupplySource)
+    {
+        if (!isUseSupplySourceTypeFlightEnabled)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().planCrossDockingFromSupplySource(_crossDockTemplateSupplySource.SupplySource))
+        {
+            int         supplyCount;
+            int         plannedCount;
+            
+            RecId       prevSupplySourceTableRecId;
+            InventDimId prevDimId;
+            boolean     valid = true;
+
+            WhsICrossDockSupplySourceType crossDockSupplySourceType = this.getCrossDockSupplySourceTypeForTemplateSupplySource(_crossDockTemplateSupplySource);
+    
+            QueryRun qr = new QueryRun(_crossDockTemplateSupplySource.PackedQueryRun);
+    
+            Query q = qr.query();
+    
+            QueryBuildDataSource qbdsInventDim = q.dataSourceTable(tableNum(InventDim));
+            QueryBuildDataSource qbdsInventTrans = q.dataSourceTable(tableNum(InventTrans));
+            if (!qbdsInventDim || !qbdsInventTrans)
+            {
+                throw error(error::wrongUseOfFunction(funcName()));
+            }
+                
+            crossDockSupplySourceType.setItemIdRangeOnSupplyQuery(q, itemId);
+            this.setDimRangesOnSupplyQuery(qbdsInventDim, itemId);
+    
+            while (qr.next())
+            {
+                supplyCount++;
+                
+                Common supplySourceTable = crossDockSupplySourceType.getSupplySourceTableFromSupplyQueryRun(qr);
+                InventTrans inventTrans = qr.get(tableNum(InventTrans));
+                InventDim curInventDim = qr.get(tableNum(InventDim));
+    
+                boolean doesContinue;
+
+                [valid, doesContinue] = this.validateLineDimension(_crossDockTemplate,
+                                                                   curInventDim,
+                                                                   valid,
+                                                                   supplySourceTable.RecId != prevSupplySourceTableRecId,
+                                                                   prevDimId != curInventDim.inventDimId,
+                                                                   crossDockSupplySourceType.getSupplyDateTimeFromSupplySourceTable(supplySourceTable));
+                
+                if (doesContinue)
+                {
+                    continue;
+                }
+
+                valid = true;
+                prevSupplySourceTableRecId = supplySourceTable.RecId;
+                prevDimId = curInventDim.inventDimId;
+    
+                this.storeSupplyTransactionQuantity(inventTrans, _crossDockTemplate.CrossDockTemplateId);
+                plannedCount++;
+
+                if (qtyToCrossDock == 0)
+                {
+                    break;
+                }
+            }
+
+            this.instrumentationLogger().plannedCrossDocking().plannedCrossDockingFromSupplySource(activityContext, supplyCount, plannedCount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCrossDockSupplySourceTypeForTemplateSupplySource</Name>
+				<Source><![CDATA[
+    private WhsICrossDockSupplySourceType getCrossDockSupplySourceTypeForTemplateSupplySource(WHSCrossDockTemplateSupplySource _crossDockTemplateSupplySource)
+    {
+        WhsCrossDockSupplySourceTypeAttribute attribute = new WhsCrossDockSupplySourceTypeAttribute(_crossDockTemplateSupplySource.SupplySource);
+        WhsICrossDockSupplySourceType crossDockSupplySourceType = SysExtensionAppClassFactory::getClassFromSysAttribute(classStr(WhsICrossDockSupplySourceType), attribute);
+
+        if (!crossDockSupplySourceType)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));        
+        }
+
+        return crossDockSupplySourceType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planCrossDockingFromTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Plans transfer order supply for cross docking and stores it.
+    /// </summary>
+    /// <param name="_crossDockTemplate">
+    /// The cross dock template used to validate supply.
+    /// </param>
+    /// <param name="_crossDockTemplateSupplySource">
+    /// The cross dock template supply source to find supply.
+    /// </param>
+    private void planCrossDockingFromTransferOrder(
+        WHSCrossDockTemplate                _crossDockTemplate,
+        WHSCrossDockTemplateSupplySource    _crossDockTemplateSupplySource)
+    {
+        if (isUseSupplySourceTypeFlightEnabled)
+        {
+            // Remove method when the flight is removed
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().planCrossDockingFromSupplySource(_crossDockTemplateSupplySource.SupplySource))
+        {
+            int         supplyCount;
+            int         plannedCount;
+            
+            RecId       prevInventTransferLine;
+            InventDimId prevDimId;
+            boolean     valid = true;
+    
+            QueryRun qr = new QueryRun(_crossDockTemplateSupplySource.PackedQueryRun);
+    
+            Query q = qr.query();
+    
+            QueryBuildDataSource qbdsInventDim = q.dataSourceTable(tableNum(InventDim));
+    
+            q.dataSourceTable(tableNum(InventTransferLine)).addRange(fieldNum(InventTransferLine, ItemId)).value(itemId);
+            this.setDimRangesOnSupplyQuery(qbdsInventDim, itemId);
+    
+            while (qr.next())
+            {
+                supplyCount++;
+
+                InventTransferLine  inventTransferLine  = qr.get(tableNum(InventTransferLine));
+                InventTrans         inventTrans         = qr.get(tableNum(InventTrans));
+                InventDim           curInventDim        = qr.get(tableNum(InventDim));
+    
+                boolean doesContinue;
+
+                [valid, doesContinue] = this.validateLineDimension(_crossDockTemplate,
+                                                                   curInventDim,
+                                                                   valid,
+                                                                   inventTransferLine.RecId != prevInventTransferLine,
+                                                                   prevDimId != curInventDim.inventDimId,
+                                                                   inventTransferLine.receiveTransDateTime());
+
+                if (doesContinue)
+                {
+                    continue;
+                }
+
+                valid = true;
+                prevInventTransferLine = inventTransferLine.RecId;
+                prevDimId = curInventDim.inventDimId;
+    
+                this.storeSupplyTransactionQuantity(inventTrans, _crossDockTemplate.CrossDockTemplateId);
+                plannedCount++;
+
+                if (qtyToCrossDock == 0)
+                {
+                    break;
+                }
+            }
+
+            this.instrumentationLogger().plannedCrossDocking().plannedCrossDockingFromSupplySource(activityContext, supplyCount, plannedCount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planCrossDockingFromProductionOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Plans production order supply for cross docking and stores it.
+    /// </summary>
+    /// <param name="_crossDockTemplate">
+    /// The cross dock template used to validate supply.
+    /// </param>
+    /// <param name="_crossDockTemplateSupplySource">
+    /// The cross dock template supply source to find supply.
+    /// </param>
+    private void planCrossDockingFromProductionOrder(
+        WHSCrossDockTemplate                _crossDockTemplate,
+        WHSCrossDockTemplateSupplySource    _crossDockTemplateSupplySource)
+    {
+        if (isUseSupplySourceTypeFlightEnabled)
+        {
+            // Remove method when the flight is removed
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().planCrossDockingFromSupplySource(_crossDockTemplateSupplySource.SupplySource))
+        {
+            int         supplyCount;
+            int         plannedCount;
+            
+            ProdId      prevProdId;
+            InventDimId prevDimId;
+            boolean     valid = true;
+    
+            QueryRun qr = new QueryRun(_crossDockTemplateSupplySource.PackedQueryRun);
+    
+            Query q = qr.query();
+    
+            QueryBuildDataSource qbdsInventDim = q.dataSourceTable(tableNum(InventDim));
+    
+            q.dataSourceTable(tableNum(ProdTable)).addRange(fieldNum(ProdTable, ItemId)).value(itemId);
+            this.setDimRangesOnSupplyQuery(qbdsInventDim, itemId);
+    
+            while (qr.next())
+            {
+                supplyCount++;
+
+                ProdTable   prodTable    = qr.get(tableNum(ProdTable));
+                InventDim   curInventDim = qr.get(tableNum(InventDim));
+                InventTrans inventTrans  = qr.get(tableNum(InventTrans));
+    
+                boolean doesContinue;
+
+                [valid, doesContinue] = this.validateLineDimension(_crossDockTemplate,
+                                                                   curInventDim,
+                                                                   valid,
+                                                                   prodTable.ProdId != prevProdId,
+                                                                   prevDimId != curInventDim.inventDimId,
+                                                                   prodTable.DeliveryDateTime(prodTable));
+
+                if (doesContinue)
+                {
+                    continue;
+                }
+    
+                valid = true;
+                prevProdId = prodTable.ProdId;
+                prevDimId = curInventDim.inventDimId;
+    
+                this.storeSupplyTransactionQuantity(inventTrans, _crossDockTemplate.CrossDockTemplateId);
+                plannedCount++;
+
+                if (qtyToCrossDock == 0)
+                {
+                    break;
+                }
+            }
+
+            this.instrumentationLogger().plannedCrossDocking().plannedCrossDockingFromSupplySource(activityContext, supplyCount, plannedCount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planCrossDockingFromPurchaseOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Plans purchse order supply for cross docking and stores it.
+    /// </summary>
+    /// <param name="_crossDockTemplate">
+    /// The cross dock template used to validate supply.
+    /// </param>
+    /// <param name="_crossDockTemplateSupplySource">
+    /// The cross dock template supply source to find supply.
+    /// </param>
+    private void planCrossDockingFromPurchaseOrder(
+        WHSCrossDockTemplate                _crossDockTemplate,
+        WHSCrossDockTemplateSupplySource    _crossDockTemplateSupplySource)
+    {
+        if (isUseSupplySourceTypeFlightEnabled)
+        {
+            // Remove method when the flight is removed
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().planCrossDockingFromSupplySource(_crossDockTemplateSupplySource.SupplySource))
+        {
+            int         supplyCount;
+            int         plannedCount;
+
+            RecId       prevPurchLine;
+            InventDimId prevDimId;
+            boolean     valid = true;
+    
+            QueryRun qr = new QueryRun(_crossDockTemplateSupplySource.PackedQueryRun);
+    
+            Query q = qr.query();
+    
+            QueryBuildDataSource qbdsInventDim = q.dataSourceTable(tableNum(InventDim));
+    
+            q.dataSourceTable(tableNum(PurchLine)).addRange(fieldNum(PurchLine, ItemId)).value(itemId);
+            this.setDimRangesOnSupplyQuery(qbdsInventDim, itemId);
+    
+            while (qr.next())
+            {
+                supplyCount++;
+
+                PurchLine purchLine       = qr.get(tableNum(PurchLine));
+                InventDim curInventDim    = qr.get(tableNum(InventDim));
+                InventTrans inventTrans   = qr.get(tableNum(InventTrans));
+    
+                boolean doesContinue;
+
+                [valid, doesContinue] = this.validateLineDimension(_crossDockTemplate,
+															       curInventDim,
+														   	       valid,
+															       purchLine.RecId != prevPurchLine,
+															       prevDimId != curInventDim.inventDimId,
+															       purchLine.deliveryTransDateTime());
+
+			    if (doesContinue)
+                {
+                    continue;
+                }
+    
+                valid = true;
+                prevPurchLine = purchLine.RecId;
+                prevDimId = curInventDim.inventDimId;
+    
+                this.storeSupplyTransactionQuantity(inventTrans, _crossDockTemplate.CrossDockTemplateId);
+                plannedCount++;
+
+                if (qtyToCrossDock == 0)
+                {
+                    break;
+                }
+            }
+
+            this.instrumentationLogger().plannedCrossDocking().plannedCrossDockingFromSupplySource(activityContext, supplyCount, plannedCount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>storeSupplyTransactionQuantity</Name>
+				<Source><![CDATA[
+	private void storeSupplyTransactionQuantity(
+		InventTrans				_inventTrans,
+		WHSCrossDockTemplateId	_crossDockTemplateId)
+    {
+        InventHandlingQty availToCrossDock = _inventTrans.Qty;
+        InventHandlingQty qty = qtyToCrossDock <= availToCrossDock ? qtyToCrossDock : availToCrossDock;
+    
+        this.storeSupply(_inventTrans, qty, _crossDockTemplateId); // Modifies qtyToCrossDock
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateLineDimension</Name>
+				<Source><![CDATA[
+	private container validateLineDimension(
+		WHSCrossDockTemplate	_crossDockTemplate,
+		InventDim				_curInventDim,
+		boolean					_curValid,
+		boolean					_newSupplyLine,
+		boolean					_newDimension,
+		utcdatetime				_supplyDateTime)
+    {
+        boolean valid = _curValid;
+        boolean doesContinue;
+
+        if (_newSupplyLine)
+        {
+            TransDateTime shipDateTime = WHSCrossDocking::calculateShipDateTime(commonDemand);
+
+            if (!this.validateWindow(_crossDockTemplate, shipDateTime, _supplyDateTime)
+                ||  !WHSCrossDockLoadLine::validateFEFOBatch(_crossDockTemplate, _curInventDim, itemId))
+            {
+                valid = false;
+                doesContinue = true;
+            }
+        }
+        else if (_newDimension)
+        {
+            if (!WHSCrossDockLoadLine::validateFEFOBatch(_crossDockTemplate, _curInventDim, itemId))  
+            {
+                valid = true;
+                doesContinue = true;
+            }
+        }
+        else
+        {
+            if (!valid)
+            {
+                doesContinue = true;
+            }
+        }
+
+        return [valid, doesContinue];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance.
+    /// </summary>
+    /// <param name="_common">
+    /// The demand for cross docking.
+    /// </param>
+    protected void new(Common _common)
+    {
+        super(_common);
+    
+        commonDemand = _common;
+
+        this.setGlobals();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromCommon</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize a new <c>WHSCrossDockingPlanned</c> class.
+    /// </summary>
+    /// <param name = "_common">The <c>Common</c> to use.</param>
+    /// <returns>An instance of the <c>WHSCrossDockingPlanned</c> class.</returns>
+    [Hookable(false)]
+    public static WHSCrossDockingPlanned newFromCommon(Common _common)
+    {
+        WHSCrossDockingPlanned crossDockingPlanned = new WHSCrossDockingPlanned(_common);
+        
+        return crossDockingPlanned;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventDim</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public InventDim parmInventDim(inventDim _inventDim = parmInventDim)
+    {
+        parmInventDim = _inventDim;
+    
+        return parmInventDim;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRegisteredLP</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal WHSLicensePlateId parmRegisteredLP(WHSLicensePlateId _registeredLP = registeredLP)
+    {
+        registeredLP = _registeredLP;
+    
+        return registeredLP;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStartLocationId</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal WMSLocationId parmStartLocationId(WMSLocationId _wMSLocationId = wMSLocationId)
+    {
+        wMSLocationId = _wMSLocationId;
+    
+        return wMSLocationId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planCrossDockingFromMarking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Plans cross docking of marked reserved ordered quantities.
+    /// </summary>
+    /// <param name="_crossDockTemplate">
+    /// The template used to validate.
+    /// </param>
+    /// <returns>
+    /// Returns true if the supply validates and a marking is created, otherwise; false.
+    /// </returns>
+    private boolean planCrossDockingFromMarking(WHSCrossDockTemplate _crossDockTemplate)
+    {
+        boolean isWhsCrossDockingOnlyValidateDateTimesIfWindowSpecifiedFlightEnabled = WhsCrossDockingOnlyValidateDateTimesIfWindowSpecifiedFlight::instance().isEnabled();
+
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().planCrossDockingFromMarking())
+        {
+            boolean ret = true;
+            int     markingCount;
+            int     plannedCount;
+            int     failedCount;
+    
+            InventTransId inventTransId = this.resolveInventTransId(commonDemand);
+        
+            InventDimParm inventDimParm;
+            inventDimParm.initFromInventDim(inventDim);
+    
+            InventHandlingQty   runningQty = consumedPreMarked;
+
+            InventDim           joinInventDim;
+            InventTrans         inventTrans;
+            InventTransOrigin   inventTransOrigin;
+
+            while select sum(Qty) from inventTrans
+                group by inventTransOrigin.InventTransId, inventTrans.MarkingRefInventTransOrigin
+                join inventTransOrigin
+                    where inventTrans.InventTransOrigin             == inventTransOrigin.RecId
+                    &&    inventTransOrigin.InventTransId           == inventTransId
+                    &&    inventTrans.StatusIssue                   >= StatusIssue::ReservOrdered
+                    &&    inventTrans.MarkingRefInventTransOrigin   != 0
+                    #InventDimExistsJoin(inventTrans.InventDimId, joinInventDim, inventDim, inventDimParm)
+            {
+                if (!runningQty)
+                {
+                    break;
+                }
+                
+                markingCount++;
+
+                InventTransOrigin   supplyInventTransOrigin = InventTransOrigin::find(inventTrans.MarkingRefInventTransOrigin);
+
+                this.instrumentationLogger().logRecordInformation(supplyInventTransOrigin);
+
+                if (!this.validateSupplySource(_crossDockTemplate, supplyInventTransOrigin))
+                {
+                    ret = checkFailed(strFmt("@WAX:SupplySourceNotValid", supplyInventTransOrigin.ReferenceCategory, _crossDockTemplate.CrossDockTemplateId));
+                    failedCount++;
+                    continue;
+                }
+   
+                TransDateTime       supplyDateTime          = WHSCrossDocking::calculateSupplyDateTime(supplyInventTransOrigin);
+                TransDateTime       shipDateTime            = WHSCrossDocking::calculateShipDateTime(commonDemand);
+
+                if (this.validateWindow(_crossDockTemplate, shipDateTime, supplyDateTime))
+                {
+                    InventHandlingQty qtyAlreadyPlannedForCrossDocking = WHSCrossDockLoadLine::calculateRemainingQtyPlannedForCrossDock(inventTransOrigin.inventTransId, inventTrans.MarkingRefInventTransOrigin, inventDim);
+    
+                    InventHandlingQty availQty = abs(inventTrans.Qty) - qtyAlreadyPlannedForCrossDocking;
+    
+                    if (this.shouldUpdateOrCreateCrossDockLoadLine(availQty))
+                    {
+                        WHSCrossDockLoadLine crossDockLoadLine;
+                        crossDockLoadLine.InventHandlingQty               = availQty;
+                        crossDockLoadLine.InventHandlingQtyRemain         = crossDockLoadLine.InventHandlingQty;
+                        crossDockLoadLine.InventTransIdDemand             = inventTransOrigin.InventTransId;
+                        crossDockLoadLine.InventTransOriginIdSupply       = inventTrans.MarkingRefInventTransOrigin;
+                        crossDockLoadLine.LoadLineRecId                   = commonDemand.RecId;
+                        crossDockLoadLine.CrossDockTemplateId             = _crossDockTemplate.CrossDockTemplateId;
+    
+                        WHSCrossDockLoadLine::updateOrCreate(crossDockLoadLine);
+    
+                        runningQty -= availQty;
+                        plannedCount++;
+                    }
+                }
+                else
+                {
+                    if (isWhsCrossDockingOnlyValidateDateTimesIfWindowSpecifiedFlightEnabled)
+                    {
+                        ret = checkFailed(strFmt("@WAX:CrossDockTimeWindowFailWithDetails", supplyInventTransOrigin.ReferenceCategory, supplyInventTransOrigin.ReferenceId));
+                    }
+                    else
+                    {
+                        ret = checkFailed("@WAX:CrossDockTimeWindowFail");
+                    }
+                    failedCount++;
+                }
+            }
+    
+            this.instrumentationLogger().plannedCrossDocking().plannedCrossDockingFromMarking(activityContext, markingCount, plannedCount, failedCount);
+
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldUpdateOrCreateCrossDockLoadLine</Name>
+				<Source><![CDATA[
+    private boolean shouldUpdateOrCreateCrossDockLoadLine(InventHandlingQty _availQty)
+    {
+        return _availQty > 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCrossDockingOfSupply</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates cross docking from located supply.
+    /// </summary>
+    /// <returns>
+    /// The amount of planned cross dock load lines.
+    /// </returns>
+    private int createCrossDockingOfSupply()
+    {
+        int createdLines;
+
+        MapEnumerator mapEnumerator = mapSupply.getEnumerator();
+    
+        while (mapEnumerator.moveNext())
+        {
+            InventTrans             supplyInventTrans = mapEnumerator.currentKey();
+            InventHandlingQty       qty;
+            WHSCrossDockTemplateId  crossDockTemplateId;
+
+            [qty, crossDockTemplateId] = mapEnumerator.currentValue();
+    
+            createdLines += this.createCrossDockLoadLines(supplyInventTrans, commonDemand, qty, crossDockTemplateId);
+        }
+
+        return createdLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDimRangesOnSupplyQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set ranges on the query for dimensions.
+    /// </summary>
+    /// <param name="_qbdsInventDim">
+    /// The data source where ranges are added.
+    /// </param>
+    /// <param name="_itemId">
+    /// The item used to find product dimensions.
+    /// </param>
+    private void setDimRangesOnSupplyQuery(
+        QueryBuildDataSource _qbdsInventDim,
+        ItemId               _itemId)
+    {
+        // Set Product dimension criteria
+        ListEnumerator le = InventDimGroupSetup::newItemIdProductDimensionsOnly(_itemId).activeFields().getEnumerator();
+
+        while (le.moveNext())
+        {
+            SysQuery::findOrCreateRange(_qbdsInventDim, le.current()).value(queryValue(inventDim.(le.current())));
+        }
+    
+        // Set criteria for dimensions above location
+        List aboveLocDimList = WHSReservationHierarchyProvider::construct().getDimListAboveLocation(this.getReservationHierarchyRecId(), WHSReservationHierarchySortOrder::TopDown);
+        le = aboveLocDimList.getEnumerator();
+    
+        while (le.moveNext())
+        {
+            WHSReservationHierarchyElementData elementData = le.current();
+            // If the dimension is not blank then set the value as a range on the query.
+            if (InventDim.(elementData.parmDimensionFieldId()))
+            {
+                SysQuery::findOrCreateRange(_qbdsInventDim, elementData.parmDimensionFieldId()).value(queryValue(inventDim.(elementData.parmDimensionFieldId())));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setGlobals</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the global values.
+    /// </summary>
+    protected void setGlobals()
+    {
+        itemId      = this.resolveItemId(commonDemand);
+        inventDim   = this.resolveInventDim(commonDemand);
+    
+        mapSupply = new Map(Types::Record, Types::Container);
+    
+        // Calculate the quantity buckets around this demand source.
+        this.calculateQuantities();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>storeSupply</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Stores the supply record to a map.
+    /// </summary>
+    /// <param name="_common">
+    /// The supply record to store.
+    /// </param>
+    /// <param name="_qty">
+    /// The quantity the supply is used for.
+    /// </param>
+    /// <param name="_crossDockTemplateId">
+    /// The cross dock template ID for the cross dock template used to validate the supply.
+    /// </param>
+    private void storeSupply(
+        Common                  _common,
+        InventQty               _qty,
+        WHSCrossDockTemplateId  _crossDockTemplateId)
+    {
+        if (_qty)
+        {
+            mapSupply.insert(_common, [_qty, _crossDockTemplateId]);
+    
+            qtyToCrossDock -= _qty;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasPlannedCrossDockToVerify</Name>
+				<Source><![CDATA[
+    private boolean hasPlannedCrossDockToVerify(InventTransId _inventTransId)
+    {
+        WHSCrossDockLoadLine crossDockLoadLine;
+
+		select firstonly RecId from crossDockLoadLine
+			where crossDockLoadLine.InventTransIdDemand == _inventTransId
+                && crossDockLoadLine.InventHandlingQtyRemain > 0;
+
+        return crossDockLoadLine.RecId != 0;
+	}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>verifyPlannedCrossDocking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Verifies if the supply receipt InventTrans is still valid for planned cross docking,
+    /// otherwise; it removes/reduces cross dock load lines that fail to validate.
+    /// </summary>
+    /// <param name="_inventTransIssue">
+    /// The <c>InventTrans</c> for the supply.
+    /// </param>
+    /// <param name="_supplyInventDim">
+    /// The inventDim for the supply.
+    /// </param>
+    /// <param name="_qtyToVerify">
+    /// The quantity needed to verify.
+    /// </param>
+    /// <returns>
+    /// Returns true if the supply InventTrans is valid, otherwise; false.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// A critical error has occurred in function %1.
+    /// </exception>
+    [Hookable(false)]
+    internal final boolean verifyPlannedCrossDocking(
+        InventTrans         _inventTransIssue,
+        InventDim           _supplyInventDim, 
+        InventHandlingQty   _qtyToVerify)
+    {
+        if (_inventTransIssue.direction() != InventDirection::Issue)
+        {
+            throw error(strfmt("@SYS19378", funcname()));
+        }
+
+        InventTransOrigin inventTransOriginIssue = _inventTransIssue.inventTransOrigin();
+
+        if (!this.hasPlannedCrossDockToVerify(inventTransOriginIssue.InventTransId))
+        {
+            return false;
+        }
+
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().verifyPlannedCrossDocking())
+        {
+            boolean valid;
+        
+            ttsbegin;
+
+            InventHandlingQty runningQty = _qtyToVerify;
+
+            WHSTmpPlannedCrossDocking tmpCrossDocking = WHSTmpPlannedCrossDocking::populatePlannedCrossDocking(_inventTransIssue);
+            WHSCrossDockLoadLine      crossDockLoadLine;
+            WHSCrossDockTemplate      crossDockTemplate;
+            WHSLoadLine               loadLine;
+
+            // Loop over loadLines tied to the _inventTransIssue to validate that cross docking can still be applied
+            // Order by the expected ship datetime of the demand source.
+            while select DemandSourceShipDateTime from tmpCrossDocking
+                order by tmpCrossDocking.DemandSourceShipDateTime
+                join forupdate crossDockLoadLine
+                    where crossDockLoadLine.RecId                         == tmpCrossDocking.CrossDockLoadLineRecId
+                    &&    crossDockLoadLine.InventTransIdDemand           == inventTransOriginIssue.InventTransId
+                    &&    crossDockLoadLine.InventHandlingQtyRemain        > 0
+                    join loadLine
+                        where loadLine.RecId == crossDockLoadLine.LoadLineRecId
+                    join crossDockTemplate
+                        where crossDockTemplate.CrossDockTemplateId == crossDockLoadLine.CrossDockTemplateId
+            {
+                if (runningQty <= 0)
+                {
+                    break;
+                }
+
+                // Reset valid value
+                valid = true;
+
+                if (!this.checkTemplateFilter(crossDockTemplate.PackedQueryRun))
+                {
+                    valid = false;
+                }
+
+                if (loadLine.Invalid)
+                {
+                    valid = false;
+                }
+
+                InventTransOrigin supplyInventTransOrigin = InventTransOrigin::find(crossDockLoadLine.InventTransOriginIdSupply);
+
+                if (crossDockTemplate.RevalidateOnReceipt
+                ||  (supplyInventTransOrigin.ReferenceCategory != InventTransType::Purch
+                &&   supplyInventTransOrigin.ReferenceCategory != InventTransType::TransferOrderReceive))
+                {
+                    TransDateTime shipDateTime = WHSCrossDocking::calculateShipDateTime(loadLine);
+
+                    valid = valid && this.validateWindow(crossDockTemplate, shipDateTime, DateTimeUtil::utcNow());
+
+                    if (loadLine.inventTable().whsBatchActive())
+                    {
+                        valid = valid && WHSCrossDockLoadLine::validateFEFOBatch(crossDockTemplate, _supplyInventDim, loadLine.ItemId);
+                    }
+                }
+
+                if (!valid)
+                {
+                    InventQty tempQtyReduce = min(crossDockLoadLine.InventHandlingQtyRemain, runningQty);
+
+                    if (tempQtyReduce >= crossDockLoadLine.InventHandlingQty)
+                    {
+                        crossDockLoadLine.delete();
+                    }
+                    else
+                    {
+                        crossDockLoadLine.InventHandlingQty         -= tempQtyReduce;
+                        crossDockLoadLine.InventHandlingQtyRemain   -= tempQtyReduce;
+                        crossDockLoadLine.InventQtyMarked = crossDockLoadLine.calculateInventQtyMarked(-tempQtyReduce);                        
+                    
+                        crossDockLoadLine.update();
+                    }
+                }
+                else
+                {
+                    runningQty -= crossDockLoadLine.InventHandlingQtyRemain;
+                }
+            }
+
+            ttscommit;
+
+            this.instrumentationLogger().plannedCrossDocking().verifiedPlannedCrossDocking(activityContext, valid);
+
+            return valid;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the demand source against the templates resevation requirements.
+    /// </summary>
+    /// <param name="_crossDockTemplate">
+    /// The template used to validate the demand.
+    /// </param>
+    /// <returns>
+    /// Returns true if the demand is valid, otherwise; false.
+    /// </returns>
+    private boolean validateQty(WHSCrossDockTemplate _crossDockTemplate)
+    {
+        boolean ret;
+    
+        switch (commonDemand.TableId)
+        {
+            case tableNum(WHSLoadLine):
+                ret = this.validateLoadLineQtyWithInstrumentation(_crossDockTemplate, commonDemand as WHSLoadLine);
+                break;
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateLoadLineQtyWithInstrumentation</Name>
+				<Source><![CDATA[
+    private boolean validateLoadLineQtyWithInstrumentation(
+        WHSCrossDockTemplate _crossDockTemplate,
+        WHSLoadLine          _loadLine)
+    {
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().validateLoadLineQty(_crossDockTemplate.DemandRequirements))
+        {
+            boolean validQty = this.validateLoadLineQty(_crossDockTemplate, _loadLine);
+            this.instrumentationLogger().plannedCrossDocking().validatedLoadLineQty(activityContext, validQty);
+            return validQty;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateLoadLineQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the quantity on the load line.
+    /// </summary>
+    /// <param name="_crossDockTemplate">
+    /// The cross dock template used in validating the quantity.
+    /// </param>
+    /// <param name="_loadLine">
+    /// The load line to validate.
+    /// </param>
+    /// <returns>
+    /// Returns true if the validation succeeds, otherwise; false.
+    /// </returns>
+    protected boolean validateLoadLineQty(
+        WHSCrossDockTemplate _crossDockTemplate, 
+        WHSLoadLine          _loadLine)
+    {
+        boolean validQty = true;
+    
+        switch (_crossDockTemplate.DemandRequirements)
+        {
+            case WHSCrossDockDemandRequirements::Marking:
+                if (qtyToCrossDock > 0)
+                {
+                    errors.addEnd(strFmt("@WAX:CrossDockErrorForMarkedTemplates", _crossDockTemplate.CrossDockTemplateId));
+                    validQty = false;
+                }
+                break;
+
+            case WHSCrossDockDemandRequirements::OrderReservation:
+                InventTransOrigin   inventTransOrigin;
+            
+                select firstOnly RecId from inventTransOrigin
+					where inventTransOrigin.InventTransId == _loadLine.InventTransId;
+    
+                InventQty qtyCrossDockedMarked = abs(WHSInvent::calculateOpenMarkedQuantity(_loadLine.InventTransId, _loadLine.InventDimId));
+                InventTransIdSum inventTransIdSum = inventTransIdSum::newTransOriginIdDimension(
+                                                                            inventTransOrigin.RecId, 
+                                                                            _loadLine.inventDim(), 
+                                                                            WHSReservationHierarchyInventDimUtil::initInventDimParmAboveLocation(_loadLine.inventTable()));
+
+                InventQty qtyReservedOrdered = abs(inventTransIdSum.reserveOrdered());
+    
+                if ((qtyReservedOrdered - qtyCrossDockedMarked) < qtyToCrossDock)
+                {
+                    errors.addEnd(strFmt("@WAX:CrossDockErrorForOrderedReservedTemplates", _crossDockTemplate.CrossDockTemplateId));
+                    validQty = false;
+                }
+                break;
+        }
+
+        return validQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSupplySource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that supply method is listed on cross-docking template.
+    /// </summary>
+    /// <param name = "_crossDockTemplate">Cross-docking template.</param>
+    /// <param name = "_supplyInventTransOrigin">The source document to be validated for cross docking.</param>
+    /// <returns>true, if source type is found on cross-docking template; otherwise, false.</returns>
+    private boolean validateSupplySource(WHSCrossDockTemplate _crossDockTemplate, InventTransOrigin _supplyInventTransOrigin)
+    {
+        using (var activityContext = this.instrumentationLogger().plannedCrossDocking().validateSupplySource())
+        {
+            InventTransType          supplyInventTransType = _supplyInventTransOrigin.ReferenceCategory;     
+            WHSCrossDockSupplySource supplySource;
+            boolean                  isSupportedSupplySource; 
+            boolean                  ret = true;
+            
+            [isSupportedSupplySource, supplySource] = WHSCrossDockingPlanned::getSupplySourceByInventTransType(supplyInventTransType);
+
+            ret = isSupportedSupplySource && WHSCrossDockingPlanned::validateSupplySourceQuery(_crossDockTemplate.CrossDockTemplateId, supplySource, _supplyInventTransOrigin);
+
+            this.instrumentationLogger().plannedCrossDocking().validatedSupplySource(activityContext, ret, supplySource, isSupportedSupplySource);
+
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSupplySourceByInventTransType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines cross-docking supply source.
+    /// </summary>
+    /// <param name = "_supplyInventTransType">Invent trans type.</param>
+    /// <returns>Container with cross-docking supply source, if found.</returns>
+    public static container getSupplySourceByInventTransType(InventTransType _supplyInventTransType)
+    {
+        WHSCrossDockSupplySource supplySource;
+        boolean isSupportedSupplySource = true;
+        switch (_supplyInventTransType)
+        {
+            case InventTransType::Purch:
+                supplySource = WHSCrossDockSupplySource::PurchaseOrder;
+                break;
+
+            case InventTransType::Production:
+                supplySource = WHSCrossDockSupplySource::ProductionOrder;
+                break;
+
+            case InventTransType::TransferOrderReceive:
+                supplySource = WHSCrossDockSupplySource::TransferOrderReceipt;
+                break;  
+
+            case InventTransType::PmfProdCoBy:
+                supplySource = WHSCrossDockSupplySource::PmfProdCoBy;
+                break;
+
+            default: 
+                isSupportedSupplySource = false;
+        }
+        return [isSupportedSupplySource, supplySource];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSupplySourceQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that query for cross-docking supply method is valid.
+    /// </summary>
+    /// <param name = "_crossDockTemplateId">The cross-docking template Id.</param>
+    /// <param name = "_supplySource">Cross-docking supply method.</param>
+    /// <param name = "_supplyInventTransOrigin">The source document to be validated for cross docking.</param>
+    /// <returns>true, if query for supply method is valid; otherwise, false.</returns>
+    public static boolean validateSupplySourceQuery(WHSCrossDockTemplateId _crossDockTemplateId, WHSCrossDockSupplySource _supplySource, InventTransOrigin _supplyInventTransOrigin)
+    {
+        boolean ret = false;
+
+        WHSCrossDockTemplateSupplySource crossDockTemplateSupplySource = WHSCrossDockTemplateSupplySource::find(_crossDockTemplateId, _supplySource);
+
+        if (crossDockTemplateSupplySource)
+        {
+            QueryRun qr = new QueryRun(crossDockTemplateSupplySource.PackedQueryRun);
+            Query q = qr.query();
+    
+            QueryBuildDataSource inventTransOrigin = q.dataSourceTable(tableNum(InventTransOrigin));
+            inventTransOrigin.addRange(fieldNum(InventTransOrigin, InventTransId)).value(_supplyInventTransOrigin.InventTransId);
+            QueryBuildDataSource qdbs = q.dataSourceTable(tableNum(InventTrans));
+            SysQuery::findOrCreateRange(qdbs, fieldNum(InventTrans, MarkingRefInventTransOrigin)).value(SysQuery::valueUnlimited());
+
+            if (_supplySource == WHSCrossDockSupplySource::TransferOrderReceipt)
+            {
+                QueryBuildRange remainStatusRange = q.dataSourceTable(tableNum(InventTransferLine)).findRange(fieldNum(InventTransferLine, RemainStatus));
+
+                if (remainStatusRange)
+                {
+                    remainStatusRange.value(queryRangeConcat(remainStatusRange.value(), InventTransferRemainStatus::Shipping));
+                }
+            }
+
+            if (qr.next())
+            {
+                ret = true;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAllDimensionsAboveLocationFilled</Name>
+				<Source><![CDATA[
+    private boolean checkAllDimensionsAboveLocationFilled()
+    {
+        if (inventDimHasBlankValuesAboveLocationExist == UnknownNoYes::Unknown)
+        {
+            var hierarchy = WhsReservationHierarchyProvider::construct().getDimListAboveLocationFromInventTable(InventTable::find(itemId), WHSReservationHierarchySortOrder::BottomUp);
+            inventDimHasBlankValuesAboveLocationExist = WhsReservationHierarchyInventDimUtil::inventDimHasBlankValues(inventDim, hierarchy) ?
+                UnknownNoYes::Yes :
+                UnknownNoYes::No;
+        }
+        
+        return inventDimHasBlankValuesAboveLocationExist == UnknownNoYes::Yes;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

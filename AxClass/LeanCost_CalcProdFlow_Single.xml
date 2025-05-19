@@ -1,0 +1,1137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>LeanCost_CalcProdFlow_Single</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>LeanCost_CalcProdFlow_Single</c> class represents the work item for running backflush costing of a single production flow order,
+///    as a single database transaction.
+/// </summary>
+/// <remarks>
+///    For each production flow that must be backflush costed, a separate instance of this class will be
+///    created to trigger it.
+/// </remarks>
+public class LeanCost_CalcProdFlow_Single extends LeanCost_CalcProdFlowBase implements BatchRetryable
+{
+    // Helpers
+    Map                                         unusedRawMaterialsQtyMap;
+
+    // Handling of cost and indirect cost
+    LeanConversionCostUpd_CalcProdFlow          costUpd;
+
+    // Ledger
+    LedgerVoucher                               ledgerVoucher;
+
+    // For telemetry logging
+    int64                                       runTimeInitLedgerVoucher;
+    int64                                       runTimeClearMaterialIssuesWIP;
+    int64                                       runTimeClearMaterialReceiptsWIP;
+    int64                                       runTimeClearOutsourcingWIP;
+    int64                                       runTimePostIndirectCosts;
+    int64                                       runTimeCalcVariances;
+    int64                                       runTimeEndLedgerVoucher;
+    int64                                       runTimeUpdateWIPFinal;
+    int64                                       nbInventTransClearMaterialIssuesWIP;
+    int64                                       nbInventTransClearMaterialReceiptsWIP;
+    int64                                       nbItemsClearMaterialIssuesWIP;
+    int64                                       nbItemsClearMaterialReceiptsWIP;
+
+    private CostManagementInstrumentationLogger LeanCost_CalcProdFlow_Single_Logger;
+
+    #DEFINE.CurrentVersion(2)
+    #LOCALMACRO.CurrentList
+        leanProductionFlowCostingRecId
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>adjustProdCalcTrans</Name>
+				<Source><![CDATA[
+        private void adjustProdCalcTrans(
+        ItemId          _itemId,
+        InventDimId     _inventDimId,
+        CostGroupId     _costGroupId,
+        InventCostLevel _inventCostLevel,
+        ItemCalcType    _itemCalcType,
+        Qty             _realConsumptionAdjustment,
+        Amount          _realCostAmountAdjustment)
+        {
+            // Now try to find the corresponding prodCalcTrans
+            ProdCalcTrans prodCalcTrans = ProdCalcTrans::findOrInitFromProdFlow(leanProductionFlowReference,
+            _itemId,
+            _inventDimId,
+            _costGroupId,
+            _inventCostLevel,
+            _itemCalcType);
+
+            // now subtract the qty
+            prodCalcTrans.RealConsump += _realConsumptionAdjustment;
+            prodCalcTrans.RealCostAmount += _realCostAmountAdjustment;
+            prodCalcTrans.write();
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInstrumentationSingleLogger</Name>
+				<Source><![CDATA[
+        final internal CostManagementInstrumentationLogger getInstrumentationSingleLogger()
+        {
+            if (!LeanCost_CalcProdFlow_Single_Logger)
+            {
+                LeanCost_CalcProdFlow_Single_Logger = CostManagementInstrumentationLogger::createLogger(classStr(LeanCost_CalcProdFlow_Single));
+            }
+
+            return LeanCost_CalcProdFlow_Single_Logger;
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcNetRealized</Name>
+				<Source><![CDATA[
+        /// <summary>
+        ///    Adjusts the <c>ProdCalcTrans</c> records to represent the current Work-In-Progress (WIP) situation.
+        /// </summary>
+        [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+        protected void calcNetRealized()
+        {
+            // The following things needs to be subtracted from WIP
+            // Unused qty
+            // Indirect cost for unused qty
+            LeanProductionFlowCostingUnusedQty      unusedQty;
+            InventTable                             inventTable;
+            InventDim                               inventDim;
+            ProdIndirectTrans                       prodIndirectTrans;
+            ItemCalcType                            itemCalcType;
+
+            using (var backflushCostingActivityContext = this.getInstrumentationSingleLogger().backflushCostingActivities().calcNetRealized(
+                                                            classStr(LeanCost_CalcProdFlow_Single),
+                                                            leanProductionFlowCostingRecId,
+                                                            false))
+            {
+                while select * from unusedQty
+                where unusedQty.LeanProductionFlowCosting == leanProductionFlowCosting.RecId
+                join inventTable
+                    where inventTable.ItemId                  == unusedQty.ItemId
+                join inventDim
+                    where inventDim.InventDimId == unusedQty.InventDimId
+                {
+                    InventItemPrice inventItemPrice = this.findItemPriceOrThrowError(inventTable, leanCosting.ToDate, inventDim);
+
+                    // Now try to find the corresponding prodCalcTrans
+                    ProdCalcTrans prodCalcTrans = ProdCalcTrans::findOrInitFromProdFlow(leanProductionFlowReference,
+                                                                                      unusedQty.ItemId,
+                                                                                      unusedQty.InventDimId,
+                                                                                      inventItemPrice.costGroupId(),
+                                                                                      InventCostLevel::Single,
+                                                                                      inventTable.inventItemType().calculationType());
+
+                    // now subtract the unused quantity (guarding against situation where system reports more unused quantity than actually present in WIP)
+                    if (-unusedQty.UnusedQty > prodCalcTrans.RealConsump)
+                    {
+                        prodCalcTrans.RealConsump = 0;
+                    }
+                    else
+                    {
+                        prodCalcTrans.RealConsump += unusedQty.UnusedQty;
+                    }
+                    prodCalcTrans.RealCostAmount = prodCalcTrans.RealConsump * inventItemPrice.pcsPrice();
+                    prodCalcTrans.write();
+
+                    // Now update the breakdown
+                    this.updateDirectMaterialBreakdown(prodCalcTrans, inventItemPrice);
+                }
+
+                // Now the indirect cost
+                while select sum(Amount), sum(Basis), Code, CostGroupId, Type from prodIndirectTrans
+                group by Code, CostGroupId, Type
+                where prodIndirectTrans.TransRefId   == leanProductionFlowReference.planReference().PlanName
+                   && prodIndirectTrans.TransRefType    == ProdTransRefType::ProductionFlow
+                   && prodIndirectTrans.VoucherEstimation == ''
+                   && prodIndirectTrans.VoucherCalc  == ledgerVoucher.lastVoucher()
+                   && prodIndirectTrans.DateCalc     == ledgerVoucher.lastTransDate()
+                   && prodIndirectTrans.Calculated   == NoYes::Yes
+                {
+                    // These indirect cost are still in WIP and need to be removed from prodCalcTrans
+
+                    itemCalcType = this.costSheetNodeType2ItemCalcType(prodIndirectTrans.Type);
+
+                    // ProdIndirectTrans amount and basis are already inverted
+                    this.adjustProdCalcTrans(prodIndirectTrans.Code,
+                    '',
+                    prodIndirectTrans.CostGroupId,
+                    InventCostLevel::Single,
+                    itemCalcType,
+                    prodIndirectTrans.Basis,
+                    prodIndirectTrans.Amount);
+                }
+
+                // remove indirect for unused outsourcing
+                while select sum(Amount), sum(Basis), Code, CostGroupId, Type
+                from prodIndirectTrans
+                group by prodIndirectTrans.Code, prodIndirectTrans.CostGroupId, prodIndirectTrans.Type
+                where prodIndirectTrans.TransRefId   == leanProductionFlowReference.planReference().PlanName
+                   && prodIndirectTrans.TransRefType    == ProdTransRefType::ProductionFlow
+                   && prodIndirectTrans.VoucherEstimation == ledgerVoucher.lastVoucher()
+                   && prodIndirectTrans.DateEstimation == ledgerVoucher.lastTransDate()
+                   && prodIndirectTrans.Calculated   == NoYes::No
+                   && prodIndirectTrans.Amount < 0 // indirect transactions for unused outsourced are created initially with negative amount
+                {
+                    // These indirect cost are still in WIP and need to be removed from prodCalcTrans
+
+                    itemCalcType = this.costSheetNodeType2ItemCalcType(prodIndirectTrans.Type);
+
+                    this.adjustProdCalcTrans(prodIndirectTrans.Code,
+                    '',
+                    prodIndirectTrans.CostGroupId,
+                    InventCostLevel::Single,
+                    itemCalcType,
+                    prodIndirectTrans.Basis,
+                    prodIndirectTrans.Amount);
+                }
+
+                // reverse sign used for outsourcing indirect transactions to be the same with other normal indirect transactions
+                update_recordset prodIndirectTrans
+                setting Amount = 0 - prodIndirectTrans.Amount
+                where prodIndirectTrans.TransRefId   == leanProductionFlowReference.planReference().PlanName
+                   && prodIndirectTrans.TransRefType    == ProdTransRefType::ProductionFlow
+                   && prodIndirectTrans.VoucherEstimation == ledgerVoucher.lastVoucher()
+                   && prodIndirectTrans.DateEstimation == ledgerVoucher.lastTransDate()
+                   && prodIndirectTrans.Calculated   == NoYes::No
+                   && prodIndirectTrans.Amount < 0;
+            }
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcVariances</Name>
+				<Source><![CDATA[
+        /// <summary>
+        ///    Triggers the variance calculation and creates a <c>inventCostTrans</c> record.
+        /// </summary>
+        [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+        protected void calcVariances()
+        {
+            InventCostTrans                 inventCostTrans;
+            InventCostTransList             inventCostTransList = InventCostTransList::construct();
+            InventCostTransVarianceList     inventCostTransVarianceList = InventCostTransVarianceList::construct();
+            InventCostTransVarianceMap      inventCostTransVarianceMap = InventCostTransVarianceMap::construct();
+            ProdStandardVariance            prodStandardVariance = ProdStandardVariance::construct(ProdTransRefType::ProductionFlow);
+
+            void addVarianceToList(
+                    InventCostLevel         _inventCostLevel,
+                    CostGroupId             _costGroupId,
+                    NoYes                   _split,
+                    InventCostVarianceType  _varianceType,
+                    CostAmount              _variance)
+            {
+                InventCostTransVariance inventCostTransVariance;
+
+                inventCostTransVariance.Level               = _inventCostLevel;
+                inventCostTransVariance.CostGroupId         = _costGroupId;
+                inventCostTransVariance.Split               = _split;
+                inventCostTransVariance.VarianceType        = _varianceType;
+                inventCostTransVariance.DefaultDimension    = inventCostTransVariance.copyDimension(leanProductionFlowReference.planReference().DefaultDimension);
+
+                inventCostTransVarianceList.find(inventCostTransVariance);
+
+                inventCostTransVariance.CostAmount += _variance;
+
+                inventCostTransVarianceList.insert(inventCostTransVariance);
+            }
+
+            using (var backflushCostingActivityContext = this.getInstrumentationSingleLogger().backflushCostingActivities().calcVariances(
+                                                                classStr(LeanCost_CalcProdFlow_Single),
+                                                                leanProductionFlowCostingRecId,
+                                                                false))
+            {
+                leanProductionFlowCosting.TransRefId = int642str(leanProductionFlowCosting.RecId);
+                LeanWIPBalanceUpdate::saveBalancesForProductionFlowCosting(leanProductionFlowCosting);
+
+                if (prodStandardVariance.calc(leanProductionFlowReference.planReference().PlanName,
+                                          ProdTransRefType::ProductionFlow,
+                                          InventCostLevel::Total,
+                                          leanProductionFlowReference.planReference().PlanName,
+                                          leanCosting.ToDate))
+                {
+                    TmpProdStandardVariance tmpProdStandardVariance = prodStandardVariance.parmTmpProdStandardVariance();
+
+                    while select tmpProdStandardVariance
+                    {
+                        if (tmpProdStandardVariance.LotSizeVariance || tmpProdStandardVariance.Split == NoYes::Yes)
+                        {
+                            addVarianceToList(tmpProdStandardVariance.InventCostLevel,
+                                               tmpProdStandardVariance.CostGroupId,
+                                               tmpProdStandardVariance.Split,
+                                               InventCostVarianceType::LotSize,
+                                               tmpProdStandardVariance.LotSizeVariance);
+                        }
+
+                        if (tmpProdStandardVariance.CostVariance || tmpProdStandardVariance.Split == NoYes::Yes)
+                        {
+                            addVarianceToList(tmpProdStandardVariance.InventCostLevel,
+                                               tmpProdStandardVariance.CostGroupId,
+                                               tmpProdStandardVariance.Split,
+                                               InventCostVarianceType::ProdPrice,
+                                               tmpProdStandardVariance.CostVariance);
+                        }
+
+                        if (tmpProdStandardVariance.QtyVariance || tmpProdStandardVariance.Split == NoYes::Yes)
+                        {
+                            addVarianceToList(tmpProdStandardVariance.InventCostLevel,
+                                               tmpProdStandardVariance.CostGroupId,
+                                               tmpProdStandardVariance.Split,
+                                               InventCostVarianceType::Quantity,
+                                               tmpProdStandardVariance.QtyVariance);
+                        }
+
+                        if (tmpProdStandardVariance.SubstitutionVariance || tmpProdStandardVariance.Split == NoYes::Yes)
+                        {
+                            addVarianceToList(tmpProdStandardVariance.InventCostLevel,
+                                               tmpProdStandardVariance.CostGroupId,
+                                               tmpProdStandardVariance.Split,
+                                               InventCostVarianceType::Substitution,
+                                               tmpProdStandardVariance.SubstitutionVariance);
+                        }
+                    }
+
+                    inventCostTrans.InventTransId        = '';
+                    inventCostTrans.ItemId               = '';
+                    inventCostTrans.FinancialInventDimId = InventDim::inventDimIdBlank();
+                    inventCostTrans.Voucher              = ledgerVoucher.lastVoucher();
+                    inventCostTrans.TransDate            = ledgerVoucher.lastTransDate();
+                    inventCostTrans.TransRefId           = leanProductionFlowReference.planReference().PlanName;
+                    inventCostTrans.DefaultDimension     = inventCostTrans.copyDimension(leanProductionFlowReference.planReference().DefaultDimension);
+                    inventCostTrans.CostTransRefType     = InventCostTransRefType::ProductionFlow;
+                    inventCostTrans.CostTransState       = InventCostTransState::Financial;
+                    inventCostTrans.CostTransType        = InventCostTransType::Receipt;
+
+                    inventCostTransList.add(inventCostTrans);
+
+                    inventCostTransVarianceMap.add(InventCostTransVarianceMap::buildKey(inventCostTrans), inventCostTransVarianceList);
+
+                    // Now post the variances
+                    InventCostPost::post(ledgerVoucher, null, inventCostTransList, inventCostTransVarianceMap);
+
+                    // Now put the variances to the global record sorted list
+                    InventCostUpdateGlobal::Instance().inventCostUpdate().finalizeCostTransVariance(inventCostTransList, inventCostTransVarianceMap);
+                }
+            }
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static ClassDescription description()
+    {
+        return "@SYS301730";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearMaterialIssueWIP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the material consumptions financially, considering the unused quantity.
+    /// </summary>
+    [Replaceable(true)]
+    protected void clearMaterialIssueWIP()
+    {
+        InventTrans                             inventTrans;
+        InventTransOrigin                       inventTransOrigin;
+        InventCostTrans                         inventCostTrans;
+        InventTable                             inventTable;
+        InventDim                               inventDim;
+        PlanReference                           planReference;
+    
+        LeanCost_CalcProdFlowClearMaterialParameters parameters = LeanCost_CalcProdFlowClearMaterialParameters::construct();
+
+        const UtilElementName NumberOfItemsClearMaterialIssuesWIP = 'NumberOfItemsClearMaterialIssuesWIP';
+        const UtilElementName NumberOfInventTransClearMaterialIssuesWIP = 'NumberOfInventTransClearMaterialIssuesWIP';
+        CostManagementInstrumentationLogger instrumentationLogger = this.getInstrumentationSingleLogger();
+
+        using (var backflushCostingActivityContext = instrumentationLogger.backflushCostingActivities().clearMaterialIssuesWIP(
+                                                        classStr(LeanCost_CalcProdFlow_Single),
+                                                        inventTable.RecId,
+                                                        leanCosting.ToDate,
+                                                        planReference.RecId,
+                                                        leanProductionFlowCostingRecId,
+                                                        planReference.DefaultDimension,
+                                                        false))
+        {
+            // Issues materials
+            while select forceliterals forupdate * from inventTrans
+                where inventTrans.DatePhysical      <= leanCosting.ToDate
+                   && ((inventTrans.StatusIssue   == StatusIssue::Deducted
+                        && inventTrans.StatusReceipt == StatusReceipt::None) ||
+                       (inventTrans.StatusIssue   == StatusIssue::None
+                        && inventTrans.StatusReceipt == StatusReceipt::Received))
+                join inventTable
+                    where inventTable.ItemId == inventTrans.ItemId
+                join inventDim
+                    where inventDim.InventDimId == inventTrans.InventDimId
+                join Tableid from inventTransOrigin
+                    order by inventTrans.ItemId, inventTransOrigin.ItemInventDimId,
+                        inventTrans.DatePhysical desc, inventTrans.StatusReceipt asc
+                    where inventTrans.InventTransOrigin    == inventTransOrigin.RecId
+                       && inventTransOrigin.ReferenceCategory != InventTransType::KanbanJobProcess
+                exists join inventCostTrans
+                    where inventCostTrans.InventTransId    == inventTransOrigin.InventTransId
+                       && inventCostTrans.CostTransRefType == InventCostTransRefType::ProductionFlow
+                exists join planReference
+                    where planReference.RecId == leanProductionFlowReference.PlanReference
+                       && planReference.PlanName == inventCostTrans.TransRefId
+            {
+                this.clearMaterialIssueWIPHelper(inventDim, inventTrans, inventTable, parameters);
+            }
+
+            if (unusedRawMaterialsQtyMap.elements() != 0)
+            {
+                warning("@SYS301728");
+            }
+
+            Set instrumentationPropertyCollection = new Set(Types::Class);
+            var loggerProperties = instrumentationLogger.properties();
+            instrumentationPropertyCollection.add(loggerProperties.addCount(NumberOfItemsClearMaterialIssuesWIP, nbItemsClearMaterialIssuesWIP));
+            instrumentationPropertyCollection.add(loggerProperties.addCount(NumberOfInventTransClearMaterialIssuesWIP, nbInventTransClearMaterialIssuesWIP));
+            instrumentationLogger.logPropertyCollection(instrumentationPropertyCollection);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearMaterialIssueWIPHelper</Name>
+				<Source><![CDATA[
+    protected void clearMaterialIssueWIPHelper(
+        InventDim                                    _inventDim,
+        InventTrans                                  _inventTrans,
+        InventTable                                  _inventTable,
+        LeanCost_CalcProdFlowClearMaterialParameters _parameters)
+    {
+        nbInventTransClearMaterialIssuesWIP++;
+
+        if (_parameters.PrevItemId != _inventTrans.ItemId ||
+            _parameters.PrevSiteId != _inventDim.InventSiteId ||
+            InventDim::getModifiedProductDimensionFields(_parameters.PrevProductDim, _inventDim).elements() > 0)
+        {
+            if (_parameters.QtyLeft != 0)
+            {
+                // on the previous item, more qty was left than I had put into the prod flow
+                warning(strFmt("@SYS301727",
+                            _parameters.PrevItemId, leanProductionFlowReference.planReference().PlanName, _parameters.QtyLeft));
+            }
+
+            if (_parameters.PrevItemId != _inventTrans.ItemId)
+            {
+                _parameters.InventCostOnHandCache = InventCostOnhandCache::construct();
+                nbItemsClearMaterialIssuesWIP++;
+            }
+    
+            _parameters.PrevItemId = _inventTrans.ItemId;
+            _parameters.PrevSiteId = _inventDim.InventSiteId;
+
+            InventDim prevProductDim;
+            prevProductDim.inventDimFieldsMap::initProductDimensionsFrom(_inventDim);
+            _parameters.PrevProductDim = prevProductDim;
+    
+            // I need to get the product dimensions
+            InventDim inventItemDim = _inventDim.data();
+            inventItemDim.clearNotSiteAndProductDim(InventDimGroupSetup::newInventTable(_inventTable));
+            _parameters.InventItemDim = InventDim::findOrCreate(inventItemDim);
+    
+            if (unusedRawMaterialsQtyMap.exists(this.unusedQtyMapKey(_parameters.PrevItemId , _parameters.InventItemDim.InventDimId)))
+            {
+                _parameters.QtyLeft = unusedRawMaterialsQtyMap.lookup(this.unusedQtyMapKey(_parameters.PrevItemId, _parameters.InventItemDim.InventDimId));
+            }
+            else
+            {
+                _parameters.QtyLeft = 0;
+            }
+    
+            _parameters.InventItemPrice = this.findItemPriceOrThrowError(_inventTable, leanCosting.ToDate, _inventDim);
+        }
+    
+        Qty remainQty;
+        Qty updateQty;
+
+        if (_parameters.QtyLeft &&
+            sign(_parameters.QtyLeft) == sign(_inventTrans.Qty) &&
+            _inventTrans.StatusReceipt == StatusReceipt::None)
+        {
+            Qty transactionRemainQty = _inventTrans.Qty;
+            if (abs(_parameters.QtyLeft) >= abs(transactionRemainQty))
+            {
+                remainQty = transactionRemainQty;
+            }
+            else
+            {
+                remainQty = _parameters.QtyLeft;
+            }
+            _parameters.QtyLeft -= remainQty;
+            updateQty = transactionRemainQty - remainQty;
+    
+            costUpd.addDirectMaterialConsumption(_parameters.InventItemPrice, -remainQty);
+    
+            if (_parameters.QtyLeft == 0)
+            {
+                unusedRawMaterialsQtyMap.remove(this.unusedQtyMapKey(_parameters.PrevItemId, _parameters.InventItemDim.InventDimId));
+            }
+        }
+        else
+        {
+            remainQty = 0;
+            updateQty = _inventTrans.Qty;
+        }
+    
+        if (updateQty)
+        {
+            InventMovement movement = InventMovement::construct(_inventTrans);
+        
+            InventUpd_Financial inventUpd_Financial = InventUpd_Financial::newKanbanMovement(
+                                                                                            movement,
+                                                                                            ledgerVoucher,
+                                                                                            updateQty,
+                                                                                            0,
+                                                                                            CurrencyExchangeHelper::amount(updateQty * _parameters.InventItemPrice.pcsPrice()));
+            inventUpd_Financial.parmInventCostOnhandCache(_parameters.InventCostOnHandCache);
+            inventUpd_Financial.updateNow();
+    
+            if (movement.mustBeBookedFinancially())
+            {
+                costUpd.clearMaterialWIPAccount(movement, _parameters.InventItemPrice, -updateQty);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearMaterialReceiptWIP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the finished goods financially.
+    /// </summary>
+    [Replaceable(true)]
+    protected void clearMaterialReceiptWIP()
+    {
+        InventTrans                             inventTrans;
+        InventTransOrigin                       inventTransOrigin;
+        InventCostTrans                         inventCostTrans;
+        InventTable                             inventTable;
+        InventDim                               inventDim;
+        PlanReference                           planReference;
+
+        LeanCost_CalcProdFlowClearMaterialParameters parameters = LeanCost_CalcProdFlowClearMaterialParameters::construct();
+
+        const UtilElementName NumberOfItemsClearMaterialReceiptsWIP = 'NumberOfItemsClearMaterialReceiptsWIP';
+        const UtilElementName NumberOfInventTransClearMaterialReceiptsWIP = 'NumberOfInventTransClearMaterialReceiptsWIP';
+        CostManagementInstrumentationLogger instrumentationLogger = this.getInstrumentationSingleLogger();
+
+        using (var backflushCostingActivityContext = instrumentationLogger.backflushCostingActivities().clearMaterialReceiptsWIP(
+                                                        classStr(LeanCost_CalcProdFlow_Single),
+                                                        inventTable.RecId,
+                                                        leanCosting.ToDate,
+                                                        planReference.RecId,
+                                                        leanProductionFlowCostingRecId,
+                                                        planReference.DefaultDimension,
+                                                        false))
+        {
+            // Finished goods
+            while select forceliterals forupdate * from inventTrans
+            order by DatePhysical desc, ItemId
+                where inventTrans.DatePhysical      <= leanCosting.ToDate
+                   && ((inventTrans.StatusIssue == StatusIssue::Deducted
+                        && inventTrans.StatusReceipt == StatusReceipt::None) ||
+                        (inventTrans.StatusIssue == StatusIssue::None
+                        && inventTrans.StatusReceipt == StatusReceipt::Received))
+            join inventTable
+                where inventTable.ItemId == inventTrans.ItemId
+            join inventDim
+                where inventDim.InventDimId == inventTrans.InventDimId
+            join inventTransOrigin
+                order by ItemInventDimId
+                where inventTrans.InventTransOrigin    == inventTransOrigin.RecId
+                   && inventTransOrigin.ReferenceCategory == InventTransType::KanbanJobProcess
+            exists join inventCostTrans
+                where inventCostTrans.InventTransId    == inventTransOrigin.InventTransId
+                   && inventCostTrans.CostTransRefType == InventCostTransRefType::ProductionFlow
+            exists join planReference
+                where planReference.RecId == leanProductionFlowReference.PlanReference
+                   && planReference.PlanName == inventCostTrans.TransRefId
+            {
+                this.clearMaterialReceiptWIPHelper(inventDim, inventTrans, inventTable, parameters);
+            }
+
+            Set instrumentationPropertyCollection = new Set(Types::Class);
+            var loggerProperties = instrumentationLogger.properties();
+            instrumentationPropertyCollection.add(loggerProperties.addCount(NumberOfItemsClearMaterialReceiptsWIP, nbItemsClearMaterialReceiptsWIP));
+            instrumentationPropertyCollection.add(loggerProperties.addCount(NumberOfInventTransClearMaterialReceiptsWIP, nbInventTransClearMaterialReceiptsWIP));
+            instrumentationLogger.logPropertyCollection(instrumentationPropertyCollection);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearMaterialReceiptWIPHelper</Name>
+				<Source><![CDATA[
+    protected void clearMaterialReceiptWIPHelper(
+        InventDim                                    _inventDim,
+        InventTrans                                  _inventTrans,
+        InventTable                                  _inventTable,
+        LeanCost_CalcProdFlowClearMaterialParameters _parameters)
+    {
+        nbInventTransClearMaterialReceiptsWIP++;
+
+        if (_parameters.PrevItemId != _inventTrans.ItemId ||
+            _parameters.PrevSiteId != _inventDim.InventSiteId ||
+            InventDim::getModifiedProductDimensionFields(_parameters.PrevProductDim, _inventDim).elements() > 0)
+        {
+            if (_parameters.PrevItemId != _inventTrans.ItemId)
+            {
+                _parameters.InventCostOnHandCache = InventCostOnhandCache::construct();
+                nbItemsClearMaterialReceiptsWIP++;
+            }
+
+            _parameters.PrevItemId = _inventTrans.ItemId;
+            _parameters.PrevSiteId = _inventDim.InventSiteId;
+            InventDim prevProductDim;
+            prevProductDim.inventDimFieldsMap::initProductDimensionsFrom(_inventDim);
+            _parameters.PrevProductDim = prevProductDim;
+
+            _parameters.InventItemPrice = this.findItemPriceOrThrowError(_inventTable, leanCosting.ToDate, _inventDim);
+        }
+
+        InventMovement movement = InventMovement::construct(_inventTrans);
+
+        InventUpd_Financial inventUpd_Financial = InventUpd_Financial::newKanbanMovement(
+                                                                                    movement,
+                                                                                    ledgerVoucher,
+                                                                                    _inventTrans.Qty,
+                                                                                    0,
+                                                                                    CurrencyExchangeHelper::amount(_inventTrans.Qty * _parameters.InventItemPrice.pcsPrice()));
+        inventUpd_Financial.parmInventCostOnhandCache(_parameters.InventCostOnHandCache);
+        inventUpd_Financial.updateNow();
+
+        if (movement.mustBeBookedFinancially())
+        {
+            costUpd.clearMaterialWIPAccount(movement, _parameters.InventItemPrice, -_inventTrans.Qty);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearOutsourcingWIP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Clears unused quantities of outsourced service items from the WIP.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void clearOutsourcingWIP()
+    {
+        LeanProductionFlowCostingUnusedQty      unusedQty;
+        InventTable                             inventTable;
+        InventDim                               inventDim;
+
+        using (var backflushCostingActivityContext = this.getInstrumentationSingleLogger().backflushCostingActivities().clearOutsourcingWIP(
+                                                         classStr(LeanCost_CalcProdFlow_Single),
+                                                         leanProductionFlowCosting.RecId,
+                                                         false))
+        {
+            while select * from unusedQty
+                where unusedQty.LeanProductionFlowCosting == leanProductionFlowCosting.RecId
+                    && unusedQty.UnusedQtyType == LeanCostingUnusedQtyType::Service
+                join inventTable
+                    where inventTable.ItemId == unusedQty.ItemId
+                join inventDim
+                    where inventDim.InventDimId == unusedQty.InventDimId
+            {
+                InventItemPrice inventItemPrice = this.findItemPriceOrThrowError(inventTable, leanCosting.ToDate, inventDim);
+
+                costUpd.createAndPostUnusedOutsourcing(
+                    leanProductionFlowReference.RecId,
+                    unusedQty.ItemId,
+                    unusedQty.InventDimId,
+                    -unusedQty.UnusedQty,
+                    inventItemPrice.pcsPrice());
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearWIP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Triggers the update of the material consumptions and finished good items.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void clearWIP()
+    {
+        // Raw materials
+        this.clearMaterialIssueWIP();
+
+        // Outsourced services
+        this.clearOutsourcingWIP();
+
+        using (var backflushCostingActivityContext = this.getInstrumentationSingleLogger().backflushCostingActivities().postIndirectCosts(
+                                                         classStr(LeanCost_CalcProdFlow_Single),
+                                                         leanProductionFlowCosting.RecId,
+                                                         false))
+        {
+            // Now post the indirect cost for the unused materials and services
+            costUpd.updateNow();
+        }
+
+        // Finished goods
+        this.clearMaterialReceiptWIP();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearWIPAccounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Clears WIP accounts for the conversion and indirect cost.
+    /// </summary>
+    /// <remarks>
+    ///    This method offsets with a rounding account.
+    /// </remarks>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void clearWIPAccounts()
+    {
+        using (var backflushCostingActivityContext = this.getInstrumentationSingleLogger().backflushCostingActivities().clearWIPAccounts(
+                                                         classStr(LeanCost_CalcProdFlow_Single),
+                                                         leanProductionFlowCosting.RecId,
+                                                         false))
+        {
+            costUpd.clearWIPAccounts(); 
+        } 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>costSheetNodeType2ItemCalcType</Name>
+				<Source><![CDATA[
+    private ItemCalcType costSheetNodeType2ItemCalcType(CostSheetNodeType _costSheetNodeType)
+    {
+        if (_costSheetNodeType == CostSheetNodeType::CalculationRate)
+        {
+            return ItemCalcType::IndirectRate;
+        }
+        else if (_costSheetNodeType == CostSheetNodeType::CalculationSurcharge)
+        {
+            return ItemCalcType::IndirectSurcharge;
+        }
+        else if (_costSheetNodeType == CostSheetNodeType::CalculationInUnitBased)
+        {
+            return ItemCalcType::IndirectInUnitBased;
+        }
+
+        throw Exception::Error;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endLedgerVoucher</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Triggers the posting to the general ledger.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void endLedgerVoucher()
+    {
+        using (var backflushCostingActivityContext = this.getInstrumentationSingleLogger().backflushCostingActivities().endLedgerVoucher(
+                                                         classStr(LeanCost_CalcProdFlow_Single),
+                                                         leanProductionFlowCosting.RecId,
+                                                         false))
+        {
+            if (ledgerVoucher)
+            {
+                // Post to ledger
+                ledgerVoucher.end();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runVarianceCalculation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Run the variance calculation process.
+    /// </summary>
+    protected void runVarianceCalculation()
+    {
+        this.initLedgerVoucher();
+
+        // 1.) Clear wip
+        this.clearWIP();
+
+        // 2.) Calc net usage
+        this.calcNetRealized();
+
+        // 3.) Calc variances
+        this.calcVariances();
+
+        // 4.) Clear WIP accounts
+        this.clearWIPAccounts();
+
+        this.endLedgerVoucher();
+
+        // Update the productionFlowCosting record
+        this.updateStatus();
+
+        // After calculation and clearing, reflect this in WIP
+        this.updateWIPFinal();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findItemPriceOrThrowError</Name>
+				<Source><![CDATA[
+    private InventItemPrice findItemPriceOrThrowError(
+        InventTable     _inventTable,
+        ToDate          _toDate,
+        InventDim       _inventDim)
+    {
+        InventItemPrice itemPrice = InventItemPrice::stdCostFindDate(_inventTable, _toDate, '', _inventDim);
+        if (!itemPrice)
+        {
+            throw error(strFmt("@SYS120478", _inventTable.ItemId, _inventDim.InventSiteId), "", SysInfoActionMissingItemPrice::construct(_inventTable));
+        }
+
+        return itemPrice;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getUnusedQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the unused quantities from the production flow.
+    /// </summary>
+    protected void getUnusedQty()
+    {
+        LeanProductionFlowCostingUnusedQty      costingUnusedQty;
+        Map                                     unusedRawMaterialsQtyMapForItem;
+
+        RecordSortedList unusedQtyList = this.getLeanCostingFacade().getUnusedQuantities(leanProductionFlowCosting.LeanProductionFlowReference, leanCosting.ToDate);
+
+        // Init map of unused qty's used then for the WIP clearing
+        unusedRawMaterialsQtyMap = new Map(Types::String, Types::Real);
+
+        boolean found = unusedQtyList.first(costingUnusedQty);
+
+        if (isResumed && found)
+        {
+            this.clearUnusedQty();
+        }
+
+        while (found)
+        {
+            if (costingUnusedQty.UnusedQtyType != LeanCostingUnusedQtyType::Service)
+            {
+                costingUnusedQty.LeanProductionFlowCosting = leanProductionFlowCosting.RecId;
+                costingUnusedQty.insert();
+
+                unusedRawMaterialsQtyMap.insert(
+                        this.unusedQtyMapKey(costingUnusedQty.ItemId, costingUnusedQty.InventDimId),
+                        costingUnusedQty.UnusedQty);
+            }
+
+            found = unusedQtyList.next(costingUnusedQty);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initLedgerVoucher</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes an instance of the <c>LedgerVoucher</c> class.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void initLedgerVoucher()
+    {
+        using (var backflushCostingActivityContext = this.getInstrumentationSingleLogger().backflushCostingActivities().initLedgerVoucher(
+                                                         leanProductionFlowCosting.RecId,
+                                                         classStr(LeanCost_CalcProdFlow_Single),
+                                                         false))
+        {
+            TransactionTxt      transactionTxt = TransactionTxt::construct();
+
+            transactionTxt.setType(LedgerTransTxt::KanbanCosting);
+            transactionTxt.setDate(leanCosting.ToDate);
+            transactionTxt.setVoucher(leanProductionFlowCosting.Voucher);
+            transactionTxt.setKey1(leanProductionFlowCosting.displayProductionFlowName());
+
+            ledgerVoucher = LedgerVoucher::newLedgerPost(DetailSummary::Summary,
+                                                             SysModule::Invent,
+                                                             NumberSeq::newGetNum(ProdParameters::numRefProdCalcVoucherId()).parmNumberSequenceCode());
+            ledgerVoucher.parmCustomDetailLevel(true);  // records are summed according to ledgerVoucherTransObject.parmRecId
+            LedgerVoucherObject ledgerVoucherObject = LedgerVoucherObject::newVoucher(leanProductionFlowCosting.Voucher,
+                                                                                  leanCosting.ToDate,
+                                                                                  SysModule::Prod,
+                                                                                  LedgerTransType::Production,
+                                                                                  NoYes::No);
+
+            ledgerVoucherObject.lastTransTxt(transactionTxt.txt());
+            ledgerVoucher.addVoucher(ledgerVoucherObject);
+            ledgerVoucher.parmCheckTransOnInsert(true);
+
+            // Initialize the indirect cost handling
+            costUpd = LeanConversionCostUpd_CalcProdFlow::newFromParameters(ledgerVoucher, leanProductionFlowReference, this.getLeanCostingFacade());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion,#CurrentList] + [super()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmLeanProductionFlowCostingRecId</Name>
+				<Source><![CDATA[
+    public RecId parmLeanProductionFlowCostingRecId(RecId _leanProductionFlowCostingRecId = leanProductionFlowCostingRecId)
+    {
+        leanProductionFlowCostingRecId = _leanProductionFlowCostingRecId;
+
+        return leanProductionFlowCostingRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rereadRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the record IDs for the lean costing record from the database.
+    /// </summary>
+    /// <remarks>
+    ///    This is performed so that the current version of the records is always available.
+    /// </remarks>
+    protected void rereadRecords()
+    {
+        super();
+
+        // Necessary to serialize based on the usage of this record
+        select firstonly pessimisticlock leanProductionFlowCosting where leanProductionFlowCosting.RecId == leanProductionFlowCostingRecId;
+
+        leanProductionFlowReference = LeanProductionFlowReference::find(leanProductionFlowCosting.LeanProductionFlowReference);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container  _packedClass)
+    {
+        Integer  version = conPeek(_packedClass,1);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                container base;
+                [version, #CurrentList, base]        = _packedClass;
+                return super(base);
+            default:
+                return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unusedQtyMapKey</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves a string that contains the item ID and the inventory dimension ID.
+    /// </summary>
+    /// <param name="_itemId">
+    ///    The <c>itemId</c> value that is part of the key.
+    /// </param>
+    /// <param name="_inventDimId">
+    ///    The <c>inventDimId</c> value that is part of the key.
+    /// </param>
+    /// <returns>
+    ///    A hash-separated string that contains the item ID and inventory dimension ID..
+    /// </returns>
+    private str unusedQtyMapKey(
+        ItemId      _itemId,
+        InventDimId _inventDimId)
+    {
+        return _itemId + '#' + _inventDimId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDirectMaterialBreakdown</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the direct material breakdown.
+    /// </summary>
+    /// <param name="_prodCalcTrans">
+    /// The <c>ProdCalcTrans</c> record for which the breakdown should be updated.
+    /// </param>
+    /// <param name="_inventItemPrice">
+    /// The <c>InventItemPrice</c> record which is the reference for the breakdown.
+    /// </param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateDirectMaterialBreakdown(ProdCalcTrans    _prodCalcTrans,
+                                                 InventItemPrice  _inventItemPrice)
+    {
+        InventItemCostGroupRollup   inventItemCostGroupRollup;
+
+        if (_prodCalcTrans)
+        {
+            CostBreakdownInsertionRule  costBreakdownInsertionRule = CostBreakdownInsertionRule::construct();
+            costBreakdownInsertionRule.parmItemId(_prodCalcTrans.Resource);
+            costBreakdownInsertionRule.parmIsProduction(_prodCalcTrans.Production);
+            
+            if (!costBreakdownInsertionRule.mustInsertCostBreakdown())
+            {
+                return;
+            }
+
+            ProdCollectRefLevel level = _prodCalcTrans.CollectRefLevel;
+            // Consumption should be only converted once, because
+            // it stays the same for all the breakdown records
+            Qty realConsumption = UnitOfMeasureConverter::convert(_prodCalcTrans.realConsumptionTotal(),
+                                                                UnitOfMeasure::unitOfMeasureIdBySymbol(_prodCalcTrans.UnitId),
+                                                                UnitOfMeasure::unitOfMeasureIdBySymbol(_inventItemPrice.UnitID),
+                                                                NoYes::Yes);
+
+            while select sum(CostAmountStd), CostGroupId from inventItemCostGroupRollup
+            group by CostGroupId
+            where inventItemCostGroupRollup.InventItemPriceRefRecId == _inventItemPrice.RecId
+                && inventItemCostGroupRollup.CostLevel               > InventCostLevel::Total
+                && inventItemCostGroupRollup.Split                  == NoYes::No                // Only decomposed cost groups
+            {
+                CostAmount proportionalRealCostAmount = 0;
+                ProdCalcTrans prodCalcTrans = ProdCalcTrans::findOrInitFromProdFlow(leanProductionFlowReference,
+                                                                                  _prodCalcTrans.Resource,
+                                                                                  "",
+                                                                                  inventItemCostGroupRollup.CostGroupId,
+                                                                                  level + 1,
+                                                                                  ItemCalcType::CostGroup);
+
+                if (_inventItemPrice.priceQty())
+                {
+                    proportionalRealCostAmount = (inventItemCostGroupRollup.CostAmountStd * (realConsumption / _inventItemPrice.priceQty()));
+                }
+
+                prodCalcTrans.RealConsump =  _prodCalcTrans.RealConsump;
+                prodCalcTrans.RealCostAmount = proportionalRealCostAmount;
+                prodCalcTrans.write();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets the lean production flow costing record to the ended status.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateStatus()
+    {
+        leanProductionFlowCosting.Status = LeanProductionFlowCostingStatus::Ended;
+        leanProductionFlowCosting.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateWIPFinal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Triggers the recalculation of the work-in-progress balances after the calculation completed.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void updateWIPFinal()
+    {
+        using (var backflushCostingActivityContext = this.getInstrumentationSingleLogger().backflushCostingActivities().updateWIPFinal(
+                                                         classStr(LeanCost_CalcProdFlow_Single),
+                                                         leanProductionFlowCosting.RecId,
+                                                         false))
+        {
+            // Now update the prodCalcTrans
+            LeanWIPBalanceUpdate::updateBalances(leanProductionFlowReference, leanCosting.ToDate, leanCosting.ToDate);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of the <c>LeanCost_CalcProdFlow_Single</c> class.
+    /// </summary>
+    /// <param name="_leanCostingFacade">
+    /// The instance of the <c>LeanCostingFacadeBase</c> class to use.
+    /// </param>
+    /// <returns>
+    /// The new instance of the <c>LeanCost_CalcProdFlow_Single</c> class.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static LeanCost_CalcProdFlow_Single construct(LeanCostingFacadeBase _leanCostingFacade)
+    {
+        LeanCost_CalcProdFlow_Single leanCostCalcProdFlow = new LeanCost_CalcProdFlow_Single();
+        leanCostCalcProdFlow.parmLeanCostingFacade(_leanCostingFacade);
+        return leanCostCalcProdFlow;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

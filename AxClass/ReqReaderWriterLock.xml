@@ -1,0 +1,1820 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqReaderWriterLock</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Monitor = System.Threading.Monitor;
+using NetThread = System.Threading.Thread;
+
+/// <summary>
+///     The <c>ReqReaderWriterLock</c> class implements the locking mechanism which supports a single writer and multiple readers.
+/// </summary>
+public class ReqReaderWriterLock implements System.IDisposable
+{
+    static internal str ReaderWriterUserConnectionFlightingName = 'ReaderWriterUserConnection';
+    static private str SqlConnectionIdleTimeInMinuteConfigurationName = 'SQLCONNECTIONIDLETIMEINMINUTE';
+    private const int MaxLockNameLength = 100; // this should be the same as ReqReaderWriterLockName edt size
+
+    #define.EnterLock_DontWait(0)
+    Map monitorMap = new Map(Types::String, Types::Class);
+
+    private readonly boolean useUserConnection;
+    private boolean forceUserConnectionLock;
+
+    private ReqInstrumentationLogger instrumentationLogger;
+    private readonly ReqReaderWriterLockOwnerId ownerId;
+    private boolean useLockOwnerTracking;
+    private boolean retryOnAcquiringLock;
+    private readonly int transientErrorsMaxRetryCount;
+    private readonly boolean readerWriterLockReleaseAllLocksFinalizeConnectionsToggleEnabled;
+    private readonly boolean reqReaderWriterLockLockReacquiringOnEnterToggleEnabled;
+    private Map mostRestrictiveLockModeAcquiredByLockName;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>enterInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The main entry point for acquiring the app lock. It spins off a new thread, waits until the lock is acquired and returns the final state.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <param name="_lockMode">
+    ///     The type of the lock.
+    /// </param>
+    /// <param name="_timeOut">
+    ///     The number of milliseconds to wait for the lock to be acquired.
+    /// </param>
+    /// <returns>Whether the lock is acquired or not.</returns>
+    protected boolean enterInternal(str _lockName, ReqAppLockMode _lockMode, int _timeOut)
+    {
+        _lockName = ReqReaderWriterLock::normalizeLockName(_lockName);
+
+        using (var activityContext = instrumentationLogger.reqReaderWriterLock().enterInternal(_lockName, _lockMode, _timeOut, useUserConnection, ownerId))
+        {
+            boolean lockAcquired;
+
+            if (useUserConnection || forceUserConnectionLock)
+            {
+                lockAcquired = this.enterInternalUserConnection(_lockName, _lockMode, _timeOut);
+            }
+            else
+            {
+                lockAcquired = this.enterInternalReqReaderWriterLockSynchronizer(_lockName, _lockMode, _timeOut);
+            }
+
+            instrumentationLogger.reqReaderWriterLock().enteredInternal(activityContext, lockAcquired);
+
+            return lockAcquired;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enterInternalUserConnection</Name>
+				<Source><![CDATA[
+    private boolean enterInternalUserConnection(str _lockName, ReqAppLockMode _lockMode, int _timeOut)
+    {
+        boolean isFirstLockOnConnection = false;
+        var logLineTry = infologLine();
+        try
+        {
+            var connection = this.getExistingConnectionForLock(_lockName);
+
+            if (!connection)
+            {
+                isFirstLockOnConnection = true;
+                instrumentationLogger
+                    .logInformation("Lock with this name has not been previously acquired by the current instance. New connection will be created.");
+                connection = this.startNewConnectionForLock(_lockName);
+            }
+
+            var lockAcquired = this.acquireSqlApplicationLock(_lockName, _lockMode, _timeOut, connection);
+
+            if (lockAcquired && this.useLockOwnerTrackingForLock(_lockName))
+            {
+                try
+                {
+                    this.setOwner(_lockName, _lockMode, connection);
+                }
+                catch
+                {
+                    // release the lock if did not manage to set the owner
+                    connection.ttsabort();
+
+                    throw;
+                }
+
+                this.updateMostRestrictiveLockModeAcquired(_lockName, _lockMode);
+            }
+
+            return lockAcquired;
+        }
+        catch (Exception::Break)
+        {
+            throw;
+        }
+        catch
+        {
+            // if this is not first lock on the connection one cannot retry as this will most likely fail again - 
+            // as the issue is most probably a dead connection
+            if (!isFirstLockOnConnection)
+            {
+                if (!reqReaderWriterLockLockReacquiringOnEnterToggleEnabled
+                    || !this.useLockOwnerTrackingForLock(_lockName))
+                {
+                    throw;
+                }
+
+                boolean hasPreviouslyAcquiredLock;
+                ReqAppLockMode mostRestrictiveLockModeAcquired;
+
+                [hasPreviouslyAcquiredLock, mostRestrictiveLockModeAcquired] = this.getMostRestrictiveLockModeAcquired(_lockName);
+
+                if (!hasPreviouslyAcquiredLock)
+                {
+                    throw;
+                }
+
+                // only if the most exclusive lock mode previously acquired is a lock that can have only a single owner
+                if (!this.canUseOwnerTrackingWithLockMode(mostRestrictiveLockModeAcquired))
+                {
+                    instrumentationLogger
+                        .logInformation('Lost lock cannot be reacquired since the most restrictive lock previously acquired does not support lock owner tracking.'
+                            + strFmt(' Most restrictive lock mode previously acquired: %1', this.lockModeToStr(mostRestrictiveLockModeAcquired)));
+                    throw;
+                }
+
+                this.reacquireLock(_lockName, this.mostRestrictiveLockMode(mostRestrictiveLockModeAcquired, _lockMode));
+
+                infolog.clear(logLineTry);
+
+                return true;
+            }
+
+            // catching all exceptions as connection issues with SQL are not always result in throwing
+            // transient SQL error exception type
+            if (!retryOnAcquiringLock)
+            {
+                throw;
+            }
+            
+            // remove the connection so we can retry on a new connection
+            this.removeConnectionForLockIgnoreErrors(_lockName);
+
+            if (ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError(transientErrorsMaxRetryCount))
+            {
+                retry;
+            }
+
+            throw;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enterInternalReqReaderWriterLockSynchronizer</Name>
+				<Source><![CDATA[
+    private boolean enterInternalReqReaderWriterLockSynchronizer(str _lockName, ReqAppLockMode _lockMode, int _timeOut)
+    {
+        boolean lockAcquired;
+
+        if (monitorMap.exists(_lockName))
+        {
+            lockAcquired = this.escalateLock(monitorMap.lookup(_lockName), _lockMode);
+        }
+        else
+        {
+            var lock = new ReqReaderWriterLockSynchronizer(_lockName, _lockMode, _timeOut);
+            try
+            {
+                this.spinLockThread(lock);
+                lockAcquired = this.waitForLockToBeAcquired(lock);
+                if (lockAcquired)
+                {
+                    monitorMap.insert(lock.lockName, lock);
+                }
+            }
+            catch
+            {
+                throw error(strFmt("@SCM:AppLockAcquireError", _lockName));
+            }
+            finally
+            {
+                //This is a precaution if some failure has caused us not to pulse and exit
+                if (Monitor::IsEntered(lock))
+                {
+                    Monitor::Pulse(lock);
+                    Monitor::Exit(lock);
+                }
+            
+            }
+        }
+
+        return lockAcquired;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isLockInState</Name>
+				<Source><![CDATA[
+    private boolean isLockInState(
+        ReqReaderWriterLockSynchronizer _lock,
+        ReqReaderWriterLockState _state)
+    {
+        boolean result = true;
+        Monitor::Enter(_lock);
+        if (_lock.state != _state)
+        {
+            result = false;
+        }
+        Monitor::Exit(_lock);
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmForceUserConnectionLock</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal boolean parmForceUserConnectionLock(boolean _forceUserConnectionLock = forceUserConnectionLock)
+    {
+        forceUserConnectionLock = _forceUserConnectionLock;
+        
+        return forceUserConnectionLock;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setConnection</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert connection to be used for lock
+    /// </summary>
+    /// <param name = "_lockName">Lock identifier</param>
+    /// <param name = "_connection">Connection</param>
+	internal void setConnection(str _lockName, Connection _connection)
+    {
+        _lockName = ReqReaderWriterLock::normalizeLockName(_lockName);
+
+        if (monitorMap)
+        {
+            monitorMap.insert(_lockName, _connection);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>escalateLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method handles the case where lock escalation is needed. Only from Shared to Update is allowed.
+    /// </summary>
+    /// <param name = "_lock">The lock object to be used for monitor, and thus inter-thread communication.</param>
+    /// <param name="_lockMode">The type of the lock requested.</param>
+    /// <returns>True if the lock has been escalated; otherwise, false.</returns>
+    protected boolean escalateLock(ReqReaderWriterLockSynchronizer _lock, ReqAppLockMode _lockMode)
+    {
+        //this is a check to see if the lock thread have failed after the lock was granted, e.g. if the connection is lost
+        if (!this.isLockInState(_lock, ReqReaderWriterLockState::Granted))
+        {
+            throw error(strFmt("@SCM:AppLockEscalateError", _lock.lockName));
+        }
+
+        boolean result = true;//if we don't escalate we have the right lock
+        
+        //we only need to do something when escalating to a more strict lock type
+        if (_lock.lockMode == ReqAppLockMode::Shared && _lockMode == ReqAppLockMode::Update)            
+        {    
+            result = this.waitForLockEscalation(_lock);
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>spinLockThread</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Spins off the thread instance which will obtain the app lock and keep the connection alive.
+    /// </summary>
+    /// <param name = "_lock">The lock object to be used for monitor, and thus inter-thread communication.</param>
+    /// <returns>The spawned thread.</returns>
+    /// <remarks>Returns null if after all tries the thread spawning is not successful, thus needs to be guarded against by the caller.</remarks>
+    private NetThread spinLockThread(ReqReaderWriterLockSynchronizer _lock)
+    {
+        System.Threading.ParameterizedThreadStart threadDelegateInstance;
+        NetThread threadInstance;
+
+        ReqReaderWriterLockThread lockThread = new ReqReaderWriterLockThread();
+        threadDelegateInstance += eventhandler(lockThread.runInternal);
+        threadInstance = new NetThread(threadDelegateInstance);
+        threadInstance.IsBackground = true;
+        threadInstance.Name = classStr(ReqReaderWriterLockThread);
+        threadInstance.Start(_lock);
+        return threadInstance;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitForLockToBeAcquired</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Waits for the lock to be acquired.
+    /// </summary>
+    /// <param name = "_lock">The lock object to be used for monitor, and thus inter-thread communication.</param>
+    /// <exception cref="Exception::Error">
+    /// Exceptions can be thrown if the lock was not Granted before time out or has an un-expected state.
+    ///</exception>
+    private boolean waitForLockToBeAcquired(ReqReaderWriterLockSynchronizer _lock)
+    {
+        boolean lockAcquired = false;
+        try
+        {
+            Monitor::Enter(_lock);
+
+            int timeWaitedInMs;
+            int pulseWaitTimeInMsForThreadToStartAcquiringLock = ReqReaderWriterLock::pulseTimeOutInMilliSecForThreadToStartAcquiringLock();
+            boolean breakLoop = false;
+            boolean giveUpWaitingForThreadToGetLock = false;
+
+            while (!breakLoop && _lock.state == ReqReaderWriterLockState::Initial)
+            {
+                //We wait for a pulse from the thread or for pulseWaitTimeInMsForThreadToStartAcquiringLock -  we need to give the thread some time to proceed so we do not use _lock.timeOut
+                //This statement places this thread in the monitor waiting queue - if the thread is not pulsed before the timeout it will move to the ready queue and enter the monitor when it is empty
+                boolean wasPulsedByThread = Monitor::wait(_lock, pulseWaitTimeInMsForThreadToStartAcquiringLock);
+                timeWaitedInMs += pulseWaitTimeInMsForThreadToStartAcquiringLock;
+
+                if (_lock.state == ReqReaderWriterLockState::Error)
+                {
+                    breakLoop = true;
+                }
+                else
+                {
+                    boolean waitingTimeExceeded = (timeWaitedInMs > _lock.maximumAllowedWaitingTimeToAcquireLockInMilliSec());
+                
+                    //if we did not get a pulse before the timeout and we exceeded the timeout without leaving the initial state so we need to fail
+                    if (!wasPulsedByThread 
+                        && waitingTimeExceeded
+                        && _lock.state == ReqReaderWriterLockState::Initial)
+                    {
+                        giveUpWaitingForThreadToGetLock = true;
+                    }
+                    
+                    //the thread may still be trying to acquire the lock so we should just determine if we exit due to a time out or loop again
+                    breakLoop = waitingTimeExceeded ? true : wasPulsedByThread; 
+                }               
+            }
+
+            //we need to determine what action to take while we are in the monitor so we are sure the state is not changed
+            if (_lock.state == ReqReaderWriterLockState::Error)
+            {
+                throw error(strFmt("@SYS341430", "@SYS342303"));
+            }
+            
+            if (giveUpWaitingForThreadToGetLock)
+            {
+                //we need to signal to the thread that we timed out and are giving up
+                _lock.state = ReqReaderWriterLockState::TimedOutBeforeGranted;
+                Monitor::Pulse(_lock);
+                Monitor::Exit(_lock);
+                        
+                throw error(strFmt("@SCM:AppLockThreadNotStartedBeforeTimeOut", _lock.lockName, _lock.maximumAllowedWaitingTimeToAcquireLockInMilliSec()));
+            }
+            
+            lockAcquired = (_lock.state == ReqReaderWriterLockState::Granted);           
+        }
+        finally
+        {
+            if (Monitor::IsEntered(_lock))
+            {
+                Monitor::Exit(_lock);
+            }
+        }
+
+        return lockAcquired;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitForLockEscalation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Waits for lock escalation.
+    /// </summary>
+    /// <param name = "_lock">The lock object to be used for monitor, and thus inter-thread communication.</param> 
+    /// <returns>The result of the escalation.</returns>
+    ///<exception cref="Exception::Error">
+    /// Exceptions can be thrown if the lock was not Granted, has an un-expected state or the result of the escalation is unknown.
+    ///</exception>
+    private boolean waitForLockEscalation(ReqReaderWriterLockSynchronizer _lock)
+    {
+        boolean result = false;
+        try
+        {
+            Monitor::Enter(_lock);
+            //just check that the lock is still granted in the unlikely event that the thread has encountered an error and flipped the state 
+            if (_lock.state != ReqReaderWriterLockState::Granted)
+            {
+                throw error(strFmt("@SCM:AppLockEscalateError", _lock.lockName));
+            }
+            _lock.signalReaderLockToUpdateLockEscalation();
+            
+            //signal to the thread to escalate
+            Monitor::Pulse(_lock);
+            
+            //we are letting the thread handle the time out so we have to wait for a pulse or for the default maximum allowed time.
+            Monitor::wait(_lock, ReqReaderWriterLockSynchronizer::defaultMaximumAllowedWaitingTimeToAcquireLockInMilliSec());
+            _lock.parmEscalateReaderLock(false);
+            //this could happen if the thread times out
+            if (_lock.state == ReqReaderWriterLockState::Error)
+            {
+                throw error(strFmt("@SYS341430", "@SYS342303"));
+            }
+
+            switch (_lock.parmReaderLockEscalationResult())
+            {
+                case UnknownNoYes::Yes : 
+                    result = true;
+                    break;
+                case UnknownNoYes::No : 
+                    result = false;
+                    break;
+                default: 
+                    throw error(strFmt("@SCM:AppLockLockEscalationHasUnknownResult", _lock.lockName));
+            }
+            Monitor::Exit(_lock);
+            
+        }
+        finally
+        {
+            //clear it to be safe
+            _lock.resetReaderLockToUpdateLockEscalationSignal();
+            if (Monitor::IsEntered(_lock))
+            {
+                Monitor::Exit(_lock);
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pulseTimeOutInMilliSecForThreadToStartAcquiringLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the time in milliseconds that the main thread should wait for the background thread to start acquiring the lock.
+    /// </summary>
+    /// <returns>The time in milliseconds that the main thread should wait for the background thread to start acquiring the lock.</returns>
+    public static int pulseTimeOutInMilliSecForThreadToStartAcquiringLock()
+    {
+        return 60*1000;// 60 s in ms by default.
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enterReaderLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Enters the reader lock with the specified lock name. The call will use the default allowed waiting time to wait for the lock to be acquired. If the lock cannot be acquired an exception is thrown.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    public void enterReaderLock(str _lockName)
+    {
+        this.enterInternal(_lockName, ReqAppLockMode::Shared, ReqReaderWriterLockSynchronizer::WaitMaximumAllowedWaitingTime);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enterUpdateLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Enters the update lock with the specified name. The call will use the default allowed waiting time to wait for the lock to be acquired. If the lock cannot be acquired an exception is thrown.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    public void enterUpdateLock(str _lockName)
+    {
+        this.enterInternal(_lockName, ReqAppLockMode::Update, ReqReaderWriterLockSynchronizer::WaitMaximumAllowedWaitingTime);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ensureStillHasUpdateLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if a lock is still acquired on the SQL side and if and if not tries to acquire an update lock. 
+    /// Acquiring update lock will work if the instance previously held an Update or Exclusive lock and 
+    /// nobody else has acquired an Update or Exclusive lock since the lock was lost by this instance.
+    /// Should be only called if update lock has been already acquired on a given lock by the instance.
+    /// </summary>
+    /// <param name="_lockName">
+    /// The name of the lock.
+    /// </param>
+    /// <remarks>
+    /// Throws if lock with a given name was not previously acquired or re-acquiring fails.
+    /// Does not check the type of lock that was previously acquired, so will pass if the instance has reader or
+    /// exclusive lock with this name without changing type of the lock.
+    /// </remarks>
+    internal void ensureStillHasUpdateLock(str _lockName)
+    {
+        _lockName = ReqReaderWriterLock::normalizeLockName(_lockName);
+
+        using (var activityContext = instrumentationLogger.reqReaderWriterLock().ensureStillHasUpdateLock(_lockName))
+        {
+            this.reacquireLock(_lockName, ReqAppLockMode::Update);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reacquireLock</Name>
+				<Source><![CDATA[
+    private void reacquireLock(str _lockName, ReqAppLockMode _lockMode)
+    {
+        if (!this.useLockOwnerTrackingForLock(_lockName))
+        {
+            return;
+        }
+
+        using (var activityContext = instrumentationLogger.reqReaderWriterLock().reacquireLock(_lockName, _lockMode, ownerId))
+        {
+            boolean lockLostAndCannotBeReacquired = false;
+
+            try
+            {
+                var connection = this.getExistingConnectionForLock(_lockName);
+
+                if (!connection)
+                {
+                    lockLostAndCannotBeReacquired = true;
+                    instrumentationLogger.logInformation('Could not reacquire lock. Connection for the lock with the given name not found.');
+                    throw error(strFmt("@SCMPlanning:ReqReaderWriterLockLostLockAndCannotReacquireErrorMessage", _lockName));
+                }
+
+                if (this.connectionStillAlive(connection))
+                {                    
+                    // if the connection is still alive then the lock should still be held on the SQL side
+                    instrumentationLogger.logInformation('Connection still alive for a lock with the given name. No need to reacquire.');
+                    return;
+                }
+
+                if (!this.isCurrentInstanceMarkedAsOwner(_lockName))
+                {
+                    lockLostAndCannotBeReacquired = true;
+                    instrumentationLogger.logInformation('Could not reacquire lock. The current instance is no longer the owner of lock with the given name.');
+                    throw error(strFmt("@SCMPlanning:ReqReaderWriterLockLostLockAndCannotReacquireErrorMessage", _lockName));
+                }
+
+                var lockReacquired = this.tryReacquireLock(_lockName, _lockMode);
+
+                if (!lockReacquired)
+                {
+                    lockLostAndCannotBeReacquired = true;
+                    instrumentationLogger.logInformation('Failed when trying to reacquire the lock.');
+                    throw error(strFmt("@SCMPlanning:ReqReaderWriterLockLostLockAndCannotReacquireErrorMessage", _lockName));
+                }
+
+                instrumentationLogger.logInformation('Successfully reacquired the lock.');
+            }
+            catch (Exception::Break)
+            {
+                throw;
+            }
+            catch
+            {
+                // catching all exceptions as connection issues with SQL are not always result in throwing
+                // transient SQL error exception type
+
+                if (lockLostAndCannotBeReacquired)
+                {
+                    throw;
+                }
+
+                if (ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError(transientErrorsMaxRetryCount))
+                {
+                    retry;
+                }
+            
+                throw;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enterWriterLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Enters the writer lock with the specified name.The call will use the default allowed waiting time to wait for the lock to be acquired. If the lock cannot be acquired an exception is thrown.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    public void enterWriterLock(str _lockName)
+    {
+        this.enterInternal(_lockName, ReqAppLockMode::Exclusive, ReqReaderWriterLockSynchronizer::WaitMaximumAllowedWaitingTime);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>exit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Exits the previously acquired lock with the specified name.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    public void exit(str _lockName)
+    {
+        _lockName = ReqReaderWriterLock::normalizeLockName(_lockName);
+
+        using (var activityContext = instrumentationLogger.reqReaderWriterLock().exit(_lockName, ownerId))
+        {
+            if (useUserConnection)
+            {
+                this.exitUserConnection(_lockName, true);
+            }
+            else
+            {
+                this.exitLockThread(_lockName, true);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>exitLockThread</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Exits the previously acquired lock with the specified name.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <param name="_removeLockObject">
+    ///     A boolean indicating whether the lock should be removed from the map or not.
+    /// </param>
+    ///<exception cref="Exception::Error">
+    ///    Exceptions can be thrown if the lock cannot be released in due time, has an wrong state after the release or if a non-acquired lock is attempted to be released.
+    ///</exception>
+    public void exitLockThread(str _lockName, boolean _removeLockObject)
+    {
+        _lockName = ReqReaderWriterLock::normalizeLockName(_lockName);
+
+        if (monitorMap.exists(_lockName))
+        {
+            ReqReaderWriterLockSynchronizer lock = monitorMap.lookup(_lockName);
+
+            if (_removeLockObject)
+            {
+                monitorMap.remove(_lockName);
+            }
+
+            try
+            {
+                Monitor::Enter(lock);
+                //the state might have changed to Error if something happened in the thread
+                if (lock.state == ReqReaderWriterLockState::Granted)
+                {
+                    boolean waitResult = false;
+                    lock.state = ReqReaderWriterLockState::ToBeReleased;                
+                    Monitor::Pulse(lock);                    
+
+                    //if we get a pulse but the state is still ToBeReleased then we exit since that is an error and we need to break to handle it
+                    while (!waitResult && lock.state == ReqReaderWriterLockState::ToBeReleased)
+                    {
+                        waitResult = Monitor::wait(lock, ReqReaderWriterLockSynchronizer::maximumAllowedWaitingTimeToReleaseLockInMilliSec());
+                
+                        if (!waitResult)
+                        {
+                            throw error(strFmt("@SCM:AppLockLockNotReleasedBeforeTimeout", lock.lockName));
+                        }
+                    }
+
+                    if (lock.state != ReqReaderWriterLockState::Released)
+                    {
+                        throw error(strFmt("@SYS341430", "@SYS342303"));
+                    }
+                }
+                Monitor::Exit(lock);
+            }
+            finally
+            {
+                if (Monitor::IsEntered(lock))
+                {
+                    Monitor::Exit(lock);
+                }
+            }
+        }
+        else
+        {
+            throw error(strFmt("@SYS342111", _lockName));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>exitUserConnection</Name>
+				<Source><![CDATA[
+    private void exitUserConnection(str _lockName, boolean _removeConnection)
+    {
+        if (!monitorMap.exists(_lockName))
+        {
+            throw error(strFmt("@SYS342111", _lockName));
+        }
+
+        Connection connection = monitorMap.lookup(_lockName);
+
+        if (!connection)
+        {
+            throw error(strFmt("@SYS341428", _lockName));
+        }
+
+        boolean isLockOwnerTrackingUsed = this.useLockOwnerTrackingForLock(_lockName); 
+        boolean isCurrentInstanceMarkedAsOwner = false;
+        
+        var logLineTry = infologLine();
+        try
+        {
+            if (isLockOwnerTrackingUsed)
+            {
+                isCurrentInstanceMarkedAsOwner = this.isCurrentInstanceMarkedAsOwner(_lockName);
+
+                if (isCurrentInstanceMarkedAsOwner)
+                {
+                    this.removeAsOwnerIgnoreErrors(_lockName);
+                }
+            }
+
+            // app lock is released when connection commits
+            // if the connection has gone down we will get an exception when calling commit
+            // This is by design since we want the consumer to get this exception since the lock was lost at some point in time
+            connection.ttscommit();
+        }
+        catch
+        {
+            if (!isLockOwnerTrackingUsed || !isCurrentInstanceMarkedAsOwner)
+            {
+                throw;
+            }
+
+            instrumentationLogger.logInformation('Errors occured when exiting the lock. They are ignored as the instance was still marked as the owner of the lock.');
+
+            // If the current instance was still the owner then the exceptions coming
+            // from ttscommit are ignored and are removed from the infolog
+            infolog.clear(logLineTry);
+        }
+        finally
+        {
+            connection.finalize();
+        
+            if (_removeConnection)
+            {
+                monitorMap.remove(_lockName);
+            }
+
+            if (this.useLockOwnerTrackingForLock(_lockName))
+            {
+                mostRestrictiveLockModeAcquiredByLockName.remove(_lockName);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>releaseAllLocks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Releases all previously acquired locks.
+    /// </summary>
+    public void releaseAllLocks()
+    {
+        using (var activityContext = instrumentationLogger.reqReaderWriterLock().releaseAllLocks(ownerId))
+        {
+            if (monitorMap.elements() <= 0)
+            {
+                return;
+            }
+
+            MapEnumerator enumerator = monitorMap.getEnumerator();
+
+            try
+            {
+                while (enumerator.moveNext())
+                {
+                    if (useUserConnection)
+                    {
+                        this.exitUserConnection(enumerator.currentKey(), false);
+                    }
+                    else
+                    {
+                        this.exitLockThread(enumerator.currentKey(), false);
+                    }
+                }
+            }
+            catch
+            {
+                if (!useUserConnection)
+                {
+                    throw;
+                }
+
+                // even if releasing one of the locks failed still all the connections should be finalized
+                this.finalizeAllUserConnections();
+
+                // even if releasing one of the locks failed still all the information about this instance being 
+                // an owner of a lock should be removed
+                this.removeAsOwnerForAllLocksIgnoreErrors();
+
+                throw;
+            }
+
+            this.resetInternalMaps();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>releaseSQLLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Release the lock of the specified name.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    ///<exception cref="Exception::Error">
+    ///    Exceptions can be thrown if the result from SQL cannot be handled.
+    ///</exception>
+    [Hookable(false)]
+    internal static void releaseSQLLock(str _lockName)
+    {
+        _lockName = ReqReaderWriterLock::normalizeLockName(_lockName);
+
+        const var lockReleasedImmediately = 0;
+
+        Connection connection = new Connection();//use the current connection
+
+        str sql = strFmt('DECLARE @res int; EXEC @res = sp_releaseapplock @resource = %1; SELECT @res;',
+            new SqlSystem().sqlLiteral(_lockName));
+
+        Statement statement = connection.createStatement();
+        ResultSet resultSet = statement.executeQuery(sql);
+
+        resultSet.next();
+
+        int result = resultSet.getInt(1);
+
+        connection.finalize();
+
+        if (result != lockReleasedImmediately)
+        {
+            throw error(strFmt("@SYS341430", result));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tryEnterReaderLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Makes an attempt to enter the reader lock.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <param name="_waitMilliseconds">
+    ///     The number of milliseconds to wait for the lock to be acquired; optional.
+    /// </param>
+    /// <returns>
+    ///     true if the lock has been acquired; otherwise, false.
+    /// </returns>
+    public boolean tryEnterReaderLock(
+        str _lockName,
+        int _waitMilliseconds = #EnterLock_DontWait)
+    {
+        return this.enterInternal(_lockName, ReqAppLockMode::Shared, _waitMilliseconds);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tryEnterUpdateLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Makes an attempt to enter the update lock.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <param name="_waitMilliseconds">
+    ///     The number of milliseconds to wait for the lock to be acquired; optional.
+    /// </param>
+    /// <returns>
+    ///     true if the lock has been acquired; otherwise, false.
+    /// </returns>
+    public boolean tryEnterUpdateLock(
+        str _lockName,
+        int _waitMilliseconds = #EnterLock_DontWait)
+    {
+        return this.enterInternal(_lockName, ReqAppLockMode::Update, _waitMilliseconds);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tryEnterWriterLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Makes an attempt to enter the writer lock.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <param name="_waitMilliseconds">
+    ///     The number of milliseconds to wait for the lock to be acquired; optional.
+    /// </param>
+    /// <returns>
+    ///     true if the lock has been acquired; otherwise, false.
+    /// </returns>
+    public boolean tryEnterWriterLock(
+        str _lockName,
+        int _waitMilliseconds = #EnterLock_DontWait)
+    {
+        return this.enterInternal(_lockName, ReqAppLockMode::Exclusive, _waitMilliseconds);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static ReqReaderWriterLock construct()
+    {
+        return new ReqReaderWriterLock();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        instrumentationLogger = ReqInstrumentationLogger::createLogger(classStr(ReqReaderWriterLock));
+
+        useUserConnection = ReqReaderWriterLock::useUserConnectionToHoldLock();
+        this.resetInternalMaps();
+
+        ownerId = System.Guid::NewGuid();
+
+        readerWriterLockReleaseAllLocksFinalizeConnectionsToggleEnabled = ReqReaderWriterLockReleaseAllLocksFinalizeConnectionsToggle::instance().isEnabled();
+
+        reqReaderWriterLockLockReacquiringOnEnterToggleEnabled = ReqReaderWriterLockLockReacquiringOnEnterToggle::instance().isEnabled();
+
+        // To read form ReqReaderWriterLockSettings table Req configuration key must be enabled
+        // and consumer might not be using Req configuration key.
+        // In case the consumer does not have the key enabled all the values will default to 0.
+        if (isConfigurationKeyEnabled(configurationKeyNum(Req))
+          && ReqUseReaderWriterLockSettingsTableToggle::instance().isEnabled())
+        {
+            ReqReaderWriterLockSettings settings = ReqReaderWriterLockSettings::find();
+            transientErrorsMaxRetryCount = settings.TransientErrorsMaxRetryCount;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetInternalMaps</Name>
+				<Source><![CDATA[
+    private void resetInternalMaps()
+    {
+        monitorMap = new Map(Types::String, Types::Class);
+        mostRestrictiveLockModeAcquiredByLockName = new Map(Types::String, Types::Enum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>testInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Tests whether the specified lock can be acquired.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <param name="_mode">
+    ///     The type of the lock.
+    /// </param>
+    /// <returns>
+    ///     true if the lock can be acquired; otherwise, false.
+    /// </returns>
+    private static boolean testInternal(str _lockName, ReqAppLockMode _mode)
+    {
+        Statement statement;
+        int result;
+        str sql;
+        ResultSet resultSet;
+        Connection connection;
+        boolean ret;
+
+        _lockName = ReqReaderWriterLock::normalizeLockName(_lockName);
+
+        sql = strFmt('SELECT APPLOCK_TEST(\'public\', %1, \'%2\', \'transaction\')',
+            new SqlSystem().sqlLiteral(_lockName),
+            strLwr(new SysDictEnum(enumNum(ReqAppLockMode)).value2Symbol(_mode)));
+
+        new SqlStatementExecutePermission(sql).assert();
+
+        connection = new UserConnection();
+
+        try
+        {
+            connection.ttsbegin();
+
+            statement = connection.createStatement();
+            resultSet = statement.executeQuery(sql);
+            resultSet.next();
+            result = resultSet.getInt(1);
+
+            connection.ttscommit();
+        }
+        finally
+        {
+            connection.finalize();
+        }
+
+        switch (result)
+        {
+            case 0:
+                ret = false;
+                break;
+            case 1:
+                ret = true;
+                break;
+            default:
+                throw error(strFmt("@SYS341429", result));
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>testReader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Tests whether the reader lock can be acquired.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <returns>
+    ///     true if the lock can be acquired; otherwise, false.
+    /// </returns>
+    public static boolean testReader(str _lockName)
+    {
+        return ReqReaderWriterLock::testInternal(_lockName, ReqAppLockMode::Shared);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>testUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Tests whether the update lock can be acquired.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <returns>
+    ///     true if the lock can be acquired; otherwise, false.
+    /// </returns>
+    public static boolean testUpdate(str _lockName)
+    {
+        return ReqReaderWriterLock::testInternal(_lockName, ReqAppLockMode::Update);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>testWriter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Tests whether the writer lock can be acquired.
+    /// </summary>
+    /// <param name="_lockName">
+    ///     The name of the lock. Lock names are case insensitive.
+    /// </param>
+    /// <returns>
+    ///     true if the lock can be acquired; otherwise, false.
+    /// </returns>
+    public static boolean testWriter(str _lockName)
+    {
+        return ReqReaderWriterLock::testInternal(_lockName, ReqAppLockMode::Exclusive);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dispose</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Disposes the current instance of an object by releasing all acquired locks.
+    /// </summary>
+    public void dispose()
+    {
+        this.releaseAllLocks();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enableLockOwnerTracking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Enables tracking of lock owner.
+    /// When enabled then releasing an update / exclusive lock will not fail even if the lock was lost on the SQL side
+    /// in a case when nobody has acquired the lock since the lock was lost.
+    /// </summary>
+    /// <remarks>
+    /// For tracking to work properly all of the instances that would be taking locks with the same names must also have
+    /// the tracking enabled.
+    /// This functionality only works if ReaderWriterUserConnection flight is enabled.
+    /// </remarks>
+    internal void enableLockOwnerTracking()
+    {
+        useLockOwnerTracking = true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enableRetryOnAcquiringLock</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Enables retrying on errors when acquiring the lock.
+    /// </summary>
+    /// <remarks>
+    /// This functionality only works if ReaderWriterUserConnection flight is enabled.
+    /// </remarks>
+    internal void enableRetryOnAcquiringLock()
+    {
+        retryOnAcquiringLock = true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>useLockOwnerTrackingForLock</Name>
+				<Source><![CDATA[
+    private boolean useLockOwnerTrackingForLock(str _lockName)
+    {
+        return useUserConnection && this.lockOwnerTrackingEnabled() && this.canConvertStrToReqReaderWriterLockOwnerName(_lockName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lockOwnerTrackingEnabled</Name>
+				<Source><![CDATA[
+    private boolean lockOwnerTrackingEnabled()
+    {
+        return useLockOwnerTracking;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>useUserConnectionToHoldLock</Name>
+				<Source><![CDATA[
+    static private boolean useUserConnectionToHoldLock()
+    {
+        return ReqReaderWriterLock::isUserConnectionFlightingEnabled();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isUserConnectionFlightingEnabled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks whether flighting is enabled for the user connection based locking.
+    /// </summary>
+    /// <returns>True if the flighting is enabled; otherwise, false.</returns>
+    static private boolean isUserConnectionFlightingEnabled()
+    {
+        return isFlightEnabled(ReqReaderWriterLock::ReaderWriterUserConnectionFlightingName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOwner</Name>
+				<Source><![CDATA[
+    private void setOwner(ReqReaderWriterLockName _lockName, ReqAppLockMode _lockMode, UserConnection _userConnectionOwningLock)
+    {
+        if (!this.canUseOwnerTrackingWithLockMode(_lockMode))
+        {
+            return;
+        }
+
+        using (var activityContext = instrumentationLogger.reqReaderWriterLock().setOwner(_lockName, _lockMode, ownerId))
+        {
+            this.onSetOwner(_lockName);
+
+            UserConnection userConnectionAssignOwner;
+
+            try
+            {
+                userConnectionAssignOwner = new UserConnection();
+
+                ReqReaderWriterLockOwner owner;
+                owner.setConnection(userConnectionAssignOwner);
+
+                userConnectionAssignOwner.ttsBegin();
+
+                var logLineTry = infologLine();
+                try
+                {
+                    owner.LockName = _lockName;
+                    owner.OwnerId = ownerId;
+                    owner.insert();
+                }
+                catch (Exception::DuplicateKeyException)
+                {
+                    // Duplicate key exception can occur in case previous owner never
+                    // properly removed themselves as an owner
+                    // or if the current instance was already the owner
+                    instrumentationLogger
+                        .logInformation('Duplicate key exception occured when setting owner.' 
+                            + ' Can happen in case previous owner never properly removed themselves'
+                            + ' as an owner or if the current instance was already the owner');
+
+                    // Removing the information about exceptions from infolog
+                    infolog.clear(logLineTry);
+
+                    select firstOnly pessimisticLock owner
+                        where owner.LockName == _lockName;
+
+                    // Record might not exist in case previous owner
+                    // was just removed as an owner
+                    if (owner.RecId)
+                    {
+                        owner.OwnerId = ownerId;
+                        owner.update();
+                    }
+                    else
+                    {
+                        owner.LockName = _lockName;
+                        owner.OwnerId = ownerId;
+                        owner.insert();
+                    }
+                }
+
+                // checking if connection is still alive - if it is not then the lock was lost
+                // so this instance should not commit itself as the lock owner
+                this.checkIfConnectionStillAlive(_userConnectionOwningLock);
+
+                // The reason for checking if connection is still alive 
+                // before committing is to prevent the following scenario:
+                // 1. Instance X acquires lock in SQL.
+                // 2. Instance X loses the lock in SQL.
+                // 3. Instance Y acquires lock in SQL.
+                // 4. Instance Y sets themselves as an owner.
+                // 5. Instance X sets themselves as an owner.
+                // In this case incorrect owner would be set.
+                userConnectionAssignOwner.ttsCommit();
+            }
+            finally
+            {
+                if (userConnectionAssignOwner)
+                {
+                    userConnectionAssignOwner.finalize();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfConnectionStillAlive</Name>
+				<Source><![CDATA[
+    private void checkIfConnectionStillAlive(UserConnection _userConnection)
+    {
+        using (var activityContext = instrumentationLogger.reqReaderWriterLock().checkIfConnectionStillAlive())
+        {
+            // if the connection is not alive running select statement on it will throw
+            Statement statement = _userConnection.createStatement();
+            ResultSet resultSet;
+            var sqlText = 'select 1 AS ReqReaderWriterLockConAliveNonThread;';
+            resultSet = statement.executeQueryWithParameters(sqlText, null);
+            resultSet.next();
+            resultSet.close();
+            statement.close();
+            statement.finalize();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canConvertStrToReqReaderWriterLockOwnerName</Name>
+				<Source><![CDATA[
+    private boolean canConvertStrToReqReaderWriterLockOwnerName(str _lockName)
+    {
+        return strLen(_lockName) <= MaxLockNameLength;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeAsOwnerIgnoreErrors</Name>
+				<Source><![CDATA[
+    private void removeAsOwnerIgnoreErrors(ReqReaderWriterLockName _lockName)
+    {
+        var logLineTry = infologLine();
+        UserConnection userConnection;
+        try
+        {
+            userConnection = new UserConnection();
+
+            ReqReaderWriterLockOwner owner;
+            owner.setConnection(userConnection);
+
+            userConnection.ttsbegin();
+            delete_from owner
+                where owner.LockName == _lockName
+                  &&  owner.OwnerId == ownerId;
+            userConnection.ttscommit();
+        }
+        catch
+        {
+            // Removing the information about exceptions from infolog
+            infolog.clear(logLineTry); 
+        }
+        finally
+        {
+            this.finalizeConnectionIgnoreErrors(userConnection);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getExistingConnectionForLock</Name>
+				<Source><![CDATA[
+    private Connection getExistingConnectionForLock(str _lockName)
+    {
+        if (!monitorMap.exists(_lockName))
+        {
+            return null;
+        }
+
+        return monitorMap.lookup(_lockName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tryReacquireLock</Name>
+				<Source><![CDATA[
+    private boolean tryReacquireLock(ReqReaderWriterLockName _lockName, ReqAppLockMode _lockMode)
+    {
+        Connection newConnection;
+        try
+        {
+            if (!this.useLockOwnerTrackingForLock(_lockName))
+            {
+                return false;
+            }
+
+            if (!this.canUseOwnerTrackingWithLockMode(_lockMode))
+            {
+                throw error(Error::wrongUseOfFunction(funcName()));
+            }
+
+            var currentConnection = this.getExistingConnectionForLock(_lockName);
+
+            if (currentConnection)
+            {
+                this.finalizeConnectionIgnoreErrors(currentConnection);
+            }
+
+            newConnection = this.startNewConnectionForLock(_lockName);
+        
+            // acquiring lock without any wait time, since if lock cannot be granted immediately it means
+            // that somebody else must have acquired that lock - so it cannot be re-acquired
+            var lockAcquired = this.acquireSqlApplicationLock(_lockName, _lockMode, #EnterLock_DontWait, newConnection);
+
+            if (!lockAcquired)
+            {
+                instrumentationLogger.logInformation('Could not reacquire lock. Reacquiring failed when trying to acquire the lock on the SQL side.');
+                return false;
+            }
+
+            // checking if the instance is still marked as the owner to account for race condition scenarios,
+            // that is - since last check somebody else might have acquired the lock and release, before this instance acquired it
+            if (!this.isCurrentInstanceMarkedAsOwner(_lockName))
+            {
+                instrumentationLogger.logInformation('Could not reacquire lock. Reacquiring failed because owner did not match after lock was reacquired on SQL side.');
+                this.exitUserConnection(_lockName, true);
+
+                return false;
+            }
+
+            this.updateMostRestrictiveLockModeAcquired(_lockName, _lockMode);
+
+            return true;
+        }
+        catch
+        {
+            // if there were any error we want to ensure we release a lock that could have been acquired
+            if (newConnection)
+            {
+                newConnection.ttsAbort();
+            }
+
+            throw;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>acquireSqlApplicationLock</Name>
+				<Source><![CDATA[
+    private boolean acquireSqlApplicationLock(str _lockName, ReqAppLockMode _lockMode, int _timeOut, Connection _connection)
+    {
+        this.onAcquireSqlApplicationLock(_connection);
+
+        // if we get the lock it is held until the transaction on the connection is alive
+        ReqReaderWriterLockState lockStatus = ReqReaderWriterLockThread::lockStatusFromAppLockStatusWaitedTime(
+            ReqReaderWriterLockThread::getAppLock(_connection, _lockName, _lockMode, _timeOut), _timeOut);
+
+        return lockStatus == ReqReaderWriterLockState::Granted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startNewConnectionForLock</Name>
+				<Source><![CDATA[
+    private Connection startNewConnectionForLock(str _lockName)
+    {
+        var connection = new UserConnection();
+        monitorMap.insert(_lockName, connection);
+        connection.ttsbegin();
+        return connection;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeConnectionForLockIgnoreErrors</Name>
+				<Source><![CDATA[
+    private void removeConnectionForLockIgnoreErrors(str _lockName)
+    {
+        var connection = this.getExistingConnectionForLock(_lockName);
+
+        this.finalizeConnectionIgnoreErrors(connection);
+        
+        monitorMap.remove(_lockName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCurrentInstanceMarkedAsOwner</Name>
+				<Source><![CDATA[
+    private boolean isCurrentInstanceMarkedAsOwner(ReqReaderWriterLockName _lockName)
+    {
+        return ReqReaderWriterLockOwner::checkIsOwner(_lockName, ownerId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalizeAllUserConnections</Name>
+				<Source><![CDATA[
+    private void finalizeAllUserConnections()
+    {
+        if (!useUserConnection ||
+            !monitorMap ||
+            monitorMap.elements() <= 0 ||
+            !readerWriterLockReleaseAllLocksFinalizeConnectionsToggleEnabled)
+        {
+            return;
+        }
+
+        var enumerator = monitorMap.getEnumerator();
+        var logLineTry = infologLine();
+        while (enumerator.moveNext())
+        {
+            try
+            {
+                if (enumerator.currentValue())
+                {
+                    Connection connection = enumerator.currentValue();
+
+                    connection.finalize();
+                }
+            }
+            catch
+            {
+                // nothing to do
+            }
+        }
+
+        // cleaning potential infolog errors
+        infolog.clear(logLineTry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeAsOwnerForAllLocksIgnoreErrors</Name>
+				<Source><![CDATA[
+    private void removeAsOwnerForAllLocksIgnoreErrors()
+    {
+        if (!useUserConnection || !this.lockOwnerTrackingEnabled())
+        {
+            return;
+        }
+
+        UserConnection userConnection;
+        var logLineTry = infologLine();
+        try
+        {
+            userConnection = new UserConnection();
+
+            ReqReaderWriterLockOwner owner;
+            owner.setConnection(userConnection);
+
+            userConnection.ttsBegin();
+
+            delete_from owner
+                where OwnerId == ownerId;
+
+            userConnection.ttsCommit();
+        }
+        finally
+        {
+            if (userConnection)
+            {
+                userConnection.finalize();
+            }
+
+            // cleaning infolog errors
+            infolog.clear(logLineTry);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canUseOwnerTrackingWithLockMode</Name>
+				<Source><![CDATA[
+    private boolean canUseOwnerTrackingWithLockMode(ReqAppLockMode _lockMode)
+    {
+        return _lockMode == ReqAppLockMode::Exclusive || _lockMode == ReqAppLockMode::Update;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>connectionStillAlive</Name>
+				<Source><![CDATA[
+    private boolean connectionStillAlive(UserConnection _userConnection)
+    {
+        var logLineTry = infologLine();
+        try
+        {
+            this.checkIfConnectionStillAlive(_userConnection);
+        }
+        catch
+        {
+            infolog.clear(logLineTry);
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMostRestrictiveLockModeAcquired</Name>
+				<Source><![CDATA[
+    private void updateMostRestrictiveLockModeAcquired(ReqReaderWriterLockName _lockName, ReqAppLockMode _acquiredLockMode)
+    {
+        boolean hasPreviouslyAcquiredLock;
+        ReqAppLockMode mostRestrictiveLockModeAcquired;
+
+        [hasPreviouslyAcquiredLock, mostRestrictiveLockModeAcquired] = this.getMostRestrictiveLockModeAcquired(_lockName);
+
+        if (!hasPreviouslyAcquiredLock || this.lockModeMoreRestrictive(_acquiredLockMode, mostRestrictiveLockModeAcquired))
+        {
+            mostRestrictiveLockModeAcquiredByLockName.insert(_lockName, _acquiredLockMode);
+            this.logTemeletryOnUpdateMostRestrictiveLockModeAcquired(hasPreviouslyAcquiredLock, mostRestrictiveLockModeAcquired, _acquiredLockMode);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logTemeletryOnUpdateMostRestrictiveLockModeAcquired</Name>
+				<Source><![CDATA[
+    private void logTemeletryOnUpdateMostRestrictiveLockModeAcquired(
+        boolean _hasPreviouslyAcquiredLock, 
+        ReqAppLockMode _mostRestrictiveLockModePreviouslyAcquired,
+        ReqAppLockMode _newlyAcquiredLockMode)
+    {
+        instrumentationLogger
+            .logInformation(
+                strFmt(
+                    'Most restrictive lock mode has been updated for the lock.' +
+                        'hasPreviouslyAcquiredLock: %1, mostRestrictiveLockModePreviouslyAcquired: %2, newlyAcquiredLockMode: %3',
+                    any2Str(_hasPreviouslyAcquiredLock),
+                    this.lockModeToStr(_mostRestrictiveLockModePreviouslyAcquired),
+                    this.lockModeToStr(_newlyAcquiredLockMode)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mostRestrictiveLockMode</Name>
+				<Source><![CDATA[
+    private ReqAppLockMode mostRestrictiveLockMode(ReqAppLockMode _lockMode, ReqAppLockMode _otherLockMode)
+    {
+        return this.lockModeMoreRestrictive(_lockMode, _otherLockMode) ? _lockMode : _otherLockMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lockModeMoreRestrictive</Name>
+				<Source><![CDATA[
+    private boolean lockModeMoreRestrictive(ReqAppLockMode _lockMode, ReqAppLockMode _otherLockMode)
+    {
+        if (_lockMode == ReqAppLockMode::Exclusive && _otherLockMode != ReqAppLockMode::Exclusive)
+        {
+            return true;
+        }
+
+        if (_lockMode == ReqAppLockMode::Update && _otherLockMode == ReqAppLockMode::Shared)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMostRestrictiveLockModeAcquired</Name>
+				<Source><![CDATA[
+    private container getMostRestrictiveLockModeAcquired(ReqReaderWriterLockName _lockName)
+    {
+        if (!mostRestrictiveLockModeAcquiredByLockName.exists(_lockName))
+        {
+            return [false, ReqAppLockMode::Shared];
+        }
+
+        return [true, mostRestrictiveLockModeAcquiredByLockName.lookup(_lockName)];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalizeConnectionIgnoreErrors</Name>
+				<Source><![CDATA[
+    private void finalizeConnectionIgnoreErrors(Connection _connection)
+    {
+        var logLineTry = infologLine();
+        if (_connection)
+        {
+            try
+            {
+                _connection.finalize();
+            }
+            catch
+            {
+                // nothing to do
+                // finalize can throw when connection has already been finalized
+                infolog.clear(logLineTry);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lockModeToStr</Name>
+				<Source><![CDATA[
+    private str lockModeToStr(ReqAppLockMode _lockMode)
+    {
+        return enum2Symbol(enumNum(ReqAppLockMode), _lockMode);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOwnerId</Name>
+				<Source><![CDATA[
+    // Added for testing purposes only
+    [Hookable(false)]
+    internal ReqReaderWriterLockOwnerId getOwnerId()
+    {
+        return ownerId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onSetOwner</Name>
+				<Source><![CDATA[
+    // Added for testing purposes only
+    private void onSetOwner(str _lockName)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onAcquireSqlApplicationLock</Name>
+				<Source><![CDATA[
+    // Added for testing purposes only
+    private void onAcquireSqlApplicationLock(Connection _connection)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isLockNameCaseSensitive</Name>
+				<Source><![CDATA[
+    [SysObsolete('This class member is deprecated because it is not used in this class anymore.', false, 18\04\2024)]
+    protected static boolean isLockNameCaseSensitive()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>normalizeLockName</Name>
+				<Source><![CDATA[
+    private static str normalizeLockName(str _lockName)
+    {
+        if (ReqReaderWriterLock::isLockNameCaseSensitive())
+        {
+            return _lockName;
+        }
+
+        return strUpr(_lockName);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

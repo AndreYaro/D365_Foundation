@@ -1,0 +1,710 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailStoreOrderSynchronizer</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Runtime.Services.CustomerOrder;
+
+/// <summary>
+/// The class <c>RetailStoreOrderSynchronizer</c> Create sales order based on store transaction data.
+/// </summary>
+[SysObsolete('This class is obsolete. Its functionality was replaced by the new Retail Statements framework.', true, 30\11\2019)]
+public class RetailStoreOrderSynchronizer
+{
+    #ISOCountryRegionCodes
+
+    // aggregationIdx fields
+    #macro.matchesAggregatedHeader(
+                       %1.Channel                   == %2.Channel
+                    && %1.store                     == %2.store
+                    && %1.businessDate              == %2.businessDate
+                    && %1.statementId               == %2.statementId
+                    && %1.currency                  == %2.currency
+                    && %1.custAccount               == %2.custAccount
+                    && %1.LogisticsPostalAddress    == %2.LogisticsPostalAddress
+                    && %1.type                      == %2.type
+                    && %1.entryStatus               == %3
+                    && %1.SalesGroup                == %2.SalesGroup
+                    && %1.IsTaxIncludedInPrice      == %2.IsTaxIncludedInPrice
+                    && !%1.incomeExpenseAmount
+                    && !%1.SkipAggregation
+                )
+    #endmacro
+
+    #define.AggregationWorkloadAdjustment(20)
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>CreateStoreSalesorders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates store sales orders.
+    /// </summary>
+    /// <param name = "_statementId">Statement id.</param>
+    /// <param name = "finalizeOrder">
+    ///     A boolean value indicate if the Sales Order is finalized.
+    ///     A finalized order will be invoiced immidiately after it is created, in addition an exception will be thrown when error occurs.
+    /// </param>
+    public static void CreateStoreSalesorders(RetailStatementId _statementId, boolean finalizeOrder)
+    {
+        RetailTransactionTable  transactionTable;
+        RetailStatementTable    statementTable;
+
+        RetailStatementPostingLogger::postAggregatedTransactionStart(_statementId);
+
+        BatchHeader batchHeader = BatchHeader::getCurrentBatchHeader();
+
+        statementTable = RetailStatementTable::find(_statementId);
+
+        RetailStoreOrderSynchronizer::registerPostingDate(_statementId);
+
+        RetailTransactionNonAggregationPostTask nonAggregationPostTask = new RetailTransactionNonAggregationPostTask();
+        nonAggregationPostTask.parmStatementId(_statementId);
+        nonAggregationPostTask.parmFinalizeOrder(finalizeOrder);
+        if (batchHeader)
+        {
+            nonAggregationPostTask.parmInBatch(true);
+            nonAggregationPostTask.batchInfo().parmCaption(strfmt("@Retail:NonAggregationPostTask", _statementId));
+            batchHeader.addRuntimeTask(nonAggregationPostTask, BatchHeader::getCurrentBatchTask().RecId);
+            batchHeader.parmCritical(NoYes::Yes);
+            batchHeader.parmMonitoringCategory(BatchMonitoringCategory::RetailStoreOrderSynchronizer);
+        }
+
+        TaxCalculationType lastTaxCalculationType;
+        int ordersCount;
+
+        RetailEodStatementConfigurationAccessor statementTableAccessor = RetailEodStatementConfigurationAccessor::construct(statementTable);
+        boolean aggregateBeforePosting = statementTableAccessor.isAggregateBeforePosting();
+
+        if (aggregateBeforePosting)
+        {
+            RetailTransactionPost transactionPost = RetailTransactionPost::construct(finalizeOrder, _statementId);
+
+            while select
+                    sum(netAmount), sum(totalDiscAmount), sum(grossAmount), sum(paymentAmount)
+                from transactionTable
+                group by
+                    // aggregationIdx fields
+                    transactionTable.Channel,
+                    transactionTable.store,
+                    transactionTable.businessDate,
+                    transactionTable.statementId,
+                    transactionTable.currency,
+                    transactionTable.custAccount,
+                    transactionTable.LogisticsPostalAddress,
+                    transactionTable.type,
+                    transactionTable.entryStatus,
+                    transactionTable.TaxCalculationType,
+                    transactionTable.SalesGroup,
+                    transactionTable.IsTaxIncludedInPrice
+                where
+                    // invoiceIdSOIdStmtIdx fields
+                    transactionTable.store              == statementTable.storeId
+                    &&  transactionTable.statementId    == statementTable.statementId
+                    &&  transactionTable.type           == RetailTransactionType::Sales
+                    &&  (transactionTable.entryStatus   == RetailEntryStatus::None || (finalizeOrder && transactionTable.entryStatus == RetailEntryStatus::PendingInvoice))
+                    &&  !transactionTable.invoiceId
+                    &&  transactionTable.incomeExpenseAmount == 0
+                    &&  !transactionTable.SkipAggregation
+            {
+                if (TaxSolutionScopeIntegrationUtil::isCompanyEnabled())
+                {
+                    if (ordersCount > 0 && lastTaxCalculationType != transactionTable.TaxCalculationType)
+                    {
+                        throw error("@RetailGTE:TransactionsIncludesDifferentCalculationType");
+                    }
+                }
+
+                transactionTable.type = RetailTransactionType::Sales;
+
+                // Searching for existing Sales Order that is not invoiced yet.
+                RetailTransactionTable aggregatedTrans;
+                select firstonly salesOrderId from aggregatedTrans
+                where
+                    #matchesAggregatedHeader(aggregatedTrans, transactionTable, RetailEntryStatus::PendingInvoice);
+
+                // CHECK invalid aggregated transaction.
+                if (aggregatedTrans.salesOrderId && _statementId)
+                {
+                    RetailTransactionTable aggregatedTransactionTablechecker;
+                    select count(RecId) from aggregatedTransactionTablechecker
+                    index hint salesOrderIdIdx
+                    where
+                        // salesOrderIdIdx fields
+                            aggregatedTransactionTablechecker.store         == statementTable.storeId
+                        &&  aggregatedTransactionTablechecker.statementId   != statementTable.statementId
+                        &&  aggregatedTransactionTablechecker.salesOrderId  == aggregatedTrans.salesOrderId;
+
+                    if (aggregatedTransactionTablechecker.RecId)
+                    {
+                        throw error(strFmt("@Retail:AggregationError", _statementId));
+                    }
+                }
+
+                transactionTable.InventLocationId = RetailStoreTable::find(transactionTable.store).inventLocation;
+                transactionTable.salesOrderId = aggregatedTrans.salesOrderId;
+                transactionTable.ReceiptDateRequested = transactionTable.businessDate;
+                transactionTable.transDate = transactionTable.businessDate;
+
+                if (transactionPost.post(transactionTable, batchHeader, nonAggregationPostTask, ((RetailParameters::find().maxSalesOrdersPerTask + #AggregationWorkloadAdjustment - 1) DIV #AggregationWorkloadAdjustment)))
+                {
+                    transactionPost = RetailTransactionPost::construct(finalizeOrder, _statementId);
+                }
+
+                lastTaxCalculationType = transactionTable.TaxCalculationType;
+                ordersCount++;
+
+            }
+
+            transactionPost.postBatch(batchHeader, nonAggregationPostTask);
+        }
+
+        RetailStatementPostingLogger::postAggregatedTransactionFinish(_statementId);
+
+        if (batchHeader)
+        {
+            RetailStatementBatchHeaderHelper::save(batchHeader, BatchHeader::getCurrentBatchTask().BatchJobId, _statementId);
+        }
+        else
+        {
+            nonAggregationPostTask.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNumberOfTransactionByStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the number of transaction give the selected transaction and status.
+    /// </summary>
+    /// <param name = "transactionTable">Retail transaction record.</param>
+    /// <param name = "status">The status of the transaction to be counted.</param>
+    /// <returns>Number of transaction with the specified status.</returns>
+    public static int getNumberOfTransactionByStatus(RetailTransactionTable transactionTable, RetailEntryStatus status)
+    {
+        RetailTransactionTable numberOfUpdatedTrans;
+        if (!transactionTable.transactionId)
+        {
+            select count(RecId) from numberOfUpdatedTrans
+            where #matchesAggregatedHeader(numberOfUpdatedTrans, transactionTable, status);
+        }
+        else
+        {
+            select count(RecId) from numberOfUpdatedTrans
+            where numberOfUpdatedTrans.transactionId == transactionTable.transactionId &&
+                  numberOfUpdatedTrans.Channel == transactionTable.Channel &&
+                  numberOfUpdatedTrans.entryStatus == status;
+        }
+
+        return any2Int(numberOfUpdatedTrans.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesIdOfTransaction</Name>
+				<Source><![CDATA[
+    private static SalesIdBase getSalesIdOfTransaction(RetailTransactionTable transactionTable)
+    {
+        if (!transactionTable.salesOrderId)
+        {
+            RetailTransactionTable transForSalesId;
+            if (!transactionTable.transactionId)
+            {
+                select firstonly salesOrderId from transForSalesId
+                    where #matchesAggregatedHeader(transForSalesId, transactionTable, RetailEntryStatus::PendingInvoice);
+            }
+            else
+            {
+                select firstonly salesOrderId from transForSalesId
+            where transForSalesId.transactionId == transactionTable.transactionId &&
+                  transForSalesId.Channel == transactionTable.Channel;
+            }
+            transactionTable.salesOrderId = transForSalesId.salesOrderId;
+        }
+        return transactionTable.salesOrderId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransactionEntryStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update entry status of retail transaction record.
+    /// </summary>
+    /// <param name = "transactionTable">Retail transaction record.</param>
+    /// <param name = "fromStatus">From status.</param>
+    /// <param name = "toStatus">To status.</param>
+    /// <param name = "salesId">Sales order Id.</param>
+    /// <param name = "invoiceId">Invoice Id.</param>
+    /// <returns>Number of transactions updated.</returns>
+    [SysObsolete('This method is obsolete. Use updateTransactionEntryStatusV2 instead.', false, 31\03\2019)]
+    public static int updateTransactionEntryStatus(
+                        RetailTransactionTable transactionTable,
+                        RetailEntryStatus fromStatus,
+                        RetailEntryStatus toStatus,
+                        SalesIdBase salesId = '',
+                        CustInvoiceId invoiceId = '')
+    {
+        return  RetailStoreOrderSynchronizer::updateTransactionEntryStatusV2(transactionTable, fromStatus, toStatus, salesId, invoiceId, 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransactionEntryStatusV2</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update entry status of retail transaction record.
+    /// </summary>
+    /// <param name = "transactionTable">Retail transaction record.</param>
+    /// <param name = "fromStatus">From status.</param>
+    /// <param name = "toStatus">To status.</param>
+    /// <param name = "salesId">Sales order Id.</param>
+    /// <param name = "invoiceId">Invoice Id.</param>
+    /// <returns>Number of transactions updated.</returns>
+    public static int updateTransactionEntryStatusV2(
+                        RetailTransactionTable transactionTable,
+                        RetailEntryStatus fromStatus,
+                        RetailEntryStatus toStatus,
+                        SalesIdBase salesId = '',
+                        CustInvoiceId invoiceId = '',
+                        RecId invoiceRecId = 0)
+    {
+        int                     updatedCount;
+        RetailTransactionTable  updateTrans;
+
+        ttsbegin;
+
+        if (!transactionTable.transactionId)
+        {
+            update_recordset updateTrans
+            setting
+                entryStatus     = toStatus,
+                salesOrderId    = salesId,
+                invoiceId       = invoiceId,
+                InvoiceRecId    = invoiceRecId
+            where
+                #matchesAggregatedHeader(updateTrans, transactionTable, fromStatus);
+
+            updatedCount = any2Int(updateTrans.RowCount());
+        }
+        else
+        {
+            RetailTransactionTable  retTransactionTable;
+
+            select forupdate firstonly retTransactionTable
+                where   retTransactionTable.transactionId   == transactionTable.transactionId
+                    &&  retTransactionTable.store           == transactionTable.store
+                    &&  retTransactionTable.terminal        == transactionTable.terminal
+                    &&  retTransactionTable.Channel         == transactionTable.Channel
+                    &&  retTransactionTable.entryStatus     == fromStatus;
+
+            if (retTransactionTable)
+            {
+                retTransactionTable.entryStatus     = toStatus;
+                retTransactionTable.salesOrderId    = SalesId;
+                retTransactionTable.invoiceId       = invoiceId;
+                retTransactionTable.InvoiceRecId    = invoiceRecId;
+
+                retTransactionTable.update();
+
+                updatedCount = 1;
+            }
+        }
+
+        ttscommit;
+
+        if (updatedCount > 0)
+        {
+            transactionTable.salesOrderId   = salesId;
+            transactionTable.entryStatus    = toStatus;
+        }
+
+        return updatedCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PostRetailTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Retail transaction posting.
+    /// </summary>
+    /// <param name = "transactionTable">The <c>RetailTransactionTable</c> record buffer.</param>
+    /// <param name = "finalizeOrder">
+    ///     A boolean value indicate if the Sales Order is finalized.
+    ///     A finalized order will be invoiced immidiately after it is created, in addition an exception will be thrown when error occurs.
+    /// </param>
+    public static void PostRetailTransaction(RetailTransactionTable transactionTable, boolean finalizeOrder)
+    {
+        #OccRetryCount
+
+        RetailTransactionTable  origTransactionTable;
+        int                     fromLine;
+        int                     retryCount;
+
+        fromLine = Global::infologLine();
+
+        // keeping the original buffer information so we can reload it in a retry logic
+        origTransactionTable.data(transactionTable);
+
+        try
+        {
+            transactionTable.data(origTransactionTable);
+            retryCount++;
+
+            ttsbegin;
+
+            if (transactionTable.entryStatus == RetailEntryStatus::PendingInvoice ||
+                RetailStoreOrderSynchronizer::updateTransactionEntryStatusV2(transactionTable, RetailEntryStatus::None, RetailEntryStatus::CreatingOrder) > 0)
+            {
+                // Invoice sales order if we have it already created and ready to be posted
+                if (transactionTable.entryStatus == RetailEntryStatus::PendingInvoice)
+                {
+                    RetailStoreOrderSynchronizer::invoiceSalesOrder(transactionTable);
+                }
+                // Generate sales order
+                else if (transactionTable.entryStatus == RetailEntryStatus::CreatingOrder)
+                {
+                    RetailStoreOrderSynchronizer::createSalesOrder(transactionTable);
+
+                    // If finalize order, invoice the sales order created for the retail transaction(s)
+                    if (finalizeOrder)
+                    {
+                        RetailStoreOrderSynchronizer::invoiceSalesOrder(transactionTable);
+                    }
+                }
+            }
+
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            if (retryCount > #RetryNum)
+            {
+                RetailStoreOrderSynchronizer::handleError(transactionTable, funcName(), #linenumber, strFmt('Deadlock exception is not recovered during retail statement posting. Maximum %1 retries reached; throw error.', int2Str(retryCount)), "@SYS65063");
+            }
+            else
+            {
+                info("@SYS65063"); // Deadlock detected
+                RetailStatementPostingLogger::Error(funcName(), #linenumber, strFmt('DeadlockException occurred in retail statement posting - retry count is %1.', int2Str(retryCount)));
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (retryCount > #RetryNum)
+            {
+                RetailStoreOrderSynchronizer::handleError(transactionTable, funcName(), #linenumber, strFmt('UpdateConflict exception is not recovered during retail statement posting. Maximum %1 retries reached; throw error.', int2Str(retryCount)), "@Retail:UpdateConflictNotRecovered");
+            }
+            else
+            {
+                info("@SYS107548"); // Update conflicts
+                RetailStatementPostingLogger::Error(funcName(), #linenumber, strFmt('UpdateConflictException occurred during retail statement posting - retry count is %1.', int2Str(retryCount)));
+                retry;
+            }
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            if (retryCount > #RetryNum)
+            {
+                RetailStoreOrderSynchronizer::handleError(transactionTable, funcName(), #linenumber, strFmt('DuplicateKeyException is not recovered during retail statement posting. Maximum %1 retries reached; throw error.', int2Str(retryCount)), "@Retail:DuplicteKeyNotRecovered");
+            }
+            else
+            {
+                info("@Retail:DuplicteKeyNotRecovered"); // Duplicate key exception is caught
+                RetailStatementPostingLogger::Error(funcName(), #linenumber, strFmt('DuplicateKeyException occurred during retail statement posting - retry count is %1.', int2Str(retryCount)));
+                retry;
+            }
+        }
+        catch
+        {
+            str errorMessage = RetailTransactionServiceUtilities::getInfologMessages(fromLine);
+            RetailStoreOrderSynchronizer::handleError(transactionTable, funcName(), #linenumber, 'Generic exception encountered during retail statement posting; throw error.', errorMessage);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the sales order for the retail transaction(s)
+    /// </summary>
+    /// <param name = "transactionTable">The aggregated or non-aggregated retail transaction with a corresponding sales order created.</param>
+    private static void createSalesOrder(RetailTransactionTable transactionTable)
+    {
+        SalesIdBase origSalesId = transactionTable.salesOrderId;
+        RetailEntryStatus origStatus = transactionTable.entryStatus;
+
+        if (transactionTable.entryStatus != origStatus || transactionTable.salesOrderId != origSalesId)
+        {
+            transactionTable.entryStatus = origStatus;
+            transactionTable.salesOrderId = origSalesId;
+        }
+
+        int processedCount = RetailStoreOrderSynchronizer::getNumberOfTransactionByStatus(transactionTable, RetailEntryStatus::CreatingOrder);
+        if (processedCount > 0)
+        {
+            RetailStatementPostingLogger::Info(funcName(), #linenumber, 'Create transaction to customer order info.');
+
+            CustomerOrderInfo custOrderInfo;
+            using (RetailTransactionTransformerContext context = RetailTransactionTransformerContext::construct())
+            {
+                context.parmUseTaxIncludedInPriceFlag(true);
+
+                custOrderInfo = RetailTransactionTransformer::ConvertTransactionToCustomerOrderInfo(transactionTable);
+            }
+            
+            str error;
+            boolean success = false;
+            SalesIdBase salesId;
+            boolean reuseInventoryReservation = false;
+
+            RetailStatementPostingLogger::createSalesOrderStart(transactionTable);
+
+            if (custOrderInfo.Id)
+            {
+                RetailStatementPostingLogger::Error(funcName(), #linenumber, 'In plan B, we should never call updateCustomerOrder().');
+                [success, error, salesId] =  RetailTransactionserviceOrders::updateCustomerOrder(custOrderInfo, true);
+            }
+            else
+            {
+                RetailStatementPostingLogger::Info(funcName(), #linenumber, 'Create customer order.');
+                boolean preventDuplicates = (transactionTable.type != RetailTransactionType::Sales);
+                
+                // Reuse Inventory Reservation is only true on non-aggregated scenarios             
+                if (RetailReuseInventoryTransactionToggle::instance().isEnabled() && transactionTable.transactionId != '')
+                {
+                    reuseInventoryReservation = true;
+                }
+
+                [success, error, salesId] = RetailTransactionserviceOrders::createCustomerOrderNew(custOrderInfo, reuseInventoryReservation, false, preventDuplicates);
+            }
+
+            RetailStatementPostingLogger::createSalesOrderFinish(transactionTable);
+
+            // If failed to create/update sales order, abort the process and revert the entry status to RetailEntryStatus::None.
+            if (!success || !salesId)
+            {
+                RetailStatementPostingLogger::Info(funcName(), #linenumber, strFmt('Failed to create or update customer order. Error message is: %1', error));
+                throw Error(error);
+            }
+
+            if (processedCount != RetailStoreOrderSynchronizer::getNumberOfTransactionByStatus(transactionTable, RetailEntryStatus::CreatingOrder))
+            {
+                RetailStatementPostingLogger::Info(funcName(), #linenumber, 'Number of transactions to change staus is not equal to number of transactions processed, abort the process.');
+                throw Error("@Retail:NumberOfTransactionMismatch");
+            }
+
+            // Stamp the Loyalty payment with sales-order ID, which will prevent double-posting of points in future.
+            RetailLoyaltyCardRewardPointTrans::UpdateLoyaltyPaymentEntriesWithSalesId(transactionTable.transactionId, salesId, true);
+
+            RetailStatementPostingLogger::Info(funcName(), #linenumber, 'Update transaction status to PendingInvoice.');
+            RetailStoreOrderSynchronizer::updateTransactionEntryStatusV2(transactionTable, RetailEntryStatus::CreatingOrder, RetailEntryStatus::PendingInvoice, salesId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>invoiceSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Invoices the sales order created for the retail transaction(s)
+    /// </summary>
+    /// <param name = "transactionTable">The aggregated or non-aggregated retail transaction with a corresponding sales order created.</param>
+    private static void invoiceSalesOrder(RetailTransactionTable transactionTable)
+    {
+        RetailStatementPostingLogger::invoiceSalesOrderStart(transactionTable);
+        
+        RetailStatementTable statementTable = RetailStatementTable::find(transactionTable.statementId);        
+        RetailStatementCustUnblocker custUnblocker = new RetailStatementCustUnblocker();
+        boolean unblockCustomers = false;
+
+        // If the customer transaction has the cust account, unblock it.
+        if (transactionTable.custAccount && statementTable.numberOfBlockedCustomers())
+        {
+            // Below will check if this transaction's customer is blocked and unblock it temporarily.
+            custUnblocker.unblockCustomer(transactionTable.custAccount);
+            unblockCustomers = true;
+        }
+
+        SalesIdBase salesId = RetailStoreOrderSynchronizer::getSalesIdOfTransaction(transactionTable);
+        SalesTable salesTable = SalesTable::find(salesId, true);
+        SalesLine salesLine;
+        #EECountryRegionCodes
+
+        if (salesTable)
+        {
+            RetailStoreOrderSynchronizer::updateDimensions(salesTable, transactionTable);
+
+            salesTable.SettleVoucher = RetailStoreOrderSynchronizer::getSettlementType();
+            salesTable.update();
+
+            if (TaxSolutionScopeIntegrationUtil::isCompanyEnabled()
+                        && SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]))
+            {
+                RetailSalesTable retailSalesTable = RetailSalesTable::find(salesId, true);
+                RetailEodStatementConfigurationAccessor statementTableAccessor = RetailEodStatementConfigurationAccessor::construct(statementTable);
+                if(retailSalesTable.RecId && statementTableAccessor.isUpdateGSTTransactionId_IN())
+                {
+                    RetailChannelTable      channelTable;
+
+                    select firstonly DefaultCustAccount from channelTable
+                                where retailSalesTable.RetailChannel == channelTable.RecId;
+                    if(salesTable.CustAccount != channelTable.DefaultCustAccount)
+                    {
+                        RetailTransactionTable  retailTrans;
+
+                        select firstonly receiptId from retailTrans where retailTrans.salesOrderId == salesTable.SalesId;
+                            
+                        ttsBegin;
+                        retailSalesTable.GSTTransactionId_IN = retailTrans.receiptId;
+                        retailSalesTable.GSTTransactionIdFromPOS_IN = NoYes::Yes;
+                        retailSalesTable.update();
+                        ttsCommit;
+                    }
+                }
+            }
+
+            // Invoice the sales order.
+            RetailStatementPostingLogger::Info(funcName(), #linenumber, strFmt('Invoice sales order - %1.', salesId));
+
+
+            var taxCalculationBehaviorController = RetailTaxCalculationBehaviorTransactionTableController::construct(transactionTable);
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion(#easternEuropeAllandRU))
+            {
+                RetailTransactionServiceOrders::postSalesInvoiceForStatement_RU(salesTable, SalesUpdate::All, transactionTable.businessDate, taxCalculationBehaviorController);
+            }
+            else
+            {
+                SalesFormLetter salesFormLetter = SalesFormLetter::construct(DocumentStatus::Invoice);
+                salesFormLetter.reArrangeNow(false);
+
+                taxCalculationBehaviorController.configureInvoicingToAllowLineLevelTaxAdjusments(salesFormLetter);
+
+                salesFormLetter.update(salesTable, transactionTable.businessDate, SalesUpdate::All, AccountOrder::None, false, false);
+            }
+
+            CustInvoiceJour custInvoiceJour = RetailStatementCustomerInvoiceHelper::findInvoiceFromOriginalSalesIdInvoiceDate(salesId, transactionTable.transDate);
+            if (!custInvoiceJour)
+            {
+                throw error(strFmt("@Retail:CustInvoiceJournalNotFound", salesId));
+            }
+
+            RetailStatementPostingLogger::Info(funcName(), #linenumber, 'Update transaction status to Posted.');
+            RetailStoreOrderSynchronizer::updateTransactionEntryStatusV2(transactionTable, RetailEntryStatus::PendingInvoice, RetailEntryStatus::Posted, salesId, custInvoiceJour.InvoiceId, custInvoiceJour.RecId);
+        }
+
+        if (unblockCustomers)
+        {
+            // Restore the blocked customers.
+            custUnblocker.restoreBlockedCustomers();
+        }
+
+        RetailStatementPostingLogger::invoiceSalesOrderFinish(transactionTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSettlementType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Gets the settlement type.
+    /// </summary>
+    /// <returns>
+    ///     The settlement type.
+    /// </returns>
+    protected static SettlementType getSettlementType()
+    {
+        return SettlementType::SelectedTransact;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDimensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the financial dimensions.
+    /// </summary>
+    /// <param name = "_salesTable">
+    /// The record buffer of <c>SalesTable</c> table.
+    /// </param>
+    /// <param name = "_transactionTable">
+    /// The record buffer of <c>RetailTransactionTable</c> table.
+    /// </param>
+    public static void updateDimensions(SalesTable _salesTable, RetailTransactionTable _transactionTable)
+    {
+        SalesLine                       salesLine;
+        SalesIdBase                     salesId = RetailStoreOrderSynchronizer::getSalesIdOfTransaction(_transactionTable);
+        LedgerDefaultDimensionValueSet  defaultDimension  =  CustTable::find(_salesTable.CustAccount).DefaultDimension;
+
+        if (defaultDimension)
+        {
+            _salesTable.DefaultDimension = LedgerDimensionDefaultFacade::serviceMergeDefaultDimensions(
+                                            custTable::find(_salesTable.CustAccount).DefaultDimension,
+                                            RetailChannelTable::findByRecId(_transactionTable.Channel).DefaultDimension,
+                                            RetailTerminalTable::find(_transactionTable.terminal).DefaultDimension,
+                                            HcmWorker::findByPersonnelNumber(_transactionTable.staff).getDefaultDimension());
+
+            while select forupdate salesLine
+                order by salesLine.LineNum
+                where salesLine.SalesId == salesId
+            {
+                salesLine.DefaultDimension = salesLine.copyDimension(_salesTable.DefaultDimension);
+                salesLine.DefaultDimension = salesLine.mergeDimension(InventTable::find(salesLine.ItemId).DefaultDimension);
+                salesLine.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerPostingDate</Name>
+				<Source><![CDATA[
+    private static void registerPostingDate(RetailStatementId _statementId)
+    {
+        RetailStatementTable    statementTable;
+
+        ttsbegin;
+
+        statementTable = RetailStatementTable::find(_statementId, true);
+        statementTable.postingDate  = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        statementTable.update();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleError</Name>
+				<Source><![CDATA[
+    private static void handleError(RetailTransactionTable retailTransactionTable, str methodName, int lineNumber, str logMessage, str errorMessage)
+    {
+        RetailStatementPostingLogger::Info(methodName, lineNumber, 'Update transaction status to None.');
+        RetailStoreOrderSynchronizer::updateTransactionEntryStatusV2(retailTransactionTable, RetailEntryStatus::PendingInvoice, RetailEntryStatus::None);
+        RetailStoreOrderSynchronizer::updateTransactionEntryStatusV2(retailTransactionTable, RetailEntryStatus::CreatingOrder, RetailEntryStatus::None);
+
+        RetailStatementPostingLogger::Error(methodName, lineNumber, logMessage);
+
+        throw error(errorMessage);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

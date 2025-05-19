@@ -1,0 +1,3251 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TaxRegulation</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>TaxRegulation</c> class is used for calculating tax on tax adjustment or regulation. On a
+///    sales order, purchase order, and free-text order, users can adjust or control the taxation of the
+///    invoice amount.
+/// </summary>
+/// <remarks>
+///    This class works in cooperation with the <c>TmpTaxRegulation</c> table.
+/// </remarks>
+public class TaxRegulation
+{
+    TmpTaxRegulation        tmpTaxRegulation;
+    TaxAmountCur            taxTotal;
+    TaxRegulationAmountCur  taxRegulationTotal;
+    TaxRegulationAmountCur  actualTaxRegulationTotal;
+    boolean                  taxLinesExist;
+    TmpTaxWorkTrans         tmpTaxWorkTrans;
+    CurrencyCode            sourceCurrencyCode;
+    TransDate               transDate;
+    LedgerJournalTrans      ledgerJournalTransSource;
+    Tax                     tax;
+    RefTableId              headingTableId;
+    RefRecId                headingRecId;
+
+    // if adjusting a single line, this is the RecId for that line
+    RefTableId              sourceTableId;
+    RefRecId                sourceRecId;
+    InvoiceId               invoiceId;
+    boolean                 isCalledFromSalesEditLines;
+    Map                     taxRegulationAmountMap;
+
+    private boolean adjustmentsForMultipleLinesExist;
+    // true when the feature CustVendConsInvoiceTaxDifferencePostingFeature_JP is enabled in Japan.
+    private boolean isConsInvoice;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        taxTotal,
+        taxRegulationTotal,
+        actualTaxRegulationTotal,
+        taxLinesExist,
+        sourceCurrencyCode,
+        transDate,
+        headingRecId,
+        sourceRecId
+    #endmacro
+    // <GIN>
+    TaxAmountCur           taxTotalCustoms;
+    TaxRegulationAmountCur totalSourceRegulateAmountCustoms;
+    container              depbSetOffRules;
+    container              dutyavailed;
+    TaxAdjustmentType      selectedTaxAdjustmentType;
+    // <GEEU>
+    #ISOCountryRegionCodes
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>allocateAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the allocated tax amount and updates the transactions in the <c>TmpTaxRegulation</c>
+    ///    table.
+    /// </summary>
+    /// <param name="_taxRegulationAmountCur">
+    ///    The currency of the tax regulation amount.
+    /// </param>
+    void allocateAmount(TaxRegulationAmountCur _taxRegulationAmountCur)
+    {
+        select sum(SourceRegulateAmountCur), sum(ActualSourceRegulateAmountCur) from tmpTaxRegulation where tmpTaxRegulation.ManualInsertedTax == NoYes::Yes;
+        TaxAmountCur totalActualTaxManualLines = tmpTaxRegulation.SourceRegulateAmountCur; // total actual tax across all lines (manual lines)
+        TaxAmountCur totalTaxManualLines = tmpTaxRegulation.ActualSourceRegulateAmountCur;
+
+        TaxAmountCur taxAmount;
+        TaxAmountCur taxAllocated;
+        TaxAmountCur actualTaxAllocated;
+        TaxCode taxCode;
+        TaxDirection taxDirection;
+        Counter taxAllocatedSign;
+
+        // <GEEU>
+        SalesTaxTransactionExchangeRate salesTaxTransactionExchangeRate;
+        boolean useSalesTaxExchangeRate = TaxParameters::isBankExchRateEnabled_W();
+        // </GEEU>
+
+        TaxAmountCur totalActualTaxExcludingManualLines = _taxRegulationAmountCur - totalActualTaxManualLines;
+        TaxAmountCur totalTaxExcludingManuallines = _taxRegulationAmountCur - totalTaxManualLines;
+
+        tmpTaxRegulation.clear();
+        int rowCount = 1;
+
+        if (taxTotal)
+        {
+            while select forupdate tmpTaxRegulation
+            {
+                if (tmpTaxRegulation.ManualInsertedTax == NoYes::No)
+                {
+                    if (tmpTaxRegulation.TaxDirection == TaxDirection::UseTax && FeatureStateProvider::isFeatureEnabled(TaxAdjustmentIgnoreUseTaxFeature::instance()))
+                    {
+                        // When TaxInvoiceRegisterIgnoreUseTaxFeature is enabled, ignore Use Tax.
+                        continue;
+                    }
+
+                    tmpTaxRegulation.SourceRegulateAmountCur =
+                        CurrencyExchangeHelper::amount(abs(totalActualTaxExcludingManualLines * tmpTaxRegulation.SourceTaxAmountCur / taxTotal), tmpTaxRegulation.SourceCurrencyCode);
+                    tmpTaxRegulation.ActualSourceRegulateAmountCur =
+                        CurrencyExchangeHelper::amount(abs(totalTaxExcludingManuallines * tmpTaxRegulation.SourceTaxAmountCur / taxTotal), tmpTaxRegulation.SourceCurrencyCode);
+
+                    // <GEEPL>
+                    this.calcRegulateAmount_PL(sourceTableId, sourceRecId, tmpTaxWorkTrans);
+                    // </GEEPL>
+
+                    this.calcTaxInCostPrice(tmpTaxRegulation);
+                    if (abs(tmpTaxRegulation.SourceRegulateAmountCur) > taxAmount)
+                    {
+                        taxAmount = tmpTaxRegulation.SourceRegulateAmountCur;
+                        taxCode = tmpTaxRegulation.TaxCode;
+                        taxDirection = tmpTaxRegulation.TaxDirection;
+                    }
+                    tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+
+                    if (!adjustmentsForMultipleLinesExist && rowCount > 1)
+                    {
+                        // Indicates that the tax adjustment amount is prorated across multiple lines.
+                        adjustmentsForMultipleLinesExist = true;
+                    }
+
+                    rowCount++;
+                }
+
+                taxAllocatedSign = this.determineSignForAdjustmentAllocation(tmpTaxRegulation);
+                taxAllocated += tmpTaxRegulation.SourceRegulateAmountCur * taxAllocatedSign;
+                actualTaxAllocated += tmpTaxRegulation.ActualSourceRegulateAmountCur * taxAllocatedSign;
+                tmpTaxRegulation.update();
+            }
+        }
+
+        if (taxAllocated < 0 && _taxRegulationAmountCur > 0)
+        {
+            _taxRegulationAmountCur = -_taxRegulationAmountCur;
+        }
+        else
+        {
+            if (taxAllocated > 0  && _taxRegulationAmountCur < 0)
+            {
+                _taxRegulationAmountCur = -_taxRegulationAmountCur;
+            }
+        }
+
+        if (taxAllocated != _taxRegulationAmountCur)
+        {
+            select forupdate tmpTaxRegulation
+            where tmpTaxRegulation.TaxCode == taxCode
+                && tmpTaxRegulation.TaxDirection == taxDirection;
+            if (tmpTaxRegulation)
+            {
+                taxAllocatedSign = this.determineSignForAdjustmentAllocation(tmpTaxRegulation);
+                tmpTaxRegulation.SourceRegulateAmountCur += (_taxRegulationAmountCur - taxAllocated) * taxAllocatedSign;
+
+                if (actualTaxAllocated != _taxRegulationAmountCur)
+                    tmpTaxRegulation.ActualSourceRegulateAmountCur += (_taxRegulationAmountCur - actualTaxAllocated) * taxAllocatedSign;
+
+                // <GEEPL>
+                this.calcRegulateAmount_PL(sourceTableId, sourceRecId, tmpTaxWorkTrans, true);
+                // </GEEPL>
+
+                tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+                this.calcTaxInCostPrice(tmpTaxRegulation);
+                tmpTaxRegulation.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>existAdjustmentsForMultipleLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the value of <c>adjustmentsForMultipleLinesExist</c>.
+    /// </summary>
+    /// <returns>The value of <c>adjustmentsForMultipleLinesExist</c>.</returns>
+    boolean existAdjustmentsForMultipleLines()
+    {
+        return adjustmentsForMultipleLinesExist;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcAndSaveTaxInCostPrice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the transactions in the specified <c>TmpTaxRegulation</c> table with the tax that is to be
+    /// included in the cost price.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The <c>TmpTaxRegulation</c> table that contains transactions to be updated.
+    /// </param>
+    /// <remarks>
+    /// The sign of the tax amount cannot be changed (Not applicable to Japan consolidated invoices).
+    /// </remarks>
+    void calcAndSaveTaxInCostPrice(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        int sign (AmountCur _amount)
+        {
+            return (_amount < 0)? -1: 1;
+        }
+
+        select forupdate firstonly tmpTaxRegulation
+            where tmpTaxRegulation.RecId == _tmpTaxRegulation.RecId;
+
+        if (tmpTaxRegulation)
+        {
+            if (tmpTaxRegulation.SourceRegulateAmountCur)
+            {
+                if (!this.isConsInvoice)
+                {
+                    _tmpTaxRegulation.SourceRegulateAmountCur = abs(_tmpTaxRegulation.SourceRegulateAmountCur) * sign(tmpTaxRegulation.SourceRegulateAmountCur);
+                }
+            }
+
+            if (tmpTaxRegulation.ActualSourceRegulateAmountCur)
+            {
+                _tmpTaxRegulation.ActualSourceRegulateAmountCur = abs(_tmpTaxRegulation.ActualSourceRegulateAmountCur) * Sign(tmpTaxRegulation.ActualSourceRegulateAmountCur);
+            }
+            tmpTaxRegulation.SourceRegulateAmountCur = _tmpTaxRegulation.SourceRegulateAmountCur;
+            tmpTaxRegulation.ActualSourceRegulateAmountCur = _tmpTaxRegulation.ActualSourceRegulateAmountCur;
+            if (this.isConsInvoice)
+            {
+                tmpTaxRegulation.ConsolidateSourceRegulateAmountCur_JP = _tmpTaxRegulation.ConsolidateSourceRegulateAmountCur_JP;
+            }
+
+            tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+            // <GIN>
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]) && TaxParameters::find().Customs_IN)
+            {
+                tmpTaxRegulation.SourceRegulateAmountCustoms_IN = _tmpTaxRegulation.SourceRegulateAmountCustoms_IN;
+            }
+            // </GIN>
+            this.calcTaxInCostPrice(tmpTaxRegulation);
+            tmpTaxRegulation.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcManualInserted</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the <c>TaxInCostPriceCur</c>, <c>TaxAmount</c>, and <c>TaxBaseAmountCur</c> fields in
+    ///    the <c>TmpTaxWorkTrans</c> table.
+    /// </summary>
+    /// <param name="_tmpTaxWorkTrans">
+    ///    The <c>TmpTaxWorkTrans</c> table for which to calculate fields.
+    /// </param>
+    /// <remarks>
+    ///    The calculations of this method depend on the <c>TaxDirection</c> and <c>CurrencyCode</c> values
+    ///    and whether the tax is stated as a tax-exempt purchase.
+    /// </remarks>
+    void calcManualInserted(TmpTaxWorkTrans _tmpTaxWorkTrans)
+    {
+        TaxData             taxData;
+        TaxTable            taxTable;
+        DimensionDefault    defaultDimension;
+        TaxCurrencyConversionRoutineHandler handler = TaxCurrencyConversionRoutineHandler::instance();
+
+        if (_tmpTaxWorkTrans.TaxDirection == TaxDirection::IncomingTax ||
+            _tmpTaxWorkTrans.TaxDirection == TaxDirection::UseTax      ||
+            _tmpTaxWorkTrans.TaxDirection == TaxDirection::TaxExemptPurchase)
+        {
+            _tmpTaxWorkTrans.SourceTaxAmountCur = 0;
+            _tmpTaxWorkTrans.SourceBaseAmountCur = 0;
+            _tmpTaxWorkTrans.TaxAutogenerated = NoYes::No;
+
+            if (_tmpTaxWorkTrans.TaxDirection == TaxDirection::TaxExemptPurchase)
+                _tmpTaxWorkTrans.ExemptTax = NoYes::Yes;
+
+            taxTable    = TaxTable::find(_tmpTaxWorkTrans.TaxCode);
+            taxData     = TaxData::find(_tmpTaxWorkTrans.TaxCode,
+                                        _tmpTaxWorkTrans.TransDate,
+                                        _tmpTaxWorkTrans.SourceBaseAmountCurRegulated);
+
+            _tmpTaxWorkTrans.CurrencyCode = taxTable.TaxCurrencyCode;
+
+            _tmpTaxWorkTrans.TaxInCostPrice         = 0;
+            _tmpTaxWorkTrans.TaxInCostPriceMST      = 0;
+            _tmpTaxWorkTrans.TaxInCostPriceCur      = 0;
+            _tmpTaxWorkTrans.TaxInCostPriceRep      = 0;
+
+            if (taxData.vatExemptPct)
+                _tmpTaxWorkTrans.TaxInCostPriceRegulated = CurrencyExchangeHelper::amount(_tmpTaxWorkTrans.SourceRegulateAmountCur * taxData.vatExemptPct / 100, sourceCurrencyCode);
+            else
+                _tmpTaxWorkTrans.TaxInCostPriceRegulated = 0;
+
+            if (sourceCurrencyCode == Ledger::accountingCurrency(CompanyInfo::current()))
+            {
+                _tmpTaxWorkTrans.TaxInCostPriceMST = _tmpTaxWorkTrans.TaxInCostPriceRegulated;
+                _tmpTaxWorkTrans.TaxAmount         = _tmpTaxWorkTrans.SourceRegulateAmountCur;
+                _tmpTaxWorkTrans.TaxBaseAmount     = _tmpTaxWorkTrans.SourceBaseAmountCurRegulated;
+            }
+            else
+            {
+                _tmpTaxWorkTrans.TaxInCostPriceMST = CurrencyExchangeHelper::mstAmount(_tmpTaxWorkTrans.TaxInCostPriceRegulated, sourceCurrencyCode, _tmpTaxWorkTrans.TransDate);
+
+                _tmpTaxWorkTrans.TaxAmount         = CurrencyExchangeHelper::mstAmount(_tmpTaxWorkTrans.SourceRegulateAmountCur, sourceCurrencyCode, _tmpTaxWorkTrans.TransDate);
+
+                _tmpTaxWorkTrans.TaxBaseAmount     = CurrencyExchangeHelper::mstAmount(_tmpTaxWorkTrans.SourceBaseAmountCurRegulated, sourceCurrencyCode, _tmpTaxWorkTrans.TransDate);
+            }
+            if (taxTable.TaxCurrencyCode)
+            {
+                //Feature Sales Tax Conversion
+                if (TaxCurrencyConversionFeatureExposure::isEnabled())
+                {
+                    _tmpTaxWorkTrans.TaxInCostPriceCur  = handler.transCurrencyToTaxCurrency(sourceCurrencyCode, taxTable.TaxCurrencyCode, _tmpTaxWorkTrans.TaxInCostPriceRegulated,
+                                                                                            _tmpTaxWorkTrans.ExchRate, _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+
+                    _tmpTaxWorkTrans.TaxInCostPriceRep  = handler.transCurrencyToReportingCurrency(sourceCurrencyCode, _tmpTaxWorkTrans.TaxInCostPriceRegulated,
+                                                                                                    _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+
+                    _tmpTaxWorkTrans.TaxAmountCur       = handler.transCurrencyToTaxCurrency(sourceCurrencyCode, taxTable.TaxCurrencyCode, _tmpTaxWorkTrans.SourceRegulateAmountCur,
+                                                                                            _tmpTaxWorkTrans.ExchRate, _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+
+                    _tmpTaxWorkTrans.TaxAmountRep       = handler.transCurrencyToReportingCurrency(sourceCurrencyCode, _tmpTaxWorkTrans.SourceRegulateAmountCur,
+                                                                                                    _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+
+                    _tmpTaxWorkTrans.TaxBaseAmountCur   = handler.transCurrencyToTaxCurrency(sourceCurrencyCode, taxTable.TaxCurrencyCode, _tmpTaxWorkTrans.SourceBaseAmountCurRegulated,
+                                                                                            _tmpTaxWorkTrans.ExchRate, _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+
+                    _tmpTaxWorkTrans.TaxBaseAmountRep   = handler.transCurrencyToReportingCurrency(sourceCurrencyCode, _tmpTaxWorkTrans.SourceBaseAmountCurRegulated,
+                                                                                                    _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+                }
+                else
+                {
+                    if (taxTable.TaxCurrencyCode == sourceCurrencyCode)
+                    {
+                        _tmpTaxWorkTrans.TaxInCostPriceCur = _tmpTaxWorkTrans.TaxInCostPriceRegulated;
+                        _tmpTaxWorkTrans.TaxAmountCur      = _tmpTaxWorkTrans.SourceRegulateAmountCur;
+                        _tmpTaxWorkTrans.TaxBaseAmountCur  = _tmpTaxWorkTrans.SourceBaseAmountCurRegulated;
+                    }
+                    else
+                        if (taxTable.TaxCurrencyCode == Ledger::accountingCurrency(CompanyInfo::current()))
+                    {
+                        _tmpTaxWorkTrans.TaxInCostPriceCur = _tmpTaxWorkTrans.TaxInCostPriceMST;
+                        _tmpTaxWorkTrans.TaxAmountCur      = _tmpTaxWorkTrans.TaxAmount;
+                        _tmpTaxWorkTrans.TaxBaseAmountCur  = _tmpTaxWorkTrans.TaxBaseAmount;
+                    }
+                    else
+                    {
+                        _tmpTaxWorkTrans.TaxInCostPriceCur = CurrencyExchangeHelper::curAmount(_tmpTaxWorkTrans.TaxInCostPriceMST, taxTable.TaxCurrencyCode, _tmpTaxWorkTrans.TransDate);
+
+                        _tmpTaxWorkTrans.TaxAmountCur      = CurrencyExchangeHelper::curAmount(_tmpTaxWorkTrans.TaxAmount, taxTable.TaxCurrencyCode, _tmpTaxWorkTrans.TransDate);
+
+                        _tmpTaxWorkTrans.TaxBaseAmountCur  = CurrencyExchangeHelper::curAmount(_tmpTaxWorkTrans.TaxBaseAmount, taxTable.TaxCurrencyCode, _tmpTaxWorkTrans.TransDate);
+                    }
+
+                    _tmpTaxWorkTrans.TaxInCostPriceRep  = handler.transCurrencyToReportingCurrency(sourceCurrencyCode, _tmpTaxWorkTrans.TaxInCostPriceRegulated,
+                                                                                                    _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+
+                    _tmpTaxWorkTrans.TaxAmountRep       = handler.transCurrencyToReportingCurrency(sourceCurrencyCode, _tmpTaxWorkTrans.SourceRegulateAmountCur,
+                                                                                                    _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+
+                    _tmpTaxWorkTrans.TaxBaseAmountRep   = handler.transCurrencyToReportingCurrency(sourceCurrencyCode, _tmpTaxWorkTrans.SourceBaseAmountCurRegulated,
+                                                                                                    _tmpTaxWorkTrans.ReportingCurrencyExchRate, _tmpTaxWorkTrans.TransDate);
+                }
+            }
+            if (_tmpTaxWorkTrans.TaxDirection != TaxDirection::TaxExemptPurchase)
+            {
+                defaultDimension = tax.getDefaultDimension(_tmpTaxWorkTrans.SourceRecId);
+
+                _tmpTaxWorkTrans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(TaxLedgerAccountGroup::accountLedgerDimension(_tmpTaxWorkTrans.TaxCode, _tmpTaxWorkTrans.TaxDirection), defaultDimension);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcTaxInCostPrice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the sales tax for the cost price.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    ///    The <c>TmpTaxRegulation</c> table for which to calculate the sales tax.
+    /// </param>
+    void calcTaxInCostPrice(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        TaxData taxData;
+        // <GIN>
+        TaxType_IN  taxType;
+        TaxOnItem   taxOnItem;
+        Percent     loiPercent;
+        Percent     nonRecPercent;
+        NoYes       compositeSchemeEnabled;
+        // </GIN>
+        if ((this.isConsInvoice
+                || _tmpTaxRegulation.SourceTaxAmountCur
+                || _tmpTaxRegulation.SourceRegulateAmountCur)
+            && (_tmpTaxRegulation.TaxDirection == TaxDirection::IncomingTax 
+                || _tmpTaxRegulation.TaxDirection == TaxDirection::UseTax))
+        {
+            if (TaxParameters::find().PurchTaxOnOperations)
+            {
+                _tmpTaxRegulation.TaxInCostPriceRegulated = CurrencyExchangeHelper::amount(_tmpTaxRegulation.SourceRegulateAmountCur, _tmpTaxRegulation.SourceCurrencyCode);
+            }
+            else
+            {
+                taxData = TaxData::find(_tmpTaxRegulation.TaxCode, this.tmpTaxWorkTrans().CalculationDate, 0);
+                // <GIN>
+                if (TaxParameters::checkTaxParameters_IN())
+                {
+                    taxType = TaxTable::find(taxData.TaxCode).TaxType_IN;
+                    if (taxType != TaxType_IN::None)
+                    {
+                        if (taxType == TaxType_IN::Customs)
+                        {
+                            _tmpTaxRegulation.TaxInCostPriceRegulated = 0;
+                        }
+                        else
+                        {
+                            compositeSchemeEnabled = this.compositeSchemeEnabled_IN();
+                            taxOnItem = TaxOnItem::find(tmpTaxWorkTrans.TaxItemGroup, taxData.TaxCode);
+                            loiPercent = taxOnItem.LoadOnInventoryPercent_IN;
+                            nonRecPercent = this.getNonRecoverablePercent();
+
+                            _tmpTaxRegulation.TaxInCostPriceRegulated = TaxTable::calcTaxInCostPrice(
+                                _tmpTaxRegulation.SourceRegulateAmountCur,
+                                taxType,
+                                compositeSchemeEnabled,
+                                loiPercent,
+                                nonRecPercent);
+                        }
+                    }
+                    else
+                    {
+                        _tmpTaxRegulation.TaxInCostPriceRegulated = CurrencyExchangeHelper::amount(_tmpTaxRegulation.SourceRegulateAmountCur * taxData.vatExemptPct / 100, _tmpTaxRegulation.SourceCurrencyCode);
+                    }
+                }
+                else
+                {
+                // </GIN>
+                    TaxTable taxTable = TaxTable::find(_tmpTaxRegulation.TaxCode);
+                    TaxRegulationAmountCur sourceRegulateAmountCur;
+
+                    if (this.isConsInvoice)
+                    {
+                        sourceRegulateAmountCur = _tmpTaxRegulation.ConsolidateSourceRegulateAmountCur_JP;
+                    }
+                    else
+                    {
+                        sourceRegulateAmountCur = _tmpTaxRegulation.SourceRegulateAmountCur;
+                    }
+                    _tmpTaxRegulation.TaxInCostPriceRegulated = taxTable.calcTaxInCostPriceWithRounding(sourceRegulateAmountCur, taxData.VATExemptPct, _tmpTaxRegulation.SourceCurrencyCode);
+
+                    if (this.isConsInvoice)
+                    {
+                        _tmpTaxRegulation.TaxInCostPriceRegulated = _tmpTaxRegulation.TaxInCostPriceRegulated - _tmpTaxRegulation.ConsolidateTaxInCostPricePosted_JP;
+                    }
+                    // <GIN>
+                }
+                // </GIN>
+            }
+        }
+        else
+        {
+            _tmpTaxRegulation.TaxInCostPriceRegulated = 0;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>compositeSchemeEnabled_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets composite scheme status
+    /// </summary>
+    /// <returns>
+    /// <c>NoYes</c> for composites scheme
+    /// </returns>
+    public NoYes compositeSchemeEnabled_IN()
+    {
+        NoYes           ret;
+        VendTrans       vendTrans = VendTrans::find(ledgerJournalTransSource.VendTransId);
+
+        if (vendTrans.RecId)
+        {
+            ret = VendTable::find(vendTrans.AccountNum).compositionScheme();
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSumsFromTmp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Totals the transactions in the <see cref="TmpTaxWorkTrans Table" />, and inserts the result into records in the <see cref="TmpTaxRegulation Table" />.
+    /// </summary>
+    void createSumsFromTmp()
+    {
+        // <GEEU>
+        boolean isBankExchRateEnabled = TaxParameters::isBankExchRateEnabled_W();
+        // </GEEU>
+        // <GEEHU>
+        boolean countryRegion_HU = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoHU, #isoCZ]);
+        // </GEEHU>
+        // <GEECZ>
+        boolean isCZES           = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoCZ, #isoES]);
+        // </GEECZ>
+
+        boolean isTaxSpecificExchRateEnabledByTable = TaxSpecificExchangeRateHelper::isTaxSpecificExchRateEnabledByTable(headingTableId, headingRecId);
+        isBankExchRateEnabled = isBankExchRateEnabled || isTaxSpecificExchRateEnabledByTable;
+
+        delete_from tmpTaxRegulation;
+
+        taxTotal = 0;
+        taxRegulationTotal = 0;
+        actualTaxRegulationTotal = 0;
+
+        TmpTaxWorkTrans taxWorkTrans;
+        taxWorkTrans.setTmpData(this.tmpTaxWorkTrans());
+
+        while select sum(SourceTaxAmountCur),
+                     sum(SourceRegulateAmountCur),
+                     sum(TaxInCostPriceRegulated),
+                     sum(TaxInCostPrice),
+                     sum(SourceBaseAmountCur),
+                     sum(SourceBaseAmountCurRegulated)
+                     // <GIN>
+                     ,sum(SourceRegulateAmountCustoms_IN)
+                     // </GIN>
+                     // <GEEU>
+                     ,sum(ExchangeRateTaxAmount)
+                     ,sum(ExchangeRateTaxBaseAmount)
+                     ,sum(ExchangeRateSourceRegulateAmount)
+                     ,sum(ExchangeRateSourceBaseAmountRegulated)
+                     // </GEEU>
+                     ,sum(ExchangeRateTaxAmountCur)
+                     ,sum(ExchangeRateTaxBaseAmountCur)
+                     ,sum(ExchangeRateRegulateAmountCur)
+                     ,sum(ExchangeRateBaseAmountCurRegulated)
+                     ,sum(ConsolidateSourceRegulateAmountCur_JP)
+                     ,sum(ConsolidateSourceTaxAmountCurPosted_JP)
+                     ,sum(ConsolidateTaxInCostPricePosted_JP)
+                     from tmpTaxWorkTrans
+        group by TaxCode, SourceCurrencyCode, TaxDirection, NegativeTax, ManualInsertedTax, TaxAutogenerated, IntracomVAT
+        where   ((sourceTableId == 0 && sourceRecId == 0) ||
+                (tmpTaxWorkTrans.SourceTableId == sourceTableId &&
+                tmpTaxWorkTrans.SourceRecId == sourceRecId)) &&
+                tmpTaxWorkTrans.Warning == TaxWarning::NoWarning &&
+                tmpTaxWorkTrans.IsDeleted == NoYes::No
+        {
+            tmpTaxRegulation.clear();
+            tmpTaxRegulation.TaxCode                 = tmpTaxWorkTrans.TaxCode;
+            tmpTaxRegulation.TaxDirection            = tmpTaxWorkTrans.TaxDirection;
+            tmpTaxRegulation.ManualInsertedTax       = tmpTaxWorkTrans.ManualInsertedTax;
+            tmpTaxRegulation.SourceCurrencyCode      = tmpTaxWorkTrans.SourceCurrencyCode;
+            tmpTaxRegulation.OverrideCalculatedTax   = !tmpTaxWorkTrans.TaxAutogenerated;
+            tmpTaxRegulation.NegativeTax             = tmpTaxWorkTrans.NegativeTax;
+
+            if (this.isConsInvoice)
+            {
+                tmpTaxRegulation.ConsolidateSourceRegulateAmountCur_JP = tmpTaxWorkTrans.ConsolidateSourceRegulateAmountCur_JP;
+                tmpTaxRegulation.ConsolidateSourceTaxAmountCurPosted_JP = tmpTaxWorkTrans.ConsolidateSourceTaxAmountCurPosted_JP;
+                tmpTaxRegulation.ConsolidateTaxInCostPricePosted_JP = tmpTaxWorkTrans.ConsolidateTaxInCostPricePosted_JP;
+            }
+
+            tmpTaxRegulation.SourceBaseAmountCur     = abs(tmpTaxWorkTrans.SourceBaseAmountCur);
+            tmpTaxRegulation.SourceBaseAmountCurRegulated = abs(tmpTaxWorkTrans.SourceBaseAmountCurRegulated);
+            // <GEEU>
+            if (isBankExchRateEnabled)
+            {
+                tmpTaxRegulation.ExchangeRateTaxBaseAmount = abs(tmpTaxWorkTrans.ExchangeRateTaxBaseAmount);
+                tmpTaxRegulation.ExchangeRateSourceBaseAmountRegulated = abs(tmpTaxWorkTrans.ExchangeRateSourceBaseAmountRegulated);
+                if (isTaxSpecificExchRateEnabledByTable)
+                {
+                    tmpTaxRegulation.ExchangeRateTaxBaseAmountCur = abs(tmpTaxWorkTrans.ExchangeRateTaxBaseAmountCur);
+                    tmpTaxRegulation.ExchangeRateBaseAmountCurRegulated = abs(tmpTaxWorkTrans.ExchangeRateBaseAmountCurRegulated);
+                }
+            }
+            // </GEEU>
+            if (tmpTaxWorkTrans.NegativeTax)
+            {
+                // For Japan consolidated invoices, a negative tax amount can be adjusted to a positive value.
+                if (this.isConsInvoice)
+                {
+                    tmpTaxRegulation.SourceTaxAmountCur = tmpTaxWorkTrans.SourceTaxAmountCur;
+                    tmpTaxRegulation.SourceRegulateAmountCur = tmpTaxWorkTrans.SourceRegulateAmountCur;
+                    tmpTaxRegulation.ActualSourceRegulateAmountCur = tmpTaxWorkTrans.SourceRegulateAmountCur;
+
+                    tmpTaxRegulation.TaxInCostPrice = tmpTaxWorkTrans.TaxInCostPrice;
+                    tmpTaxRegulation.TaxInCostPriceRegulated = tmpTaxWorkTrans.TaxInCostPriceRegulated;
+                }
+                else
+                {
+                    tmpTaxRegulation.SourceTaxAmountCur      = abs(tmpTaxWorkTrans.SourceTaxAmountCur) * -1;
+                    tmpTaxRegulation.SourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur) * -1;
+                    tmpTaxRegulation.ActualSourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur) * -1;
+
+                    tmpTaxRegulation.TaxInCostPrice          = abs(tmpTaxWorkTrans.TaxInCostPrice) * -1;
+                    tmpTaxRegulation.TaxInCostPriceRegulated = abs(tmpTaxWorkTrans.TaxInCostPriceRegulated) * -1;
+                }
+
+                // <GEECZ>
+                if (isCZES && tmpTaxWorkTrans.IntracomVAT)
+                {
+                    tmpTaxWorkTrans.SourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
+                }
+                // </GEECZ>
+
+                // <GIN>
+                if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]) && TaxParameters::find().Customs_IN)
+                {
+                    tmpTaxRegulation.SourceRegulateAmountCustoms_IN = abs(tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN) * -1;
+                }
+                // </GIN>
+                // <GEEU>
+                if (isBankExchRateEnabled)
+                {
+                    tmpTaxRegulation.ExchangeRateTaxAmount = abs(tmpTaxWorkTrans.ExchangeRateTaxAmount) * -1;
+                    tmpTaxRegulation.ExchangeRateSourceRegulateAmount = abs(tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount) * -1;
+                    if (isTaxSpecificExchRateEnabledByTable)
+                    {
+                        tmpTaxRegulation.ExchangeRateTaxAmountCur = abs(tmpTaxWorkTrans.ExchangeRateTaxAmountCur) * -1;
+                        tmpTaxRegulation.ExchangeRateRegulateAmountCur = abs(tmpTaxWorkTrans.ExchangeRateRegulateAmountCur) * -1;
+                    }
+                }
+                // </GEEU>
+            }
+            else
+            {
+                // For Japan consolidated invoices, a positive tax amount can be adjusted to a negative value.
+                if (this.isConsInvoice)
+                {
+                    tmpTaxRegulation.SourceTaxAmountCur = tmpTaxWorkTrans.SourceTaxAmountCur;
+                    tmpTaxRegulation.SourceRegulateAmountCur = tmpTaxWorkTrans.SourceRegulateAmountCur;
+                    tmpTaxRegulation.ActualSourceRegulateAmountCur = tmpTaxWorkTrans.SourceRegulateAmountCur;
+                    tmpTaxRegulation.TaxInCostPrice = tmpTaxWorkTrans.TaxInCostPrice;
+                    tmpTaxRegulation.TaxInCostPriceRegulated = tmpTaxWorkTrans.TaxInCostPriceRegulated;
+                }
+                else
+                {
+                    tmpTaxRegulation.SourceTaxAmountCur      = abs(tmpTaxWorkTrans.SourceTaxAmountCur);
+                    tmpTaxRegulation.SourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
+                    tmpTaxRegulation.ActualSourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
+                    tmpTaxRegulation.TaxInCostPrice          = abs(tmpTaxWorkTrans.TaxInCostPrice);
+                    tmpTaxRegulation.TaxInCostPriceRegulated = abs(tmpTaxWorkTrans.TaxInCostPriceRegulated);
+                }
+                // <GIN>
+                if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]) && TaxParameters::find().Customs_IN)
+                {
+                    tmpTaxRegulation.SourceRegulateAmountCustoms_IN = abs(tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN);
+                }
+                // </GIN>
+                // <GEEU>
+                if (isBankExchRateEnabled)
+                {
+                    tmpTaxRegulation.ExchangeRateTaxAmount = abs(tmpTaxWorkTrans.ExchangeRateTaxAmount);
+                    tmpTaxRegulation.ExchangeRateSourceRegulateAmount = abs(tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount);
+                    if (isTaxSpecificExchRateEnabledByTable)
+                    {
+                        tmpTaxRegulation.ExchangeRateTaxAmountCur = abs(tmpTaxWorkTrans.ExchangeRateTaxAmountCur);
+                        tmpTaxRegulation.ExchangeRateRegulateAmountCur = abs(tmpTaxWorkTrans.ExchangeRateRegulateAmountCur);
+                    }
+                }
+                // </GEEU>
+
+                select firstonly SourceTableId, InventTransId, SourceRecId, HeadingTableId, SourceTaxAmountCur, TransDate from taxWorkTrans
+                    where ((sourceTableId == 0 && sourceRecId == 0) 
+                        || (taxWorkTrans.SourceTableId == sourceTableId 
+                        && taxWorkTrans.SourceRecId == sourceRecId)) 
+                        && taxWorkTrans.Warning == TaxWarning::NoWarning 
+                        && taxWorkTrans.IsDeleted == NoYes::No;
+
+                TaxTrans taxTrans = TaxRegulation::updateAdjustedSalesTaxAmount(taxWorkTrans);
+                if (taxWorkTrans.Source == TaxModuleType::Project && taxTrans && taxTrans.SourceRegulateAmountCur)
+                {
+                    tmpTaxRegulation.SourceRegulateAmountCur = abs(taxTrans.SourceRegulateAmountCur);
+                }
+            }
+            tmpTaxRegulation.insert();
+            // <GIN>
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]) &&  TaxTable::find(tmpTaxRegulation.TaxCode).TaxType_IN == TaxType_IN::Customs)
+            {
+                taxTotalCustoms += tmpTaxRegulation.SourceTaxAmountCur;
+            }
+
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]) &&  TaxParameters::find().Customs_IN)
+            {
+                totalSourceRegulateAmountCustoms += tmpTaxRegulation.SourceRegulateAmountCustoms_IN;
+            }
+            // </GIN>
+
+            taxLinesExist = true;
+        }
+
+        this.calcTaxTotal();
+
+        select firstonly tmpTaxWorkTrans;
+        if (tmpTaxWorkTrans)
+        {
+            sourceCurrencyCode = tmpTaxWorkTrans.SourceCurrencyCode;
+            transDate          = tmpTaxWorkTrans.TransDate;
+        }
+        else
+        {
+            if (ledgerJournalTransSource.RecId != 0)
+            {
+                sourceCurrencyCode = ledgerJournalTransSource.CurrencyCode;
+                transDate          = ledgerJournalTransSource.TransDate;
+                headingTableId     = ledgerJournalTransSource.TableId;
+                headingRecId       = ledgerJournalTransSource.RecId;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateAdjustedSalesTaxAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Fetches the <c>SourceBaseAmountCurRegulated</c> and <c>SourceRegulateAmountCur</c> fields stored in
+    ///    the <c>TaxTrans</c> table based on the <c>TmpTaxWorkTrans</c> record.
+    /// </summary>
+    /// <param name="_taxWorkTrans">
+    ///    The <c>TmpTaxWorkTrans</c> table for which to calculate fields.
+    /// </param>
+    /// <returns> 
+    /// The buffer of <c>TaxTrans</c>. 
+    /// </returns>
+    public static TaxTrans updateAdjustedSalesTaxAmount(TmpTaxWorkTrans _taxWorkTrans)
+    {
+        ProjTransPosting projTransPosting;
+        TaxTrans taxTrans;
+        switch (_taxWorkTrans.SourceTableId)
+        {
+            case tableNum(ProjProposalCost):
+                ProjProposalCost projProposalCost;
+                select firstonly SourceRegulateAmountCur, SourceBaseAmountCurRegulated from taxTrans
+                    exists join projTransPosting
+                    where taxTrans.Voucher == projTransPosting.Voucher
+                        && taxTrans.TransDate == _taxWorkTrans.TransDate
+                        && taxTrans.HeadingTableId == _taxWorkTrans.HeadingTableId
+                        && taxTrans.SourceTaxAmountCur == -_taxWorkTrans.SourceTaxAmountCur
+                    exists join projProposalCost
+                    where projTransPosting.TransId == projProposalCost.TransId
+                        && projProposalCost.RecId == _taxWorkTrans.SourceRecId;
+                break;
+            case tableNum(ProjProposalItem):
+                select firstonly SourceRegulateAmountCur, SourceBaseAmountCurRegulated from taxTrans
+                    where taxTrans.InventTransId == _taxWorkTrans.InventTransId
+                        && taxTrans.TransDate == _taxWorkTrans.TransDate
+                        && taxTrans.SourceTaxAmountCur == -_taxWorkTrans.SourceTaxAmountCur;
+                break;
+            case tableNum(ProjProposalEmpl):
+                ProjProposalEmpl projProposalEmpl;
+                select firstonly SourceRegulateAmountCur, SourceBaseAmountCurRegulated from taxTrans
+                    exists join projTransPosting
+                    where taxTrans.Voucher == projTransPosting.Voucher
+                        && taxTrans.TransDate == _taxWorkTrans.TransDate
+                        && taxTrans.HeadingTableId == _taxWorkTrans.HeadingTableId
+                        && taxTrans.SourceTaxAmountCur == -_taxWorkTrans.SourceTaxAmountCur
+                    exists join projProposalEmpl
+                    where projTransPosting.TransId == projProposalEmpl.TransId
+                        && projProposalEmpl.RecId == _taxWorkTrans.SourceRecId;
+                break;
+            case tableNum(ProjProposalRevenue):
+                ProjProposalRevenue projProposalRevenue;
+                select firstonly SourceRegulateAmountCur, SourceBaseAmountCurRegulated from taxTrans
+                    exists join projTransPosting
+                    where taxTrans.Voucher == projTransPosting.Voucher
+                        && taxTrans.TransDate == _taxWorkTrans.TransDate
+                        && taxTrans.HeadingTableId == _taxWorkTrans.HeadingTableId
+                        && taxTrans.SourceTaxAmountCur == -_taxWorkTrans.SourceTaxAmountCur
+                    exists join projProposalRevenue
+                    where projTransPosting.TransId == projProposalRevenue.TransId
+                        && projProposalRevenue.RecId == _taxWorkTrans.SourceRecId;
+                break;
+        }
+        return taxTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcTaxTotal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate tax total amount.
+    /// </summary>
+    private void calcTaxTotal()
+    {
+        while select * from tmpTaxWorkTrans
+            where ((sourceTableId == 0 && sourceRecId == 0)
+                    || (tmpTaxWorkTrans.SourceTableId == sourceTableId
+                        && tmpTaxWorkTrans.SourceRecId == sourceRecId))
+                && tmpTaxWorkTrans.Warning == TaxWarning::NoWarning
+                && tmpTaxWorkTrans.IsDeleted == NoYes::No
+        {
+            if (tmpTaxRegulation.TaxDirection == TaxDirection::UseTax && FeatureStateProvider::isFeatureEnabled(TaxAdjustmentIgnoreUseTaxFeature::instance()))
+            {
+                // When TaxInvoiceRegisterIgnoreUseTaxFeature is enabled, ignore Use Tax.
+                continue;
+            }
+
+            if (tmpTaxWorkTrans.TaxDirection == TaxDirection::OutgoingTax
+                && tmpTaxWorkTrans.ReverseCharge_W == NoYes::Yes
+                && !Tax::changeSignForReverseCharge(tmpTaxWorkTrans))
+            {
+                taxTotal += tmpTaxWorkTrans.SourceTaxAmountCur;
+                taxRegulationTotal += tmpTaxWorkTrans.SourceRegulateAmountCur;
+            }
+            else
+            {
+                taxTotal += tax.taxAmountSign(tmpTaxWorkTrans.SourceTaxAmountCur, tmpTaxWorkTrans.TaxDirection);
+                taxRegulationTotal += tax.taxAmountSign(tmpTaxWorkTrans.SourceRegulateAmountCur, tmpTaxWorkTrans.TaxDirection);
+            }
+        }
+
+        actualTaxRegulationTotal = taxRegulationTotal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSumsFromTmp_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts tmpTaxRegulation based on tmpTaxWorkTrans.
+    /// </summary>
+    public void createSumsFromTmp_IN()
+    {
+        while select sum(SourceTaxAmountCur),
+                     sum(SourceRegulateAmountCur),
+                     sum(TaxInCostPriceRegulated),
+                     sum(TaxInCostPrice),
+                     sum(SourceBaseAmountCur),
+                     sum(SourceBaseAmountCurRegulated)
+        from tmpTaxWorkTrans
+        group by TaxCode, SourceCurrencyCode, TaxDirection, NegativeTax, ManualInsertedTax
+            where tmpTaxWorkTrans.HeadingTableId == headingTableId
+                && tmpTaxWorkTrans.HeadingRecId == headingRecId
+        {
+            tmpTaxRegulation.clear();
+            tmpTaxRegulation.TaxCode                      = tmpTaxWorkTrans.TaxCode;
+            tmpTaxRegulation.TaxDirection                 = tmpTaxWorkTrans.TaxDirection;
+            tmpTaxRegulation.ManualInsertedTax            = tmpTaxWorkTrans.ManualInsertedTax;
+            tmpTaxRegulation.SourceCurrencyCode           = tmpTaxWorkTrans.SourceCurrencyCode;
+            tmpTaxRegulation.SourceBaseAmountCur          = abs(tmpTaxWorkTrans.SourceBaseAmountCur);
+            tmpTaxRegulation.SourceBaseAmountCurRegulated = abs(tmpTaxWorkTrans.SourceBaseAmountCurRegulated);
+
+            if (tmpTaxWorkTrans.NegativeTax)
+            {
+                tmpTaxRegulation.SourceTaxAmountCur      = abs(tmpTaxWorkTrans.SourceTaxAmountCur) * -1;
+                tmpTaxRegulation.SourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur) * -1;
+                tmpTaxRegulation.ActualSourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur) * -1;
+                tmpTaxRegulation.TaxInCostPrice          = abs(tmpTaxWorkTrans.TaxInCostPrice) * -1;
+                tmpTaxRegulation.TaxInCostPriceRegulated = abs(tmpTaxWorkTrans.TaxInCostPriceRegulated) * -1;
+            }
+            else
+            {
+                tmpTaxRegulation.SourceTaxAmountCur      = abs(tmpTaxWorkTrans.SourceTaxAmountCur);
+                tmpTaxRegulation.SourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
+                tmpTaxRegulation.ActualSourceRegulateAmountCur = abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
+                tmpTaxRegulation.TaxInCostPrice          = abs(tmpTaxWorkTrans.TaxInCostPrice);
+                tmpTaxRegulation.TaxInCostPriceRegulated = abs(tmpTaxWorkTrans.TaxInCostPriceRegulated);
+            }
+            tmpTaxRegulation.insert();
+
+            taxTotal           += tmpTaxRegulation.SourceTaxAmountCur;
+            taxRegulationTotal += tmpTaxRegulation.SourceRegulateAmountCur;
+            actualTaxRegulationTotal += tmpTaxRegulation.ActualSourceRegulateAmountCur;
+
+            if (TaxTable::find(tmpTaxRegulation.TaxCode).TaxType_IN == TaxType_IN::Customs)
+            {
+                taxTotalCustoms += tmpTaxRegulation.SourceTaxAmountCur;
+            }
+
+            taxLinesExist = true;
+        }
+        select firstonly tmpTaxWorkTrans;
+        if (tmpTaxWorkTrans)
+        {
+            sourceCurrencyCode = tmpTaxWorkTrans.SourceCurrencyCode;
+            transDate          = tmpTaxWorkTrans.TransDate;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>customsAllocateAmount_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Allocating adjusted amount to tmpTaxRegulation.
+    /// </summary>
+    /// <param name="_customsTaxRegulationAmountCur">
+    /// The value to set.
+    /// </param>
+    /// <param name="_taxRegulationAmountCur">
+    /// The value to set.
+    /// </param>
+    public void customsAllocateAmount_IN(TaxRegulationAmountCur _customsTaxRegulationAmountCur,
+                                         TaxRegulationAmountCur _taxRegulationAmountCur)
+    {
+        TaxAmountCur taxAmount;
+        TaxAmountCur taxAllocated;
+        TaxAmountCur customsTaxAllocated;
+        TaxAmountCur actualTaxAllocated;
+        TaxCode      taxCode;
+        TaxDirection taxDirection;
+        TaxTable     taxTable;
+        Direction_IN customsDirection;
+
+        if (taxTotal)
+        {
+            while select forupdate tmpTaxRegulation
+                join taxTable
+                where taxTable.TaxCode      == tmpTaxRegulation.TaxCode
+                   && taxTable.TaxType_IN   == TaxType_IN::Customs
+            {
+                if (tmpTaxRegulation.ManualInsertedTax == NoYes::No)
+                {
+                    tmpTaxRegulation.SourceRegulateAmountCur =
+                        CurrencyExchangeHelper::amount(_taxRegulationAmountCur * tmpTaxRegulation.SourceTaxAmountCur / taxTotal, tmpTaxRegulation.SourceCurrencyCode);
+
+                    tmpTaxRegulation.ActualSourceRegulateAmountCur = 
+                        CurrencyExchangeHelper::amount(_taxRegulationAmountCur * tmpTaxRegulation.SourceTaxAmountCur / taxTotal, tmpTaxRegulation.SourceCurrencyCode);
+
+                    if (tmpTaxRegulation.TaxDirection == TaxDirection::IncomingTax)
+                    {
+                        customsDirection = Direction_IN::Import;
+                    }
+                    else if (tmpTaxRegulation.TaxDirection == TaxDirection::OutgoingTax)
+                    {
+                        customsDirection = Direction_IN::Export;
+                    }
+
+                    tmpTaxRegulation.SourceRegulateAmountCustoms_IN =
+                        CurrencyExchangeHelper::amount(_customsTaxRegulationAmountCur * tmpTaxRegulation.SourceTaxAmountCur / taxTotal, tmpTaxRegulation.SourceCurrencyCode);
+
+                    tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+                    this.calcTaxInCostPrice(tmpTaxRegulation);
+
+                    if (abs(tmpTaxRegulation.SourceRegulateAmountCustoms_IN) > taxAmount)
+                    {
+                        taxAmount    = tmpTaxRegulation.SourceRegulateAmountCustoms_IN;
+                        taxCode      = tmpTaxRegulation.TaxCode;
+                        taxDirection = tmpTaxRegulation.TaxDirection;
+                    }
+                }
+                customsTaxAllocated += tmpTaxRegulation.SourceRegulateAmountCustoms_IN;
+                taxAllocated        += tmpTaxRegulation.SourceRegulateAmountCur;
+                actualTaxAllocated  += tmpTaxRegulation.ActualSourceRegulateAmountCur;
+                tmpTaxRegulation.update();
+            }
+        }
+
+        if (customsTaxAllocated != _customsTaxRegulationAmountCur)
+        {
+            select forupdate tmpTaxRegulation
+            where tmpTaxRegulation.TaxCode      == taxCode
+               && tmpTaxRegulation.TaxDirection == taxDirection
+               join taxTable
+               where taxTable.TaxCode       == tmpTaxRegulation.TaxCode
+                  && taxTable.TaxType_IN    == TaxType_IN::Customs;
+            if (tmpTaxRegulation)
+            {
+                tmpTaxRegulation.SourceRegulateAmountCustoms_IN += _customsTaxRegulationAmountCur - customsTaxAllocated;
+                tmpTaxRegulation.SourceRegulateAmountCur        += _taxRegulationAmountCur - taxAllocated;
+                tmpTaxRegulation.ActualSourceRegulateAmountCur  += _taxRegulationAmountCur - actualTaxAllocated;
+                tmpTaxRegulation.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteTaxWithholdUncommitted_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete withholding tax uncommitted data
+    /// </summary>
+    public void deleteTaxWithholdUncommitted_IN()
+    {
+        ttsbegin;
+        if (tax.useTaxUncommitted())
+        {
+            TaxWithholdUncommitted_IN::deleteForDocumentHeader(tax.headingTableId(), tax.headingRecId(), tax.useSubLedgerJournalLines());
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineSignForAdjustmentAllocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the sign for adjustment allocation.
+    /// </summary>
+    /// <param name = "_tmpTaxRegulation">The buffer of <c>TmpTaxRegulation</c>.</param>
+    /// <returns>The sign for adjustment allocation.</returns>
+    Counter determineSignForAdjustmentAllocation(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        Counter defaultSign;
+
+        if (TaxIntegrationSpecificExchangeRateSelectFlight::instance().isEnabled())
+        {
+            // The <c>SalesTaxExchangeRate</c> and <c>SalesTaxExchangeRateCur</c> are used in method <c>calcRegulateAmount_PL</c>.
+            select NegativeTax, sum (SourceTaxAmountCur), TaxDirection, SalesTaxExchangeRate, SalesTaxExchangeRateCur from tmpTaxWorkTrans
+                group by TaxCode, SourceCurrencyCode, TaxDirection, NegativeTax, ManualInsertedTax, SalesTaxExchangeRate, SalesTaxExchangeRateCur
+                where tmpTaxWorkTrans.TaxCode == _tmpTaxRegulation.TaxCode
+                    && tmpTaxWorkTrans.SourceCurrencyCode == _tmpTaxRegulation.SourceCurrencyCode
+                    && tmpTaxWorkTrans.TaxDirection == _tmpTaxRegulation.TaxDirection
+                    && tmpTaxWorkTrans.ManualInsertedTax == _tmpTaxRegulation.ManualInsertedTax;
+        }
+        else
+        {
+            select NegativeTax, sum (SourceTaxAmountCur), TaxDirection from tmpTaxWorkTrans
+                group by TaxCode, SourceCurrencyCode, TaxDirection, NegativeTax, ManualInsertedTax
+                where tmpTaxWorkTrans.TaxCode == _tmpTaxRegulation.TaxCode
+                    && tmpTaxWorkTrans.SourceCurrencyCode == _tmpTaxRegulation.SourceCurrencyCode
+                    && tmpTaxWorkTrans.TaxDirection == _tmpTaxRegulation.TaxDirection
+                    && tmpTaxWorkTrans.ManualInsertedTax == _tmpTaxRegulation.ManualInsertedTax;
+        }
+
+        if (tmpTaxWorkTrans.TaxDirection == TaxDirection::OutgoingTax)
+        {
+            if (tmpTaxWorkTrans.NegativeTax)
+            {
+                defaultSign = tmpTaxWorkTrans.SourceTaxAmountCur >= 0 ? 1 : -1;
+            }
+            else
+            {
+                defaultSign = tmpTaxWorkTrans.SourceTaxAmountCur > 0 ? -1 : 1;
+            }
+        }
+        else
+        {
+            if (tmpTaxWorkTrans.NegativeTax)
+            {
+                defaultSign = tmpTaxWorkTrans.SourceTaxAmountCur > 0 ? -1 : 1;
+            }
+            else
+            {
+                defaultSign = tmpTaxWorkTrans.SourceTaxAmountCur >= 0 ? 1 : -1;
+            }
+        }
+
+        return defaultSign;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustomsTotalRegulationAmount_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updating SourceRegulateAmountCustoms_IN.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The value to set.
+    /// </param>
+    /// <returns>
+    /// The value of the <c>totalSourceRegulateAmountCustoms</c> parameter.
+    /// </returns>
+    public TaxRegulationAmountCur getCustomsTotalRegulationAmount_IN(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        select firstonly forupdate tmpTaxRegulation
+            where tmpTaxRegulation.TaxCode      == _tmpTaxRegulation.TaxCode
+               && tmpTaxRegulation.TaxDirection == _tmpTaxRegulation.TaxDirection;
+
+        if (tmpTaxRegulation)
+        {
+            tmpTaxRegulation.SourceRegulateAmountCustoms_IN = _tmpTaxRegulation.SourceRegulateAmountCustoms_IN;
+            tmpTaxRegulation.update();
+        }
+
+        select sum(SourceRegulateAmountCustoms_IN)
+            from tmpTaxRegulation;
+        totalSourceRegulateAmountCustoms = tmpTaxRegulation.SourceRegulateAmountCustoms_IN;
+
+        return totalSourceRegulateAmountCustoms;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNonRecoverablePercent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves a non-recoverable percentage for India VAT that is based on the <c>tmpTaxWorkTrans</c>
+    /// field.
+    /// </summary>
+    /// <returns>
+    /// The India VAT non-recoverable percentage.
+    /// </returns>
+    public Percent getNonRecoverablePercent()
+    {
+        TransTaxInformation transTaxInformation;
+
+        transTaxInformation = TransTaxInformationHelper::findOrCreateTransTaxInformation(tmpTaxWorkTrans.SourceTableId, tmpTaxWorkTrans.SourceRecId);
+
+        return transTaxInformation.VATNonRecoverablePercent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTotalRegulationAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the total regulated amount in the <c>TmpTaxRegulation</c> table.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    ///    The <c>TmpTaxRegulation</c> table to be updated.
+    /// </param>
+    /// <returns>
+    ///    The amount of the total tax regulation.
+    /// </returns>
+    TaxRegulationAmountCur getTotalRegulationAmount(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        ;
+        select forupdate tmpTaxRegulation
+            where tmpTaxRegulation.TaxCode      == _tmpTaxRegulation.TaxCode &&
+                  tmpTaxRegulation.TaxDirection == _tmpTaxRegulation.TaxDirection;
+
+        if (tmpTaxRegulation)
+        {
+            tmpTaxRegulation.SourceRegulateAmountCur = _tmpTaxRegulation.SourceRegulateAmountCur;
+            tmpTaxRegulation.SourceBaseAmountCurRegulated = _tmpTaxRegulation.SourceBaseAmountCurRegulated;
+            tmpTaxRegulation.update();
+        }
+
+        select sum(SourceRegulateAmountCur) from tmpTaxRegulation;
+        taxRegulationTotal = tmpTaxRegulation.SourceRegulateAmountCur;
+
+        return taxRegulationTotal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getActualTotalRegulationAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the total regulated amount in the <c>TmpTaxRegulation</c> table.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    ///    The <c>TmpTaxRegulation</c> table to be updated.
+    /// </param>
+    /// <returns>
+    ///    The amount of the total tax regulation.
+    /// </returns>
+    TaxRegulationAmountCur getActualTotalRegulationAmount(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        select forupdate tmpTaxRegulation
+            where tmpTaxRegulation.TaxCode      == _tmpTaxRegulation.TaxCode &&
+                  tmpTaxRegulation.TaxDirection == _tmpTaxRegulation.TaxDirection;
+
+        if (tmpTaxRegulation)
+        {
+            tmpTaxRegulation.ActualSourceRegulateAmountCur = _tmpTaxRegulation.ActualSourceRegulateAmountCur;
+            tmpTaxRegulation.SourceBaseAmountCurRegulated = _tmpTaxRegulation.SourceBaseAmountCurRegulated;
+            tmpTaxRegulation.update();
+        }
+
+        select sum(ActualSourceRegulateAmountCur) from tmpTaxRegulation;
+        actualTaxRegulationTotal = tmpTaxRegulation.ActualSourceRegulateAmountCur;
+
+        return actualTaxRegulationTotal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets some of the fields in the <c>TmpTaxRegulation</c> table upon initialization.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    ///    The <c>TmpTaxRegulation</c> table that is initialized.
+    /// </param>
+    void initValue(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        _tmpTaxRegulation.SourceCurrencyCode = sourceCurrencyCode;
+        _tmpTaxRegulation.ManualInsertedTax  = NoYes::Yes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isImportExportOrder_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validating whether Import order or Export order.
+    /// </summary>
+    /// <returns>
+    /// The value of the <c>ret</c> parameter.
+    /// </returns>
+    public boolean isImportExportOrder_IN()
+    {
+        boolean         ret = false;
+        SalesParmTable  salesParmTable;
+
+        if (TaxParameters::find().Customs_IN)
+        {
+            switch (headingTableId)
+            {
+                case tableNum(PurchTable):
+                    ret = PurchTable::findRecId(headingRecId).purchTable_W().CustomsImportOrder_IN;
+                    break;
+
+                case tableNum(SalesTable):
+                    ret = SalesTable::findRecId(headingRecId).CustomsExportOrder_IN;
+                    break;
+
+                case tableNum(PurchParmTable):
+                    ret = PurchTable::find(PurchParmTable::findRecId(headingRecId).PurchId).purchTable_W().CustomsImportOrder_IN;
+                    break;
+
+                case tableNum(SalesParmTable):
+                    select firstonly SalesId from salesParmTable
+                        where salesParmTable.RecId == headingRecId;
+                    ret = SalesTable::find(salesParmTable.SalesId).CustomsExportOrder_IN;
+                    break;
+
+                case tableNum(VendInvoiceInfoTable):
+                    ret = PurchTable::find(VendInvoiceInfoTable::findRecId(headingRecId).PurchId).purchTable_W().CustomsImportOrder_IN;
+                    break;
+
+                default :
+                    ret = false;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        List    tmpTaxWorkTransList = new List(Types::Record);
+        List    tmpTaxRegulationList = new List(Types::Record);
+
+        //pack the temp tables
+        while select tmpTaxRegulation
+        {
+            tmpTaxRegulationList.addEnd(tmpTaxRegulation);
+        }
+
+        return [#CurrentVersion, #CurrentList, buf2Con(ledgerJournalTransSource), tableId2name(headingTableId),
+            tableId2name(sourceTableId), tmpTaxRegulationList.pack()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSourceRecId</Name>
+				<Source><![CDATA[
+    private RefRecId parmSourceRecId(RefRecId _sourceRecId = sourceRecId)
+    {
+        sourceRecId = _sourceRecId;
+
+        return sourceRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSourceTableId</Name>
+				<Source><![CDATA[
+    private RefTableId parmSourceTableId(RefTableId _sourceTableId = sourceTableId)
+    {
+        sourceTableId = _sourceTableId;
+
+        return sourceTableId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIsCalledFromSalesEditLies</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets this is called from sales edit lines.
+    /// </summary>
+    /// <param name = "_isCalledfromSalesEditLines">Is called form sales edit lines.</param>
+    /// <returns>If this is called from sales edit lines return true, otherwise false.</returns>
+    public boolean parmIsCalledFromSalesEditLies(boolean _isCalledfromSalesEditLines = isCalledFromSalesEditLines)
+    {
+        isCalledFromSalesEditLines = _isCalledFromSalesEditLines;
+        return isCalledFromSalesEditLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeTaxRegulationForHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes the tax adjustments for a source document.
+    /// </summary>
+    /// <param name="_isSingleLineTaxAdjustmentAllowed">
+    /// A Boolean value that indicates whether a single source document line tax adjustment is enabled.
+    /// </param>
+    protected void removeTaxRegulationForHeader(boolean _isSingleLineTaxAdjustmentAllowed)
+    {
+        TaxWorkRegulation taxWorkRegulation;
+
+        if (_isSingleLineTaxAdjustmentAllowed)
+        {
+            TmpTaxWorkTransSourceIdTable tmpTaxWorkTransSourceIdTable;
+            RecordInsertList tmpTaxWorkTransSourceIdTableList = new RecordInsertList(tableNum(TmpTaxWorkTransSourceIdTable), true, true, true, true, true, tmpTaxWorkTransSourceIdTable);
+            while select SourceTableId, SourceRecId from tmpTaxWorkTrans
+                group by SourceTableId, SourceRecId
+            {
+                tmpTaxWorkTransSourceIdTable.SourceTableId = tmpTaxWorkTrans.SourceTableId;
+                tmpTaxWorkTransSourceIdTable.SourceRecId = tmpTaxWorkTrans.SourceRecId;
+                tmpTaxWorkTransSourceIdTableList.add(tmpTaxWorkTransSourceIdTable);
+            }
+
+            while select ParentSourceTableId, ParentSourceRecId from tmpTaxWorkTrans
+                group by ParentSourceTableId, ParentSourceRecId
+                where tmpTaxWorkTrans.ParentSourceTableId != 0
+                    && tmpTaxWorkTrans.ParentSourceRecId != 0
+            {
+                tmpTaxWorkTransSourceIdTable.SourceTableId = tmpTaxWorkTrans.ParentSourceTableId;
+                tmpTaxWorkTransSourceIdTable.SourceRecId = tmpTaxWorkTrans.ParentSourceRecId;
+                tmpTaxWorkTransSourceIdTableList.add(tmpTaxWorkTransSourceIdTable);
+            }
+
+            tmpTaxWorkTransSourceIdTableList.insertDatabase();
+
+            if (isCalledFromSalesEditLines)
+            {
+                taxRegulationAmountMap = new Map(Types::Container, Types::Real);
+                while select HeadingTableId, HeadingRecId, TaxRegulationAmountCur, TaxCode from taxWorkRegulation
+                    exists join tmpTaxWorkTransSourceIdTable
+                    where taxWorkRegulation.HeadingTableId == tmpTaxWorkTransSourceIdTable.SourceTableId
+                            && taxWorkRegulation.HeadingRecId == tmpTaxWorkTransSourceIdTable.SourceRecId
+                {
+                    taxRegulationAmountMap.insert([taxWorkRegulation.HeadingTableId, taxWorkRegulation.HeadingRecId, taxWorkRegulation.TaxCode], taxWorkRegulation.TaxRegulationAmountCur);
+                }
+            }
+
+            delete_from taxWorkRegulation
+                exists join tmpTaxWorkTransSourceIdTable
+                where taxWorkRegulation.HeadingTableId == tmpTaxWorkTransSourceIdTable.SourceTableId
+                    && taxWorkRegulation.HeadingRecId == tmpTaxWorkTransSourceIdTable.SourceRecId;
+        }
+        else
+        {
+            if (isCalledFromSalesEditLines)
+            {
+                taxRegulationAmountMap = new Map(Types::Container, Types::Real);
+                while select HeadingTableId, HeadingRecId, TaxRegulationAmountCur, TaxCode from taxWorkRegulation
+                    where taxWorkRegulation.HeadingTableId == headingTableId &&
+                            taxWorkRegulation.HeadingRecId == headingRecId
+                {
+                    taxRegulationAmountMap.insert([taxWorkRegulation.HeadingTableId, taxWorkRegulation.HeadingRecId, taxWorkRegulation.TaxCode], taxWorkRegulation.TaxRegulationAmountCur);
+                }
+            }
+            delete_from taxWorkRegulation
+                where taxWorkRegulation.HeadingTableId == headingTableId &&
+                        taxWorkRegulation.HeadingRecId == headingRecId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeTaxRegulationForLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes a tax adjustment for a single source document line.
+    /// </summary>
+    protected void removeTaxRegulationForLine()
+    {
+        TaxWorkRegulation taxWorkRegulation;
+
+        TmpTaxWorkTransSourceIdTable tmpTaxWorkTransSourceIdTable;
+        RecordInsertList tmpTaxWorkTransSourceIdTableList = new RecordInsertList(tableNum(TmpTaxWorkTransSourceIdTable), true, true, true, true, true, tmpTaxWorkTransSourceIdTable);
+        while select SourceTableId, SourceRecId from tmpTaxWorkTrans
+            group by SourceTableId, SourceRecId
+            where (tmpTaxWorkTrans.SourceTableId == sourceTableId
+                    && tmpTaxWorkTrans.SourceRecId == sourceRecId)
+                || (tmpTaxWorkTrans.ParentSourceTableId == sourceTableId
+                    && tmpTaxWorkTrans.ParentSourceRecId == sourceRecId)
+        {
+            tmpTaxWorkTransSourceIdTable.SourceTableId = tmpTaxWorkTrans.SourceTableId;
+            tmpTaxWorkTransSourceIdTable.SourceRecId = tmpTaxWorkTrans.SourceRecId;
+
+            tmpTaxWorkTransSourceIdTableList.add(tmpTaxWorkTransSourceIdTable);
+        }
+
+        tmpTaxWorkTransSourceIdTableList.insertDatabase();
+
+        if (isCalledFromSalesEditLines)
+        {
+            taxRegulationAmountMap = new Map(Types::Container, Types::Real);
+            while select HeadingTableId, HeadingRecId, TaxRegulationAmountCur, TaxCode from taxWorkRegulation
+                exists join tmpTaxWorkTransSourceIdTable
+                where taxWorkRegulation.HeadingTableId == tmpTaxWorkTransSourceIdTable.SourceTableId
+                    && taxWorkRegulation.HeadingRecId == tmpTaxWorkTransSourceIdTable.SourceRecId
+            {
+                taxRegulationAmountMap.insert([taxWorkRegulation.HeadingTableId, taxWorkRegulation.HeadingRecId, taxWorkRegulation.TaxCode], taxWorkRegulation.TaxRegulationAmountCur);
+            }
+        }
+
+        delete_from taxWorkRegulation
+            exists join tmpTaxWorkTransSourceIdTable
+            where taxWorkRegulation.HeadingTableId == tmpTaxWorkTransSourceIdTable.SourceTableId
+                && taxWorkRegulation.HeadingRecId == tmpTaxWorkTransSourceIdTable.SourceRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetOverrideCalculatedTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the tax amounts to the calculated tax amounts for a specified tax adjustment.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The tax adjustment record.
+    /// </param>
+    /// <param name="_ignoreCalculatedTax">
+    /// A Boolean value that indicates whether the calculated tax amounts should be ignored.
+    /// </param>
+    protected void resetOverrideCalculatedTax(TmpTaxRegulation _tmpTaxRegulation, boolean _ignoreCalculatedTax)
+    {
+        if (_ignoreCalculatedTax)
+        {
+            _tmpTaxRegulation.SourceRegulateAmountCur = 0;
+            tmpTaxRegulation.ActualSourceRegulateAmountCur = 0;
+        }
+        else
+        {
+            _tmpTaxRegulation.SourceRegulateAmountCur = _tmpTaxRegulation.SourceTaxAmountCur;
+            _tmpTaxRegulation.ActualSourceRegulateAmountCur = _tmpTaxRegulation.SourceTaxAmountCur;
+        }
+
+        _tmpTaxRegulation.OverrideCalculatedTax = NoYes::No;
+        _tmpTaxRegulation.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetTaxRegulation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Runs through the <see cref="T:TmpTaxWorkTrans" /> and <see cref="T:TmpTaxRegulation" /> tables and
+    ///    resets some of the fields by updating the fields by using a default value.
+    /// </summary>
+    /// <remarks>
+    ///    This method also deletes all of the transactions in the <c>TaxWorkRegulation</c> table.
+    /// </remarks>
+    void resetTaxRegulation()
+    {
+        taxTotal = 0;
+        taxRegulationTotal = 0;
+        actualTaxRegulationTotal = 0;
+        taxLinesExist = false;
+
+        ttsbegin;
+
+        if (tax.allowSingleLineAdjustment())
+        {
+            if (sourceTableId && sourceRecId)
+            {
+                this.resetTaxRegulationForLine();
+            }
+            else
+            {
+                this.resetTaxRegulationForHeader(true);
+            }
+        }
+        else
+        {
+            this.resetTaxRegulationForHeader(false);
+        }
+
+        delete_from tmpTaxWorkTrans
+            where tmpTaxWorkTrans.ManualInsertedTax;
+
+        delete_from tmpTaxRegulation;
+        this.createSumsFromTmp(); // rebuild tmpTaxRegulation
+
+        tax.tmpTaxWorkTrans(tmpTaxWorkTrans);
+
+        if (tax.useTaxUncommitted())
+        {
+            tax.updateTaxUncommitted();
+        }
+
+        // <GIN>
+        if (TaxParameters::isCustomsEnable_IN())
+        {
+            totalSourceRegulateAmountCustoms = 0;
+        }
+        // </GIN>
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetTaxRegulationForHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the tax amounts to the calculated tax amounts for a source document.
+    /// </summary>
+    /// <param name="_isSingleLineTaxAdjustmentAllowed">
+    /// A Boolean value that indicates whether a single source document line tax adjustment is enabled.
+    /// </param>
+    protected void resetTaxRegulationForHeader(boolean _isSingleLineTaxAdjustmentAllowed)
+    {
+        update_recordset tmpTaxWorkTrans
+            setting
+                TaxAutogenerated = NoYes::Yes,
+                SourceBaseAmountCur = tmpTaxWorkTrans.SourceBaseAmountCurCalculated,
+                SourceRegulateAmountCur = tmpTaxWorkTrans.SourceTaxAmountCur,
+                ConsolidateSourceRegulateAmountCur_JP = tmpTaxWorkTrans.ConsolidateSourceTaxAmountCur_JP,
+                ConsolidateTaxInCostPriceRegulated_JP = tmpTaxWorkTrans.ConsolidateTaxInCostPrice_JP,
+                TaxInCostPriceRegulated = tmpTaxWorkTrans.TaxInCostPrice,
+                SourceBaseAmountCurRegulated = 0
+                // <GEEU>
+                , ExchangeRateSourceBaseAmountRegulated = 0
+                , ExchangeRateSourceRegulateAmount = 0
+                // </GEEU>
+                , ExchangeRateBaseAmountCurRegulated = 0
+                , ExchangeRateRegulateAmountCur = 0
+                // <GBR>
+                , TaxationCodeAdj_BR = ''
+                // </GBR>
+                ;
+
+        // <GBR>
+        if (BrazilParameters::isEnabled())
+        {
+            while select forUpdate tmpTaxWorkTrans
+                where (tmpTaxWorkTrans.SourceTableId == sourceTableId &&
+                            tmpTaxWorkTrans.SourceRecId == sourceRecId) ||
+                            (tmpTaxWorkTrans.ParentSourceTableId == sourceTableId &&
+                                tmpTaxWorkTrans.ParentSourceRecId == sourceRecId)
+            {
+                TaxAdjustmentReportingFields_BR::adjust(tmpTaxWorkTrans, sourceCurrencyCode);
+                tmpTaxWorkTrans.update(tax.ignoreCalculatedSalesTax());
+            }
+        }
+        // </GBR>
+
+        this.removeTaxRegulationForHeader(_isSingleLineTaxAdjustmentAllowed);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetTaxRegulationForLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the tax amounts to the calculated tax amounts for a single source document line.
+    /// </summary>
+    protected void resetTaxRegulationForLine()
+    {
+        update_recordset tmpTaxWorkTrans
+            setting
+                TaxAutogenerated = NoYes::Yes,
+                SourceBaseAmountCur = tmpTaxWorkTrans.SourceBaseAmountCurCalculated,
+                SourceRegulateAmountCur = tmpTaxWorkTrans.SourceTaxAmountCur,
+                TaxInCostPriceRegulated = tmpTaxWorkTrans.TaxInCostPrice,
+                SourceBaseAmountCurRegulated = 0
+                // <GEEU>
+                , ExchangeRateSourceBaseAmountRegulated = 0
+                , ExchangeRateSourceRegulateAmount = 0
+                // </GEEU>
+                , ExchangeRateBaseAmountCurRegulated = 0
+                , ExchangeRateRegulateAmountCur = 0
+                where (tmpTaxWorkTrans.SourceTableId == sourceTableId &&
+                    tmpTaxWorkTrans.SourceRecId == sourceRecId) ||
+                    (tmpTaxWorkTrans.ParentSourceTableId == sourceTableId &&
+                        tmpTaxWorkTrans.ParentSourceRecId == sourceRecId);
+
+        this.removeTaxRegulationForLine();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveTaxRegulation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the tax regulation and inserts it into transactions in the <see cref="T:TmpTaxWorkTrans"
+    ///    /> table.
+    /// </summary>
+    /// <param name="_dateOfVATRegister">
+    ///    The date of VAT register.
+    /// </param>
+    /// <param name="_salesTaxExchangeRate">
+    ///    The sales tax exchange rate.
+    /// </param>
+    void saveTaxRegulation(
+        TransDate             _dateOfVATRegister = dateNull(),
+        CurrencyExchangeRate  _salesTaxExchangeRate = 0.0
+        )
+    {
+        TaxAmountCur        taxAmount;
+        TaxAmountCur        calculatedTaxAmount;
+        TaxAmountCur        taxAllocated;
+        RecId               taxWorkTransRecId;
+        TaxWorkRegulation   taxWorkRegulation;
+        Counter             defaultSign = 1;
+        Counter             taxAllocatedSign;
+        boolean             emptyTaxAllocated;
+        TmpTaxWorkTrans     tmpTaxWorkTransSource;
+        TaxTable            taxTable;
+        TaxAmountCur        adjustedTaxAmount;
+        Map                 adjustedBasePerSourceLine;
+        Map                 calculatedBasePerSourceLine;
+        Map                 adjustedTaxPerSourceLine;
+        Map                 calculatedTaxPerSourceLine;
+        // <GIN>
+        TaxParameters       taxParameters = TaxParameters::find();
+        boolean             isCustomsEnabled = TaxParameters::isCustomsEnable_IN();
+        boolean             isTaxTypeCustoms;
+        TaxAmountCur        taxAllocatedCustoms;
+        TaxAmountCur        customsSourceTaxAmountCur;
+        boolean             isEximEnabled = TaxParameters::isEximIncentiveSchemEnable_IN();
+        // </GIN>
+        // <GEEU>
+        TaxAmount           taxAmountAccountingCurrency;
+        TaxAmount           taxAmountTaxCurrency;
+        TaxAmountCur        taxAllocatedAccountingCurrency;
+        Counter             taxAllocatedSignAccountingCurrency;
+        TaxAmountCur        taxAllocatedTaxCurrency;
+        Counter             taxAllocatedSignTaxCurrency;
+        CurrencyCode        accountingCurrency;
+        boolean             allocatedAmountIsDifferent;
+        boolean             allocatedAmountCurIsDifferent;
+        boolean             isBankExchRateEnabled = TaxParameters::isBankExchRateEnabled_W();
+        // </GEEU>
+
+        boolean isTaxSpecificExchRateEnabledByTable = TaxSpecificExchangeRateHelper::isTaxSpecificExchRateEnabledByTable(headingTableId, headingRecId);
+        isBankExchRateEnabled = isBankExchRateEnabled || isTaxSpecificExchRateEnabledByTable;
+
+        adjustedBasePerSourceLine = new Map(Types::Int64, Types::Real);
+        calculatedBasePerSourceLine = new Map(Types::Int64, Types::Real);
+        adjustedTaxPerSourceLine = new Map(Types::Int64, Types::Real);
+        calculatedTaxPerSourceLine = new Map(Types::Int64, Types::Real);
+        taxRegulationAmountMap = new Map(Types::Container, Types::Real);
+
+        // <GEEU>
+        if (isBankExchRateEnabled)
+        {
+            accountingCurrency = Ledger::accountingCurrency();
+        }
+        // </GEEU>
+
+        ttsbegin;
+
+        select firstonly tmpTaxWorkTrans;
+        if (tmpTaxWorkTrans)
+        {
+            tmpTaxWorkTransSource.data(tmpTaxWorkTrans);
+        }
+
+        if (tax.allowSingleLineAdjustment())
+        {
+            if (isCalledFromSalesEditLines)
+            {
+                while select HeadingTableId, HeadingRecId, TaxRegulationAmountCur, TaxCode from taxWorkRegulation
+                    where taxWorkRegulation.HeadingTableId  == sourceTableId
+                       && taxWorkRegulation.HeadingRecId    == sourceRecId
+                {
+                    taxRegulationAmountMap.insert([taxWorkRegulation.HeadingTableId, taxWorkRegulation.HeadingRecId, taxWorkRegulation.TaxCode], taxWorkRegulation.TaxRegulationAmountCur);
+                }
+            }
+            delete_from taxWorkRegulation
+                where taxWorkRegulation.HeadingTableId  == sourceTableId
+                   && taxWorkRegulation.HeadingRecId    == sourceRecId;
+        }
+        else
+        {
+            if (isCalledFromSalesEditLines)
+            {
+                while select HeadingTableId, HeadingRecId, TaxRegulationAmountCur, TaxCode from taxWorkRegulation
+                    where taxWorkRegulation.HeadingTableId  == headingTableId
+                       && taxWorkRegulation.HeadingRecId    == headingRecId
+                {
+                    taxRegulationAmountMap.insert([taxWorkRegulation.HeadingTableId, taxWorkRegulation.HeadingRecId, taxWorkRegulation.TaxCode], taxWorkRegulation.TaxRegulationAmountCur);
+                }
+            }
+
+            delete_from taxWorkRegulation
+                where taxWorkRegulation.HeadingTableId  == headingTableId
+                   && taxWorkRegulation.HeadingRecId    == headingRecId;
+        }
+
+        delete_from tmpTaxWorkTrans
+            where tmpTaxWorkTrans.ManualInsertedTax;
+
+        select sum(SourceTaxAmountCur)
+        from tmpTaxWorkTrans;
+        if (tmpTaxWorkTrans.SourceTaxAmountCur < 0)
+            defaultSign = -1;
+        if (tmpTaxWorkTrans.SourceTaxAmountCur == 0 &&
+            ledgerJournalTransSource)
+        {
+            if (ledgerJournalTransSource.amount() < 0)
+                defaultSign = -1;
+        }
+
+        while select tmpTaxRegulation
+            where tmpTaxRegulation.ManualInsertedTax
+        {
+            tmpTaxWorkTrans.clear();
+            tmpTaxWorkTrans.data(tmpTaxWorkTransSource);
+            tmpTaxWorkTrans.HeadingRecId                 = headingRecId;
+            tmpTaxWorkTrans.HeadingTableId               = headingTableId;
+            tmpTaxWorkTrans.SourceRecId                  = sourceRecId;
+            tmpTaxWorkTrans.SourceTableId                = sourceTableId;
+            tmpTaxWorkTrans.TaxCode                      = tmpTaxRegulation.TaxCode;
+            tmpTaxWorkTrans.TaxDirection                 = tmpTaxRegulation.TaxDirection;
+            tmpTaxWorkTrans.SourceCurrencyCode           = sourceCurrencyCode;
+            tmpTaxWorkTrans.TransDate                    = transDate;
+            tmpTaxWorkTrans.ManualInsertedTax            = tmpTaxRegulation.ManualInsertedTax;
+            if (isCalledFromSalesEditLines)
+                tmpTaxWorkTrans.SourceRegulateAmountCur  = tmpTaxRegulation.ActualSourceRegulateAmountCur * defaultSign;
+            else
+                tmpTaxWorkTrans.SourceRegulateAmountCur      = tmpTaxRegulation.SourceRegulateAmountCur * defaultSign ;
+            tmpTaxWorkTrans.SourceBaseAmountCurRegulated = tmpTaxRegulation.SourceBaseAmountCurRegulated * defaultSign ;
+            tmpTaxWorkTrans.SourceBaseAmountCur = 0;
+            tmpTaxWorkTrans.SourceBaseAmountCurRaw = 0;
+            tmpTaxWorkTrans.SourceTaxAmountCur = 0;
+            tmpTaxWorkTrans.SourceTaxAmountCurReal = 0;
+            tmpTaxWorkTrans.TaxBaseQty = 0;
+            tmpTaxWorkTrans.TaxInCostPrice = 0;
+            tmpTaxWorkTrans.TaxInCostPriceCur = 0;
+            tmpTaxWorkTrans.TaxInCostPriceRep = 0;
+            tmpTaxWorkTrans.TaxInCostPriceMST = 0;
+            tmpTaxWorkTrans.TaxAmount = 0;
+            tmpTaxWorkTrans.TaxAmountCur = 0;
+            tmpTaxWorkTrans.TaxAmountRep = 0;
+            tmpTaxWorkTrans.TaxAutogenerated = !tmpTaxWorkTrans.ManualInsertedTax;
+            tmpTaxWorkTrans.InvoiceId = invoiceId;
+            this.calcManualInserted(tmpTaxWorkTrans);
+            tmpTaxWorkTrans.insert();
+        }
+
+        // <GIN>
+        if (isCustomsEnabled)
+        {
+            tax.parmDEPBSetOffRules_IN(conNull());
+            tax.parmDEPBDutyAvailed_IN(conNull());
+        }
+        // </GIN>
+
+        while select tmpTaxRegulation
+            where !tmpTaxRegulation.ManualInsertedTax
+        {
+            taxAllocated        = 0;
+            taxAmount           = 0;
+            emptyTaxAllocated   = false;
+            // <GEEU>
+            taxAmountAccountingCurrency = 0;
+            taxAllocatedAccountingCurrency = 0;
+            // </GEEU>
+            taxAmountTaxCurrency = 0;
+            taxAllocatedTaxCurrency = 0;
+
+            // <GIN>
+            if (isCustomsEnabled)
+            {
+                isTaxTypeCustoms    = (TaxTable::find(tmpTaxRegulation.TaxCode).TaxType_IN == TaxType_IN::Customs);
+                taxAllocatedCustoms = 0;
+                customsSourceTaxAmountCur = 0;
+            }
+
+            // Tax Regulation for customs should be done at the time of BillOfEntry, as Taxes are finalized at this stage.
+            // There is no point in adjustments during invoice time. Tax Vouchers are created during invoice from BOE taxes.
+            if (isCustomsEnabled
+                && isTaxTypeCustoms
+                && (headingTableId == tableNum(PurchParmTable) || headingTableId == tableNum(PurchTable))
+                && tax.documentStatus_IN() == DocumentStatus::Invoice)
+            {
+                continue;
+            }
+
+            if (isCustomsEnabled
+                && isTaxTypeCustoms
+                && (headingTableId == tableNum(PurchParmTable) || headingTableId == tableNum(PurchTable))
+                && tax.documentStatus_IN() == DocumentStatus::BillOfEntry_IN)
+            {
+                while select forupdate tmpTaxWorkTrans
+                    where tmpTaxWorkTrans.TaxCode      == tmpTaxRegulation.TaxCode &&
+                          tmpTaxWorkTrans.TaxDirection == tmpTaxRegulation.TaxDirection &&
+                          (!tax.allowSingleLineAdjustment() ||
+                          (tmpTaxWorkTrans.SourceTableId == sourceTableId &&
+                          tmpTaxWorkTrans.SourceRecId == sourceRecId))
+                {
+                    if (tmpTaxWorkTrans.EximIncentiveScheme_IN == EximIncentiveScheme_IN::EPCG
+                        && tmpTaxWorkTrans.SourceTaxAmountCur != (tmpTaxWorkTrans.EximTaxAmountCur_IN + tmpTaxWorkTrans.EximBalanceTaxAmountCur_IN))
+                    {
+                        customsSourceTaxAmountCur += tmpTaxWorkTrans.EximTaxAmountCur_IN + tmpTaxWorkTrans.EximBalanceTaxAmountCur_IN;
+                    }
+                    else
+                    {
+                        customsSourceTaxAmountCur += tmpTaxWorkTrans.SourceTaxAmountCur;
+                    }
+                }
+            }
+            // </GIN>
+
+            while select forupdate tmpTaxWorkTrans
+                where tmpTaxWorkTrans.TaxCode      == tmpTaxRegulation.TaxCode &&
+                      tmpTaxWorkTrans.TaxDirection == tmpTaxRegulation.TaxDirection &&
+                      (!tax.allowSingleLineAdjustment() ||
+                      (tmpTaxWorkTrans.SourceTableId == sourceTableId &&
+                      tmpTaxWorkTrans.SourceRecId == sourceRecId))
+            {
+                adjustedTaxAmount = 0;
+                calculatedTaxAmount = 0;
+
+                tmpTaxWorkTrans.ManualInsertedTax = tmpTaxRegulation.ManualInsertedTax;
+                tmpTaxWorkTrans.TaxAutogenerated = !tmpTaxRegulation.OverrideCalculatedTax;
+
+                // Base regulated
+                if ((tmpTaxWorkTrans.SourceBaseAmountCur > 0 &&
+                     tmpTaxRegulation.SourceBaseAmountCurRegulated < 0) ||
+                    (tmpTaxWorkTrans.SourceBaseAmountCur < 0 &&
+                     tmpTaxRegulation.SourceBaseAmountCurRegulated > 0))
+                {
+                    tmpTaxWorkTrans.SourceBaseAmountCurRegulated = -tmpTaxRegulation.SourceBaseAmountCurRegulated * abs(tmpTaxWorkTrans.SourceBaseAmountCur / tmpTaxRegulation.SourceBaseAmountCur);
+                }
+                else
+                {
+                    if (tmpTaxRegulation.SourceBaseAmountCur == 0)
+                    {
+                        tmpTaxWorkTrans.SourceBaseAmountCurRegulated = 0 ;
+                    }
+                    else
+                    {
+                        tmpTaxWorkTrans.SourceBaseAmountCurRegulated = tmpTaxRegulation.SourceBaseAmountCurRegulated * abs(tmpTaxWorkTrans.SourceBaseAmountCur / tmpTaxRegulation.SourceBaseAmountCur ) ;
+                    }
+                }
+                // <GEEU>
+                if (isBankExchRateEnabled)
+                {
+                    if ((tmpTaxWorkTrans.SourceBaseAmountCur > 0 &&
+                         tmpTaxRegulation.ExchangeRateSourceBaseAmountRegulated < 0) ||
+                        (tmpTaxWorkTrans.SourceBaseAmountCur < 0 &&
+                         tmpTaxRegulation.ExchangeRateSourceBaseAmountRegulated > 0))
+                    {
+                        tmpTaxWorkTrans.ExchangeRateSourceBaseAmountRegulated = -tmpTaxRegulation.ExchangeRateSourceBaseAmountRegulated * abs(tmpTaxWorkTrans.SourceBaseAmountCur / tmpTaxRegulation.SourceBaseAmountCur);
+                    }
+                    else
+                    {
+                        if (tmpTaxRegulation.SourceBaseAmountCur == 0)
+                        {
+                            tmpTaxWorkTrans.ExchangeRateSourceBaseAmountRegulated = 0 ;
+                        }
+                        else
+                        {
+                            tmpTaxWorkTrans.ExchangeRateSourceBaseAmountRegulated = tmpTaxRegulation.ExchangeRateSourceBaseAmountRegulated * abs(tmpTaxWorkTrans.SourceBaseAmountCur / tmpTaxRegulation.SourceBaseAmountCur);
+                        }
+                    }
+
+                    if (isTaxSpecificExchRateEnabledByTable)
+                    {
+                        if ((tmpTaxWorkTrans.SourceBaseAmountCur > 0 && tmpTaxRegulation.ExchangeRateBaseAmountCurRegulated < 0)
+                            || (tmpTaxWorkTrans.SourceBaseAmountCur < 0 && tmpTaxRegulation.ExchangeRateBaseAmountCurRegulated > 0))
+                        {
+                            tmpTaxWorkTrans.ExchangeRateBaseAmountCurRegulated = -tmpTaxRegulation.ExchangeRateBaseAmountCurRegulated * abs(tmpTaxWorkTrans.SourceBaseAmountCur / tmpTaxRegulation.SourceBaseAmountCur);
+                        }
+                        else
+                        {
+                            if (tmpTaxRegulation.SourceBaseAmountCur == 0)
+                            {
+                                tmpTaxWorkTrans.ExchangeRateBaseAmountCurRegulated = 0 ;
+                            }
+                            else
+                            {
+                                tmpTaxWorkTrans.ExchangeRateBaseAmountCurRegulated = tmpTaxRegulation.ExchangeRateBaseAmountCurRegulated * abs(tmpTaxWorkTrans.SourceBaseAmountCur / tmpTaxRegulation.SourceBaseAmountCur);
+                            }
+                        }
+                    }
+                }
+                // </GEEU>
+                // Tax regulated
+                if (tmpTaxRegulation.SourceTaxAmountCur == 0 && !emptyTaxAllocated)
+                {
+                    // Not adjust tax amount if totalTaxAmount is the same as adjusted tax amount
+                    if (isCalledFromSalesEditLines)
+                    {
+                        if (tmpTaxRegulation.SourceTaxAmountCur != tmpTaxRegulation.ActualSourceRegulateAmountCur)
+                        {
+                            tmpTaxWorkTrans.SourceRegulateAmountCur = CurrencyExchangeHelper::amount(tmpTaxRegulation.ActualSourceRegulateAmountCur, tmpTaxRegulation.SourceCurrencyCode);
+                        }
+                    }
+                    else if (tmpTaxRegulation.SourceTaxAmountCur != tmpTaxRegulation.SourceRegulateAmountCur)
+                    {
+                        tmpTaxWorkTrans.SourceRegulateAmountCur = CurrencyExchangeHelper::amount(tmpTaxRegulation.SourceRegulateAmountCur, tmpTaxRegulation.SourceCurrencyCode);
+                        if (this.isConsInvoice)
+                        {
+                            tmpTaxWorkTrans.ConsolidateSourceRegulateAmountCur_JP = tmpTaxRegulation.ConsolidateSourceRegulateAmountCur_JP;
+                        }
+                    }
+
+                    // <GEEU>
+                    if (isBankExchRateEnabled)
+                    {
+                        tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount = CurrencyExchangeHelper::amount(tmpTaxRegulation.ExchangeRateSourceRegulateAmount, accountingCurrency);
+                        if (isTaxSpecificExchRateEnabledByTable)
+                        {
+                            tmpTaxWorkTrans.ExchangeRateRegulateAmountCur = CurrencyExchangeHelper::amount(tmpTaxRegulation.ExchangeRateRegulateAmountCur, tmpTaxWorkTrans.CurrencyCode);
+                        }
+                    }
+                    // </GEEU>
+                    // <GIN>
+                    if (isCustomsEnabled && isTaxTypeCustoms)
+                    {
+                        tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN =
+                            CurrencyExchangeHelper::amount(tmpTaxRegulation.SourceRegulateAmountCustoms_IN, tmpTaxRegulation.SourceCurrencyCode);
+                    }
+                    // </GIN>
+                    emptyTaxAllocated = true;
+                }
+                else
+                if (tmpTaxRegulation.SourceTaxAmountCur != 0)
+                {
+                    if (isCustomsEnabled
+                        && isTaxTypeCustoms
+                        && (headingTableId == tableNum(PurchParmTable) || headingTableId == tableNum(PurchTable))
+                        && tmpTaxWorkTrans.EximIncentiveScheme_IN == EximIncentiveScheme_IN::EPCG
+                        && tax.documentStatus_IN() == DocumentStatus::BillOfEntry_IN
+                        && tmpTaxWorkTrans.SourceTaxAmountCur != (tmpTaxWorkTrans.EximTaxAmountCur_IN + tmpTaxWorkTrans.EximBalanceTaxAmountCur_IN))
+                    {
+                        if (isCalledFromSalesEditLines)
+                            tmpTaxWorkTrans.SourceRegulateAmountCur =
+                                CurrencyExchangeHelper::amount(tmpTaxRegulation.ActualSourceRegulateAmountCur * (abs(tmpTaxWorkTrans.EximTaxAmountCur_IN) + abs(tmpTaxWorkTrans.EximBalanceTaxAmountCur_IN)) / customsSourceTaxAmountCur, tmpTaxRegulation.SourceCurrencyCode);
+                        else
+                            tmpTaxWorkTrans.SourceRegulateAmountCur =
+                                CurrencyExchangeHelper::amount(tmpTaxRegulation.SourceRegulateAmountCur * (abs(tmpTaxWorkTrans.EximTaxAmountCur_IN) + abs(tmpTaxWorkTrans.EximBalanceTaxAmountCur_IN)) / customsSourceTaxAmountCur, tmpTaxRegulation.SourceCurrencyCode);
+                    }
+                    else
+                    {
+                        if (isCalledFromSalesEditLines)
+                            tmpTaxWorkTrans.SourceRegulateAmountCur =
+                                CurrencyExchangeHelper::amount(tmpTaxRegulation.ActualSourceRegulateAmountCur * abs(tmpTaxWorkTrans.SourceTaxAmountCur) / tmpTaxRegulation.SourceTaxAmountCur, tmpTaxRegulation.SourceCurrencyCode);
+                        else
+                        {
+                            TaxRegulationAmountCur sourceRegulateAmountCur;
+                            if (this.isConsInvoice)
+                            {
+                                // For Japan consolidated invoices, if tmpTaxWorkTrans.SourceTaxAmountCur is negative and adjusted to a positive value
+                                // we don't need to reverse the value back.
+                                sourceRegulateAmountCur = tmpTaxRegulation.SourceRegulateAmountCur * abs(tmpTaxWorkTrans.SourceTaxAmountCur / tmpTaxRegulation.SourceTaxAmountCur);
+                            }
+                            else 
+                            {
+                                sourceRegulateAmountCur = tmpTaxRegulation.SourceRegulateAmountCur * abs(tmpTaxWorkTrans.SourceTaxAmountCur) / tmpTaxRegulation.SourceTaxAmountCur;
+                            }
+                            tmpTaxWorkTrans.SourceRegulateAmountCur = CurrencyExchangeHelper::amount(sourceRegulateAmountCur, tmpTaxRegulation.SourceCurrencyCode);
+                            if (this.isConsInvoice)
+                            {
+                                tmpTaxWorkTrans.ConsolidateSourceRegulateAmountCur_JP = tmpTaxRegulation.ConsolidateSourceRegulateAmountCur_JP;
+                            }
+                        }
+                    }
+                    // <GEEU>
+                    if (isBankExchRateEnabled)
+                    {
+                        tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount =
+                            CurrencyExchangeHelper::amount(tmpTaxRegulation.ExchangeRateSourceRegulateAmount * abs(tmpTaxWorkTrans.SourceTaxAmountCur) / tmpTaxRegulation.SourceTaxAmountCur, accountingCurrency);
+                        if (isTaxSpecificExchRateEnabledByTable)
+                        {
+                            tmpTaxWorkTrans.ExchangeRateRegulateAmountCur =
+                                CurrencyExchangeHelper::amount(tmpTaxRegulation.ExchangeRateRegulateAmountCur * abs(tmpTaxWorkTrans.SourceTaxAmountCur) / tmpTaxRegulation.SourceTaxAmountCur, tmpTaxWorkTrans.CurrencyCode);
+                        }
+                    }
+                    // </GEEU>
+                    // <GIN>
+                    if (isCustomsEnabled && isTaxTypeCustoms)
+                    {
+                        if ((headingTableId == tableNum(PurchParmTable) || headingTableId == tableNum(PurchTable))
+                            && tax.documentStatus_IN() == DocumentStatus::BillOfEntry_IN
+                            && tmpTaxWorkTrans.EximIncentiveScheme_IN == EximIncentiveScheme_IN::EPCG
+                            && tmpTaxWorkTrans.SourceTaxAmountCur != (tmpTaxWorkTrans.EximTaxAmountCur_IN + tmpTaxWorkTrans.EximBalanceTaxAmountCur_IN))
+                        {
+                            tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN =
+                                  CurrencyExchangeHelper::amount(tmpTaxRegulation.SourceRegulateAmountCustoms_IN * (abs(tmpTaxWorkTrans.EximTaxAmountCur_IN) + abs(tmpTaxWorkTrans.EximBalanceTaxAmountCur_IN)) / customsSourceTaxAmountCur, tmpTaxRegulation.SourceCurrencyCode);
+                        }
+                        else
+                        {
+                            tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN =
+                                CurrencyExchangeHelper::amount(tmpTaxRegulation.SourceRegulateAmountCustoms_IN * abs(tmpTaxWorkTrans.SourceTaxAmountCur) / tmpTaxRegulation.SourceTaxAmountCur, tmpTaxRegulation.SourceCurrencyCode);
+                        }
+
+                        if (isEximEnabled)
+                        {
+                            tax.calcCorrectedTaxExim_IN(tmpTaxWorkTrans);
+                        }
+                    }
+                    // </GIN>
+                }
+                if (abs(tmpTaxWorkTrans.SourceRegulateAmountCur) > taxAmount)
+                {
+                    taxAmount = tmpTaxWorkTrans.SourceRegulateAmountCur;
+                    taxWorkTransRecId = tmpTaxWorkTrans.RecId;
+                }
+                if (((tmpTaxWorkTrans.SourceTaxAmountCur < 0) &&
+                    (tmpTaxWorkTrans.SourceRegulateAmountCur > 0)) ||
+                    ((tmpTaxWorkTrans.SourceTaxAmountCur > 0) &&
+                    (tmpTaxWorkTrans.SourceRegulateAmountCur < 0)))
+                // <GIN>
+                {
+                    // </GIN>
+                    // For Japan consolidated invoices, the tax amount can be adjusted from a positive value to a negative value, and vice versa.
+                    if (!this.isConsInvoice)
+                    {
+                        tmpTaxWorkTrans.SourceRegulateAmountCur = -tmpTaxWorkTrans.SourceRegulateAmountCur;
+                    }
+
+                    // <GIN>
+                    if (isCustomsEnabled && isTaxTypeCustoms)
+                    {
+                        tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN = -tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN;
+
+                        if (isEximEnabled)
+                        {
+                            tmpTaxWorkTrans.EximTaxCorrectedAmount_IN        = -tmpTaxWorkTrans.EximTaxCorrectedAmount_IN;
+                            tmpTaxWorkTrans.EximBalanceTaxCorrectedAmount_IN = -tmpTaxWorkTrans.EximBalanceTaxCorrectedAmount_IN;
+                        }
+                    }
+                }
+                // </GIN>
+                else if (tmpTaxWorkTrans.SourceTaxAmountCur == 0)
+                {
+                    if (tmpTaxWorkTrans.SourceBaseAmountCur == 0)
+                    {
+                        tmpTaxWorkTrans.SourceRegulateAmountCur = tmpTaxWorkTrans.SourceRegulateAmountCur * tmpTaxWorkTrans.taxChangeDisplaySign(null);
+                    }
+                    else if ((tmpTaxWorkTrans.NegativeTax && tmpTaxWorkTrans.SourceRegulateAmountCur * tmpTaxWorkTrans.SourceBaseAmountCur > 0)
+                         || (!tmpTaxWorkTrans.NegativeTax && tmpTaxWorkTrans.SourceRegulateAmountCur * tmpTaxWorkTrans.SourceBaseAmountCur < 0))
+                    {
+                        tmpTaxWorkTrans.SourceRegulateAmountCur = -tmpTaxWorkTrans.SourceRegulateAmountCur;
+                    }
+                }
+
+                // <GEEU>
+                if (isBankExchRateEnabled)
+                {
+                    if (abs(tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount) > taxAmountAccountingCurrency)
+                    {
+                        taxAmountAccountingCurrency = tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount;
+                        taxWorkTransRecId = tmpTaxWorkTrans.RecId;
+                    }
+
+                    if ((tmpTaxWorkTrans.SourceTaxAmountCur < 0 && tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount > 0) ||
+                        (tmpTaxWorkTrans.SourceTaxAmountCur > 0 && tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount < 0))
+                    {
+                        tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount = -tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount;
+                    }
+                    else if (tmpTaxWorkTrans.SourceTaxAmountCur == 0
+                        && ((tmpTaxWorkTrans.NegativeTax && tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount * tmpTaxWorkTrans.SourceBaseAmountCur > 0)
+                            || (!tmpTaxWorkTrans.NegativeTax && tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount * tmpTaxWorkTrans.SourceBaseAmountCur < 0)))
+                    {
+                        tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount = -tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount;
+                    }
+
+                    taxAllocatedAccountingCurrency += tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount;
+                }
+                // </GEEU>
+                if (isTaxSpecificExchRateEnabledByTable)
+                {
+                    if (abs(tmpTaxWorkTrans.ExchangeRateRegulateAmountCur) > taxAmountTaxCurrency)
+                    {
+                        taxAmountTaxCurrency = tmpTaxWorkTrans.ExchangeRateRegulateAmountCur;
+                        taxWorkTransRecId = tmpTaxWorkTrans.RecId;
+                    }
+
+                    if ((tmpTaxWorkTrans.SourceTaxAmountCur < 0 && tmpTaxWorkTrans.ExchangeRateRegulateAmountCur > 0)
+                        || (tmpTaxWorkTrans.SourceTaxAmountCur > 0 && tmpTaxWorkTrans.ExchangeRateRegulateAmountCur < 0))
+                    {
+                        tmpTaxWorkTrans.ExchangeRateRegulateAmountCur = -tmpTaxWorkTrans.ExchangeRateRegulateAmountCur;
+                    }
+                    else if (tmpTaxWorkTrans.SourceTaxAmountCur == 0
+                        && ((tmpTaxWorkTrans.NegativeTax && tmpTaxWorkTrans.ExchangeRateRegulateAmountCur * tmpTaxWorkTrans.SourceBaseAmountCur > 0)
+                            || (!tmpTaxWorkTrans.NegativeTax && tmpTaxWorkTrans.ExchangeRateRegulateAmountCur * tmpTaxWorkTrans.SourceBaseAmountCur < 0)))
+                    {
+                        tmpTaxWorkTrans.ExchangeRateRegulateAmountCur = -tmpTaxWorkTrans.ExchangeRateRegulateAmountCur;
+                    }
+
+                    taxAllocatedTaxCurrency += tmpTaxWorkTrans.ExchangeRateRegulateAmountCur;
+                }
+
+                taxTable = TaxTable::find(tmpTaxWorkTrans.TaxCode);
+
+                if (tax.allowAdjustBaseAmountForTaxAdjustment() && tax.getTaxIncludedInItemPrice())
+                {
+                    // stash some information for later so we can ensure that base + tax = line amount.
+                    if (adjustedTaxPerSourceLine.exists(tmpTaxWorkTrans.SourceRecId))
+                    {
+                        adjustedTaxAmount = adjustedTaxPerSourceLine.lookup(tmpTaxWorkTrans.SourceRecId);
+                    }
+
+                    if (!TaxCalculationAdjustment::isTaxBaseNotAdjustedForUseTax() || (TaxCalculationAdjustment::isTaxBaseNotAdjustedForUseTax() && tmpTaxWorkTrans.TaxDirection != TaxDirection::UseTax))
+                    {
+                        adjustedTaxPerSourceLine.insert(tmpTaxWorkTrans.SourceRecId, adjustedTaxAmount + tmpTaxWorkTrans.SourceRegulateAmountCur);
+                    }
+
+                    if (calculatedTaxPerSourceLine.exists(tmpTaxWorkTrans.SourceRecId))
+                    {
+                        calculatedTaxAmount = calculatedTaxPerSourceLine.lookup(tmpTaxWorkTrans.SourceRecId);
+                    }
+
+                    if (!TaxCalculationAdjustment::isTaxBaseNotAdjustedForUseTax() || (TaxCalculationAdjustment::isTaxBaseNotAdjustedForUseTax() && tmpTaxWorkTrans.TaxDirection != TaxDirection::UseTax))
+                    {
+                        calculatedTaxPerSourceLine.insert(tmpTaxWorkTrans.SourceRecId, calculatedTaxAmount + tmpTaxWorkTrans.SourceTaxAmountCur);
+                    }
+                }
+
+                taxAllocated += tmpTaxWorkTrans.SourceRegulateAmountCur;
+
+                // Some transactions require a tax adjustment to automatically adjust the base amount.
+                if (tax.allowAdjustBaseAmountForTaxAdjustment() && tax.getTaxIncludedInItemPrice())
+                // <GIN>
+                if (tax.allowAdjustBaseAmountForTaxAdjustment()
+                    && (!isCustomsEnabled
+                    || !isTaxTypeCustoms))
+                // </GIN>
+                {
+                    // stash away some information so we can adjust the base amount later due to tax on tax tax line
+                    if (taxTable.canTaxBaseAdjusted())
+                    {
+                        calculatedBasePerSourceLine.insert(tmpTaxWorkTrans.SourceRecId, tmpTaxWorkTrans.SourceBaseAmountCurCalculated);
+                        adjustedBasePerSourceLine.insert(tmpTaxWorkTrans.SourceRecId, tmpTaxWorkTrans.SourceBaseAmountCur);
+                    }
+                }
+                // <GIN>
+                if (isCustomsEnabled && isTaxTypeCustoms)
+                {
+                    taxAllocatedCustoms += tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN;
+                }
+                // </GIN>
+
+                tmpTaxWorkTrans.adjustTaxInCostPrice();
+
+                // If we are ignoring calculculated sales tax and no tax adjustment is present then
+                // actual sales tax is always 0.
+                if (tax.ignoreCalculatedSalesTax() && tmpTaxWorkTrans.TaxAutogenerated)
+                {
+                    tmpTaxWorkTrans.SourceRegulateAmountCur = 0;
+                    tmpTaxWorkTrans.TaxAmount = 0;
+                    tmpTaxWorkTrans.TaxAmountCur = 0;
+                    tmpTaxWorkTrans.TaxAmountRep = 0;
+                }
+
+                tmpTaxWorkTrans.update(tax.ignoreCalculatedSalesTax() && tmpTaxWorkTrans.TaxAutogenerated);
+            }
+            taxAllocatedSign = taxAllocated < 0 ? -1 : 1;
+            taxAllocated = abs(taxAllocated);
+
+            // <GEEU>
+            if (isBankExchRateEnabled)
+            {
+                taxAllocatedSignAccountingCurrency = taxAllocatedAccountingCurrency < 0 ? -1 :1;
+                taxAllocatedAccountingCurrency     = abs(taxAllocatedAccountingCurrency);
+
+                if (taxAllocatedAccountingCurrency != abs(tmpTaxRegulation.ExchangeRateSourceRegulateAmount))
+                {
+                    allocatedAmountIsDifferent= true;
+                }
+
+                if (isTaxSpecificExchRateEnabledByTable)
+                {
+                    taxAllocatedSignTaxCurrency = taxAllocatedTaxCurrency < 0 ? -1 :1;
+                    taxAllocatedTaxCurrency = abs(taxAllocatedTaxCurrency);
+
+                    if (taxAllocatedTaxCurrency != abs(tmpTaxRegulation.ExchangeRateRegulateAmountCur))
+                    {
+                        allocatedAmountCurIsDifferent = true;
+                    }
+                }
+            }
+            // </GEEU>
+
+            // <GIN>
+            if (isCustomsEnabled && isTaxTypeCustoms)
+            {
+                taxAllocatedCustoms = abs(taxAllocatedCustoms);
+            }
+            // </GIN>
+
+            if (taxAllocated != abs(tmpTaxRegulation.SourceRegulateAmountCur)
+                // <GEEU>
+                || allocatedAmountIsDifferent
+                // </GEEU>
+                || (isTaxSpecificExchRateEnabledByTable
+                    && allocatedAmountCurIsDifferent)
+                )
+            {
+                select forupdate tmpTaxWorkTrans
+                    where tmpTaxWorkTrans.RecId == taxWorkTransRecId;
+                // <GEEU>
+                if (isBankExchRateEnabled)
+                {
+                    if (allocatedAmountIsDifferent)
+                    {
+                        tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount += (abs(tmpTaxRegulation.ExchangeRateSourceRegulateAmount) - taxAllocatedAccountingCurrency) * taxAllocatedSignAccountingCurrency;
+                    }
+
+                    if (isTaxSpecificExchRateEnabledByTable && allocatedAmountCurIsDifferent)
+                    {
+                        tmpTaxWorkTrans.ExchangeRateRegulateAmountCur += (abs(tmpTaxRegulation.ExchangeRateRegulateAmountCur) - taxAllocatedTaxCurrency) * taxAllocatedSignTaxCurrency;
+                    }
+                }
+                // </GEEU>
+                if (isCalledFromSalesEditLines)
+                    tmpTaxWorkTrans.SourceRegulateAmountCur += (abs(tmpTaxRegulation.ActualSourceRegulateAmountCur) - taxAllocated) * taxAllocatedSign;
+                else
+                    tmpTaxWorkTrans.SourceRegulateAmountCur += (abs(tmpTaxRegulation.SourceRegulateAmountCur) - taxAllocated) * taxAllocatedSign;
+                tmpTaxWorkTrans.adjustTaxInCostPrice();
+                tmpTaxWorkTrans.update(tax.ignoreCalculatedSalesTax() && tmpTaxWorkTrans.TaxAutogenerated);
+
+                if (!TaxCalculationAdjustment::isTaxBaseNotAdjustedForUseTax() || tmpTaxWorkTrans.TaxDirection != TaxDirection::UseTax)
+                {
+                    adjustedTaxPerSourceLine.insert(tmpTaxWorkTrans.SourceRecId, tmpTaxWorkTrans.SourceRegulateAmountCur);
+                }
+            }
+
+            // <GIN>
+            if (isCustomsEnabled && isTaxTypeCustoms && (taxAllocatedCustoms != abs(tmpTaxRegulation.SourceRegulateAmountCustoms_IN)))
+            {
+                select forupdate tmpTaxWorkTrans
+                    where tmpTaxWorkTrans.RecId == taxWorkTransRecId;
+
+                tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN += (abs(tmpTaxRegulation.SourceRegulateAmountCustoms_IN) - taxAllocatedCustoms) * taxAllocatedSign;
+                tmpTaxWorkTrans.update(tax.ignoreCalculatedSalesTax() && tmpTaxWorkTrans.TaxAutogenerated);
+            }
+            // </GIN>
+        }
+
+        if (tax.allowAdjustBaseAmountForTaxAdjustment() && tax.getTaxIncludedInItemPrice())
+        {
+            TaxCalculationAdjustment::adjustBaseForAllLines(adjustedTaxPerSourceLine, calculatedTaxPerSourceLine, adjustedBasePerSourceLine, calculatedBasePerSourceLine, tmpTaxWorkTrans, tax, 0, 0);
+            TaxCalculationAdjustment::adjustBaseForTaxIncluded(tax.getAmountInclTaxMap(), adjustedBasePerSourceLine, calculatedBasePerSourceLine, adjustedTaxPerSourceLine, calculatedTaxPerSourceLine, tmpTaxWorkTrans, tax);
+        }
+
+        while select sum(SourceRegulateAmountCur),
+                     sum(SourceBaseAmountCurRegulated)
+                     // <GIN>
+                     ,sum(SourceRegulateAmountCustoms_IN)
+                     // </GIN>
+                     // <GEEU>
+                     , sum(ExchangeRateSourceBaseAmountRegulated)
+                     , sum(ExchangeRateSourceRegulateAmount)
+                     // </GEEU>
+                     , sum(ExchangeRateBaseAmountCurRegulated)
+                     , sum(ExchangeRateRegulateAmountCur)
+                     , sum(ConsolidateSourceRegulateAmountCur_JP)
+                     from tmpTaxWorkTrans
+        group by TaxCode, TaxDirection, ManualInsertedTax
+        where (!tax.allowSingleLineAdjustment() ||
+              (tmpTaxWorkTrans.SourceRecId == sourceRecId &&
+               tmpTaxWorkTrans.SourceTableId == sourceTableId)) &&
+              (tmpTaxWorkTrans.TaxAutogenerated == NoYes::No ||
+              tmpTaxWorkTrans.SourceBaseAmountCurRegulated != 0
+              // <GEEU>
+              || tmpTaxWorkTrans.ExchangeRateSourceBaseAmountRegulated != 0
+              || tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount != 0
+              // </GEEU>
+              || (isTaxSpecificExchRateEnabledByTable
+                  && (tmpTaxWorkTrans.ExchangeRateBaseAmountCurRegulated != 0
+                    || tmpTaxWorkTrans.ExchangeRateRegulateAmountCur != 0)))
+        {
+            // <GIN>
+            if (isCustomsEnabled
+                && (TaxTable::find(tmpTaxWorkTrans.TaxCode).TaxType_IN == TaxType_IN::Customs)
+                && (headingTableId == tableNum(PurchParmTable) || headingTableId == tableNum(PurchTable))
+                && tax.documentStatus_IN() == DocumentStatus::Invoice)
+            {
+                continue;
+            }
+            // </GIN>
+
+            // Records in taxWorkRegulation exist iff
+            // a) tax amount adjusted by user (TaxAutogenerated is false)
+            // b) base amount adjusted by user (SourceBaseAmountCurRegulated is non-zero)
+            // User manually inserted lines will fall under condition (a)
+            if (tax.allowSingleLineAdjustment())
+            {
+                taxWorkRegulation.HeadingTableId                = sourceTableId;
+                taxWorkRegulation.HeadingRecId                  = sourceRecId;
+            }
+            else
+            {
+                taxWorkRegulation.HeadingTableId                = headingTableId;
+                taxWorkRegulation.HeadingRecId                  = headingRecId;
+            }
+            taxWorkRegulation.TaxCode                       = tmpTaxWorkTrans.TaxCode;
+            taxWorkRegulation.TaxDirection                  = tmpTaxWorkTrans.TaxDirection;
+            taxWorkRegulation.ManualInsertedTax             = tmpTaxWorkTrans.ManualInsertedTax;
+            if (isCalledFromSalesEditLines)
+            {
+                taxWorkRegulation.IsCreatedFromUIInDetailedMode = NoYes::Yes;
+                taxWorkRegulation.ActualTaxRegulationAmountCur  = tmpTaxWorkTrans.SourceRegulateAmountCur;
+                if (taxRegulationAmountMap.exists([taxWorkRegulation.HeadingTableId, taxWorkRegulation.HeadingRecId, taxWorkRegulation.TaxCode]))
+                    taxWorkRegulation.TaxRegulationAmountCur = taxRegulationAmountMap.lookup([taxWorkRegulation.HeadingTableId, taxWorkRegulation.HeadingRecId, taxWorkRegulation.TaxCode]);
+                else
+                    taxWorkRegulation.TaxRegulationAmountCur = tmpTaxWorkTrans.SourceRegulateAmountCur;
+            }
+            else
+            {
+                taxWorkRegulation.TaxRegulationAmountCur        = tmpTaxWorkTrans.SourceRegulateAmountCur;
+                if (this.isConsInvoice)
+                {
+                    taxWorkRegulation.ConsolidateSourceRegulateAmountCur_JP = tmpTaxWorkTrans.ConsolidateSourceRegulateAmountCur_JP;
+                }
+            }
+            taxWorkRegulation.SourceBaseAmountCurRegulated  = tmpTaxWorkTrans.SourceBaseAmountCurRegulated;
+            // <GEEU>
+            if (isBankExchRateEnabled)
+            {
+                taxWorkRegulation.SourceRegulateAmount_W = tmpTaxWorkTrans.ExchangeRateSourceRegulateAmount;
+                taxWorkRegulation.SourceBaseAmountRegulated_W = tmpTaxWorkTrans.ExchangeRateSourceBaseAmountRegulated;
+                if (isTaxSpecificExchRateEnabledByTable)
+                {
+                    taxWorkRegulation.ExchangeRateTaxAmountCurRegulated = tmpTaxWorkTrans.ExchangeRateRegulateAmountCur;
+                    taxWorkRegulation.ExchangeRateTaxBaseAmountCurRegulated = tmpTaxWorkTrans.ExchangeRateBaseAmountCurRegulated;
+                }
+            }
+            // </GEEU>
+            // <GIN>
+            if (isCustomsEnabled)
+            {
+                taxWorkRegulation.TaxRegulationAmountCustoms_IN = tmpTaxWorkTrans.SourceRegulateAmountCustoms_IN;
+            }
+            // </GIN>
+
+            taxWorkRegulation.insert();
+        }
+
+        tax.tmpTaxWorkTrans(tmpTaxWorkTrans);
+
+        if (isTaxSpecificExchRateEnabledByTable)
+        {
+            tax.calculateTaxDifferenceAmountInternal();
+        }
+
+        if (tax.useTaxUncommitted())
+        {
+            tax.updateTaxUncommitted();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets a <c>LedgerJournalTransSource</c> value to be equal to the specified parameter.
+    /// </summary>
+    /// <param name="_ledgerJournalTrans">
+    ///    A <c>LedgerJournalTrans</c> record to be modified.
+    /// </param>
+    void setLedgerJournalTrans(LedgerJournalTrans _ledgerJournalTrans)
+    {
+        ;
+        ledgerJournalTransSource = _ledgerJournalTrans;
+
+        if (_ledgerJournalTrans.RecId != 0)
+        {
+            if (tax.allowSingleLineAdjustment())
+            {
+                sourceRecId = _ledgerJournalTrans.RecId;
+                sourceTableId = _ledgerJournalTrans.TableId;
+                invoiceId = _ledgerJournalTrans.Invoice;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOverrideCalculatedTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the override calculated tax value for a specified tax adjustment record.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The tax adjustment record.
+    /// </param>
+    protected void setOverrideCalculatedTax(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        _tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+        _tmpTaxRegulation.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTax</Name>
+				<Source><![CDATA[
+    void setTax(Tax _tax)
+    {
+        tax = _tax;
+        tmpTaxWorkTrans.setTmpData(tax.tmpTaxWorkTrans());
+        headingTableId  = tax.headingTableId();
+        headingRecId    = tax.headingRecId();
+        sourceCurrencyCode = tax.getTransactionalCurrency();
+        if (TaxConsInvoice_JP::isTaxDifferencePostingOnConsInvoiceEnabled())
+        {
+            if (headingTableId == tableNum(CustConsInvoice_JP) || headingTableId == tableNum(VendConsInvoice_JP))
+            {
+                isConsInvoice = true;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTmpTaxWorkTransTmpData</Name>
+				<Source><![CDATA[
+    public void setTmpTaxWorkTransTmpData(TmpTaxWorkTrans _tmpTaxWorkTrans)
+    {
+        tmpTaxWorkTrans.setTmpData(_tmpTaxWorkTrans);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taxLinesExist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the <c>taxLinesExist</c> value.
+    /// </summary>
+    /// <returns>
+    ///    The value of the <c>taxLinesExist</c> variable.
+    /// </returns>
+    boolean taxLinesExist()
+    {
+        return taxLinesExist;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taxRegulationTotal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the <c>TaxRegulationTotal</c> value.
+    /// </summary>
+    /// <returns>
+    ///    The value of the <c>TaxRegulationTotal</c> variable.
+    /// </returns>
+    TaxRegulationAmountCur taxRegulationTotal()
+    {
+        return taxRegulationTotal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tmpTaxRegulation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the <c>TmpTaxRegulation</c> value.
+    /// </summary>
+    /// <returns>
+    ///    The value of the <c>TmpTaxRegulation</c> variable.
+    /// </returns>
+    TmpTaxRegulation tmpTaxRegulation()
+    {
+        return tmpTaxRegulation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tmpTaxRegulationDetail</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the detailed tax adjustments.
+    /// </summary>
+    /// <returns>
+    /// The detailed tax adjustments.
+    /// </returns>
+    public TmpTaxRegulation tmpTaxRegulationDetail()
+    {
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tmpTaxWorkTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the buffer of <c>TmpTaxWorkTrans</c>.
+    /// </summary>
+    /// <returns>The buffer of <c>TmpTaxWorkTrans</c></returns>
+    public TmpTaxWorkTrans tmpTaxWorkTrans()
+    {
+        return tmpTaxWorkTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>totalSourceRegulateAmountCustoms_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returning totalSourceRegulateAmountCustoms.
+    /// </summary>
+    /// <returns>
+    /// The value of the <c>totalSourceRegulateAmountCustoms</c> parameter.
+    /// </returns>
+    public TaxRegulationAmountCur totalSourceRegulateAmountCustoms_IN()
+    {
+        return totalSourceRegulateAmountCustoms;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        //table buffer containers
+        container               ledgerJournalTransSourcePacked;
+
+        container               headingTableIdPacked;
+        container               sourceTableIdPacked;
+        Version                 version = RunBase::getVersion(packedClass);
+
+        //temp table containers
+        container               tmpTaxRegulationListPacked;
+
+        //enumerator for unpacking lists
+        ListEnumerator          listEnumerator;
+        //table to store records in temporarily
+        Common                  common;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList, ledgerJournalTransSourcePacked, headingTableIdPacked, sourceTableIdPacked,
+                    tmpTaxRegulationListPacked] = packedClass;
+
+                //unpack the temp tables
+                listEnumerator = List::create(tmpTaxRegulationListPacked).getEnumerator();
+                while (listEnumerator.moveNext())
+                {
+                    common = listEnumerator.current();
+                    tmpTaxRegulation.data(common.data());
+                    tmpTaxRegulation.insert();
+                }
+
+                //pull the packed tables into the buffers
+                con2Buf(ledgerJournalTransSourcePacked, ledgerJournalTransSource);
+
+                headingTableId = tableName2id(conPeek(headingTableIdPacked,1));
+                sourceTableId = tableName2id(conPeek(sourceTableIdPacked,1));
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExchangeRateTaxAmounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates a <c>TmpTaxRegulation</c> record by using the <c>TmpTaxWorkTrans</c> records for accounting currency amounts.
+    /// </summary>
+    void updateExchangeRateTaxAmounts()
+    {
+        while select forupdate tmpTaxRegulation
+        {
+            select sum(ExchangeRateTaxAmount), sum(ExchangeRateTaxBaseAmount)
+                from tmpTaxWorkTrans
+                group by TaxCode, HeadingRecId
+                where tmpTaxWorkTrans.TaxCode == tmpTaxRegulation.TaxCode
+                    && tmpTaxWorkTrans.HeadingRecId == tax.headingRecId()
+                    && tmpTaxWorkTrans.HeadingTableId == tax.headingTableId();
+
+            tmpTaxRegulation.ExchangeRateTaxAmount     = abs(tmpTaxWorkTrans.ExchangeRateTaxAmount);
+            tmpTaxRegulation.ExchangeRateTaxBaseAmount = abs(tmpTaxWorkTrans.ExchangeRateTaxBaseAmount);
+            tmpTaxRegulation.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExchangeRateTaxAmountCur</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates a <c>TmpTaxRegulation</c> record by using the <c>TmpTaxWorkTrans</c> records for tax currency amounts.
+    /// </summary>
+    internal void updateExchangeRateTaxAmountCur()
+    {
+        while select forupdate tmpTaxRegulation
+        {
+            select sum(ExchangeRateTaxAmountCur), sum(ExchangeRateTaxBaseAmountCur)
+                from tmpTaxWorkTrans
+                group by TaxCode, HeadingRecId
+                where tmpTaxWorkTrans.TaxCode == tmpTaxRegulation.TaxCode
+                    && tmpTaxWorkTrans.HeadingRecId == tax.headingRecId()
+                    && tmpTaxWorkTrans.HeadingTableId == tax.headingTableId();
+
+            tmpTaxRegulation.ExchangeRateTaxAmountCur = abs(tmpTaxWorkTrans.ExchangeRateTaxAmountCur);
+            tmpTaxRegulation.ExchangeRateTaxBaseAmountCur = abs(tmpTaxWorkTrans.ExchangeRateTaxBaseAmountCur);
+            tmpTaxRegulation.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOverrideCalculatedTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the override calculated tax value for a specified tax adjustment record.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The tax adjustment record.
+    /// </param>
+    public final void updateOverrideCalculatedTax(TmpTaxRegulation _tmpTaxRegulation)
+    {
+        boolean ignoreCalculatedTax;
+
+        if (_tmpTaxRegulation.OverrideCalculatedTax == NoYes::No)
+        {
+            if (tax && tax.ignoreCalculatedSalesTax() && _tmpTaxRegulation.TaxDirection == TaxDirection::IncomingTax)
+            {
+                ignoreCalculatedTax = true;
+            }
+
+            this.resetOverrideCalculatedTax(_tmpTaxRegulation, ignoreCalculatedTax);
+        }
+        else
+        {
+            this.setOverrideCalculatedTax(_tmpTaxRegulation);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSourceBaseAmountCurRegulated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the adjusted amount origin for the specified tax adjustment record with the specified new
+    /// adjusted amount origin.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The tax adjustment record.
+    /// </param>
+    /// <param name="_newSourceBaseAmountCurRegulated">
+    /// The new adjusted amount origin.
+    /// </param>
+
+    public void updateSourceBaseAmountCurRegulated(TmpTaxRegulation _tmpTaxRegulation, TaxBaseCur _newSourceBaseAmountCurRegulated)
+    {
+        _tmpTaxRegulation.SourceBaseAmountCurRegulated = _newSourceBaseAmountCurRegulated;
+        _tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+        _tmpTaxRegulation.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTaxRegulationAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the tax adjustment amount for a specified tax adjustment record by using a specified new
+    /// tax adjustment amount.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The tax adjustment record.
+    /// </param>
+    /// <param name="_newTaxRegulationAmount">
+    /// The tax adjustment amount.
+    /// </param>
+    /// <param name="_canUpdate">
+    /// Specifies whether the table buffer can be updated; optional.
+    /// </param>
+
+    public void updateTaxRegulationAmount(TmpTaxRegulation _tmpTaxRegulation, TaxRegulationAmountCur _newTaxRegulationAmount, boolean _canUpdate = true)
+    {
+        _tmpTaxRegulation.SourceRegulateAmountCur = _newTaxRegulationAmount;
+        _tmpTaxRegulation.ActualSourceRegulateAmountCur = _newTaxRegulationAmount;
+        _tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+
+        // When tax code adjustment feature enabled, TmpTaxRegulation records can be created manually.
+        // If manual creation, the TmpTaxRegulation records should insert.
+        if (!_tmpTaxRegulation.RecId && TaxIntegrationAdjustment::isEnabledForTransaction(headingTableId, headingRecId))
+        {
+            _tmpTaxRegulation.insert();
+        }
+        else if (_canUpdate)
+        {
+            _tmpTaxRegulation.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateConsolidateSourceRegulateAmountCur_JP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the consolidated sales tax amount for a specified tax adjustment record by using a specified new
+    /// consolidated sales tax amount.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The tax adjustment record.
+    /// </param>
+    /// <param name="_newTaxRegulationAmount">
+    /// The new consolidated sales tax amount.
+    /// </param>
+    /// <param name="_canUpdate">
+    /// Specifies whether the table buffer can be updated; optional.
+    /// </param>
+    internal void updateConsolidateSourceRegulateAmountCur_JP(
+        TmpTaxRegulation _tmpTaxRegulation, 
+        TaxRegulationAmountCur _newTaxRegulationAmount, 
+        boolean _canUpdate = true)
+    {
+        _tmpTaxRegulation.SourceRegulateAmountCur = _newTaxRegulationAmount - _tmpTaxRegulation.ConsolidateSourceTaxAmountCurPosted_JP;
+        _tmpTaxRegulation.ConsolidateSourceRegulateAmountCur_JP = _newTaxRegulationAmount;
+        _tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+
+        if (_canUpdate)
+        {
+            _tmpTaxRegulation.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateActualTaxRegulationAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the tax adjustment amount for a specified tax adjustment record by using a specified new
+    /// tax adjustment amount.
+    /// </summary>
+    /// <param name="_tmpTaxRegulation">
+    /// The tax adjustment record.
+    /// </param>
+    /// <param name="_newTaxRegulationAmount">
+    /// The tax adjustment amount.
+    /// </param>
+    /// <param name="_canUpdate">
+    /// Specifies whether the table buffer can be updated; optional.
+    /// </param>
+    public void updateActualTaxRegulationAmount(TmpTaxRegulation _tmpTaxRegulation, TaxRegulationAmountCur _newTaxRegulationAmount, boolean _canUpdate = true)
+    {
+        _tmpTaxRegulation.ActualSourceRegulateAmountCur = _newTaxRegulationAmount;
+        _tmpTaxRegulation.OverrideCalculatedTax = NoYes::Yes;
+
+        // When tax code adjustment feature enabled, TmpTaxRegulation records can be created manually.
+        // If manual creation, the TmpTaxRegulation records should insert.
+        if (!_tmpTaxRegulation.RecId && TaxIntegrationAdjustment::isEnabledForTransaction(headingTableId, headingRecId))
+        {
+            _tmpTaxRegulation.SourceRegulateAmountCur = _newTaxRegulationAmount;
+            _tmpTaxRegulation.insert();
+        }
+        else if (_canUpdate)
+        {
+            _tmpTaxRegulation.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustTaxInvoice</Name>
+				<Source><![CDATA[
+    static void adjustTaxInvoice(Voucher _voucher, InvoiceDate _date, InventTransId _transId, TableId _tableId, RecId _recId, Qty _qtyOrdered, Qty _qty
+                                ,boolean _taxAsPerOriginalInvoice = false
+    )
+    {
+        TaxWorkRegulation       taxWorkRegulation;
+        TaxTrans                taxTrans;
+        TaxRegulationAmountCur  taxRegulationAmountCur;
+
+        // <GIN>
+        boolean                 taxAsPerOriginalInvoice = _taxAsPerOriginalInvoice;
+        boolean                 taxesMarked;
+        // </GIN>
+        ;
+
+        // <GIN>
+        taxesMarked = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN]) &&  TaxParameters::checkTaxParameters_IN();
+        // </GIN>
+
+        if (!_qty)
+            return;
+
+        if (!_tableId || !_recId)
+            return;
+
+        while select SourceRegulateAmountCur, SourceCurrencyCode, TaxCode, TaxDirection from taxTrans
+            where  taxTrans.Voucher                 == _voucher
+                && taxTrans.TransDate               == _date
+                && taxTrans.InventTransId           == _transId
+                && taxTrans.TaxDirection            != TaxDirection::UseTax
+                && taxTrans.TaxOrigin               != TaxOrigin::TaxReversed
+                && taxTrans.TaxOrigin               != TaxOrigin::Transfer
+                && !taxTrans.TaxAutogenerated
+        {
+            // <GIN>
+            if (taxesMarked)
+            {
+                if (taxAsPerOriginalInvoice)
+                {
+                    taxRegulationAmountCur = CurrencyExchangeHelper::amount(_qtyOrdered * taxTrans.SourceRegulateAmountCur / _qty, taxTrans.SourceCurrencyCode);
+
+                    if (!taxRegulationAmountCur)
+                        continue;
+                    taxWorkRegulation = TaxWorkRegulation::findByTaxCodeTaxDirection(_tableId, _recId, taxTrans.TaxCode, taxTrans.TaxDirection, true);
+
+                    taxWorkRegulation.HeadingTableId         = _tableId;
+                    taxWorkRegulation.HeadingRecId           = _recId;
+                    taxWorkRegulation.TaxCode                = taxTrans.TaxCode;
+                    taxWorkRegulation.TaxDirection           = taxTrans.TaxDirection;
+                    taxWorkRegulation.TaxRegulationAmountCur = taxRegulationAmountCur;
+                    taxWorkRegulation.ActualTaxRegulationAmountCur = taxRegulationAmountCur;
+                    if (taxWorkRegulation)
+                    {
+                        taxWorkRegulation.update();
+                    }
+                    else
+                    {
+                        taxWorkRegulation.insert();
+                    }
+                }
+            }
+            else
+            {
+                // </GIN>
+                taxRegulationAmountCur = CurrencyExchangeHelper::amount(_qtyOrdered * taxTrans.SourceRegulateAmountCur / _qty, taxTrans.SourceCurrencyCode);
+
+                if (!taxRegulationAmountCur)
+                    continue;
+
+                // tax adjustments are stored in the taxWorkRegulation table grouped and summarized by Tax Code.
+                // So, an adjustment may already exist.
+                taxWorkRegulation = TaxWorkRegulation::findByTaxCodeTaxDirection(_tableId, _recId, taxTrans.TaxCode, taxTrans.TaxDirection, true);
+
+                taxWorkRegulation.HeadingTableId         = _tableId;
+                taxWorkRegulation.HeadingRecId           = _recId;
+                taxWorkRegulation.TaxCode                = taxTrans.TaxCode;
+                taxWorkRegulation.TaxDirection           = taxTrans.TaxDirection;
+                taxWorkRegulation.TaxRegulationAmountCur += taxRegulationAmountCur;
+                taxWorkRegulation.ActualTaxRegulationAmountCur += taxRegulationAmountCur;
+                if (taxWorkRegulation)
+                {
+                    taxWorkRegulation.update();
+                }
+                else
+                {
+                    taxWorkRegulation.insert();
+                }
+                // <GIN>
+            }
+            // </GIN>
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustTaxInvoiceV2</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the tax adjustment with the following scenarios:
+    /// 1. Bring forward the tax adjustment from original SO to credit note or return order.
+    /// 2. Dynamically update the tax adjustment on credit note or return order upon qty update or line delete.
+    /// </summary>
+    /// <param name = "_salesLine">The salesLine instance.</param>
+    /// <param name = "_origQty">The original quantity value.</param>
+    /// <param name = "_newQty">The new quantity value.</param>
+    internal static void adjustTaxInvoiceV2(SalesLine _salesLine, Qty _origQty, Qty _newQty)
+    {
+        // If no quantity updates, omit the tax adjustment process.
+        if (_origQty == _newQty)
+        {
+            return;
+        }
+
+        CustInvoiceTrans custInvoiceTrans = CustInvoiceTrans::findRecId(_salesLine.RefReturnInvoiceTrans_W);
+        if (!custInvoiceTrans)
+        {
+            return;
+        }
+
+        ttsbegin;
+        CustInvoiceJour custInvoiceJour = CustInvoiceJour::findFromCustInvoiceTrans(
+            custInvoiceTrans.SalesId,
+            custInvoiceTrans.InvoiceId,
+            custInvoiceTrans.InvoiceDate,
+            custInvoiceTrans.NumberSequenceGroup);
+        InventQty totalQty = -custInvoiceTrans.Qty;// Mark negative as for return.
+        RecId salesTableRecId = _salesLine.salesTable().RecId;
+        boolean isSingleLineTaxAdjustmentEnabled = CustParameters::find().EnableSingleLineTaxAdjustment;
+
+        TaxTrans taxTrans;
+        while select TaxCode, TaxDirection, SourceRegulateAmountCur from taxTrans
+            where taxTrans.Voucher == custInvoiceJour.LedgerVoucher
+                && taxTrans.TransDate == custInvoiceTrans.InvoiceDate
+                && taxTrans.InventTransId == custInvoiceTrans.InventTransId
+                && taxTrans.TaxDirection != TaxDirection::UseTax
+                && taxTrans.TaxOrigin != TaxOrigin::TaxReversed
+                && taxTrans.TaxOrigin != TaxOrigin::Transfer
+        {
+            CurrencyCode currencyCode = _salesLine.CurrencyCode;
+            TaxAmountCur newTaxRegulationAmountCur = TaxRegulation::getTaxRegulationAmountCur(
+                taxTrans,
+                currencyCode,
+                totalQty,
+                _newQty);
+
+            TaxWorkRegulation taxWorkRegulation;
+            if (isSingleLineTaxAdjustmentEnabled)
+            {
+                // Detail mode.
+                taxWorkRegulation = TaxWorkRegulation::findByTaxCodeTaxDirection(
+                    tableNum(SalesLine),
+                    _salesLine.RecId,
+                    taxTrans.TaxCode,
+                    taxTrans.TaxDirection,
+                    true);
+                if (!taxWorkRegulation)
+                {
+                    taxWorkRegulation.HeadingTableId = tableNum(SalesLine);
+                    taxWorkRegulation.HeadingRecId = _salesLine.RecId;
+                }
+                taxWorkRegulation.TaxRegulationAmountCur = newTaxRegulationAmountCur;
+                taxWorkRegulation.ActualTaxRegulationAmountCur = newTaxRegulationAmountCur;
+            }
+            else
+            {
+                // Summary mode.
+                taxWorkRegulation = TaxWorkRegulation::findByTaxCodeTaxDirection(
+                    tableNum(SalesTable),
+                    salesTableRecId,
+                    taxTrans.TaxCode,
+                    taxTrans.TaxDirection,
+                    true);
+                if (!taxWorkRegulation)
+                {
+                    taxWorkRegulation.HeadingTableId = tableNum(SalesTable);
+                    taxWorkRegulation.HeadingRecId = salesTableRecId;
+                }
+
+                TaxAmountCur origTaxRegulationAmountCur = TaxRegulation::getTaxRegulationAmountCur(
+                taxTrans,
+                currencyCode,
+                totalQty,
+                _origQty);
+
+                TaxAmountCur taxRegulationAmountCur = newTaxRegulationAmountCur - origTaxRegulationAmountCur;
+                taxWorkRegulation.TaxRegulationAmountCur += taxRegulationAmountCur;
+                taxWorkRegulation.ActualTaxRegulationAmountCur += taxRegulationAmountCur;
+            }
+
+            if (!taxWorkRegulation)
+            {
+                taxWorkRegulation.TaxCode = taxTrans.TaxCode;
+                taxWorkRegulation.TaxDirection = taxTrans.TaxDirection;
+                taxWorkRegulation.OverrideCalculatedTax = 1;
+            }
+            taxWorkRegulation.write();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaxRegulationAmountCur</Name>
+				<Source><![CDATA[
+    internal static TaxAmountCur getTaxRegulationAmountCur(
+        TaxTrans _taxTrans,
+        CurrencyCode _currencyCode,
+        Qty _totalQty,
+        Qty _qty)
+    {
+        TaxAmountCur totalTaxAmountCur = abs(_taxTrans.SourceRegulateAmountCur);
+        TaxAmountCur currentTaxAmountCur = _totalQty == 0 ? totalTaxAmountCur : totalTaxAmountCur * _qty / _totalQty;
+        return CurrencyExchangeHelper::amount(currentTaxAmountCur, _currencyCode);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newTaxRegulation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes and retrieves a new instance of the <c>TaxRegulation</c> class.
+    /// </summary>
+    /// <param name="_tax">
+    ///    A tax value.
+    /// </param>
+    /// <param name="_ledgerJournalTrans">
+    ///    The <c>ledgerJournalTrans</c> value of the <c>TaxRegulation</c> class; the default value is null.
+    /// </param>
+    /// <param name="_taxRegulationSourceTableId">
+    ///    The table ID of the tax adjustment source; optional.
+    /// </param>
+    /// <param name="_taxRegulationSourceRecId">
+    ///    The record ID of the tax adjustment source; optional.
+    /// </param>
+    /// <returns>
+    ///    An instance of the <c>TaxRegulation</c> class.
+    /// </returns>
+    static TaxRegulation newTaxRegulation(Tax               _tax,
+                                         LedgerJournalTrans _ledgerJournalTrans = null,
+                                         RefTableId         _taxRegulationSourceTableId = 0,
+                                         RefRecId           _taxRegulationSourceRecId = 0)
+    {
+        TaxRegulation   taxRegulation;
+
+        if ((_tax.allowSingleLineAdjustment()
+                && (SysCountryRegionCode::isLegalEntityInConsolidatedCountryRegion()
+                    || CustParameters::enableSingleLineTaxAdjustment())
+                && _tax.getTaxAdjustmentTypes().in(TaxAdjustmentType::Detail))
+            || TaxIntegrationAdjustment::isEnabledForTransaction(_tax.headingTableId(), _tax.headingRecId()))
+        {
+            taxRegulation = TaxRegulationDetail::construct();
+        }
+        else
+        {
+            taxRegulation = new TaxRegulation();
+        }
+
+        if (_tax.allowSingleLineAdjustment() || VendParameters::findByCompany(curExt()).KeepSalesTaxAdjustmentsForPO == NoYes::Yes)
+        {
+            taxRegulation.parmSourceTableId(_taxRegulationSourceTableId);
+            taxRegulation.parmSourceRecId(_taxRegulationSourceRecId);
+        }
+
+        taxRegulation.setTax(_tax);
+        taxRegulation.setLedgerJournalTrans(_ledgerJournalTrans);
+        // <GIN>
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoIN])
+            && _tax.headingTableId() == tableNum(InventQualityOrderTable)
+            && TaxParameters::checkVatExciseParameters_IN())
+        {
+            taxRegulation.createSumsFromTmp_IN();
+        }
+        else
+        {
+            // </GIN>
+            taxRegulation.createSumsFromTmp();
+            // <GIN>
+        }
+        // </GIN>
+        return taxRegulation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTaxAdjustmentType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the variable selectedTaxAdjustmentType
+    /// </summary>
+    /// <param name="_taxAdjustmentType">
+    /// Selected value of tax adjustment type on TaxTmpWorkTrans form
+    /// </param>
+    /// <returns>
+    /// The selected tax adjustmenst type
+    /// </returns>
+    public TaxAdjustmentType parmTaxAdjustmentType(TaxAdjustmentType _taxAdjustmentType)
+    {
+        selectedTaxAdjustmentType = _taxAdjustmentType;
+
+        return selectedTaxAdjustmentType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isConsolidatedInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Indicates whether the source transaction is a consolidated invoice.
+    /// </summary>
+    /// <returns>
+    ///     True if the source transaction is a consolidated invoice; Otherwhise, false.
+    /// </returns>
+    internal boolean isConsolidatedInvoice()
+    {
+        return this.isConsInvoice;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcRegulateAmount_PL</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates exchange rate source regulate amount
+    /// </summary>
+    /// <param name = "_sourceTableId">Source table id</param>
+    /// <param name = "_sourceRecId">Source recid</param>
+    /// <param name = "_tmpTaxWorkTrans">TmpTaxWorkTrans talle buffer</param>
+    /// <param name = "_isSum">Summary the amount or not</param>
+    /// <remarks>
+    /// This method is not only used for Poland now.
+    /// When tax specific exchange rate is enabled, it is for all the countries.
+    /// </remarks>
+    protected void calcRegulateAmount_PL(
+        RefTableId _sourceTableId,
+        RefRecId _sourceRecId,
+        TmpTaxWorkTrans _tmpTaxWorkTrans,
+        boolean _isSum = false)
+    {
+        SalesTaxTransactionExchangeRate salesTaxTransactionExchangeRate;
+        boolean useSalesTaxExchangeRate = TaxParameters::isBankExchRateEnabled_W();
+        boolean isTaxSpecificExchRateEnabledByTable = TaxSpecificExchangeRateHelper::isTaxSpecificExchRateEnabledByTable(headingTableId, headingRecId);
+
+        TaxAmount exchangeRateSourceRegulateAmount;
+        TaxAmount exchangeRateRegulateAmountCur;
+
+        if ((isTaxSpecificExchRateEnabledByTable && TaxIntegrationTotalTaxAdjWithSpecExchRateFlight::instance().isEnabled())
+            || (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoPL]) && useSalesTaxExchangeRate))
+        {
+            if (_sourceTableId == tableNum(LedgerJournalTrans))
+            {
+                if (isTaxSpecificExchRateEnabledByTable)
+                {
+                    Map exchRateMap = TaxSpecificExchangeRateHelper::getExchangeRateMap(_sourceTableId, _sourceRecId);
+                    CurrencyExchangeRate accountingExchRate = exchRateMap.exists(Ledger::accountingCurrency()) ? exchRateMap.lookup(Ledger::accountingCurrency()) : 100;
+                    exchangeRateSourceRegulateAmount = CurrencyExchangeHelper::amountCur2MST(
+                        _isSum ? tmpTaxRegulation.SourceRegulateAmountCur : abs(tmpTaxRegulation.SourceRegulateAmountCur),
+                        tmpTaxRegulation.SourceCurrencyCode,
+                        accountingExchRate);
+
+                    CurrencyExchangeRate taxExchRate = exchRateMap.exists(tmpTaxWorkTrans.CurrencyCode) ? exchRateMap.lookup(tmpTaxWorkTrans.CurrencyCode) : 100;
+                    exchangeRateRegulateAmountCur = CurrencyExchangeHelper::amountCur2MST(
+                        _isSum ? tmpTaxRegulation.SourceRegulateAmountCur : abs(tmpTaxRegulation.SourceRegulateAmountCur),
+                        tmpTaxRegulation.SourceCurrencyCode,
+                        taxExchRate);
+                }
+                else
+                {
+                    if (!salesTaxTransactionExchangeRate)
+                    {
+                        salesTaxTransactionExchangeRate = SalesTaxTransactionExchangeRate::findBySourceRecord(_sourceTableId, _sourceRecId);
+                    }
+
+                    exchangeRateSourceRegulateAmount = CurrencyExchangeHelper::amountCur2MST(
+                        _isSum ? tmpTaxRegulation.SourceRegulateAmountCur : abs(tmpTaxRegulation.SourceRegulateAmountCur),
+                        tmpTaxRegulation.SourceCurrencyCode,
+                        salesTaxTransactionExchangeRate.SalesTaxExchangeRate);
+                }
+            }
+            else
+            {
+                if (!_tmpTaxWorkTrans)
+                {
+                    select firstonly SalesTaxExchangeRate, SalesTaxExchangeRateCur from _tmpTaxWorkTrans
+                        where _tmpTaxWorkTrans.TaxOrigin != TaxOrigin::TaxReversed;
+                }
+
+                if (isTaxSpecificExchRateEnabledByTable)
+                {
+                    exchangeRateSourceRegulateAmount = CurrencyExchangeHelper::amountCur2MST(
+                        _isSum ? tmpTaxRegulation.SourceRegulateAmountCur : abs(tmpTaxRegulation.SourceRegulateAmountCur),
+                        tmpTaxRegulation.SourceCurrencyCode,
+                        _tmpTaxWorkTrans.SalesTaxExchangeRate ? _tmpTaxWorkTrans.SalesTaxExchangeRate : 100);
+
+                    exchangeRateRegulateAmountCur = CurrencyExchange::calculateAmount(
+                        _isSum ? tmpTaxRegulation.SourceRegulateAmountCur : abs(tmpTaxRegulation.SourceRegulateAmountCur),
+                        _tmpTaxWorkTrans.SalesTaxExchangeRateCur ? _tmpTaxWorkTrans.SalesTaxExchangeRateCur : 100);
+
+                    exchangeRateRegulateAmountCur = CurrencyExchange::roundWithRuleTypeCurrencyTable(
+                        exchangeRateRegulateAmountCur,
+                        Currency::find(_tmpTaxWorkTrans.CurrencyCode),
+                        CurrencyRoundingRuleType::Amount);
+                }
+                else
+                {
+                    exchangeRateSourceRegulateAmount = CurrencyExchangeHelper::amountCur2MST(
+                        _isSum ? tmpTaxRegulation.SourceRegulateAmountCur : abs(tmpTaxRegulation.SourceRegulateAmountCur),
+                        tmpTaxRegulation.SourceCurrencyCode,
+                        _tmpTaxWorkTrans.SalesTaxExchangeRate);
+                }
+            }
+
+            if (_isSum)
+            {
+                tmpTaxRegulation.ExchangeRateSourceRegulateAmount += exchangeRateSourceRegulateAmount;
+                if (isTaxSpecificExchRateEnabledByTable)
+                {
+                    tmpTaxRegulation.ExchangeRateRegulateAmountCur += exchangeRateRegulateAmountCur;
+                }
+            }
+            else
+            {
+                tmpTaxRegulation.ExchangeRateSourceRegulateAmount = exchangeRateSourceRegulateAmount;
+                if (isTaxSpecificExchRateEnabledByTable)
+                {
+                    tmpTaxRegulation.ExchangeRateRegulateAmountCur = exchangeRateRegulateAmountCur;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

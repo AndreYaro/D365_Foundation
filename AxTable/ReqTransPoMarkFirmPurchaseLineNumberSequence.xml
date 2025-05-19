@@ -1,0 +1,349 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxTable xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqTransPoMarkFirmPurchaseLineNumberSequence</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+// This table has been created to address the following scenario.
+// During firming there are multiple threads creating lines in the same purchase order header (due to the grouping functionality).
+// We want to avoid duplicate key exceptions (on the PurchLineIdx index) that would happen if we used standard logic for assigning line numbers.
+public class ReqTransPoMarkFirmPurchaseLineNumberSequence extends common
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getNextNumber</Name>
+				<Source><![CDATA[
+    internal static int64 getNextNumber(PurchId _purchId, ReqFirmingRunId _firmingRunId)
+    {
+        const int RetryCount = 42; // We are retrying to account for the following scenario. There are many threads trying to get a line number for the same header in a very narrow window of time. Then it might happen that for a thread, between running generateMoreNumbers and trying to find the next unused line number other threads already picked all the created line numbers
+        
+        for (int i = 0; i < RetryCount; i++)
+        {
+            ReqTransPoMarkFirmPurchaseLineNumberSequence sequenceLineNextNumber;
+
+            // We are taking the first number that has not been "reserved" by any other thread
+            sequenceLineNextNumber.readPast(true);
+
+            // We are only selecting LineNumber to ensure that the UnusedLineNumberIdx is selected by the SQL query plan optimizer.
+            // This index will be selected because the query range fits the index and the selected values (LineNumber) and the order by columns (LineNumber) are also part of the index
+            select firstonly pessimisticlock LineNumber from sequenceLineNextNumber
+                order by LineNumber
+                where sequenceLineNextNumber.FirmingRunId == _firmingRunId
+                    && sequenceLineNextNumber.PurchId == _purchId
+                    && sequenceLineNextNumber.IsUsed == false;
+            
+            var lineNumber = sequenceLineNextNumber.LineNumber;
+            
+            if (lineNumber)
+            {
+                ReqTransPoMarkFirmPurchaseLineNumberSequence sequenceLineForUpdate;
+
+                // We are using update_recordset because we do not have RecId index on the ReqTransPoMarkFirmPurchaseLineNumberSequence table
+                update_recordset sequenceLineForUpdate
+                    setting IsUsed = true
+                    where sequenceLineForUpdate.FirmingRunId == _firmingRunId
+                        && sequenceLineForUpdate.PurchId == _purchId
+                        && sequenceLineForUpdate.LineNumber == lineNumber;
+
+                return lineNumber;
+            }
+            else
+            {
+                ReqTransPoMarkFirmPurchaseLineNumberSequence::generateMoreNumbers(_purchId, _firmingRunId);
+            }
+        }
+
+        ReqInstrumentationSegmentFactory::create(tableStr(ReqTransPoMarkFirmPurchaseLineNumberSequence), ReqInstrumentationActivities::DefaultActivityId, SysInstrumentationAdditionalParameters::construct().add('RetryCountExceeded', '42'));
+
+        return 1; // It means we have failed to get a new number with all of our retries
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateMoreNumbers</Name>
+				<Source><![CDATA[
+    private static void generateMoreNumbers(PurchId _purchId, ReqFirmingRunId _firmingRunId)
+    {
+        const int NumberOfLinesToCreate = 10;
+        Integer increment = SystemParameters::getSystemLineNumberIncrement();
+
+        UserConnection userConnection;
+
+        var logLineTry = infologLine();
+        try
+        {
+            userConnection = new UserConnection(); // line numbers are generated in a separate connection
+
+            userConnection.ttsbegin();
+
+            ReqTransPoMarkFirmPurchaseLineNumberSequence sequenceLineMaxNum;
+
+            sequenceLineMaxNum.setConnection(userConnection);
+
+            select maxof(LineNumber) from sequenceLineMaxNum
+                where sequenceLineMaxNum.FirmingRunId == _firmingRunId
+                &&  sequenceLineMaxNum.PurchId        == _purchId;
+
+            var maxLineNumber = sequenceLineMaxNum.LineNumber;
+
+            ReqTransPoMarkFirmPurchaseLineNumberSequence newSequenceLine;
+            newSequenceLine.setConnection(userConnection);
+
+            // We are not using direct sql, InsertRecordList, SortedRecordList or set-based operations, since then we could not detect duplicateKeyException properly
+            for (int i = 1; i <= NumberOfLinesToCreate; i++)
+            {
+                newSequenceLine.FirmingRunId = _firmingRunId;
+                newSequenceLine.PurchId = _purchId;
+                newSequenceLine.LineNumber = maxLineNumber + i * increment;
+                newSequenceLine.IsUsed = false;
+                newSequenceLine.insert();
+            }
+
+            userConnection.ttscommit();
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            // DuplicateKeyExcaption is due to other process trying to create new lines - no need to do anything
+            infolog.clear(logLineTry); // We want to remove the information about duplicate key exception from the infolog
+        }
+        finally
+        {
+            if (userConnection)
+            {
+                userConnection.finalize();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>syncNumbersWithPurchLineTable</Name>
+				<Source><![CDATA[
+    // this should be run only if no other processes is using the table for this purchId and firmingRunId
+    internal static void syncNumbersWithPurchLineTable(PurchId _purchId, ReqFirmingRunId _firmingRunId)
+    {
+        UserConnection userConnection;
+
+        try
+        {
+            userConnection = new UserConnection();
+
+            userConnection.ttsbegin();
+
+            PurchLine purchLineMaxLineNumber;
+            purchLineMaxLineNumber.setConnection(userConnection);
+
+            select maxof(LineNumber) from purchLineMaxLineNumber
+                where purchLineMaxLineNumber.PurchId == _purchId;
+
+            var maxLineNumber = purchLineMaxLineNumber.LineNumber;
+
+            // Delete all previous numbers
+            ReqTransPoMarkFirmPurchaseLineNumberSequence deleteLineNumberSequence;
+            deleteLineNumberSequence.setConnection(userConnection);
+
+            delete_from deleteLineNumberSequence
+                where deleteLineNumberSequence.FirmingRunId == _firmingRunId
+                &&    deleteLineNumberSequence.PurchId == _purchId;
+
+            // Insert max line number as used
+            ReqTransPoMarkFirmPurchaseLineNumberSequence newSequenceLine;
+
+            newSequenceLine.setConnection(userConnection);
+            newSequenceLine.FirmingRunId = _firmingRunId;
+            newSequenceLine.PurchId = _purchId;
+            newSequenceLine.LineNumber = maxLineNumber;
+            newSequenceLine.IsUsed = true;
+            newSequenceLine.insert();
+
+            userConnection.ttscommit();
+        }
+        finally
+        {
+            if (userConnection)
+            {
+                userConnection.finalize();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpFirmingRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cleans up all records related to a single firming run.
+    /// </summary>
+    /// <param name = "_firmingRunId">The firming id.</param>
+    internal static void cleanUpFirmingRun(ReqFirmingRunId _firmingRunId)
+    {
+        ReqTransPoMarkFirmPurchaseLineNumberSequence numberSequenceLine;
+
+        delete_from numberSequenceLine
+            where numberSequenceLine.FirmingRunId == _firmingRunId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldThrowExceptionOnZeroDelete</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if concurrent deletes should throw exception.
+    /// </summary>
+    /// <returns>true if exception should be thrown; otherwise false.</returns>
+    public boolean shouldThrowExceptionOnZeroDelete()
+    {
+        return super() || ReqEnforceConcurrentDeletesFlight::instance().isEnabled();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+	<ConfigurationKey>Req</ConfigurationKey>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
+	<Visible>No</Visible>
+	<ClusteredIndex>LineNumberIdx</ClusteredIndex>
+	<CreateRecIdIndex>No</CreateRecIdIndex>
+	<Modules>MasterPlanning</Modules>
+	<PrimaryIndex>LineNumberIdx</PrimaryIndex>
+	<DeleteActions />
+	<FieldGroups>
+		<AxTableFieldGroup>
+			<Name>AutoReport</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoLookup</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoIdentification</Name>
+			<AutoPopulate>Yes</AutoPopulate>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoSummary</Name>
+			<Fields />
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>AutoBrowse</Name>
+			<Fields />
+		</AxTableFieldGroup>
+	</FieldGroups>
+	<Fields>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldGuid">
+			<Name>FirmingRunId</Name>
+			<AllowEdit>No</AllowEdit>
+			<AssetClassification>System Metadata</AssetClassification>
+			<ExtendedDataType>ReqFirmingRunId</ExtendedDataType>
+			<Mandatory>Yes</Mandatory>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>PurchId</Name>
+			<AllowEdit>No</AllowEdit>
+			<AssetClassification>Customer Content</AssetClassification>
+			<ExtendedDataType>PurchId</ExtendedDataType>
+			<Mandatory>Yes</Mandatory>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldInt64">
+			<Name>LineNumber</Name>
+			<AllowEdit>No</AllowEdit>
+			<AssetClassification>Customer Content</AssetClassification>
+			<ExtendedDataType>TradeLineNumber</ExtendedDataType>
+			<Mandatory>Yes</Mandatory>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldEnum">
+			<Name>IsUsed</Name>
+			<AssetClassification>System Metadata</AssetClassification>
+			<EnumType>NoYes</EnumType>
+		</AxTableField>
+	</Fields>
+	<FullTextIndexes />
+	<Indexes>
+		<AxTableIndex>
+			<Name>UnusedLineNumberIdx</Name>
+			<AllowDuplicates>Yes</AllowDuplicates>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>FirmingRunId</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>PurchId</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>IsUsed</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>LineNumber</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+		<AxTableIndex>
+			<Name>LineNumberIdx</Name>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>FirmingRunId</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>PurchId</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>LineNumber</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+	</Indexes>
+	<Mappings />
+	<Relations>
+		<AxTableRelation xmlns=""
+			i:type="AxTableRelationForeignKey">
+			<Name>ProcessAutoFirmingRun</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<RelatedTable>ReqProcessAutoFirmingRun</RelatedTable>
+			<RelatedTableCardinality>ZeroOne</RelatedTableCardinality>
+			<RelatedTableRole>PurchaseLineNumberSequences</RelatedTableRole>
+			<RelationshipType>Association</RelationshipType>
+			<UseDefaultRoleNames>No</UseDefaultRoleNames>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>FirmingRunId</Name>
+					<Field>FirmingRunId</Field>
+					<RelatedField>FirmingRunId</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+			<Index>RunIdIdx</Index>
+		</AxTableRelation>
+		<AxTableRelation>
+			<Name>PurchTable</Name>
+			<Cardinality>ZeroMore</Cardinality>
+			<RelatedTable>PurchTable</RelatedTable>
+			<RelatedTableCardinality>ZeroOne</RelatedTableCardinality>
+			<RelatedTableRole>PurchTable</RelatedTableRole>
+			<RelationshipType>Association</RelationshipType>
+			<Role>PurchaseLineNumberSequences</Role>
+			<UseDefaultRoleNames>No</UseDefaultRoleNames>
+			<Constraints>
+				<AxTableRelationConstraint xmlns=""
+					i:type="AxTableRelationConstraintField">
+					<Name>PurchId</Name>
+					<Field>PurchId</Field>
+					<RelatedField>PurchId</RelatedField>
+				</AxTableRelationConstraint>
+			</Constraints>
+		</AxTableRelation>
+	</Relations>
+	<StateMachines />
+</AxTable>

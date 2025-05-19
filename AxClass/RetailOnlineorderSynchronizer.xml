@@ -1,0 +1,307 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailOnlineorderSynchronizer</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+using Microsoft.Dynamics.Commerce.Runtime.Services.CustomerOrder;
+
+/// <summary>
+/// Synchronize retail transaction to reatail order.
+/// </summary>
+public class RetailOnlineorderSynchronizer
+{
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+    private const str ValidationSampleRate = 'ASYNC_ORDER_DRY_RUN_VALIDATION_SAMPLE_RATE';
+
+    private static System.Random validationSampleRandom = new System.Random();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>CreateOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a sales order from a given Retail transaction table entry
+    /// </summary>
+    /// <param name="transactionTable">
+    /// Retail transaction table entry to create a sales order for.
+    /// </param>
+    /// <returns>
+    /// Container: [success/fail, error info, sales order id, last InventTransId]
+    /// </returns>
+    /// <remarks>
+    /// Creates a SalesTable, MarkupTrans, SalesLine and payment Journal entries.
+    /// </remarks>
+    public static container CreateOrder(RetailTransactionTable transactionTable)
+    {
+        boolean     success = false;
+        str         error;
+        int         fromLine;
+        SalesIdBase salesId;
+        RecId       lastInventTransId;
+        int         numberOfLines;
+
+        boolean isAsyncOrderValidationEnabled = RetailEnhancedAsyncOrdersFeatureExposure::isAsyncOrderValidationEnabled();
+
+        // Abort the order due to an exception
+        void abortOrder(str _error = '')
+        {
+            error = _error == '' ? RetailTransactionServiceUtilities::getInfologMessages(fromLine) : _error;
+            success = false;
+            lastInventTransId = 0;
+            salesId = '';
+
+            eventSource.EventWriteSynchronizeOrdersTaskCreateOrderForTransactionCreationAborted(transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionType), transactionTable.type));
+        }
+
+        System.Diagnostics.Stopwatch synchronizationStopwatch = new System.Diagnostics.Stopwatch();
+        synchronizationStopwatch.Start();
+
+        eventSource.EventWriteSynchronizeOrdersTaskCreateOrderForTransactionStart(transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionType), transactionTable.type));
+
+        try
+        {
+            fromLine = Global::infologLine();
+
+            if (transactionTable)
+            {
+                // If the transaction already has a sales Id associated with it that means that the transaction has already been synchronized
+                if (transactionTable.salesOrderId)
+                {
+                    eventSource.EventWriteSynchronizeOrdersTaskCreateOrderForTransactionOrderAlreadyCreated(transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionType), transactionTable.type));
+
+                    [success, error, salesId, lastInventTransId] = RetailOnlineorderSynchronizer::setReturnValuesForAlreadySynchronizedOrder(transactionTable);
+                }
+                else
+                {
+                    System.Diagnostics.Stopwatch transformerStopwatch = new System.Diagnostics.Stopwatch();
+                    transformerStopwatch.Start();
+                    
+                    if (isAsyncOrderValidationEnabled)
+                    {
+                        RetailTransactionTableColumnInitializer::initTaxIncludedInPrice(transactionTable);
+                    }
+
+                    CustomerOrderInfo custOrderInfo = null;
+                    using (RetailTransactionTransformerContext context = RetailTransactionTransformerContext::construct())
+                    {
+                        context.parmUseTaxIncludedInPriceFlag(isAsyncOrderValidationEnabled);
+
+                        custOrderInfo = RetailTransactionTransformer::ConvertTransactionToCustomerOrderInfo(transactionTable);
+                    }
+
+                    transformerStopwatch.Stop();
+                    eventSource.EventWriteSynchronizeOrdersTaskCreateOrderForTransactionPopulateCustomerOrderInfo(transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionType), transactionTable.type), transformerStopwatch.ElapsedMilliseconds);
+
+                    if (isAsyncOrderValidationEnabled)
+                    {
+                        RetailOnlineorderSynchronizer::runValidation(transactionTable, custOrderInfo);
+                        if (transactionTable.ValidationStatus != RetailTransactionValidationStatus::Ok)
+                        {
+                            warning("@Retail:EnhancedAsyncOrdersFeatureTransactionValidationFailure");
+                            abortOrder();
+                        }
+                    }
+                    else if (RetailDryRunAsyncOrderValidationFlight::instance().isEnabled() && validationSampleRandom.nextDouble() <= RetailOnlineorderSynchronizer::getValidationSampleRate())
+                    {
+                        // If RetailDryRunAsyncOrderValidationFlight is enabled, we randomly sample some transactions to dry run validation. The results will be further analyzed.
+                        RetailOnlineorderSynchronizer::runValidation(transactionTable, custOrderInfo);
+                        eventSource.EventWriteDryRunAsyncOrderValidationResult(transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionValidationStatus), enum2int(transactionTable.ValidationStatus)));
+                    }
+
+                    if (!isAsyncOrderValidationEnabled || transactionTable.ValidationStatus == RetailTransactionValidationStatus::Ok)
+                    {
+                        numberOfLines = custOrderInfo.Items.Count;
+
+                        System.Diagnostics.Stopwatch orderCreationStopwatch = new System.Diagnostics.Stopwatch();
+                        orderCreationStopwatch.Start();
+
+                        ttsBegin;
+
+                        [success, error, salesId] =  transactionTable.type == RetailTransactionType::AsyncCustomerQuote
+                                                ? RetailTransactionServiceOrders::createCustomerQuote(custOrderInfo)
+                                                : RetailTransactionserviceOrders::createCustomerOrder(custOrderInfo);
+
+                        orderCreationStopwatch.Stop();
+                        eventSource.EventWriteSynchronizeOrdersTaskCreateOrderForTransactionOrderCreated(transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionType), transactionTable.type), orderCreationStopwatch.ElapsedMilliseconds);
+
+                        if (success)
+                        {
+                            if (transactionTable.type != RetailTransactionType::AsyncCustomerQuote)
+                            {
+                                if (!RetailAttributesOnNonAggregatedTransactionsFlight::instance().isEnabled())
+                                {
+                                    SalesTable salesTable = SalesTable::find(salesId);
+                                    RetailOnlineorderSynchronizer::CreateCustomAttributes(salesTable, transactionTable);
+                                }
+
+                                lastInventTransId = RetailInventTransHelper::getLastInventTransForSalesOrder(salesId);
+                            }
+                    
+                            eventSource.EventWriteSynchronizeOrdersTaskCreateOrderForTransactionMarkAsPosted(transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionType), transactionTable.type));
+
+                            transactionTable.selectForUpdate(true);
+                            transactionTable.salesOrderId = salesId;
+                            transactionTable.entryStatus = RetailEntryStatus::Posted;
+                            transactionTable.update();
+                        }
+                        else
+                        {
+                            abortOrder(error);
+                        }
+
+                        ttsCommit;
+                    }
+                }
+
+            }
+        }
+        catch(Exception::CLRError)
+        {
+            abortOrder();
+        }
+        catch(Exception::Error)
+        {
+            abortOrder();
+        }
+        finally
+        {
+            synchronizationStopwatch.Stop();
+            eventSource.EventWriteSynchronizeOrdersTaskCreateOrderForTransactionStop(transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionType), transactionTable.type), numberOfLines, synchronizationStopwatch.ElapsedMilliseconds, success);
+        }
+
+        return [success, error, salesId, lastInventTransId];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateCustomAttributes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create Attribute values for the sales order
+    /// </summary>
+    /// <param name="salesTable">
+    /// Sales order to create attributes values for
+    /// </param>
+    /// <param name="transactionTable">
+    /// Retail transaction table entry to create charges from
+    /// </param>
+    private static void CreateCustomAttributes(SalesTable salesTable, RetailTransactionTable transactionTable)
+    {
+        RetailTransactionAttributeTrans attributeTrans;
+
+        // Create a dictionary with key: lineNum, value: List of Attributes on lineNum.
+        Map attributesDict = new Map(Types::Real, Types::Class);
+
+        // Loop and insert each custom attribute
+        while select Name, TextValue, HeaderOrLineNum from attributeTrans
+            where attributeTrans.transactionId == transactionTable.transactionId
+               && attributeTrans.store == transactionTable.store
+               && attributeTrans.terminal == transactionTable.terminal
+               && attributeTrans.Channel == transactionTable.Channel
+        {
+            AttributeValueInfoCollection attributeList;
+
+            if (!attributesDict.exists(attributeTrans.HeaderOrLineNum))
+            {
+                attributeList = new AttributeValueInfoCollection();
+                attributesDict.insert(attributeTrans.HeaderOrLineNum, attributeList);
+            }
+            else 
+            {
+                attributeList = attributesDict.lookup(attributeTrans.HeaderOrLineNum);
+            }
+
+            AttributeValueInfo attributeInfo = new AttributeValueInfo();
+            attributeInfo.Name = attributeTrans.Name;
+            attributeInfo.TextValue = attributeTrans.TextValue;
+            attributeList.Add(attributeInfo);
+        }
+
+        MapEnumerator enumerator = attributesDict.getEnumerator();
+
+        while (enumerator.moveNext())
+        {
+            RetailAttributeHelper::createOrUpdateRetailSalesOrderAttributeValues(
+                transactionTable.Channel,
+                transactionTable.store,
+                transactionTable.terminal,
+                transactionTable.transactionId,
+                salesTable.SalesId,
+                salesTable.DataAreaId,
+                enumerator.currentKey(),
+                enumerator.currentValue());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runValidation</Name>
+				<Source><![CDATA[
+    private static void runValidation(RetailTransactionTable _transactionTable, CustomerOrderInfo _custOrderInfo)
+    {
+        if (_transactionTable.ValidationStatus == RetailTransactionValidationStatus::Ok)
+        {
+            eventSource.EventWriteSynchronizeOrdersTaskCreateOrderForTransactionAlreadyValidatedSkippingValidation(_transactionTable.RecId, enum2Symbol(enumNum(RetailTransactionType), _transactionTable.type));
+        }
+        else 
+        {
+            RetailTransactionValidationResultPersister resultPersister = RetailTransactionValidationResultPersister::construct(_transactionTable);
+            resultPersister.cleanUpPreviousErrors();
+
+            using (var timer = RetailTransactionValidationTimer::construct(_transactionTable))
+            {
+                RetailTransactionValidationValidateSingleTransaction singleTransactionValidator = RetailTransactionValidationValidateSingleTransaction::construct(_transactionTable, _custOrderInfo);
+                RetailTransactionValidationResult validationResult = singleTransactionValidator.run();
+
+                if (validationResult != null)
+                {
+                    resultPersister.persist(validationResult);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setReturnValuesForAlreadySynchronizedOrder</Name>
+				<Source><![CDATA[
+    private static container setReturnValuesForAlreadySynchronizedOrder(RetailTransactionTable transactionTable)
+    {
+        return [true, '', transactionTable.salesOrderId, RetailInventTransHelper::getLastInventTransForSalesOrder(transactionTable.salesOrderId)];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getValidationSampleRate</Name>
+				<Source><![CDATA[
+    private static System.Double getValidationSampleRate()
+    {
+        // Commerce Share Parameters -> Configuration Parameters: ORDER_SYNCHRONIZER_VALIDATION_SAMPLE_RATE.
+        RetailSharedConfigurationParameters configParameters = RetailSharedConfigurationParameters::findByName(ValidationSampleRate);
+
+        if (configParameters)
+        {
+            System.Double configValue;
+            if (System.Double::TryParse(configParameters.Value, byref configValue) && configValue >= 0 && configValue <= 1)
+            {
+                return configValue;
+            }
+        }
+
+        // By default, the sample rate is 10%.
+        return 0.1;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

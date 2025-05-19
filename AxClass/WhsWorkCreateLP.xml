@@ -1,0 +1,1054 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsWorkCreateLP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WhsWorkCreateLP</c> class creates warehouse work for receiving license plates.
+/// </summary>
+public class WhsWorkCreateLP extends WHSWorkCreateReceiving
+{
+    protected WHSWorkCreateId     workCreateId;
+    protected WHSUOMStructure     structure;
+    protected WHSModule           module;
+    protected InventQty           inventQty;
+    private boolean               wasTempWorkCreationAttempted = false;
+
+    private boolean mustDelayASNCleanup;
+    private Set uomStructuresToCleanUp;
+    private Set asnItemsToCleanUp;
+
+    private WhsASNItemRegistrator asnItemRegistrator;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates temporary work information used in work creation
+    /// </summary>
+    public void createTempTable()
+    {
+        ttsbegin;
+        this.initializeReceivingLPTempTableCreation();
+        this.registerASNItems();
+        
+        WHSShipmentTable    shipmentTable;
+        WHSUOMStructure     locStructure;
+        LineNum             tmpLineNum;
+        WHSTmpWorkLine      tmpTmpWorkLine;
+        WHSTmpWorkLine      findTmpWorkLine;
+        
+        this.initASNCleanupCollections();
+
+        this.createLicensePlates();
+
+        tmpTmpWorkLine.setTmp();
+        findTmpWorkLine.setTmp();
+
+        boolean cleanUpASNItemsOnLPReceiving = WhsCleanUpASNItemsOnLPReceivingFlightV2::instance().isEnabled();
+        
+        using (var activityContext = this.instrumentationLogger().workCreateLP().createTempTable())
+        {
+            boolean isWHSWorkCreateLPGroupByLoadLineRefRecIdFlightEnabled = WHSWorkCreateLPGroupByLoadLineRefRecIdFlight::instance().isEnabled();
+            int workSkipCount = 0;
+
+            while select LicensePlateId, LicensePlateParent, ShipmentId, LoadId from locStructure
+            order by RecId
+            where (locStructure.LicensePlateId      == structure.LicensePlateId
+                    || locStructure.LicensePlateParent  == structure.LicensePlateId)
+                && locStructure.Module              == module
+                join shipmentTable
+                    where shipmentTable.ShipmentId      == locStructure.ShipmentId
+            {
+                if (this.isReceiptFromWarehouseAllowed(locStructure.plannedWarehouseId()))
+                {
+                    InventTable         asnItemInventTable;
+                    WHSASNItem          asnItem;
+
+                    while select forupdate asnItem
+                        order by LoadLineRefRecId
+                        where asnItem.LicensePlateId        == locStructure.LicensePlateId
+                            && asnItem.Module               == module
+                            && asnItem.ShipmentId           == locStructure.ShipmentId
+                            exists join asnItemInventTable
+                            where asnItemInventTable.ItemId     == asnItem.ItemId
+                                && asnItemInventTable.ItemType  != ItemType::Service
+                    {
+                        WHSLoadLine loadLine = WHSLoadLine::findbyRecId(asnItem.LoadLineRefRecId, true);
+                        this.inititializeWorkInventDim(asnItem, loadLine);
+                
+                        if (module == WHSModule::Transfer
+                        && PdsGlobal::pdsIsCWItem(loadLine.ItemId))
+                        {
+                            this.updateReceivedCWTags(loadLine.InventTransId);
+                        }
+
+                        if (!this.isWorkCreationAllowed(asnItem.ItemId))
+                        {
+                            if (module == WHSModule::Transfer && cleanUpASNItemsOnLPReceiving)
+                            {
+                                if (mustDelayASNCleanup)
+                                {
+                                    asnItemsToCleanUp.add(asnItem.RecId);
+                                }
+                                else
+                                {
+                                    asnItem.delete();
+                                }
+
+                                uomStructuresToCleanUp.add([locStructure.LicensePlateId, locStructure.ShipmentId]);
+                            }
+                            else
+                            {
+                                WHSASNItemReceiptHandler::registerASNItemWorkCreatedQty(asnItem, 0);
+                            }
+
+                            workSkipCount++;
+                            continue;
+                        }
+
+                        wasTempWorkCreationAttempted = true;
+                        tmpLineNum++;
+                    
+                        tmpTmpWorkLine.data(this.initializeTmpWorkLine(shipmentTable));
+                        tmpTmpWorkLine.WorkCreateId            = workCreateId;
+                        tmpTmpWorkLine.LineNum                 = tmpLineNum;
+                        tmpTmpWorkLine.CustVendAC              = loadLine.displayVendAccount();
+                        
+                        // Determine if we need to group with another tmpWorkLine.
+                        findTmpWorkLine.setTmpData(tmpTmpWorkLine);
+
+                        if (isWHSWorkCreateLPGroupByLoadLineRefRecIdFlightEnabled)
+                        {
+                            select firstonly findTmpWorkLine
+                            where findTmpWorkLine.InventTransId     == loadLine.InventTransId
+                            &&    findTmpWorkLine.InventDimId       == workInventDim.InventDimId
+                            &&    findTmpWorkLine.LoadLineRefRecId  == loadLine.RecId;
+                        }
+                        else
+                        {
+                            select firstonly findTmpWorkLine
+                            where findTmpWorkLine.InventTransId == loadLine.InventTransId
+                            &&    findTmpWorkLine.InventDimId   == workInventDim.InventDimId;
+                        }                        
+
+                        InventQty locInventQty;
+                        if (findTmpWorkLine)
+                        {
+                            tmpTmpWorkLine.data(findTmpWorkLine);
+                            locInventQty = WHSCatchWeightHelper::convertInventQuantity(
+                                                        tmpTmpWorkLine.ItemId,
+                                                        asnItem.UOM,
+                                                        asnItem.Qty,
+                                                        asnItem.InventDimId);
+
+                            tmpTmpWorkLine.InventQty += locInventQty;
+                            tmpTmpWorkLine.update();
+                        }
+                        else
+                        {
+                            if (!tmpTmpWorkLine.OriginRefId)
+                            {
+                                tmpTmpWorkLine.OriginRefId = loadLine.LoadId;
+                            }
+
+                            tmpTmpWorkLine.RefRecId            = loadLine.RecId;
+                            tmpTmpWorkLine.InventTransId       = loadLine.InventTransId;
+                            tmpTmpWorkLine.ItemId              = loadLine.ItemId;
+                            tmpTmpWorkLine.LicensePlateId      = locStructure.LicensePlateParent ? locStructure.LicensePlateParent : locStructure.LicensePlateId;
+                            tmpTmpWorkLine.LoadLineRefRecId    = loadLine.RecId;
+                            tmpTmpWorkLine.PackingQty          = loadLine.PackingQty;
+                            tmpTmpWorkLine.OrderNum            = loadLine.OrderNum;
+
+                            locInventQty = WHSCatchWeightHelper::convertInventQuantity(
+                                                        asnItem.ItemId,
+                                                        asnItem.UOM,
+                                                        asnItem.Qty,
+                                                        asnItem.InventDimId);
+
+                            tmpTmpWorkLine.InventQty = locInventQty;
+                            tmpTmpWorkLine.InventDimId = workInventDim.InventDimId;
+                            tmpTmpWorkLine.insert();
+                        }
+
+                        WHSASNItemReceiptHandler::registerASNItemWorkCreatedQty(asnItem, locInventQty);
+
+                        if (workTransType != WHSWorkTransType::TransferReceipt)
+                        {
+                            loadLine.WorkCreatedQty += locInventQty;
+                            loadLine.update();
+                        }
+                    }
+                }
+                
+            }
+
+            if (!mustDelayASNCleanup)
+            {
+                this.cleanUpEmptyUomStructures(uomStructuresToCleanUp);
+            }
+
+            this.instrumentationLogger().workCreateLP().logTotalProductsSkipped(workSkipCount);
+            if (workSkipCount && !WMSLocation::find(startLocationId, inventLocationId).whsLocationIsLPControlled())
+            {
+                this.instrumentationLogger().workCreateLP().logReceivingLocationIsNotLPEnabled();
+            }
+        }
+
+        WHSLicensePlateId prevLicensePlateId;
+        WHSWorkBuildId crossDockWorkBuildId;
+        WHSWorkBuildId qualityItemSamplingWorkBuildId;
+        Map lineItemsQtyProcessedMap;
+
+        this.initializeCrossDockQuantityAllocation();
+
+        while select tmpTmpWorkLine
+        {
+            tmpWorkLine.data(tmpTmpWorkLine);
+            tmpWorkLine.LineNum = 0;
+            InventQty qtyToCreateWork = tmpWorkLine.InventQty;
+            tmpWorkLine.InventQty = 0;
+            workInventDim = InventDim::find(tmpWorkLine.InventDimId);
+            tmpWorkLine.InventDimId = '';
+
+            if (prevLicensePlateId != tmpTmpWorkLine.LicensePlateId)
+            {
+                crossDockWorkBuildId = WHSWorkTable::findCrossDockWorkBuildId(tmpTmpWorkLine.LicensePlateId);
+                qualityItemSamplingWorkBuildId = WHSWorkTable::findQualityItemSamplingWorkBuildId(tmpTmpWorkLine.LicensePlateId);
+
+                if (crossDockWorkBuildId)
+                {
+                    this.parmWorkCreateId(crossDockWorkBuildId);
+                }
+
+                prevLicensePlateId = tmpTmpWorkLine.LicensePlateId;
+            }
+
+            if (crossDockWorkBuildId)
+            {
+                qtyToCreateWork = this.getWorkCreateQuantityAfterCrossDock(qtyToCreateWork,
+                                                                           crossDockWorkBuildId,
+                                                                           tmpTmpWorkLine.ItemId,
+                                                                           targetLicensePlateId,
+                                                                           workInventDim);
+                
+            }
+
+            // Reduce the qty for work creation if item sampling work has been created already.
+            qtyToCreateWork = this.getWorkCreateQuantityAfterQualityItemSampling(qtyToCreateWork,
+                                                                                qualityItemSamplingWorkBuildId,
+                                                                                tmpTmpWorkLine.InventTransId,
+                                                                                targetLicensePlateId,
+                                                                                workInventDim);
+
+            tmpWorkLine.WorkCreateId = workCreateId;
+
+            this.setGlobals();
+    
+            if (qtyToCreateWork > 0)
+            {
+                this.createTempLine(tmpWorkLine, qtyToCreateWork);
+            }
+        }
+
+        ttscommit;
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpEmptyAsnItemsAndUomStructures</Name>
+				<Source><![CDATA[
+    internal void cleanUpEmptyAsnItemsAndUomStructures()
+    {
+        this.cleanUpEmptyAsnItems(asnItemsToCleanUp);
+        this.cleanUpEmptyUomStructures(uomStructuresToCleanUp);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpEmptyAsnItems</Name>
+				<Source><![CDATA[
+    private void cleanUpEmptyAsnItems(Set _asnItemsToCleanUp)
+    {
+        if (!_asnItemsToCleanUp || _asnItemsToCleanUp.elements() == 0)
+        {
+            return;
+        }
+
+        SetEnumerator asnItemEnumerator = _asnItemsToCleanUp.getEnumerator();
+        
+        while (asnItemEnumerator.moveNext())
+        {
+            WHSASNItem asnItem;
+
+            delete_from asnItem
+                where asnItem.RecId == asnItemEnumerator.current();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpEmptyUomStructures</Name>
+				<Source><![CDATA[
+    private void cleanUpEmptyUomStructures(Set _uomStructuresToCleanUp)
+    {
+        if (!_uomStructuresToCleanUp || _uomStructuresToCleanUp.elements() == 0)
+        {
+            return;
+        }
+
+        Set uomStructuresToCleanUpLocal = new Set(Types::Container);
+
+        SetEnumerator uomStructureEnumerator = _uomStructuresToCleanUp.getEnumerator();
+        while (uomStructureEnumerator.moveNext())
+        {
+            WHSLicensePlateId licensePlateId;
+            WHSShipmentId shipmentId; 
+
+            [licensePlateId, shipmentId] = uomStructureEnumerator.current();
+
+            if (!WHSASNItem::existsAnyForUomStructure(licensePlateId, module, shipmentId)
+                && !WHSUOMStructure::existForParentLicensePlateIdAndShipment(licensePlateId, module, shipmentId))
+            {
+                WHSUOMStructure uomStructure = WHSUOMStructure::find(licensePlateId, module, shipmentId, true);
+
+                if (uomStructure.LicensePlateParent)
+                {
+                    uomStructuresToCleanUpLocal.add([uomStructure.LicensePlateParent, uomStructure.ShipmentId]);
+                }
+
+                uomStructure.delete();
+            }            
+        }
+
+        this.cleanUpEmptyUomStructures(uomStructuresToCleanUpLocal);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initASNCleanupCollections</Name>
+				<Source><![CDATA[
+    private void initASNCleanupCollections()
+    {
+        if (!uomStructuresToCleanUp)
+        {
+            uomStructuresToCleanUp = new Set(Types::Container);
+        }
+        
+        if (!asnItemsToCleanUp)
+        {
+            asnItemsToCleanUp = new Set(Types::Int64);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeReceivingLPTempTableCreation</Name>
+				<Source><![CDATA[
+    protected void initializeReceivingLPTempTableCreation()
+    {
+        WHSLoadLine loadLine = WHSLoadLine::findFirstForShipmentId(structure.ShipmentId);
+
+        if (!workTransType)
+        {
+            workTransType = WHSWorkTransType::Purch;
+        }
+
+        this.parmTargetLicensePlateId(structure.LicensePlateId);
+
+        if (workTransType == WHSWorkTransType::Purch)
+        {
+            if (!startLocationId)
+            {
+                startLocationId = this.defaultReceiptLocationId(loadLine.purchLine().InventDimId);
+            }
+            module = WHSModule::Purch;
+        }
+        else if (workTransType == WHSWorkTransType::TransferReceipt)
+        {
+            InventTransferTable inventTransferTable = loadLine.orderHeader() as InventTransferTable;
+            inventLocationId = inventTransferTable.InventLocationIdTo;
+            if (!startLocationId)
+            {
+                startLocationId = InventLocation::find(inventTransferTable.InventLocationIdTo).wmsLocationIdDefaultReceipt;
+            }
+            module = WHSModule::Transfer;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isWorkCreationAllowed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if work creation is allowed for an item.
+    /// </summary>
+    /// <param name = "_itemId">The item.</param>
+    /// <returns>true if work creation is allowed; otherwise, false.</returns>
+    protected boolean isWorkCreationAllowed(ItemId _itemId)
+    {
+        return WHSWorkPolicy::isWorkAllowedToBeCreatedForWorkProcess(
+            workTransType, 
+            this.parmInventLocationId(), 
+            startLocationId, 
+            WhsWorkProcess::LicensePlateReceiving,
+            _itemId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>inititializeWorkInventDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the work inventory dimension.
+    /// </summary>
+    /// <param name = "_asnItem">The ASN item.</param>
+    /// <param name = "_loadLine">The load line.</param>
+    protected void inititializeWorkInventDim(WHSASNItem _asnItem, WHSLoadLine _loadLine)
+    {
+        if (workTransType == WHSWorkTransType::Purch)
+        {
+            InventDim asnItemInventDim = InventDim::find(_asnItem.InventDimId);
+            workInventDim.data(asnItemInventDim);
+            this.initWarehouse(workInventDim, asnItemInventDim);
+            workInventDim.clearLocationAndBelowDim(_asnItem.ItemId);
+            workInventDim = InventDim::findOrCreate(workInventDim);
+        }
+        else if (workTransType == WHSWorkTransType::TransferReceipt)
+        {
+            InventTransferTable inventTransferTable = _loadLine.orderHeader() as InventTransferTable;
+            workInventDim                   = InventDim::find(_loadLine.InventDimId);
+            workInventDim.InventLocationId  = inventTransferTable.InventLocationIdTo;
+            inventLocationId                = inventTransferTable.InventLocationIdTo;
+            workInventDim.InventSiteId      = InventLocation::find(inventTransferTable.InventLocationIdTo).InventSiteId;
+            workInventDim.clearLocationAndBelowDim(_asnItem.ItemId);
+            workInventDim                   = InventDim::findOrCreate(workInventDim);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wasWorkCreationAttempted</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// States if work creation was attempted.
+    /// </summary>
+    /// <returns>true if work creation was attempted; otherwise, false.</returns>
+    /// <remarks>This method states if the constraints were actually met to start temp work creation.</remarks>
+    [Hookable(false)]
+    internal boolean wasWorkCreationAttempted()
+    {
+        return wasTempWorkCreationAttempted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTempTable</Name>
+				<Source><![CDATA[
+    public WHSWorkBuildId processTempTable()
+    {
+        WHSWorkBuildId workBuildId = super();
+
+        // Combine similar cross docking work for a work created ID.
+        WhsWorkCreateLP::combineLikeWork(workBuildId);
+
+        return workBuildId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPutLocations</Name>
+				<Source><![CDATA[
+    private static container getPutLocations(
+        WHSWorkId           _workId,
+        WHSWorkTemplateCode _workTemplateCode,
+        WHSShipmentId       _shipmentId)
+    {
+        WHSWorkLine workLine;
+        container ret = [_workTemplateCode, _shipmentId];
+
+        while select WMSLocationId from workLine
+            order by LineNum
+            where workLine.WorkId == _workId
+            &&    workLine.WorkType == WHSWorkType::Put
+        {
+            ret += workLine.WMSLocationId;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>combineLikeWork</Name>
+				<Source><![CDATA[
+    internal static void combineLikeWork(WHSWorkBuildId _workBuildId)
+    {
+        Map locationListWorkId = new Map(Types::Container, Types::Class);
+        WHSWorkTable workTable;
+        container prevPutLocations;
+        List workIds = new List(Types::String);
+        const LineNum FirstLineNum = 1;
+
+        while select WorkId, WorkTemplateCode, ShipmentId from workTable
+            order by ShipmentId, WorkTemplateCode, WorkId
+            where workTable.WorkBuildId == _workBuildId
+            &&    workTable.WorkTransType == WHSWorkTransType::CrossDocking
+        {
+            if (WHSWorkTemplateTable::find(workTable.WorkTemplateCode, WHSWorkTransType::CrossDocking).SplitCrossDockWorkAtLicensePlateReceiving)
+            {
+                continue;
+            }
+
+            container putLocations = WhsWorkCreateLP::getPutLocations(workTable.WorkId, workTable.WorkTemplateCode, workTable.ShipmentId);
+
+            if (prevPutLocations == putLocations)
+            {
+                workIds.addEnd(workTable.WorkId);
+            }
+            else if (locationListWorkId.exists(putLocations))
+            {
+                workIds = locationListWorkId.lookup(putLocations);
+                workIds.addEnd(workTable.WorkId);
+            }
+            else
+            {
+                workIds = new List(Types::String);
+                workIds.addEnd(workTable.WorkId);
+            }
+
+            locationListWorkId.insert(putLocations, workIds);
+            prevPutLocations = putLocations;
+        }
+
+        MapEnumerator me = new MapEnumerator(locationListWorkId);
+
+        ttsbegin;
+
+        while (me.moveNext())
+        {
+            workIds = me.currentValue();
+            int numberOfWorkIds = workIds.elements();
+
+            // Can only combine works if more than one found.
+            if (numberOfWorkIds > 1)
+            {
+                ListEnumerator workIdListEnumerator = workIds.getEnumerator();
+
+                // The first work will be the one the others combine too.
+                workIdListEnumerator.moveNext();
+
+                WHSWorkId firstWorkId = workIdListEnumerator.current();
+                LineNum targetLineNum = FirstLineNum + 1;
+
+                WHSWorkLine::renumberWorkLines(firstWorkId, targetLineNum, numberOfWorkIds - 1);
+                
+                WHSWorkTable targetWorkTable = WHSWorkTable::find(firstWorkId, true);
+
+                while (workIdListEnumerator.moveNext())
+                {
+                    WHSWorkTable combineWorkTable = WHSWorkTable::find(workIdListEnumerator.current(), true);
+
+                    if (targetWorkTable.OrderNum 
+                        && combineWorkTable.OrderNum != targetWorkTable.OrderNum)
+                    {
+                        targetWorkTable.OrderNum = '';
+                    }
+
+                    if (targetWorkTable.LoadId 
+                        && combineWorkTable.LoadId != targetWorkTable.LoadId)
+                    {
+                        targetWorkTable.LoadId = '';
+                    }
+
+                    targetWorkTable.update();
+
+                    WHSWorkLine combineWorkLine = WHSWorkLine::find(combineWorkTable.WorkId, FirstLineNum, true);
+
+                    // Move the current WITs to the new pick workline.
+                    WHSWorkInventTrans::moveToNewWorkLine(combineWorkLine.WorkId, combineWorkLine.LineNum, targetWorkTable.WorkId, targetLineNum);
+                    
+                    // Move the pick workLine to be on the target work header as a new initial pick
+                    combineWorkLine.WorkId  = targetWorkTable.WorkId;
+                    combineWorkLine.LineNum = targetLineNum;
+                    combineWorkLine.update();
+
+                    InventUnitId inventUnitId = InventTableModule::find(combineWorkLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
+                    WHSWorkLine targetWorkLine;
+
+                    // Loop over all the non-initial pick worklines and update.
+                    while select forupdate targetWorkLine
+                        order by LineNum
+                        where targetWorkLine.WorkId  == targetWorkTable.WorkId
+                        &&    targetWorkLine.LineNum >  targetLineNum
+                    {
+                        // Compare combined workLine fields to see if they need to be cleared out
+                        if (targetWorkLine.ItemId != combineWorkLine.ItemId)
+                        {
+                            targetWorkLine.ItemId = '';
+                        }
+
+                        if (targetWorkLine.InventDimId != combineWorkLine.InventDimId)
+                        {
+                            targetWorkLine.InventDimId = '';
+                        }
+
+                        if (targetWorkLine.LoadId != combineWorkLine.LoadId)
+                        {
+                            targetWorkLine.LoadId = '';
+                        }
+
+                        if (targetWorkLine.LoadLineRefRecId != combineWorkLine.LoadLineRefRecId)
+                        {
+                            targetWorkline.LoadLineRefRecId = 0;
+                        }
+
+                        if (targetWorkLine.InventTransId != combineWorkLine.InventTransId)
+                        {
+                            targetWorkLine.InventTransId = '';
+                        }
+
+                        if (targetWorkLine.InventTransOriginIdSupply!= combineWorkLine.InventTransOriginIdSupply)
+                        {
+                            targetWorkLine.InventTransOriginIdSupply = 0;
+                        }
+
+                        // Increase quantity buckets on workLine
+                        if (EcoResProductUnitConverter::canBeConvertedGivenUnitSymbolsForReleasedProduct(combineWorkLine.ItemId,
+                                                                                                         combineWorkLine.InventDimId,
+                                                                                                         inventUnitId,
+                                                                                                         targetWorkLine.UnitId))
+                        {
+                            Qty workQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(combineWorkLine.ItemId,
+                                                                                                                combineWorkLine.InventDimId,
+                                                                                                                combineWorkLine.InventQtyRemain,
+                                                                                                                inventUnitId,
+                                                                                                                targetWorkLine.UnitId,
+                                                                                                                NoYes::No,
+                                                                                                                NoYes::No);
+                                
+                            targetWorkLine.QtyRemain += workQty;
+                            targetWorkLine.QtyWork   += workQty;
+                        }
+                        else
+                        {
+                            targetWorkLine.UnitId     = '';
+                            targetWorkLine.QtyRemain += combineWorkLine.QtyRemain;
+                            targetWorkLine.QtyWork   += combineWorkLine.QtyWork;
+                        }
+
+                        targetWorkLine.InventQtyRemain  += combineWorkLine.InventQtyRemain;
+                        targetWorkLine.InventQtyWork    += combineWorkLine.InventQtyWork;
+
+                        targetWorkLine.update();
+                    }
+
+                    // Delete the work table that was combined.
+                    combineWorkTable.delete();
+
+                    // Increment the targetLineNum for the next initial pick being combine to this work.
+                    targetLineNum++;
+                }
+            }
+        }
+        
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeTmpWorkLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>WHSTmpWorkLine</c> record.
+    /// </summary>
+    /// <param name = "_shipmentTable">The <c>WHSShipmentTable</c> record related to the current allocation being run.</param>
+    /// <returns>
+    /// The initialized <c>WHSTmpWorkLine</c> record instance.
+    /// </returns>
+    protected WHSTmpWorkLine initializeTmpWorkLine(WHSShipmentTable _shipmentTable)
+    {
+        WHSTmpWorkLine tmpTmpWorkLine;
+        
+        tmpTmpWorkLine.InventBatchId           = inventBatchId;
+        tmpTmpWorkLine.WorkType                = WHSWorkType::Put;
+        tmpTmpWorkLine.OriginType              = WHSOriginType::Load;
+        tmpTmpWorkLine.WorkTransType           = workTransType;
+        tmpTmpWorkLine.WaveId                  = _shipmentTable.WaveId;
+        tmpTmpWorkLine.LoadId                  = _shipmentTable.LoadId;
+        tmpTmpWorkLine.ShipmentId              = _shipmentTable.ShipmentId;
+        tmpTmpWorkLine.RefTableId              = tableNum(WHSLoadLine);
+        tmpTmpWorkLine.StartLocationId         = startLocationId;
+        tmpTmpWorkLine.CarrierCode             = _shipmentTable.CarrierCode;
+        tmpTmpWorkLine.CarrierServiceCode      = _shipmentTable.CarrierServiceCode;
+        tmpTmpWorkLine.ModeCode                = _shipmentTable.ModeCode;
+
+        return tmpTmpWorkLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    void new(Common _common, WHSWorkCreateId _workCreateId = '')
+    {
+        structure = _common;
+
+        workCreateId = _workCreateId ? _workCreateId : NumberSeq::newGetNum(WHSParameters::numRefWHSWorkCreateId()).num();
+
+        super(structure, workCreateId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventQty</Name>
+				<Source><![CDATA[
+    public InventQty parmInventQty(InventQty _inventQty = inventQty)
+    {
+        inventQty = _inventQty;
+
+        return inventQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStructure</Name>
+				<Source><![CDATA[
+    public WHSUOMStructure parmStructure(WHSUOMStructure _structure = structure)
+    {
+        structure = _structure;
+
+        return structure;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmModule</Name>
+				<Source><![CDATA[
+    internal WHSModule parmModule()
+    {
+        return module;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWorkCreateId</Name>
+				<Source><![CDATA[
+    public WHSWorkCreateId parmWorkCreateId(WHSWorkCreateId _workCreateId = workCreateId)
+    {
+        workCreateId = _workCreateId;
+
+        return workCreateId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmMustDelayASNCleanup</Name>
+				<Source><![CDATA[
+    internal boolean parmMustDelayASNCleanup(boolean _mustDelayASNCleanup = mustDelayASNCleanup)
+    {
+        mustDelayASNCleanup = _mustDelayASNCleanup;
+
+        return mustDelayASNCleanup;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustRegisterASNItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the ASN item must be registered.
+    /// </summary>
+    /// <param name = "_asnItem">The ASN item.</param>
+    /// <returns>true if the ASN item must be registered; otherwise, false.</returns>
+    [SysObsolete('Use WhsWorkCreateLPRegistrateASN.mustRegisterASNItem() instead.', false, 19\4\2022)]
+    protected internal boolean mustRegisterASNItem(WHSASNItem _asnItem)
+    {
+        return this.asnItemRegistrator().mustRegisterASNItem(_asnItem);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isReceiptFromWarehouseAllowed</Name>
+				<Source><![CDATA[
+    public boolean isReceiptFromWarehouseAllowed(InventLocationId _plannedWarehouseId)
+    {
+        return (_plannedWarehouseId == inventLocationId
+             || !this.isInboundOrder()
+             || InventSite::allowReceiptAtOtherWarehouse(_plannedWarehouseId, inventLocationId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isInboundOrder</Name>
+				<Source><![CDATA[
+    protected boolean isInboundOrder()
+    {
+        return module == WHSModule::Purch;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerASNItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Register the quantity on the ASN item.
+    /// </summary>
+    protected void registerASNItems()
+    {
+        this.setMustCleanupUOMStructure(false);
+        this.asnItemRegistrator().registerASNItems();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>asnItemRegistrator</Name>
+				<Source><![CDATA[
+    private WhsASNItemRegistrator asnItemRegistrator()
+    {
+        if (!asnItemRegistrator)
+        {
+            asnItemRegistrator = WhsASNItemRegistrator::construct();
+            asnItemRegistrator.initFromWhsWorkCreateLP(this);
+        }
+        return asnItemRegistrator;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerASNItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers an ASN Item.
+    /// </summary>
+    /// <param name = "_loadLine">The load line.</param>
+    /// <param name = "_registerLP">The license plate.</param>
+    /// <param name = "_registerInventDim">The inventory dimensions.</param>
+    /// <param name = "_totalHandlineQty">The quantity.</param>
+    /// <param name = "_totalCatchWeight">The transaction weight.</param>
+    [SysObsolete('Use WhsWorkCreateLPRegistrateASN.registerASNItem() instead.', false, 19\4\2022)]
+    protected internal void registerASNItem(
+        WHSLoadLine         _loadLine,
+        WHSLicensePlateId   _registerLP,
+        InventDim           _registerInventDim,
+        InventHandlingQty   _totalHandlineQty,
+        WHSTransWeight      _totalCatchWeight)
+    {   
+        this.asnItemRegistrator().registerASNItem(_loadLine, _registerLP, _registerInventDim, _totalHandlineQty, _totalCatchWeight);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustSuppressPhysicalRereservationOnNonWorkEnabledIssues</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    protected boolean mustSuppressPhysicalRereservationOnNonWorkEnabledIssues()
+    {
+        return this.isWorkCreationAllowed(this.asnItemRegistrator().parmCurrentItemInRegisterASNItem());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustIncludeLicensePlate</Name>
+				<Source><![CDATA[
+    internal boolean mustIncludeLicensePlate(InventDim _inventDim, ItemId _itemId)
+    {
+        return ((_inventDim.wmsLocationId 
+                    ? _inventDim.wmsLocation().whsLocationIsLPControlled() 
+                    : WMSLocation::find(startLocationId, _inventDim.inventLocationId).whsLocationIsLPControlled())
+                || this.isWorkCreationAllowed(_itemId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructor method for the class instances.
+    /// </summary>
+    /// <param name="_common">
+    /// Common record to be used to construct instance.
+    /// </param>
+    /// <param name="_workCreateId">
+    /// Work creation id to be used to construct instance.
+    /// </param>
+    /// <returns>
+    /// The <c>WHSWorkCreateLP</c> instance.
+    /// </returns>
+    static WHSWorkCreateLP construct(Common _common, WHSWorkCreateId _workCreateId = '')
+    {
+        return new WHSWorkCreateLP(_common, _workCreateId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLicensePlates</Name>
+				<Source><![CDATA[
+    protected void createLicensePlates()
+    {
+        WHSUOMStructure     locStructure;
+        WHSUOMStructure     childLocStructure;
+        WHSLicensePlate     licensePlate;
+
+        while select LicensePlateParent, LicensePlateId, LoadId, ShipmentId from locStructure
+            order by RecId
+            where (locStructure.LicensePlateId      == structure.LicensePlateId
+                || locStructure.LicensePlateParent  == structure.LicensePlateId)
+                && locStructure.Module              == module
+        {
+            if (this.isReceiptFromWarehouseAllowed(locStructure.plannedWarehouseId()))
+            {
+                licensePlate = WHSLicensePlate::find(locStructure.LicensePlateId, true);
+
+                if (locStructure.LicensePlateParent)
+                {
+                    //It is a child
+                    licensePlate.LicensePlateLevel  = 0;
+                }
+                else
+                {
+                    select firstonly childLocStructure
+                    where childLocStructure.LicensePlateParent == locStructure.LicensePlateId;
+
+                    if (childLocStructure)
+                    {
+                        licensePlate.LicensePlateLevel  = 1;
+                    }
+                    else
+                    {
+                        licensePlate.LicensePlateLevel  = 0;
+                    }
+
+                    licensePlate.ContainerTypeCode = this.parmContainerTypeCode();
+                }
+                licensePlate.LicensePlateId     = locStructure.LicensePlateId;
+                licensePlate.LicensePlateParent = locStructure.LicensePlateParent;
+                licensePlate.write();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReceivedCWTags</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// When receiving a LP, register the tag with the corresponding source.
+    /// </summary>
+    /// <param name = "_inventTransId">The inventory transaction id.</param>
+    private void updateReceivedCWTags(InventTransId _inventTransId)
+    {
+        if (WHSCatchWeightTagCache::construct().isCatchWeightTagFeatureUsed() && _inventTransId)
+        {
+            WHSCatchWeightTagLastRegistration lastRegistration;
+            WHSCatchWeightTag catchWeightTag;
+
+            WHSCatchWeightTagEventRegistration tagRegistration = WHSCatchWeightTagEventRegistration::instantiateFromTagRegistration(WHSCatchWeightTagRegistrationEvent::TagRegistered);
+            tagRegistration.parmInventTransId(_inventTransId);
+
+            while select TagNumber from lastRegistration
+                where lastRegistration.RegistrationEvent == WHSCatchWeightTagRegistrationEvent::Shipped
+                    && lastRegistration.InventTransId == _inventTransId
+                    exists join catchWeightTag
+                        where  catchWeightTag.TagNumber == lastRegistration.TagNumber
+                            && catchWeightTag.IsDeleted == NoYes::No
+            {
+                tagRegistration.registerEvent(WHSCatchWeightTag::find(lastRegistration.TagNumber));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveWMSLocationFromReceiptLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the location from receipt location.
+    /// </summary>
+    /// <param name = "_inventDim">
+    /// The inventory dimension record.
+    /// </param>
+    /// <returns>
+    /// The location id if found; otherwise empty.
+    /// </returns>
+    protected WMSLocationId retrieveWMSLocationFromReceiptLocation(InventDim _inventDim)
+    {
+        return startLocationId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wmsLocationFromReceiptLocation</Name>
+				<Source><![CDATA[
+    internal WMSLocationId wmsLocationFromReceiptLocation(InventDim _inventDim)
+    {
+        return this.retrieveWMSLocationFromReceiptLocation(_inventDim);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeTransferLPReceivingDims</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the inventory dimension used for registering transfer order items.
+    /// </summary>
+    /// <param name = "_inventDimIdInit">Initial inventory dimension id.</param>
+    /// <param name="_itemId">The item ID.</param>
+    /// <returns>An <c>InventDim</c> record.</returns>
+    [Hookable(false)]
+    internal InventDim initializeTransferLPReceivingDims(InventDimId _inventDimIdInit, ItemId _itemId)
+    {
+        InventDim recvDim = super(_inventDimIdInit, _itemId);
+
+        recvDim.wMSLocationId = startLocationId;
+
+        if (!this.mustIncludeLicensePlate(recvDim, _itemId))
+        {
+            recvDim.LicensePlateId = '';
+        }
+        recvDim = InventDim::findOrCreate(recvDim);
+
+        return recvDim;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,601 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ResWBSAutoAssignResource</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class ResWBSAutoAssignResource
+{
+    #TimeConstants
+    ActivityRecId  activity;
+    const real oneMinute = #MinutesPerHour / #SecondsPerHour;
+    boolean isWorkflowEnabled;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>autoAssignResources</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Automatically assign the best matching resources to the specified activity.
+    /// </summary>
+    /// <param name = "_commitType">The type of commit; optional.</param>
+    /// <returns>Container of propose status as boolean and proposal message.</returns>
+    public container autoAssignResources(ResCommitType _commitType = ResCommitType::HardBook)
+    {
+        isWorkflowEnabled = ResRequestHelper::isWorkflowEnabled();
+        if (isWorkflowEnabled)
+        {
+            ResRequestHelper::validateWorkflowConfiguration();
+        }
+
+        ProjPlanVersion task = ProjPlanVersion::findByActivityRecId(this.activity);
+
+        container assignResourcesCon;
+        if (task)
+        {
+            assignResourcesCon = this.assignResources(task, _commitType);
+        }
+        return assignResourcesCon;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignResources</Name>
+				<Source><![CDATA[
+    private container assignResources(ProjPlanVersion _task, ResCommitType _commitType)
+    {
+        boolean succeed;
+        str     outputMessage;
+
+        ResourceCategoryRecId resourceCategory = _task.ResourceCategory;
+        Hours originalRemainingHours = _task.getRemainingEffortHours();
+        
+        // Attempt to fulfill the task by local resources first
+        this.assignResourcesLoop(_task, resourceCategory, _commitType);
+        Hours updatedRemainingHours = ProjPlanVersion::findByRecId(_task.RecId).getRemainingEffortHours();
+
+        if (originalRemainingHours == updatedRemainingHours)
+        {
+            outputMessage = "@Res:AutoAssignNoResourceIsFound";
+            succeed = false;
+        }
+        else if (updatedRemainingHours > (oneMinute))
+        {
+            outputMessage = "@Res:AutoAssignNotFullyStaffed";
+            succeed = false;
+
+            // Update team info and scheduling status
+            ResUtil::updateTeamInfo(this.activity);
+            ProjActivityCapacity::updateScheduleStatusByActivity(this.activity);
+        }
+        else
+        {
+            succeed = true;
+
+            // Update team info and scheduling status
+            ResUtil::updateTeamInfo(this.activity);
+            ProjActivityCapacity::updateScheduleStatusByActivity(this.activity);
+        }
+
+        return [succeed, outputMessage];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignResourcesLoop</Name>
+				<Source><![CDATA[
+    private void assignResourcesLoop(ProjPlanVersion _task, ResourceCategoryRecId _resourceCategory, ResCommitType _commitType)
+    {
+        DataAreaId  currentCompany = curExt();
+        ProjId      projectId = ProjPlanVersionDetail::findLatestByHierarchyId(_task.HierarchyId).ProjId;
+        utcdatetime taskStartDateTime = dateTimeUtil::newDateTime(_task.TaskStartDate, 0);
+        utcdatetime taskEndDateTime = datetimeUtil::newDateTime(_task.TaskFinishDate, #LastSecondOfTheDay);
+
+        boolean hasRoleConstraint = _task.ResourceCategory &&
+            !PSASchedRole::find(_task.ResourceCategory).DefaultResourceCategory;
+
+        ttsbegin;
+        ResTmpAutoAssignResource tmpResourceTable;
+        tmpResourceTable = this.addResourcesToTmpTable(tmpResourceTable, _task, _resourceCategory,
+            currentCompany, taskStartDateTime, taskEndDateTime, projectId, hasRoleConstraint);
+
+        //Update temp table resource remaining capacity with the minimum records possible
+        Hours           currentActivityRemainingHours = _task.getRemainingEffortHours();
+        Seconds         currentActivityRemainingSeconds = real2int(currentActivityRemainingHours * #SecondsPerHour);
+        Seconds         resourceRemainingCapacity, resourceQualifyTotalCapacityCounter;
+        Seconds         projectCalendarCapacityPerDay, resourceCapacityPerDay;
+        ActivityRecId   rootActivity = ProjWBS::getRootActivityRecId(projectId);
+
+        projectCalendarCapacityPerDay = this.getProjectCalendarCapacityPerDay(projectId, taskStartDateTime, taskEndDateTime);
+
+        while select forupdate tmpResourceTable
+            order by TeamMemberRanking asc, LegalEntityRanking asc, Resource asc
+        {
+            [resourceRemainingCapacity, resourceCapacityPerDay]  = this.getResourceRemainingCapacity(
+                    tmpResourceTable.Resource,
+                    tmpResourceTable.ResourceCalendar, rootActivity, projectId,
+                    taskStartDateTime, taskEndDateTime);
+            tmpResourceTable.RemainingCapacity = resourceRemainingCapacity;
+            tmpResourceTable.update();
+            //Measure if the average reosurce capacity per day is equal to the average project calendar capacity per day
+            //If so, add it to a total resource qualified capacity.
+            //Once this counter is equal ore more than the task remaining capacity, break the loop.
+            if (resourceCapacityPerDay >= projectCalendarCapacityPerDay)
+            {
+                resourceQualifyTotalCapacityCounter += resourceRemainingCapacity;
+            }
+            if (resourceQualifyTotalCapacityCounter >= currentActivityRemainingSeconds)
+            {
+                break;
+            }
+        }
+
+        //Assign resources from the teamp table to the task with appropriate order
+        //Once the assigned hours is equal or less than task remaining hours - 1 minute, break the loop.
+        while select Resource from tmpResourceTable
+            order by RemainingCapacity desc, TeamMemberRanking asc, LegalEntityRanking asc, Resource asc
+        {
+            if (currentActivityRemainingHours <= (oneMinute))
+            {
+                break;
+            }
+
+            this.assignResourceRemainingCapacityToActivity(tmpResourceTable.Resource,
+                taskStartDateTime, taskEndDateTime,
+                currentActivityRemainingHours, _commitType, _resourceCategory);
+            currentActivityRemainingHours = ProjPlanVersion::findByRecId(_task.RecId).getRemainingEffortHours();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addResourcesToTmpTable</Name>
+				<Source><![CDATA[
+    private ResTmpAutoAssignResource addResourcesToTmpTable(  ResTmpAutoAssignResource _tmpResourceTable,
+        ProjPlanVersion _task, ResourceCategoryRecId _resourceCategory, DataAreaId _recipientCompany,
+        utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime, ProjId _projectId, boolean hasRoleConstraint)
+    {
+        Query   query = new Query();
+
+        if (isWorkflowEnabled)
+        {
+            //Add all effecitive resources for this engagement to the resources temp table
+            query = this.getTeamMemberResourcesQuery(_resourceCategory,
+                _taskStartDateTime, _taskEndDateTime, _projectId, hasRoleConstraint);
+            _tmpResourceTable = this.addTeamMemberResourceRecordsToTmpTableByQuery(_tmpResourceTable,
+                query, _recipientCompany);
+        }
+        else if (!hasRoleConstraint)
+        {
+            //Add all effecitive resources for this company to the resources temp table
+            query = this.getResourcesQuery(_task, _resourceCategory, _recipientCompany,
+                _taskStartDateTime, _taskEndDateTime, _projectId, false, false);
+            _tmpResourceTable = this.addResourceRecordsToTmpTableByQuery(_tmpResourceTable,
+                query, _recipientCompany, _projectId, false);
+        }
+        else
+        {
+            //Add all effective resources with matching default resource category for this company
+            //to the resources temp table
+            query = this.getResourcesQuery(_task, _resourceCategory, _recipientCompany,
+                _taskStartDateTime, _taskEndDateTime, _projectId, true, false);
+            _tmpResourceTable = this.addResourceRecordsToTmpTableByQuery(_tmpResourceTable,
+                query, _recipientCompany, _projectId, false);
+
+            //Add all effective resources which hasn't been included in the resoruces temp table in
+            //this project's project team which has the matching resoruce category to the
+            //resoruces temp table.
+            query = this.getResourcesQuery(_task, _resourceCategory, _recipientCompany,
+                _taskStartDateTime, _taskEndDateTime, _projectId, true, true);
+            _tmpResourceTable = this.addResourceRecordsToTmpTableByQuery(_tmpResourceTable,
+                query, _recipientCompany, _projectId, true);
+        }
+        return _tmpResourceTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTeamMemberResourcesQuery</Name>
+				<Source><![CDATA[
+    private Query getTeamMemberResourcesQuery(  ResourceCategoryRecId _resourceCategory,
+        utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime, ProjId _projectId, boolean _hasRoleConstraint)
+    {
+        Query                       query = new Query();
+        QueryBuildDataSource        firstAutoAssignResourceView, secondAutoAssignResourceView, categoryDS;
+
+        date taskStartDate = DateTimeUtil::date(_taskStartDateTime);
+        date taskEndDate = DateTimeUtil::date(_taskEndDateTime);
+
+        // Get all staffed team member in this engagement.
+        firstAutoAssignResourceView = query.addDataSource(tableNum(ResWBSWorkflowEnabledAutoAssignResourceView));
+        firstAutoAssignResourceView.addRange(fieldNum(ResWBSWorkflowEnabledAutoAssignResourceView, ProjId))
+            .value(queryValue(_projectId));
+        firstAutoAssignResourceView.addRange(fieldNum(ResWBSWorkflowEnabledAutoAssignResourceView, EarliestBookingDate))
+            .value(queryRange(dateNull(), _taskStartDateTime));
+        firstAutoAssignResourceView.addRange(fieldNum(ResWBSWorkflowEnabledAutoAssignResourceView, LatestBookingDate))
+            .value(queryRange(_taskEndDateTime, dateMax() + 1));
+
+        if (_hasRoleConstraint)
+        {
+            // Set role requirement.
+            firstAutoAssignResourceView.addRange(fieldNum(ResWBSWorkflowEnabledAutoAssignResourceView, ResourceCategory))
+                .value(queryValue(_resourceCategory));
+
+            // Union with the same staffed team member in this engagement but look up the role by the resource default role
+            query.queryType(QueryType::Union);
+            secondAutoAssignResourceView = query.addDataSource(tableNum(ResWBSWorkflowEnabledAutoAssignResourceView));
+            secondAutoAssignResourceView.addRange(fieldNum(ResWBSWorkflowEnabledAutoAssignResourceView, ProjId))
+            .value(queryValue(_projectId));
+            secondAutoAssignResourceView.addRange(fieldNum(ResWBSWorkflowEnabledAutoAssignResourceView, EarliestBookingDate))
+            .value(queryRange(dateNull(), _taskStartDateTime));
+            secondAutoAssignResourceView.addRange(fieldNum(ResWBSWorkflowEnabledAutoAssignResourceView, LatestBookingDate))
+            .value(queryRange(_taskEndDateTime, dateMax() + 1));
+
+            categoryDS = secondAutoAssignResourceView.addDataSource(tableNum(ResResourceCategoryView));
+            categoryDS.joinMode(JoinMode::ExistsJoin);
+            categoryDS.addLink(fieldnum(ResWBSWorkflowEnabledAutoAssignResourceView, Resource),
+                    fieldnum(ResResourceCategoryView, Resource));
+            categoryDS.addRange(fieldnum(ResResourceCategoryView, ResourceCategory))
+                    .value(queryValue(_resourceCategory));
+            categoryDS.addRange(fieldNum(ResResourceCategoryView, ValidFrom))
+                    .value(queryRange(dateNull(), taskStartDate));
+            categoryDS.addRange(fieldNum(ResResourceCategoryView, ValidTo))
+                    .value(queryRange(taskEndDate, dateMax() + 1));
+        }
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addTeamMemberResourceRecordsToTmpTableByQuery</Name>
+				<Source><![CDATA[
+    private ResTmpAutoAssignResource addTeamMemberResourceRecordsToTmpTableByQuery(ResTmpAutoAssignResource _tmpResourceTable,
+        Query _resourceQuery, DataAreaId _recipientCompany)
+    {
+        LegalEntityRecId legalEntity = CompanyInfo::findDataArea(_recipientCompany).RecId;
+
+        QueryRun queryRun = new QueryRun(_resourceQuery);
+
+        while (queryRun.next())
+        {
+            ResWBSWorkflowEnabledAutoAssignResourceView teamMember = queryRun.getNo(1);
+            LegalEntityRecId resourceLegalEntity = ResourceFacade::getLegalEntity(teamMember.Resource);
+            if (!this.tmpResourceTableRecordExists(_tmpResourceTable,
+                    teamMember.Resource, resourceLegalEntity))
+            {
+                _tmpResourceTable.Resource = teamMember.Resource;
+                _tmpResourceTable.SourceLegalEntity = resourceLegalEntity;
+                _tmpResourceTable.ResourceCalendar = teamMember.Calendar;
+                _tmpResourceTable.TeamMemberRanking = 1;
+                _tmpResourceTable.LegalEntityRanking = resourceLegalEntity == legalEntity ? 1 : 2;
+                _tmpResourceTable.insert();
+            }
+        }
+        return _tmpResourceTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getResourcesQuery</Name>
+				<Source><![CDATA[
+    private Query getResourcesQuery( ProjPlanVersion _task,
+        ResourceCategoryRecId _resourceCategory, DataAreaId _currentCompany,
+        utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime, ProjId _projectId,
+        boolean _hasRoleConstraint, boolean _isProjectTeamQuery)
+    {
+        Query                       query = new Query();
+        QueryBuildDataSource        resourceDS, categoryDS, projectTeamDS;
+
+        //Get all resources for this company
+        resourceDS = query.addDataSource(tableNum(ResCompanyResourceSchedulableView));
+        resourceDS.addRange(fieldNum(ResCompanyResourceSchedulableView, RecipientCompany))
+            .value(queryValue(_currentCompany));
+        resourceDS.addRange(fieldNum(ResCompanyResourceSchedulableView, EffectiveDate))
+            .value(queryRange(dateNull(), _task.TaskStartDate));
+        resourceDS.addRange(fieldNum(ResCompanyResourceSchedulableView, ExpirationDate))
+            .value(queryRange(_task.TaskFinishDate, dateMax() + 1));
+        resourceDS.addRange(fieldNum(ResCompanyResourceSchedulableView, EffectiveDate))
+            .value(queryRange(dateNull(), _taskStartDateTime));
+        resourceDS.addRange(fieldNum(ResCompanyResourceSchedulableView, ExpirationDate))
+            .value(queryRange(_taskEndDateTime, dateMax() + 1));
+
+        if (_hasRoleConstraint && !_isProjectTeamQuery)
+        {
+            //Inner join with all reaources with default role equal to target role and add it to temp table
+            categoryDS = resourceDS.addDataSource(tableNum(ResResourceCategoryView));
+            categoryDS.joinMode(JoinMode::InnerJoin);
+            categoryDS.addLink(fieldnum(ResCompanyResourceSchedulableView, Resource),
+                    fieldnum(ResResourceCategoryView, Resource));
+            categoryDS.addRange(fieldnum(ResResourceCategoryView, ResourceCategory))
+                    .value(queryValue(_resourceCategory));
+            categoryDS.addRange(fieldNum(ResResourceCategoryView, ValidFrom))
+                    .value(queryRange(dateNull(), _task.TaskStartDate));
+            categoryDS.addRange(fieldNum(ResResourceCategoryView, ValidTo))
+                    .value(queryRange(_task.TaskFinishDate, dateMax() + 1));
+        }
+        else if (_hasRoleConstraint && _isProjectTeamQuery)
+        {
+            //Inner join with all reosurces in this project team table with this target role and add it to temp table
+            projectTeamDS = resourceDS.addDataSource(tableNum(PSAProjSchedRole));
+            projectTeamDS.joinMode(JoinMode::InnerJoin);
+            projectTeamDS.addLink(fieldnum(ResCompanyResourceSchedulableView, Resource),
+                fieldnum(PSAProjSchedRole, Resource));           
+            projectTeamDS.addRange(fieldNum(PSAProjSchedRole, ProjId))
+                .value(queryValue(_projectId));
+            projectTeamDS.addRange(fieldnum(PSAProjSchedRole, ResourceCategory))
+                .value(queryValue(_resourceCategory));
+        }
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addResourceRecordsToTmpTableByQuery</Name>
+				<Source><![CDATA[
+    private ResTmpAutoAssignResource addResourceRecordsToTmpTableByQuery( ResTmpAutoAssignResource _tmpResourceTable,
+        Query _resourceQuery, DataAreaId _recipientCompany, ProjId _projectId, boolean _checkExisting)
+    {
+        QueryRun queryRun = new QueryRun(_resourceQuery);
+
+        while (queryRun.next())
+        {
+            ResCompanyResourceSchedulableView companyResourceView = queryRun.getNo(1);
+            if (!_checkExisting || !this.tmpResourceTableRecordExists(_tmpResourceTable,
+                    companyResourceView.Resource, companyResourceView.SourceLegalEntity))
+            {
+                _tmpResourceTable.Resource = companyResourceView.Resource;
+                _tmpResourceTable.SourceLegalEntity = companyResourceView.SourceLegalEntity;
+                _tmpResourceTable.ResourceCalendar = companyResourceView.Calendar;
+                _tmpResourceTable.TeamMemberRanking = ActivityResourceFacade::
+                                                        isTeamMember(_projectId, companyResourceView.Resource) ? 1 : 2;
+                _tmpResourceTable.LegalEntityRanking = companyResourceView.SourceCompany == _recipientCompany ? 1 : 2;
+                _tmpResourceTable.insert();
+            }
+        }
+        return _tmpResourceTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tmpResourceTableRecordExists</Name>
+				<Source><![CDATA[
+    private boolean tmpResourceTableRecordExists(ResTmpAutoAssignResource _tmpResourceTable,
+        ResourceRecId _resource, LegalEntity _sourceLegalEntity)
+    {
+        if ((_resource) && (_sourceLegalEntity))
+        {
+            select firstonly _tmpResourceTable
+                where _tmpResourceTable.Resource == _resource
+                    && _tmpResourceTable.SourceLegalEntity == _sourceLegalEntity;
+        }
+
+        return _tmpResourceTable ? true : false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>synchronizeCalendarCapacity</Name>
+				<Source><![CDATA[
+    private void synchronizeCalendarCapacity(CalendarId _calendarId, utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime)
+    {
+        // Add data into table ResCalendarCapacity which is the data source of ResCalendarCapacityWorkDaysView.
+        ResCalendarCapacitySynchronizationTask calendarCapacitySynchronization;
+        calendarCapacitySynchronization = ResCalendarCapacitySynchronizationTask::construct();
+        calendarCapacitySynchronization.parmCalendarId(_calendarId);
+        calendarCapacitySynchronization.parmFromDate(DateTimeUtil::date(_taskStartDateTime) - 1);
+        calendarCapacitySynchronization.parmToDate(DateTimeUtil::date(_taskEndDateTime) + 1);
+        calendarCapacitySynchronization.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProjectCalendarTotalCapacityAndWorkingDay</Name>
+				<Source><![CDATA[
+    private Container getProjectCalendarTotalCapacityAndWorkingDay(CalendarRecId _projectCalendar,
+        utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime)
+    {
+        ResCalendarCapacityWorkDaysView calendarWorkDays;
+
+        select sum(Capacity), sum(RecId) from calendarWorkDays
+            where calendarWorkDays.Calendar == _projectCalendar
+                && calendarWorkDays.Day >= _taskStartDateTime
+                && calendarWorkDays.Day <= _taskEndDateTime;
+
+        return [calendarWorkDays.Capacity, calendarWorkDays.RecId];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProjectCalendarCapacityPerDay</Name>
+				<Source><![CDATA[
+    private Seconds getProjectCalendarCapacityPerDay(ProjId _projectId, utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime)
+    {
+        Seconds capacityPerDay;
+
+        if (_taskEndDateTime >= _taskStartDateTime)
+        {
+            WorkCalendarTable calendarTable = WorkCalendarTable::find(ProjTable::find(_projectId).PSASchedCalendarId);
+            
+            Seconds totalCapacity;
+            int     workingDaysNum;
+            [totalCapacity, workingDaysNum] = this.getProjectCalendarTotalCapacityAndWorkingDay(calendarTable.RecID, _taskStartDateTime, _taskEndDateTime);
+
+            if (!workingDaysNum)
+            {
+                // If number of working days is 0, then it could be casued by the data in ResCalendarCapacityWorkDaysView has not been synchronized.
+                this.synchronizeCalendarCapacity(calendarTable.CalendarId, _taskStartDateTime, _taskEndDateTime);
+                [totalCapacity, workingDaysNum] = this.getProjectCalendarTotalCapacityAndWorkingDay(calendarTable.RecID, _taskStartDateTime, _taskEndDateTime);
+            }
+
+            if (!totalCapacity)
+            {
+                throw error(strFmt("@Res:CalendarHasNoWorkingDays",
+                    date2StrUsr(DateTimeUtil::date(_taskStartDateTime), DateFlags::FormatAll),
+                    date2StrUsr(DateTimeUtil::date(_taskEndDateTime), DateFlags::FormatAll),
+                    calendarTable.CalendarId));
+            }
+
+            capacityPerDay = real2int(decRound(totalCapacity / workingDaysNum, 0));
+        }
+        else
+        {
+            throw error("@ProjPlan:StartDateGreaterThanEndDateWarning");
+        }
+        
+        return capacityPerDay;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getResourceRemainingCapacity</Name>
+				<Source><![CDATA[
+    private container getResourceRemainingCapacity( ResourceRecId _resource,
+        CalendarRecId _calendar, ActivityRecId _rootActivity,
+        ProjId _projectId, utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime)
+    {
+        ResCalendarCapacityWorkDaysView     calendarWorkDays;
+        ResDayCapacityUsageView             dayCapacityUsageView;
+        ResBookingView                      bookingView;
+        PSAProjSchedRole                    projectTeamTable;
+        Seconds                             calendarCapacity, usedCapacity, bookedCapacityForThisProject;
+        Seconds                             remainingCapacity, averageCapacityPerWorkingDay;
+
+        select count(RecId) from calendarWorkDays
+            where calendarWorkDays.Calendar == _calendar
+                && calendarWorkDays.Day >= _taskStartDateTime
+                && calendarWorkDays.Day <= _taskEndDateTime;
+
+        Day workingDayCounter = int642int(calendarWorkDays.RecId);
+
+        select sum(Capacity) from calendarWorkDays
+            where calendarWorkDays.Calendar == _calendar
+                && calendarWorkDays.Day >= _taskStartDateTime
+                && calendarWorkDays.Day <= _taskEndDateTime;
+
+        calendarCapacity = calendarWorkDays.Capacity;
+
+        select sum(UsedCapacity) from dayCapacityUsageView
+            where dayCapacityUsageView.Resource == _resource
+                    && dayCapacityUsageView.Day >=  _taskStartDateTime
+                    && dayCapacityUsageView.Day <=  _taskEndDateTime
+                    && dayCapacityUsageView.CommitType == ResCommitType::HardBook;
+
+        usedCapacity = dayCapacityUsageView.UsedCapacity;
+
+        select RecId from projectTeamTable
+            where projectTeamTable.ProjId == _projectId
+                && projectTeamTable.Resource == _resource;
+        if (projectTeamTable)
+        {
+            select sum(Capacity) from bookingView
+                where bookingView.ActivityResource == projectTeamTable.RecId
+                    && bookingView.Activity == _rootActivity
+                    && bookingView.Day >=  _taskStartDateTime
+                    && bookingView.Day <=  _taskEndDateTime
+                    && bookingView.CommitType == ResCommitType::HardBook;
+
+            bookedCapacityForThisProject = real2int(decround(bookingView.Capacity, 0));
+        }
+
+        remainingCapacity = calendarCapacity - usedCapacity + bookedCapacityForThisProject;
+        averageCapacityPerWorkingDay = real2int(decRound(remainingCapacity / workingDayCounter, 0));
+
+        return [remainingCapacity, averageCapacityPerWorkingDay];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignResourceRemainingCapacityToActivity</Name>
+				<Source><![CDATA[
+    private void assignResourceRemainingCapacityToActivity(ResourceRecId _resource,
+        utcdatetime _taskStartDateTime,
+        utcdatetime _taskEndDateTime, real _effort, ResCommitType _commitType,
+        ResourceCategoryRecId _resourceCategory)
+    {
+        ResIResourceManager     resourceManager = ResResourceManager::construct();
+        ResIReserveProcessor    reserveProcessor = ResReserveProcessor::getProcessor(ResBookingType::RemainingCapacity);
+        List                    schedulesList = new List(Types::Class);
+
+        if (activity)
+        {
+            ResReservationSchedule resSchedule = ResReservationSchedule::construct();
+            resSchedule.ReservationType(ResReservationType::Assignment);
+            resSchedule.Commitment(_commitType);
+            resSchedule.Resource(_resource);
+            resSchedule.Activity(activity);
+            resSchedule.Start(_taskStartDateTime);
+            resSchedule.End(_taskEndDateTime);
+            resSchedule.ResourceCategory(_resourceCategory);
+            schedulesList.addEnd(resSchedule);
+
+            // if the scheules contain soft reservation, ask user if user will cancel the soft reservation and cancel soft reservation accordingly
+            ResCancelSoftReservation cancelSoftReservation = ResCancelSoftReservation::construct(schedulesList);
+            if (cancelSoftReservation.hasSoftReservation() && cancelSoftReservation.getUserFeedBackOnSoftReservationCancelling())
+            {
+                cancelSoftReservation.cancelSoftReservation(true);
+            }
+
+            // reserve the scheduling collection
+            resourceManager.ReserveProcessor(reserveProcessor);
+            resourceManager.Schedules(schedulesList);
+            resourceManager.Capacity(_effort);
+            resourceManager.Reserve(true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of <c>ResAutoAssignResource</c>.
+    /// </summary>
+    /// <param name = "_activity">The selected activity rec Id.</param>
+    protected void new(ActivityRecId _activity)
+    {
+        activity = _activity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct an object for automatically assign the best matching resources.
+    /// </summary>
+    /// <param name = "_activity">
+	/// The selected activity recId.
+	/// </param>
+    /// <returns>
+    /// Returns an instance of <c>ResWBSAutoAssignResource</c> class.
+	/// </returns>
+    public static ResWBSAutoAssignResource construct(ActivityRecId _activity)
+    {
+        ResWBSAutoAssignResource autoAssign = new ResWBSAutoAssignResource(_activity);
+        return autoAssign;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

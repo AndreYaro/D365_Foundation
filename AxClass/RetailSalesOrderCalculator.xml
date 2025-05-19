@@ -1,0 +1,1797 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailSalesOrderCalculator</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+using CrtSalesTransaction = Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesTransaction;
+using CrtSalesLine = Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine;
+using CrtDiscountLine = Microsoft.Dynamics.Commerce.Runtime.DataModel.DiscountLine;
+
+/// <summary>
+/// Retail Sales order calculator.
+/// </summary>
+class RetailSalesOrderCalculator extends RetailOrderCalculator
+{
+    protected static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+    SalesId salesId;
+    SalesLine currentSalesLine;
+    RetailSalesLine currentRetailSalesLine;
+
+    SalesTable salesTable;
+    RetailSalesTable retailSalesTable;
+    private SalesPriceDateType dateType;
+
+    RetailPriceOverrideWorkflowHelper retailPriceOverrideWorkflowHelper = RetailPriceOverrideWorkflowHelper::construct();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initializeForDataManagerPerformance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a temporary table for data manager performance.
+    /// </summary>
+    protected void initializeForDataManagerPerformance()
+    { 
+        InventTable inventTable;
+        InventDimCombination inventDimCombination;
+        SalesLine salesLineLocal;
+
+        if (tmpOrderItemInitialized)
+        {
+            return;
+        }
+
+        using(var t = RetailInstrumentationSegment::construct('PriceEngine', 'RetailSalesOrderCalculator.InitializeTempOrderItem'))
+        {
+            this.initTempOrderItem();
+            this.fixCurrentLineInRetailTmpOrderItem();
+
+            update_recordSet tempOrderItem
+                setting Product = inventTable.Product,
+                        Variant = inventDimCombination.DistinctProductVariant,
+                        InventDimId = inventDimCombination.InventDimId
+                join inventTable
+                    where tempOrderItem.ItemId == inventTable.ItemId
+                outer join inventDimCombination
+                    where tempOrderItem.retailVariantId == inventDimCombination.RetailVariantId
+                        && tempOrderItem.retailVariantId;
+
+            // If the feature is enabled, we need the Product to be the variant product id.
+            if (RetailPricingFeatureToggle::shouldUseRetailPricingDataManagerV3())
+            {
+                update_recordSet tempOrderItem
+                    setting Product = inventDimCombination.DistinctProductVariant
+                    join inventDimCombination
+                        where tempOrderItem.retailVariantId == inventDimCombination.RetailVariantId
+                            && tempOrderItem.retailVariantId;
+            }
+
+            select count(RecId) from tempOrderItem;
+            t.rowCount = tempOrderItem.RecId;
+        }
+
+        tmpOrderItemInitialized = true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTempOrderItem</Name>
+				<Source><![CDATA[
+    protected void initTempOrderItem()
+    {
+        SalesLine salesLineLocal;
+        InventDim inventDim;
+
+        if (RetailPricingDisableGetPriceTradeAgreementsBySearchCriteriaFlight::instance().isEnabled())
+        {
+            insert_recordset tempOrderItem(itemId, RetailVariantId, LineNum)
+                select ItemId, RetailVariantId, LineNum from salesLineLocal
+                    group by ItemId, RetailVariantId, LineNum
+                        where salesLineLocal.SalesId == salesId;
+        }
+        else
+        {
+            try
+            {
+                insert_recordset tempOrderItem(itemId, retailVariantId, inventDimId, LineNum, InventSiteId, InventLocationId)
+                    select ItemId, RetailVariantId, inventDimId, LineNum from salesLineLocal
+                        group by ItemId, RetailVariantId, inventDimId, LineNum
+                            where salesLineLocal.SalesId == salesId
+                    outer join InventSiteId, InventLocationId from inventDim
+                        group by InventSiteId, InventLocationId
+                            where salesLineLocal.InventDimId == inventDim.inventDimId;
+            }
+            catch (Exception::Error)
+            {
+                throw error("@RetailPricing:InvalidInventDimIds");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fixCurrentLineInRetailTmpOrderItem</Name>
+				<Source><![CDATA[
+    protected void fixCurrentLineInRetailTmpOrderItem()
+    {
+        if (RetailPricingDisableGetPriceTradeAgreementsBySearchCriteriaFlight::instance().isEnabled())
+        {
+            this.fixCurrentLineInRetailTmpOrderItemLegacy();
+        }
+        else
+        {
+            this.fixCurrentLineInRetailTmpOrderItemWithSearchCriteria();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fixCurrentLineInRetailTmpOrderItemLegacy</Name>
+				<Source><![CDATA[
+    private void fixCurrentLineInRetailTmpOrderItemLegacy()
+    {
+        UserId userId = curUserId();
+        ItemId currentItemId = currentSalesLine.ItemId;
+        RetailValidationId currentRetailVariantId = currentSalesLine.RetailVariantId;
+
+        // The current sales line may not have been saved yet.
+        if (currentRetailVariantId)
+        {
+            select firstOnly RecId from tempOrderItem
+                where tempOrderItem.ItemId == currentItemId
+                    && tempOrderItem.retailVariantId == currentRetailVariantId;
+            
+            if (!tempOrderItem.RecId)
+            {
+                tempOrderItem.clear();
+                tempOrderItem.ItemId = currentItemId;
+                tempOrderItem.retailVariantId = currentRetailVariantId;
+                tempOrderItem.LineNum = currentSalesLine.LineNum;
+                
+                tempOrderItem.insert();
+            }
+        }
+        else if (currentItemId)
+        {
+            select firstOnly RecId from tempOrderItem
+                where tempOrderItem.ItemId == currentItemId;
+            
+            if (!tempOrderItem.RecId)
+            {
+                tempOrderItem.clear();
+                tempOrderItem.ItemId = currentItemId;
+                tempOrderItem.LineNum = currentSalesLine.LineNum;
+                
+                tempOrderItem.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fixCurrentLineInRetailTmpOrderItemWithSearchCriteria</Name>
+				<Source><![CDATA[
+    private void fixCurrentLineInRetailTmpOrderItemWithSearchCriteria()
+    {
+        UserId userId = curUserId();
+        ItemId currentItemId = currentSalesLine.ItemId;
+        RetailValidationId currentRetailVariantId = currentSalesLine.RetailVariantId;
+        InventDim currentInventDim = InventDim::find(currentSalesLine.InventDimId);
+        str currentInventSiteId = currentInventDim.InventSiteId;
+        str currentInventLocationId = currentInventDim.InventLocationId;
+
+        // The current sales line may not have been saved yet.
+        if (currentRetailVariantId)
+        {
+            select firstOnly RecId from tempOrderItem
+                where tempOrderItem.ItemId == currentItemId
+                    && tempOrderItem.retailVariantId == currentRetailVariantId
+                    && tempOrderItem.InventSiteId == currentInventSiteId
+                    && tempOrderItem.InventLocationId == currentInventLocationId;
+
+            if (!tempOrderItem.RecId)
+            {
+                tempOrderItem.clear();
+                tempOrderItem.ItemId = currentItemId;
+                tempOrderItem.retailVariantId = currentRetailVariantId;
+                tempOrderItem.InventSiteId = currentInventSiteId;
+                tempOrderItem.InventLocationId = currentInventLocationId;
+                tempOrderItem.LineNum = currentSalesLine.LineNum;
+
+                tempOrderItem.insert();
+            }
+        }
+        else if (currentItemId)
+        {
+            select firstOnly RecId from tempOrderItem
+                where tempOrderItem.ItemId == currentItemId
+                    && tempOrderItem.InventSiteId == currentInventSiteId
+                    && tempOrderItem.InventLocationId == currentInventLocationId;
+
+            if (!tempOrderItem.RecId)
+            {
+                tempOrderItem.clear();
+                tempOrderItem.ItemId = currentItemId;
+                tempOrderItem.InventSiteId = currentInventSiteId;
+                tempOrderItem.InventLocationId = currentInventLocationId;
+                tempOrderItem.LineNum = currentSalesLine.LineNum;
+
+                tempOrderItem.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCalculationResult</Name>
+				<Source><![CDATA[
+    private RetailSalesOrderCalculatorResult getCalculationResult()
+    {
+        RetailSalesOrderCalculatorResult result;
+
+        using(var t = RetailPricingInstrumentationSegment::construct(
+            classstr(RetailSalesOrderCalculator), methodStr(RetailSalesOrderCalculator, getCalculationResult)))
+        {
+            t.addExtendedData(RetailPricingInstrumentationSegmentConstants::TableName, tableStr(SalesTable));
+            t.addExtendedData(RetailPricingInstrumentationSegmentConstants::RecordId, int642Str(salesTable.RecId));
+            result = this.doGetCalculationResult();
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doGetCalculationResult</Name>
+				<Source><![CDATA[
+    protected RetailSalesOrderCalculatorResult doGetCalculationResult()
+    {
+        CrtSalesLine crtSalesLine;
+        CLRObject clrSalesLines, enumeratorSalesLine;
+        CrtDiscountLine crtDiscountLine;
+        CLRObject clrDiscountLines, enumeratorDiscountLine;
+        Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceLine crtPriceLine;
+        CLRObject clrPriceLines, enumeratorPriceLine;
+
+        int crtDiscountType;
+        int crtCustomerDiscountType;
+        int crtManualDiscountType;
+        str crtOfferId;
+
+        RetailSalesDiscountLine discountLine;
+        RetailSalesLine retailSalesLineLocal;
+        RetailSalesPriceAdjustmentLine adjustmentLine;
+
+        str lineId;
+        InventTransId inventTransId;
+        Price oldPrice, newPrice, dealPrice;
+        DiscAmount discountAmount, unitAmount, periodicDiscount, lineManualDiscountAmount, totalDiscount, lineDiscount;
+        DiscPct percentageDiscount, periodicDiscountPercentage, lineManualDiscountPercent, totalDiscountPercent, linePercentageDiscount;
+        RetailDiscountBundleId bundleId;
+        int newLineCount;
+        int oldDiscountCount, newDiscountCount;
+        RetailSalesOrderCalculatorResult result = new RetailSalesOrderCalculatorResult();
+        boolean requireRecalculation = false;
+
+        CrtDiscountLine fineCrtDiscountLine(
+            CLRObject _clrDiscountLines,
+            int _discountType,
+            int _customerDiscountType,
+            int _manualDiscountType,
+            RetailOfferIdEx3 _offerId)
+        {
+            CrtDiscountLine crtDiscountLineLocal, ret = null;
+
+            enumeratorDiscountLine = _clrDiscountLines.GetEnumerator();
+            while (enumeratorDiscountLine.MoveNext())
+            {
+                crtDiscountLineLocal = enumeratorDiscountLine.get_Current();
+                crtDiscountType = crtDiscountLineLocal.get_DiscountLineTypeValue();
+                crtCustomerDiscountType = crtDiscountLineLocal.get_CustomerDiscountTypeValue();
+                crtManualDiscountType = crtDiscountLineLocal.get_ManualDiscountTypeValue();
+                crtOfferId = crtDiscountLineLocal.get_OfferId();
+
+                if (_discountType == crtDiscountType &&
+                    _customerDiscountType == crtCustomerDiscountType &&
+                    _manualDiscountType == crtManualDiscountType &&
+                    _offerId == crtOfferId)
+                {
+                    ret = crtDiscountLineLocal;
+                    break;
+                }
+            }
+
+            return ret;
+        }
+
+        clrSalesLines = crtSalesTransaction.get_SalesLines();
+
+        newLineCount = clrSalesLines.get_Count();
+
+        requireRecalculation = (newLineCount != lineCount);
+
+        enumeratorSalesLine = clrSalesLines.GetEnumerator();
+        while (enumeratorSalesLine.MoveNext())
+        {
+            crtSalesLine = enumeratorSalesLine.get_Current();
+            lineId = crtSalesLine.get_LineId();
+            if (lineId != crtLineIdCurrentLine)
+            {
+                if (!requireRecalculation)
+                {
+                    newPrice = crtSalesLine.get_Price();
+                    oldPrice = existingPricesExceptCurrentLine.lookup(lineId);
+                    requireRecalculation = (newPrice != oldPrice);
+                }
+
+                if (!requireRecalculation)
+                {
+                    oldDiscountCount = 0;
+                    inventTransId = lineId;
+                    clrDiscountLines = crtSalesLine.get_DiscountLines();
+                    newDiscountCount = clrDiscountLines.get_Count();
+                    while select discountLine
+                        where discountLine.InventTransId == inventTransId
+                    {
+                        oldDiscountCount++;
+
+                        crtDiscountLine = fineCrtDiscountLine(clrDiscountLines, discountLine.DiscountOriginType, discountLine.CustomerDiscountType, discountLine.ManualDiscountType, discountLine.PeriodicDiscountOfferId);
+                        requireRecalculation = (crtDiscountLine == null);
+
+                        if (!requireRecalculation)
+                        {
+                            discountAmount = crtDiscountLine.get_EffectiveAmount();
+                            requireRecalculation = (discountLine.Amount != discountAmount);
+                        }
+
+                        if (requireRecalculation)
+                        {
+                            break; // break while select discountLine
+                        }
+                    }
+
+                    if (!requireRecalculation)
+                    {
+                        requireRecalculation = (newDiscountCount != oldDiscountCount);
+                    }
+                }
+            }
+            else
+            {
+                periodicDiscount = crtSalesLine.get_PeriodicDiscount();
+                periodicDiscountPercentage = crtSalesLine.get_PeriodicPercentageDiscount();
+                lineManualDiscountAmount = crtSalesLine.get_LineManualDiscountAmount();
+                lineManualDiscountPercent = crtSalesLine.get_LineManualDiscountPercentage();
+                totalDiscount = crtSalesLine.get_TotalDiscount();
+                totalDiscountPercent = crtSalesLine.get_TotalPercentageDiscount();
+                lineDiscount = crtSalesLine.get_LineDiscount();
+                linePercentageDiscount = crtSalesLine.get_LinePercentageDiscount();
+                DiscAmount tenderDiscount = crtSalesLine.TenderDiscountAmount;
+                DiscPct tenderDiscountPercentage = crtSalesLine.get_TenderDiscountPercentage();
+
+                retailSalesLineLocal.clear();
+                retailSalesLineLocal.PeriodicDiscount = periodicDiscount;
+                retailSalesLineLocal.PeriodicPercentageDiscount = periodicDiscountPercentage;
+                retailSalesLineLocal.LineManualDiscountAmount = lineManualDiscountAmount;
+                retailSalesLineLocal.LineManualDiscountPercentage = lineManualDiscountPercent;
+                retailSalesLineLocal.TotalDiscount = totalDiscount;
+                retailSalesLineLocal.TotalPctDiscount = totalDiscountPercent;
+                retailSalesLineLocal.LineDscAmount = lineDiscount;
+                retailSalesLineLocal.LinePercentageDiscount = linePercentageDiscount;
+                retailSalesLineLocal.TenderDiscount = tenderDiscount;
+                retailSalesLineLocal.TenderDiscountPercentage = tenderDiscountPercentage;
+
+                result.parmRetailSalesQuotationLine(retailSalesLineLocal);
+
+                clrDiscountLines = crtSalesLine.get_DiscountLines();
+                enumeratorDiscountLine = clrDiscountLines.GetEnumerator();
+                while (enumeratorDiscountLine.MoveNext())
+                {
+                    crtDiscountLine = enumeratorDiscountLine.get_Current();
+                    this.initDiscountLineFromCrtDiscountLine(discountLine, crtDiscountLine);
+
+                    result.addRetailSalesDiscountLine(discountLine);
+                }
+
+                clrPriceLines = crtSalesLine.get_PriceLines();
+                enumeratorPriceLine = clrPriceLines.GetEnumerator();
+                // add all the price adjustment lines related to the sales line to the calculator result
+                while (enumeratorPriceLine.MoveNext())
+                {
+                    crtPriceLine = enumeratorPriceLine.get_Current();
+
+                    if (crtPriceLine is Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceAdjustmentPriceLine)
+                    {
+                        adjustmentLine = this.initRetailSalesPriceAdjustmentLineMap(adjustmentLine, currentSalesLine, crtPriceLine);
+                        result.addRetailSalesPriceAdjustmentLine(adjustmentLine);
+                    }
+                }
+            }
+        }
+
+        result.parmInventTransId(currentSalesLine.InventTransId);
+        result.parmNeedsRecalculateWholeOrder(requireRecalculation);
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeCrtTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize Crt transaction
+    /// </summary>
+    /// <returns>
+    /// Crt transaction.
+    /// </returns>
+    protected CrtSalesTransaction initializeCrtTransaction()
+    {
+        lineIdToInventTransIdMap = new Map(Types::String, Types::String);
+
+        CrtSalesTransaction crtSalesTransactionLocal;
+        utcDateTime sessionDateTime = DateTimeUtil::getSystemDateTime();
+        SalesParameters salesParameters = SalesParameters::find();
+        RetailParameters retailParameters = RetailParameters::find();
+
+        var currencyCode = currentSalesLine.CurrencyCode != '' ? currentSalesLine.CurrencyCode : salesTable.CurrencyCode;
+
+        this.initializeCrt(retailSalesTable.RetailChannel, salesTable.CustAccount, currencyCode, sessionDateTime);
+
+        crtSalesTransactionLocal = RetailPricingEngineHelper::getSalesTransactionFromOrderBasedOnDateType(
+            salesTable, currentSalesLine, lineIdToInventTransIdMap, dateType);
+        crtSalesTransactionLocal.set_IsTaxIncludedInPrice(priceIncludesTax);
+        crtSalesTransactionLocal.set_IsTaxExemptedForPriceInclusive(exemptTaxesForPriceInclusive);
+
+        return crtSalesTransactionLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(SalesId _salesId, SalesLine _currentSalesLine)
+    {
+        salesId = _salesId;
+        currentSalesLine = _currentSalesLine;
+        dateType = SalesParameters::find().PriceDateType;
+
+        currentRetailSalesLine = currentSalesLine.retailSalesLine();
+
+        currentInventTransId = currentSalesLine.InventTransId;
+
+        priceCalculated = false;
+        discountCalculated = false;
+
+        crtSalesTransaction = null;
+
+        if (RetailPricingCalcBulkInsertTempTableFlight::instance().isEnabled())
+        {
+            salesTable = SalesTable::find(salesId);
+            retailSalesTable = RetailSalesTable::findSalesTable(salesTable);
+        }
+        else
+        {
+            select firstonly salesTable
+                where salesTable.SalesId == salesId
+                join retailSalesTable
+                    where retailSalesTable.SalesTable == salesTable.RecId;
+        }
+
+        lineDisc = salesTable.LineDisc;
+        multilineDisc = salesTable.MultiLineDisc;
+        endDisc = salesTable.EndDisc;
+        salesOrderPriceGroup = salesTable.PriceGroupId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldCreateNewSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Whether new line should be created for given original line ID.
+    /// </summary>
+    /// <param name = "_originalLineId">Original line Id</param>
+    /// <returns>True if new line should be created; otherwise, false.</returns>
+    protected boolean shouldCreateNewSalesLine(str _originalLineId)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldProcessSalesLineWhenSavingSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether to process the given sales line when saving the sales order with updated pricing and discount.
+    /// </summary>
+    /// <param name = "_originalLineId">Original line ID.</param>
+    /// <returns>True if sales line of the given ID will be processed; false otherwise.</returns>
+    /// <remarks>Extensibility request 657490.</remarks>
+    protected boolean shouldProcessSalesLineWhenSavingSalesOrder(str _originalLineId)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveSalesOrder</Name>
+				<Source><![CDATA[
+    protected void saveSalesOrder()
+    {
+        CLRObject clrSalesLines, enumeratorSalesLine;
+        SalesLine salesLine; 
+
+        RecordInsertList discountRecordList   = new RecordInsertList(tableNum(RetailSalesDiscountLine));
+        RecordInsertList adjustmentRecordList = new RecordInsertList(tableNum(RetailSalesPriceAdjustmentLine));
+
+        if (!priceCalculated || !discountCalculated)
+        {
+            return;
+        }
+
+        clrSalesLines = crtSalesTransaction.get_SalesLines();
+        enumeratorSalesLine = clrSalesLines.GetEnumerator();
+        ttsBegin;
+        
+        // remove all discount and price history
+        this.deletePriceAndDiscountHistory();
+
+        while (enumeratorSalesLine.MoveNext())
+        {
+            CrtSalesLine crtSalesLine = enumeratorSalesLine.get_Current();
+            str originalLineId = crtSalesLine.get_OriginLineId();
+
+            if (!this.shouldProcessSalesLineWhenSavingSalesOrder(originalLineId))
+            {
+                // Extension causes the processing of sales line to be skipped.
+                eventSource.EventWritePricingExtensionTriggered(
+                    classStr(RetailSalesOrderCalculator),
+                    methodStr(RetailSalesOrderCalculator, shouldProcessSalesLineWhenSavingSalesOrder),
+                    newGuid(),
+                    '');
+                continue;
+            }
+
+            RetailSalesLine retailSalesLineLocal;
+
+            [salesLine, retailSalesLineLocal] = this.createOrUpdateSalesLineInternal(originalLineId, crtSalesLine, NoYes::Yes);
+
+            discountRecordList = this.createDiscountRecords(discountRecordList, crtSalesLine, salesLine);
+
+            if (!RetailPreservePriceHistoryFlight::instance().isEnabled() || this.shouldUpdatePriceHistoryForSalesLine(salesLine, retailSalesLineLocal))
+            {    
+                adjustmentRecordList = this.createPriceAdjustmentRecords(adjustmentRecordList, crtSalesLine, salesLine);
+            }
+        }
+
+        discountRecordList.insertDatabase();
+        adjustmentRecordList.insertDatabase();
+        this.updateSalesTable();
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createNewSalesLineFromOriginalSalesLine</Name>
+				<Source><![CDATA[
+    public SalesLine createNewSalesLineFromOriginalSalesLine(SalesLine _salesline, SalesLine _originalSalesLine, CrtSalesLine _crtSalesLine, boolean _searchMarkup)
+    {
+        // Copy delivery type and populate the related delivery fields.
+        _salesLine.DeliveryType = _originalSalesLine.DeliveryType;
+        _salesLine.SourcingVendAccount = _originalSalesLine.SourcingVendAccount;
+        _salesLine.SourcingOrigin = _originalSalesLine.SourcingOrigin;
+        _salesLine.SourcingCompanyId = _originalSalesLine.SourcingCompanyId;
+        _salesLine.SourcingInventSiteId = _originalSalesLine.SourcingInventSiteId;
+        _salesLine.SourcingInventLocationId = _originalSalesLine.SourcingInventLocationId;
+        _salesLine.MatchingAgreementLine = _crtSalesLine.get_SalesAgreementLineRecordId();
+        _salesLine.AgreementSkipAutoLink = _crtSalesLine.get_IsSalesAgreementSkipped();
+
+        _salesLine.createLine(  false,  //  validation
+                                false,  //  initFromSalesTable
+                                false,  //  _initFromItemOrCategory
+                                true,   //  calcInventQty
+                                _searchMarkup,   //  searchMarkup
+                                false,  //  searchPrice
+                                false,  //  checkReservation
+                                false,  //  skipCreditLimitCheck
+                                true,   //  ignoreSalesTableInventDim
+                                true);  //  setLineNum
+
+        retailPriceOverrideWorkflowHelper.autoActivateWorkflowForSalesLine(_salesLine, _originalSalesLine);
+
+        return _salesline;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRetailOrderLineMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes sales line buffer.
+    /// </summary>
+    /// <param name = "_originalSalesLine">Original sales line.</param>
+    /// <param name = "_crtSalesLine">CRT sales line.</param>
+    /// <returns>Sales line.</returns>
+    public RetailOrderLineMap initRetailOrderLineMap(RetailOrderLineMap _originalSalesLine, CrtSalesLine _crtSalesLine)
+    {
+        SalesLine salesLine;
+        salesLine.SalesId = salesTable.SalesId;
+        salesLine.initFromSalesTable(salesTable);
+        salesLine.initFromSalesLine(_originalSalesLine, true, true, true, _crtSalesLine.get_Quantity());
+
+        if (!RetailPricingKillSwitch::disableCopyOtherFieldsDuringLineSplit())
+        {
+            salesLine.ShippingDateRequested = _originalSalesLine.ShippingDateRequested;
+            salesLine.ReceiptDateRequested = _originalSalesLine.ReceiptDateRequested;
+
+            salesLine.CurrencyCode = _originalSalesLine.CurrencyCode;
+        }
+
+        salesLine.SalesPrice = _crtSalesLine.get_Price();
+        salesLine.LineDisc = this.getUnitDiscountAmount(_crtSalesLine);
+        salesLine.LineAmount = salesLine.calcLineAmountForced();
+        return salesLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePriceAndDiscountOnSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update price and discount on the sales line.
+    /// </summary>
+    /// <param name = "_salesLine">Sales line.</param>
+    /// <param name = "_crtSalesLine">CRT sales line.</param>
+    protected void updatePriceAndDiscountOnSalesLine(SalesLine _salesLine, CrtSalesLine _crtSalesLine)
+    {
+        Qty qty = _crtSalesLine.get_Quantity();
+        if (qty != _salesLine.SalesQty)
+        {
+            _salesLine.SalesQty = qty;
+            _salesLine.salesQtyModifiedInteraction(hasGUI());
+            InventMovement::bufferSetRemainQty(_salesLine);
+        }
+        _salesLine.SalesPrice = _crtSalesLine.get_Price();
+        _salesLine.LineDisc = this.getUnitDiscountAmount(_crtSalesLine);
+        _salesLine.LineAmount = _salesLine.calcLineAmountForced();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findSalesLineAndRelatedTables</Name>
+				<Source><![CDATA[
+    private static SalesLine findSalesLineAndRelatedTables(InventTransId _inventTransId)
+    {
+        SalesLine salesLine;
+        RetailSalesLine retailSalesLine;
+        MCRSalesLine mcrSalesLine;
+
+        select firstonly forupdate salesLine
+            where salesLine.InventTransId == _inventTransId
+        outer join retailSalesLine
+            where retailSalesLine.SalesLine == salesLine.RecId
+        outer join mcrSalesLine
+            where mcrSalesLine.SalesLine == salesLine.RecId;
+        
+        salesLine.SysExtensionSerializerMap::packExtensionTable(retailSalesLine);
+        salesLine.SysExtensionSerializerMap::packExtensionTable(mcrSalesLine);
+
+        return salesLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDiscountOnCurrentLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set discount on current line.
+    /// </summary>
+    public void setDiscountOnCurrentLine()
+    {
+        RetailSalesOrderCalculatorCache orderCalculatorCache =
+            RetailSalesOrderCalculatorCache::newCacheForDiscount(currentSalesLine);
+
+        if (orderCalculatorCache.shouldCalculatePriceDiscountForLine())
+        {
+            using(var t = RetailPricingTimedEventInstrumentation::construct(
+                classstr(RetailSalesOrderCalculator), methodStr(RetailSalesOrderCalculator, setDiscountOnCurrentLine)))
+            {
+                t.addExtendedData(RetailPricingInstrumentationSegmentConstants::TableName, tableStr(SalesTable));
+                t.addExtendedData(RetailPricingInstrumentationSegmentConstants::RecordId, int642Str(salesTable.RecId));
+                this.setEngineAndDataAccessorInfoInTelemetry(t.getExtendDataMap());
+
+                RetailParameters retailParameters = RetailParameters::find();
+                // When delayed calculation is enabled, only single line discount is calculated.
+                // InternalPriceContextHelper.MatchCalculationMode limits calculation of periodic discounts to simple discount.
+                // Discount.CalcCustomerDiscount limits calculation of trade agreement discounts to line.
+                boolean calculateSimpleDiscountOnly =
+                    retailParameters.EnableDelayedPriceAndDiscountCalculation == NoYes::Yes;
+                t.addExtendedData('calculateSimpleDiscountOnly', int2Str(calculateSimpleDiscountOnly));
+
+                currentSalesLine.LineDisc = this.getDiscountOnCurrentLineV2(calculateSimpleDiscountOnly);
+                RetailCouponHelper::UpdateCouponUsage(crtSalesTransaction, salesId);
+
+                // Update calculation result on RetailSalesTable.
+                ttsBegin;
+                retailSalesTable = RetailSalesTable::findSalesTable(salesTable, true);
+                retailSalesTable.TmpPriceDiscountData = this.getCalculationResult().pack();
+
+                // Requires later recalculation on the whole order when only simple discount is considered on the current line.
+                retailSalesTable.IsPriceAndDiscountRecalculationRequired = calculateSimpleDiscountOnly;
+
+                retailSalesTable.update();
+                ttsCommit;
+
+                // cache sales line
+                RetailSalesOrderCalculatorCache::addCalculatedDiscountLine(currentSalesLine);
+
+                t.parmIsSuccessful(true);
+                t.parmRowCount(lineCount);
+            }
+        }
+        else
+        {
+            currentSalesLine.LineDisc = orderCalculatorCache.getCachedSalesLine().LineDisc;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPriceOnCurrentLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set price on the current sales line.
+    /// </summary>
+    public void setPriceOnCurrentLine()
+    {
+        using(var t = RetailPricingTimedEventInstrumentation::construct(
+            classstr(RetailSalesOrderCalculator), methodStr(RetailSalesOrderCalculator, setPriceOnCurrentLine)))
+        {
+            t.addExtendedData(RetailPricingInstrumentationSegmentConstants::TableName, tableStr(SalesTable));
+            t.addExtendedData(RetailPricingInstrumentationSegmentConstants::RecordId, int642Str(salesTable.RecId));
+            this.setEngineAndDataAccessorInfoInTelemetry(t.getExtendDataMap());
+
+            var orderCalculatorCache = RetailSalesOrderCalculatorCache::newCacheForPrice(currentSalesLine);
+
+            if (orderCalculatorCache.shouldCalculatePriceDiscountForLine())
+            {
+                CLRObject clrSalesLines, enumeratorSalesLine;
+
+                // Initialize calculation result on RetailSalesTable.
+                ttsBegin;
+                retailSalesTable = RetailSalesTable::findSalesTable(salesTable, true);
+                if (retailSalesTable.TmpPriceDiscountData)
+                {
+                    retailSalesTable.TmpPriceDiscountData = conNull();
+                    retailSalesTable.update();
+                }
+                ttsCommit;
+
+                this.calculatePricesForOrder();
+
+                clrSalesLines = crtSalesTransaction.get_SalesLines();
+                enumeratorSalesLine = clrSalesLines.GetEnumerator();
+                while (enumeratorSalesLine.MoveNext())
+                {
+                    CrtSalesLine crtSalesLine = enumeratorSalesLine.get_Current();
+                    str lineId = crtSalesLine.get_LineId();
+
+                    if (lineId == crtLineIdCurrentLine)
+                    {
+                        this.setSalesPrice(crtSalesLine, currentSalesLine);
+
+                        this.setTaxExemptPriceInclusiveValues(crtSalesLine, currentRetailSalesLine);
+                        currentSalesLine.retailPackRetailSalesLine(currentRetailSalesLine);
+
+                        // set sales agreement.
+                        SalesLine salesLine = currentSalesLine;
+                        int64 newSalesAgreementLineRecId = crtSalesLine.get_SalesAgreementLineRecordId();
+
+                        if (salesLine.MatchingAgreementLine != newSalesAgreementLineRecId)
+                        {
+                            eventSource.EventWritePricingSalesAgreementLineUpdatedOnSalesLine(salesLine.RecId, salesLine.MatchingAgreementLine, newSalesAgreementLineRecId);
+                            salesLine.MatchingAgreementLine = crtSalesLine.get_SalesAgreementLineRecordId();
+                        }
+                    }
+                }
+                // cache sales line
+                RetailSalesOrderCalculatorCache::addCalculatedPriceLine(currentSalesLine);
+            }
+            else
+            {
+                currentSalesLine.SalesPrice = orderCalculatorCache.getCachedSalesLine().SalesPrice;
+            }
+
+            t.parmIsSuccessful(true);
+            t.parmRowCount(lineCount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPricesDiscountsOnOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set prices and discounts on the order.
+    /// </summary>
+    /// <param name="_totalManualDiscountPercent">
+    /// Total manual discount percent.
+    /// </param>
+    public void setPricesDiscountsOnOrder(DiscPct _totalManualDiscountPercent)
+    {
+        SalesLine salesLine;
+        System.Exception exception;
+
+        using(var t = RetailPricingTimedEventInstrumentation::construct(
+            classstr(RetailSalesOrderCalculator), methodStr(RetailSalesOrderCalculator, setPricesDiscountsOnOrder)))
+        {
+            t.addExtendedData(RetailPricingInstrumentationSegmentConstants::TableName, tableStr(SalesTable));
+            t.addExtendedData(RetailPricingInstrumentationSegmentConstants::RecordId, int642Str(salesTable.RecId));
+            this.setEngineAndDataAccessorInfoInTelemetry(t.getExtendDataMap());
+
+            try
+            {
+                select count(RecId) from salesLine
+                where salesLine.SalesId == salesId;
+
+                if (salesLine.RecId == 0)
+                {
+                    return;
+                }
+
+                this.calculatePricesForOrder();
+                crtSalesTransaction.set_TotalManualDiscountPercentage(_totalManualDiscountPercent);
+                this.calculateDiscountsForOrder();
+                RetailCouponHelper::UpdateCouponUsage(crtSalesTransaction, salesId);
+
+                this.saveSalesOrder();
+
+                if (RetailOrdersFeatureControl::isApplyRetailTenderDiscountToRetailOrdersFeatureEnabled())
+                {
+                    this.setTenderDiscountOnOrderForPayment();
+                }
+
+                if (RetailShippingDiscountFeature::existsConfiguration())
+                {
+                    RetailOrderCalculator shippingDiscountCalculator = RetailOrderCalculator::construct(salesTable.TableId, salesTable.SalesId);
+                    shippingDiscountCalculator.initializeCrtTransactionInstanceVariable();
+
+                    if (RetailPricingConsolidateShippingDiscountCalculationFlight::instance().isEnabled())
+                    {
+                        Map dlvModeIdDiscountMap = shippingDiscountCalculator.calculateShippingDiscountsBySalesLineDlvMode();
+                        shippingDiscountCalculator.applyShippingDiscountsByDlvModeToOrder(dlvModeIdDiscountMap, HeadingLine::Line, MarkupModuleType::Cust);
+                        shippingDiscountCalculator.applyShippingDiscountsByDlvModeToOrder(dlvModeIdDiscountMap, HeadingLine::Line, MarkupModuleType::Delivery);
+                    }
+                    else
+                    {
+                        shippingDiscountCalculator.calculateShippingDiscountsForOrder(HeadingLine::Line, MarkupModuleType::Cust);
+                        shippingDiscountCalculator.calculateShippingDiscountsForOrder(HeadingLine::Line, MarkupModuleType::Delivery);
+                    }
+                }
+
+                tmpOrderItemInitialized = false;
+
+                t.parmIsSuccessful(true);
+                t.parmRowCount(lineCount);
+            }
+            catch (Exception::CLRError)
+            {
+                exception = CLRInterop::getLastException();
+
+                if (exception != null)
+                {
+                    exception = exception.get_InnerException();
+
+                    if (exception != null)
+                    {
+                        warning(exception.ToString());
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRetailSalesDiscountLine</Name>
+				<Source><![CDATA[
+    protected RetailSalesDiscountLine initRetailSalesDiscountLine(
+        RetailSalesDiscountLine _discountLine, SalesLine _salesLine, CrtDiscountLine _crtDiscountLine)
+    {
+        return this.initRetailSalesQuotesDiscountLineMap(_discountLine, _salesLine, _crtDiscountLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>prepareTransactionForShippingDiscCalcOnOrder</Name>
+				<Source><![CDATA[
+    protected void prepareTransactionForShippingDiscCalcOnOrder(CLRObject _clrSalesLinesWithDlvMode)
+    {
+        CLRObject transactionSalesLine = crtSalesTransaction.get_SalesLines();
+        transactionSalesLine.clear();
+
+        CLRObject enumeratorSalesLine = _clrSalesLinesWithDlvMode.GetEnumerator();
+        while (enumeratorSalesLine.MoveNext())
+        {
+            CrtSalesLine crtSalesLine = enumeratorSalesLine.get_Current();
+            SalesLine salesLine = SalesLine::findInventTransId(crtSalesLine.get_LineId());
+
+            if (salesLine)
+            {
+                crtSalesLine.set_Price(crtSalesLine.get_Price() - salesLine.discAmount());
+            }
+
+            transactionSalesLine.add(crtSalesLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyShippingDiscountToOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Applies a discount pct to misc. charges to sales order shipping charges.
+    /// </summary>
+    /// <param name = "_dlvModeId">The delivery mode.</param>
+    /// <param name = "_discPct">The discount percentage.</param>
+    /// <param name = "_offerId">The shipping discount offer id.</param>
+    /// <param name = "_offerName">The shipping discount offer name.</param>
+    /// <param name = "_headingLine">Indicates if discount should be applied to header or line.</param>
+    /// <param name = "_moduleType">Charge module type.</param>
+    protected internal void applyShippingDiscountToOrder(
+        DlvModeId _dlvModeId,
+        DiscPct _discPct,
+        RetailOfferIdEx3 _offerId,
+        Name _offerName,
+        HeadingLine _headingLine,
+        MarkupModule _moduleType)
+    {
+        MarkupTrans markupTrans;
+        MarkupTable markupTable;
+
+        if (_headingLine == HeadingLine::Heading)
+        {
+            // Applies discount to header shipping charges
+            while select forupdate markupTrans
+                where markupTrans.ModuleCategory == _headingLine
+                    && markupTrans.ModuleType == _moduleType
+                    && markupTrans.TransTableId == salesTable.TableId
+                    && markupTrans.TransRecId == salesTable.RecId
+            exists join markupTable
+                where markupTable.MarkupCode == markupTrans.MarkupCode
+                    && markupTable.ModuleType == _moduleType
+                    && markupTable.IsShipping == true
+            {
+                markupTrans.RetailShippingPromotionDiscount = _discPct;
+                markupTrans.Txt += strFmt(' (%1:%2)' , _offerId, _offerName);
+                markupTrans.update();   
+            }
+
+            SalesLine salesLine;
+
+            if (!crtSalesTransaction || !RetailProrateShippingChargeWithDiscountFlight::instance().isEnabled())
+            {
+                while select forupdate markupTrans
+                    where markupTrans.ModuleCategory == _headingLine
+                        && markupTrans.ModuleType == _moduleType
+                    exists join salesLine
+                        where salesLine.TableId == markupTrans.TransTableId
+                            && salesLine.RecId == markupTrans.TransRecId
+                            && salesLine.SalesId == salesTable.SalesId
+                            && salesLine.DlvMode == _dlvModeId
+                    exists join markupTable
+                        where markupTable.MarkupCode == markupTrans.MarkupCode
+                            && markupTable.ModuleType == markupTrans.ModuleType
+                            && markupTable.IsShipping == true
+                {
+                    markupTrans.RetailShippingPromotionDiscount = _discPct;
+                    markupTrans.Txt += strFmt(' (%1:%2)' , _offerId, _offerName);
+                    markupTrans.update();
+                }
+            }
+            else
+            {
+                CLRObject clrSalesLines  = crtSalesTransaction.get_SalesLines();
+                CLRObject enumeratorSalesLine = clrSalesLines.GetEnumerator();
+
+                while (enumeratorSalesLine.MoveNext())
+                {
+                    Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine crtSalesLine = enumeratorSalesLine.get_Current();
+                    str lineId = crtSalesLine.get_OriginLineId();
+                    CLRObject crtDiscountLines = crtSalesLine.get_DiscountLines();
+                    CLRObject enumeratorDiscountline = crtDiscountLines.GetEnumerator();
+
+                    while (enumeratorDiscountline.MoveNext())
+                    {
+                        Microsoft.Dynamics.Commerce.Runtime.DataModel.DiscountLine discountLine = enumeratorDiscountline.get_Current();
+
+                        if (discountLine.DiscountLineTypeValue == enum2int(RetailDiscountOriginType::Periodic)
+                            && discountLine.PeriodicDiscountTypeValue == enum2int(RetailDiscountOfferTypeBase::Shipping)
+                            && discountLine.get_OfferId() == _offerId)
+                        {
+                            while select forupdate markupTrans
+                                where markupTrans.ModuleCategory == _headingLine
+                                   && markupTrans.ModuleType == _moduleType
+                                exists join salesLine
+                                    where salesLine.TableId == markupTrans.TransTableId
+                                       && salesLine.RecId == markupTrans.TransRecId
+                                       && salesLine.SalesId == salesTable.SalesId
+                                       && salesLine.DlvMode == _dlvModeId
+                                       && salesLine.InventTransId == lineId
+                                exists join markupTable
+                                    where markupTable.MarkupCode == markupTrans.MarkupCode
+                                       && markupTable.ModuleType == markupTrans.ModuleType
+                                       && markupTable.IsShipping == true
+                            {
+                                markupTrans.RetailShippingPromotionDiscount = _discPct;
+                                markupTrans.Txt += strFmt(' (%1:%2)' , _offerId, _offerName);
+                                markupTrans.update();
+                            }
+
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (_headingLine == HeadingLine::Line && currentSalesLine.DlvMode == _dlvModeId)
+        {
+            // Applies discount to lines shipping charges
+            SalesLine salesLine;
+            while select forupdate markupTrans
+                where markupTrans.ModuleCategory == _headingLine
+                    && markupTrans.ModuleType == _moduleType
+                    && markupTrans.TransTableId == currentSalesLine.TableId
+                    && markupTrans.TransRecId == currentSalesLine.RecId
+                exists join markupTable
+                    where markupTable.MarkupCode == markupTrans.MarkupCode
+                        && markupTable.ModuleType == _moduleType
+                        && markupTable.IsShipping == true
+            {
+                markupTrans.RetailShippingPromotionDiscount = _discPct;
+                markupTrans.Txt += strFmt(' (%1:%2)' , _offerId, _offerName);
+                markupTrans.update();
+            }
+        }
+        // Re-assign discounts for all shipment charges
+        else if (_headingLine == HeadingLine::Line && currentSalesLine.RecId == 0)
+        {
+            SalesLine salesLine;
+            while select forupdate markupTrans
+                where markupTrans.ModuleCategory == _headingLine
+                    && markupTrans.ModuleType == _moduleType
+                exists join salesLine
+                    where salesLine.TableId == markupTrans.TransTableId
+                        && salesLine.RecId == markupTrans.TransRecId
+                        && salesLine.SalesId == salesTable.SalesId
+                        && salesLine.DlvMode == _dlvModeId
+                exists join markupTable
+                    where markupTable.MarkupCode == markupTrans.MarkupCode
+                        && markupTable.ModuleType == markupTrans.ModuleType
+                        && markupTable.IsShipping == true
+            {
+                str offerTxt = strFmt(' (%1:%2)' , _offerId, _offerName);
+
+                // Re-assign discounts if changed
+                if (markupTrans.RetailShippingPromotionDiscount != _discPct
+                    || strScan(markupTrans.Txt, offerTxt, 1, strLen(markupTrans.Txt)) == 0)
+                {
+                    markupTrans.Txt = MarkupTable::find(markupTrans.ModuleType, markupTrans.MarkupCode).Txt;
+                    markupTrans.Txt += offerTxt;
+                    markupTrans.RetailShippingPromotionDiscount = _discPct;
+                    markupTrans.update();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeCrtTransactionInstanceVariable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize the channel retail table (CRT) instance variable.
+    /// </summary>
+    internal protected void initializeCrtTransactionInstanceVariable()
+    {
+        if (retailSalesTable.RetailChannel == 0)
+        {
+            crtSalesTransaction = null;
+        }
+        else
+        {
+            crtSalesTransaction = this.initializeCrtTransaction();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct a new instance of <c>RetailSalesOrderCalculator</c>.
+    /// </summary>
+    /// <param name="_salesId">
+    /// SalesId.
+    /// </param>
+    /// <param name="_currentSalesLine">
+    /// Current sales line.
+    /// </param>
+    /// <returns>
+    /// A new instance of <c>RetailSalesOrderCalculator</c>.
+    /// </returns>
+    /// <remarks>
+    /// Use <c>RetailOrderCalculator::construct()</c> instead.
+    /// This method does not use SysPlugin to do the instantiation of the object and does not take extensibility into consideration.
+    /// </remarks>
+    [SysObsolete('This method was replaced by RetailOrderCalculator::construct to enable extensibility scenarios.', false, 30\11\2017)]
+    public static RetailSalesOrderCalculator construct(SalesId _salesId, SalesLine _currentSalesLine = null)
+    {
+        return new RetailSalesOrderCalculator(_salesId, _currentSalesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct a new instance of the default/built-in <c>RetailSalesOrderCalculator</c>.
+    /// </summary>
+    /// <param name="_salesId">
+    /// SalesId.
+    /// </param>
+    /// <param name="_currentSalesLine">
+    /// Current sales line.
+    /// </param>
+    /// <returns>
+    /// A new instance of <c>RetailSalesOrderCalculator</c>.
+    /// </returns>
+    internal static RetailSalesOrderCalculator constructDefault(SalesId _salesId, SalesLine _currentSalesLine = null)
+    {
+        return new RetailSalesOrderCalculator(_salesId, _currentSalesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructDefaultWithDateType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a new instance of the default/built-in <c>RetailSalesOrderCalculator</c>.
+    /// </summary>
+    /// <param name="_salesId">
+    /// SalesId.
+    /// </param>
+    /// <param name="_currentSalesLine">
+    /// Current sales line.
+    /// </param>
+    /// <param name="_dateType">
+    /// Date type.
+    /// </param>
+    /// <returns>
+    /// A new instance of <c>RetailSalesOrderCalculator</c>.
+    /// </returns>
+    internal static RetailSalesOrderCalculator constructDefaultWithDateType(SalesId _salesId, SalesLine _currentSalesLine = null, SalesPriceDateType _dateType = SalesPriceDateType::Today)
+    {
+        RetailSalesOrderCalculator retailSalesOrderCalculator =  new RetailSalesOrderCalculator(_salesId, _currentSalesLine);
+        retailSalesOrderCalculator.setDateTypeOnOrder(_dateType);
+        return retailSalesOrderCalculator;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPricesDiscountsOnOrderOnServer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set prices and discounts on the order.
+    /// </summary>
+    /// <param name="_salesId">
+    /// SalesId.
+    /// </param>
+    /// <param name="_discPct">
+    /// Discount percentage.
+    /// </param>
+    public static void setPricesDiscountsOnOrderOnServer(SalesId _salesId, DiscPct _discPct)
+    {
+        RetailOrderCalculator retailCalculator = RetailOrderCalculator::construct(tableNum(SalesTable), _salesId);
+        retailCalculator.setPricesDiscountsOnOrder(_discPct);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPricesDiscountsAndDateTypeOnOrderOnServer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets prices and discounts on the order.
+    /// </summary>
+    /// <param name="_salesId">
+    /// SalesId.
+    /// </param>
+    /// <param name="_discPct">
+    /// Discount percentage.
+    /// </param>
+    /// <param name="_dateType">
+    /// Date type.
+    /// </param>
+    public static void setPricesDiscountsAndDateTypeOnOrderOnServer(SalesId _salesId, DiscPct _discPct, SalesPriceDateType _dateType = SalesPriceDateType::Today)
+    {
+        SalesLine emptySalesLine;
+        RetailOrderCalculator retailCalculator = RetailOrderCalculator::constructWithDateType(tableNum(SalesTable), _salesId, emptySalesLine, _dateType);
+        retailCalculator.setPricesDiscountsOnOrder(_discPct);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransactionId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get the Transaction Id.
+    /// </summary>
+    /// <returns>sales id as transaction id.</returns>
+    public TransactionID getTransactionId()
+    {
+        return salesId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTenderDiscountOnOrderForPayment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set tender discount for current sales order.
+    /// </summary>
+    public void setTenderDiscountOnOrderForPayment()
+    {
+        MCRCustPaymTable custPaymTable;
+        RecordSortedList recordSortedList = new RecordSortedList(tableNum(MCRCustPaymTable));
+        recordSortedList.sortOrder(fieldNum(MCRCustPaymTable, LineNum));
+
+        boolean hasTenderDiscount;
+        while select custPaymTable
+            order by LineNum asc
+            where custPaymTable.RefTableId == salesTable.TableId
+              && custPaymTable.RefRecId == salesTable.RecId
+              && custPaymTable.Status != MCRCustPaymStatus::Paid
+        {
+            recordSortedList.ins(custPaymTable);
+
+            if (RetailTenderDiscount::existsForTenderType(custPaymTable.TenderTypeId, custPaymTable.CardTypeId))
+            {
+                hasTenderDiscount = true;
+            }
+        }
+
+        if (hasTenderDiscount == false)
+        {
+            // Tender discount is configured, check if the order has tender discounts, don't recalculate if don't have tender discount lines 
+            RetailSalesDiscountLine retailSalesDiscountLine;
+            SalesLine salesLine;
+            select firstonly retailSalesDiscountLine
+                where retailSalesDiscountLine.DiscountOriginType == RetailDiscountOriginType::Tender
+                join salesLine
+                    where salesLine.InventTransId == retailSalesDiscountLine.InventTransId
+                    && salesLine.SalesId == salesTable.SalesId;
+
+            if (!retailSalesDiscountLine.RecId)
+            {
+                return;
+            }
+        }
+
+        if (crtSalesTransaction == null)
+        {
+            this.calculatePricesForOrder();
+        }
+
+        System.Collections.IList tenderLines = crtSalesTransaction.TenderLines;
+
+        boolean recordExists = recordSortedList.first(custPaymTable);
+        while (recordExists)
+        {
+            AmountCur paymentAmount = custPaymTable.Amount;
+
+            Microsoft.Dynamics.Commerce.Runtime.DataModel.TenderLine tenderLine = new Microsoft.Dynamics.Commerce.Runtime.DataModel.TenderLine();
+            tenderLine.AmountInCompanyCurrency = paymentAmount;
+            tenderLine.CardTypeId = custPaymTable.CardTypeId;
+            tenderLine.TenderTypeId = custPaymTable.TenderTypeId;
+            tenderLines.Add(tenderLine);
+
+            recordExists = recordSortedList.next(custPaymTable);
+        }
+
+        this.calculateDiscountsForOrder();
+        this.saveSalesOrder();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEstimateTenderDiscount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the estimated tender discount for given given tender type.
+    /// </summary>
+    /// <param name = "_tenderType">The tender type to calculate discounts.</param>
+    /// <param name = "_cardType">The card type to calculate discounts.</param>
+    /// <param name = "_paymentAmount">The amount to be used as basis of dicount calculation.</param>
+    /// <returns>The <c>RetailTenderDiscountLine</c> with estimated payment amount and discount</returns>
+    public RetailTenderDiscountLine getEstimateTenderDiscount(MCRRetailStoreTenderTypeId _tenderType, RetailStoreCardTypeId _cardType, Amountcur _paymentAmount)
+    {
+        this.calculatePricesForOrder();
+
+        Microsoft.Dynamics.Commerce.Runtime.DataModel.TenderLine tenderLine = new Microsoft.Dynamics.Commerce.Runtime.DataModel.TenderLine();
+        tenderLine.AmountInCompanyCurrency = _paymentAmount;
+        tenderLine.CardTypeId = _cardType;
+        tenderLine.TenderTypeId = _tenderType;
+
+        System.Collections.IList list = crtSalesTransaction.TenderLines;
+        list.Add(tenderLine);
+
+        MCRCustPaymTable custPaymTable;
+        RecordSortedList recordSortedList = new RecordSortedList(tableNum(MCRCustPaymTable));
+        recordSortedList.sortOrder(fieldNum(MCRCustPaymTable, LineNum));
+
+        boolean hasTenderDiscount;
+        while select custPaymTable
+            order by LineNum asc
+            where custPaymTable.RefTableId == salesTable.TableId
+              && custPaymTable.RefRecId == salesTable.RecId
+              && custPaymTable.Status != MCRCustPaymStatus::Paid
+        {
+            tenderLine = new Microsoft.Dynamics.Commerce.Runtime.DataModel.TenderLine();
+            tenderLine.AmountInCompanyCurrency = custPaymTable.Amount;
+            tenderLine.CardTypeId = custPaymTable.CardTypeId;
+            tenderLine.TenderTypeId = custPaymTable.TenderTypeId;
+            list.Add(tenderLine);
+        }
+
+        this.calculateDiscountsForOrder();
+
+        CLRObject clrSalesLines, enumeratorSalesLine;
+        clrSalesLines = crtSalesTransaction.get_SalesLines();
+        enumeratorSalesLine = clrSalesLines.GetEnumerator();
+
+        AmountCur totalTenderDiscountAmount;
+        while (enumeratorSalesLine.MoveNext())
+        {
+            CrtSalesLine crtSalesLine = enumeratorSalesLine.get_Current();
+            totalTenderDiscountAmount += crtSalesLine.get_TenderDiscountAmount();
+        }
+
+        RetailPricingTotalling totals = new RetailPricingTotalling(salesTable);
+
+        var tenderDiscountLine = new RetailTenderDiscountLine();
+
+        tenderDiscountLine.DiscountAmount = totalTenderDiscountAmount;
+        tenderDiscountLine.PaymentAmount = RetailPricingTotalling::CalculateTransactionAmountDue(salesTable, crtSalesTransaction);
+
+        return tenderDiscountLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRetailPricingTotalling</Name>
+				<Source><![CDATA[
+    protected RetailPricingTotalling initRetailPricingTotalling()
+    {
+        return new RetailPricingTotalling(salesTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDiscountLineFromCrtDiscountLine</Name>
+				<Source><![CDATA[
+    protected void initDiscountLineFromCrtDiscountLine(
+        RetailSalesDiscountLine _discountLine, CrtDiscountLine _crtDiscountLine)
+    {
+        _discountLine.clear();
+        _discountLine.Amount = _crtDiscountLine.get_EffectiveAmount();
+        _discountLine.CustomerDiscountType = _crtDiscountLine.get_CustomerDiscountTypeValue();
+        // unit amount is the offer discount amount.
+        _discountLine.DiscountAmount = _crtDiscountLine.get_Amount();
+        _discountLine.DiscountOriginType = _crtDiscountLine.get_DiscountLineTypeValue();
+        _discountLine.ManualDiscountType = _crtDiscountLine.get_ManualDiscountTypeValue();
+        _discountLine.PeriodicDiscountOfferId = _crtDiscountLine.get_OfferId();
+        // percentage is the offer discount percentage.
+        _discountLine.Percentage = _crtDiscountLine.get_Percentage();
+        _discountLine.DealPrice = _crtDiscountLine.get_DealPrice();
+        _discountLine.BundleId = _crtDiscountLine.BundleId;
+        _discountLine.DiscountCode = _crtDiscountLine.get_DiscountCode();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isInterCompanySalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks whether current sales line is intercompany.
+    /// </summary>
+    /// <param name = "_salesLine">Salesline buffer.</param>
+    /// <returns>True if the salesline is intercompany; false if not.</returns>
+    /// <remarks>
+    /// Refer to /Forms/SalesTable/Controls/ButtonInterCompanySalesTable/Methods/clicked.
+    /// </remarks>
+    private boolean isInterCompanySalesLine(SalesLine _salesLine)
+    {
+        return _salesLine.SourcingOrigin == SalesSourcingOrigin::Intercompany
+            || _salesLine.salesTable().isInterCompanyOrder();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeAllDiscountLines</Name>
+				<Source><![CDATA[
+    protected void removeAllDiscountLines()
+    {
+        RetailSalesDiscountLine discountLine;
+        SalesLine               salesLine;
+
+        delete_from discountLine
+            exists join salesLine
+                where discountLine.InventTransId == salesLine.InventTransId
+                    && salesLine.SalesId == salesTable.SalesId;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDateTypeOnOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets date type on the order.
+    /// </summary>
+    /// <param name="_dateType">
+    /// Date type.
+    /// </param>
+    internal void setDateTypeOnOrder(SalesPriceDateType _dateType)
+    {
+        dateType = _dateType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createOrUpdateSalesLine</Name>
+				<Source><![CDATA[
+    [Hookable(false), Wrappable(false)]
+    protected container createOrUpdateSalesLine(
+        str _originalLineId, CrtSalesLine _crtSalesLine)
+    {
+        return this.createOrUpdateSalesLineInternal(_originalLineId, _crtSalesLine, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldUpdateSalesLine</Name>
+				<Source><![CDATA[
+    protected boolean shouldUpdateSalesLine(SalesLine _salesLine, CrtSalesLine _crtSalesLine)
+    {
+        return _salesLine.SalesPrice != _crtSalesLine.get_Price()
+            || _salesLine.LineDisc != this.getUnitDiscountAmount(_crtSalesLine)
+            || _salesLine.SalesQty != _crtSalesLine.get_Quantity();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isFullUpdateSalesLineRequired</Name>
+				<Source><![CDATA[
+    protected boolean isFullUpdateSalesLineRequired(SalesLine _salesLine, CrtSalesLine _crtSalesLine)
+    {
+        return _crtSalesLine.get_Quantity() != _salesLine.SalesQty
+            || RetailPricingKillSwitch::alwaysCallSalesLineUpdateInOrderCalculator()
+            || this.isInterCompanySalesLine(_salesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createOrUpdateSalesLineInternal</Name>
+				<Source><![CDATA[
+    [Hookable(false), Wrappable(false)]
+    protected container createOrUpdateSalesLineInternal(
+        str _originalLineId, CrtSalesLine _crtSalesLine, NoYes _skipPriceRecalculation)
+    {
+        SalesLine salesLine;
+        RetailSalesLine retailSalesLineLocal;
+        boolean searchMarkup = RetailRecalculateChargesForAutoCreatedLinesFromPricingEngineToggle::instance().isEnabled();
+
+        str lineId = _crtSalesLine.get_LineId();
+        salesLine.clear();
+        if (_originalLineId && _originalLineId != lineId)
+        {
+            if (this.shouldCreateNewSalesLine(_originalLineId))
+            {
+                SalesLine originalSalesLine = this.findSalesLineAndRelatedTable(_originalLineId);
+                salesLine = this.initRetailOrderLineMap(originalSalesLine, _crtSalesLine);
+
+                salesLine = this.createNewSalesLineFromOriginalSalesLine(salesLine, originalSalesLine, _crtSalesLine, searchMarkup);
+
+                RetailSalesLine originalRetailSalesLine = originalSalesLine.retailSalesLine();
+
+                retailSalesLineLocal = salesLine.retailSalesLine();
+                retailSalesLineLocal.selectForUpdate(true);
+                retailSalesLineLocal.LineManualDiscountPercentage = originalRetailSalesLine.LineManualDiscountPercentage;
+            }
+            else
+            {
+                // Extension causes the create line to be skipped.
+                eventSource.EventWritePricingExtensionTriggered(
+                        classStr(RetailSalesOrderCalculator),
+                        methodStr(RetailSalesOrderCalculator, shouldCreateNewSalesLine),
+                        newGuid(),
+                        '');
+            }
+        }
+        else
+        {
+            salesLine = this.findSalesLineAndRelatedTable(_crtSalesLine.get_LineId());
+
+            Qty qty = _crtSalesLine.get_Quantity();
+            Price price = _crtSalesLine.get_Price();
+            RetailDiscAmount unitDiscountAmount = this.getUnitDiscountAmount(_crtSalesLine);
+
+            salesLine.MatchingAgreementLine = _crtSalesLine.get_SalesAgreementLineRecordId();
+            salesLine.AgreementSkipAutoLink = _crtSalesLine.get_IsSalesAgreementSkipped();
+            salesLine.SkipPriceDiscCalcInBulkCreation = _skipPriceRecalculation;
+
+            // skip sales line update if price or discount didn't change
+            if (this.shouldUpdateSalesLine(salesLine, _crtSalesLine))
+            {
+                boolean fullUpdateRequired = this.isFullUpdateSalesLineRequired(salesLine, _crtSalesLine);
+
+                this.updatePriceAndDiscountOnSalesLine(salesLine, _crtSalesLine);
+
+                if (fullUpdateRequired)
+                {
+                    salesLine.update();
+                }
+                else
+                {
+                    salesLine.doUpdate();
+                }
+
+                retailSalesLineLocal = salesLine.retailSalesLine();
+                retailSalesLineLocal.selectForUpdate(true);
+            }
+        }
+
+        if (retailSalesLineLocal)
+        {
+            retailSalesLineLocal = this.initRetailSalesPurchLineMap(retailSalesLineLocal, salesLine, _crtSalesLine);
+            retailSalesLineLocal.TenderDiscount = _crtSalesLine.TenderDiscountAmount;
+            retailSalesLineLocal.TenderDiscountPercentage = _crtSalesLine.TenderDiscountPercentage;
+            retailSalesLineLocal.write();
+        }
+
+        return [salesLine, retailSalesLineLocal];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findSalesLineAndRelatedTable</Name>
+				<Source><![CDATA[
+    protected SalesLine findSalesLineAndRelatedTable(InventTransId _inventTransId)
+    {
+        return RetailSalesOrderCalculator::findSalesLineAndRelatedTables(_inventTransId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deletePriceAndDiscountHistory</Name>
+				<Source><![CDATA[
+    [Hookable(false), Wrappable(false)]
+    protected void deletePriceAndDiscountHistory()
+    {
+        // remove all the discount lines related to the sales transaction
+        this.removeAllDiscountLines();
+
+        // remove all the price adjustment lines related to the sales transaction
+        this.removePriceAdjustmentHistory();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createDiscountRecords</Name>
+				<Source><![CDATA[
+    [Hookable(false), Wrappable(false)]
+    protected RecordInsertList createDiscountRecords(
+        RecordInsertList _discountRecordList,
+        CrtSalesLine _crtSalesLine,
+        SalesLine _salesLine)
+    {
+        RetailSalesDiscountLine discountLine;
+
+        CLRObject clrDiscountLines = _crtSalesLine.get_DiscountLines();
+        CLRObject enumeratorDiscountLine = clrDiscountLines.GetEnumerator();
+        // add discount lines related to the sales line to the discountRecordList
+        while (enumeratorDiscountLine.MoveNext())
+        {
+            CrtDiscountLine crtDiscountLine = enumeratorDiscountLine.get_Current();
+            discountLine = this.initRetailSalesDiscountLine(discountLine, _salesLine, crtDiscountLine);
+            _discountRecordList.add(discountLine);
+        }
+
+        return _discountRecordList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPriceAdjustmentRecords</Name>
+				<Source><![CDATA[
+    [Hookable(false), Wrappable(false)]
+    protected RecordInsertList createPriceAdjustmentRecords(
+        RecordInsertList _adjustmentRecordList,
+        CrtSalesLine _crtSalesLine,
+        SalesLine _salesLine)
+    {
+        CLRObject clrPriceLines = _crtSalesLine.get_PriceLines();
+        CLRObject enumeratorPriceLine = clrPriceLines.GetEnumerator();
+        RetailSalesPriceAdjustmentLine adjustmentLine;
+
+        // add price adjustment lines related to the sales line to the adjustmentRecordList
+        while (enumeratorPriceLine.MoveNext())
+        {
+            Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceLine crtPriceLine = enumeratorPriceLine.get_Current();
+                
+            if(crtPriceLine is Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceAdjustmentPriceLine)
+            {
+                adjustmentLine = this.initRetailSalesPriceAdjustmentLineMap(adjustmentLine, _salesLine, crtPriceLine);
+                _adjustmentRecordList.add(adjustmentLine);
+            }
+        }
+
+        return _adjustmentRecordList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesTable</Name>
+				<Source><![CDATA[
+    [Hookable(false), Wrappable(false)]
+    protected void updateSalesTable()
+    {
+        retailSalesTable = RetailSalesTable::findSalesTable(salesTable, true);
+
+        if (retailSalesTable)
+        {
+            if (retailSalesTable.TmpPriceDiscountData || retailSalesTable.TotalManualDiscountAmount)
+            {
+                retailSalesTable.TmpPriceDiscountData = conNull();
+
+                // User can update total manual discount percentage in AX.
+                Percent totalManualDiscountPercent = crtSalesTransaction.get_TotalManualDiscountPercentage();
+                if (totalManualDiscountPercent)
+                {
+                    retailSalesTable.TotalManualDiscountAmount = 0;
+                }
+            }
+            retailSalesTable.IsPriceAndDiscountRecalculationRequired = NoYes::No;
+
+            retailSalesTable.update();
+        }
+
+        RecId newSalesAgreementRecordId = crtSalesTransaction.get_SalesAgreementRecordId();
+
+        if (salesTable.MatchingAgreement != newSalesAgreementRecordId)
+        {
+            eventSource.EventWritePricingSalesAgreementUpdatedOnSalesTable(salesTable.RecId, salesTable.MatchingAgreement, newSalesAgreementRecordId);
+
+            salesTable.MatchingAgreement = newSalesAgreementRecordId;
+            salesTable.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removePriceAdjustmentHistory</Name>
+				<Source><![CDATA[
+    private void removePriceAdjustmentHistory()
+    {
+        RetailSalesPriceAdjustmentLine adjustmentLine;
+        SalesLine salesLine;
+
+        // remove all the price adjustment lines related to the sales transaction
+        if (RetailPreservePriceHistoryFlight::instance().isEnabled())
+        {
+            RetailSalesLine retailSalesLine;
+
+            delete_from adjustmentLine
+                exists join salesLine
+                    where adjustmentLine.InventTransId == salesLine.InventTransId
+                        && salesLine.SalesId == salesTable.SalesId
+                        && salesLine.InventTransId != ''
+                        && salesLine.InventTransIdReturn == ''
+                        && salesLine.SalesStatus != SalesStatus::Invoiced
+                        && salesLine.SalesStatus != SalesStatus::Canceled
+                exists join retailSalesLine
+                    where salesLine.RecId == retailSalesLine.SalesLine
+                        && retailSalesLine.IsPriceLocked == NoYes::No
+                        && retailSalesLine.FulfillmentStatus != RetailFulfillmentLineStatus::PartiallyInvoiced;
+        }
+        else
+        {
+            delete_from adjustmentLine
+                exists join salesLine
+                    where adjustmentLine.InventTransId == salesLine.InventTransId
+                        && salesLine.SalesId == salesTable.SalesId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldUpdatePriceHistoryForSalesLine</Name>
+				<Source><![CDATA[
+    protected boolean shouldUpdatePriceHistoryForSalesLine(SalesLine _salesLine, retailSalesLine _retailSalesLine)
+    {
+        if (_retailSalesLine.RecId == 0)
+        {
+            _retailSalesLine = _salesLine.retailSalesLine();
+        }
+
+        if (_salesLine.InventTransId == ''
+            || _salesLine.SalesStatus == SalesStatus::Invoiced
+            || _salesLine.SalesStatus == SalesStatus::Canceled
+            || _retailSalesLine.isPriceLocked == NoYes::Yes
+            || _retailSalesLine.FulfillmentStatus == RetailFulfillmentLineStatus::PartiallyInvoiced
+            || _salesLine.InventTransIdReturn)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

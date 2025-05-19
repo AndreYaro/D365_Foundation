@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>MCRRefundCheckBatch</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// The class <c>MCRRefundCheckBatch</c> contorls
+/// printing and posting of refund checks.
+/// </summary>
+class MCRRefundCheckBatch
+{
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>postCheckBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Posts a payment journal based on a journal number field.
+    /// </summary>
+    /// <param name="_trcTransBatchTable">
+    ///     A record in the <c>MCRRCTransBatchTable</c> table.
+    /// </param>
+    /// <exception cref="Exception::Warning">
+    ///     The check batch could not be posted because of transactions that were not sent.
+    /// </exception>
+    /// <remarks>
+    ///     This method will post a payment journal based on the journal number
+    ///     field in the <c>MCRRCTransBatchTable</c> table record.
+    /// </remarks>
+    public static void postCheckBatch(MCRRCTransBatchTable _trcTransBatchTable)
+    {
+        LedgerJournalTable      ledgerJournalTable;
+        LedgerJournalCheckPost  ledgerJournalCheckPost;
+        LedgerJournalTrans      ledgerJournalTrans;
+        MCRRCSettlementTable    mcrrcSettlementTable;
+        MCRCustPaymTotals       mcrCustPaymTotals;
+        SalesTable              salesTable;
+        MCRCustPaymTable        mcrCustPaymTable;
+
+        // Verify all trans records are at a sent status meaning the checks have been printed.
+        select firstonly RecId from ledgerJournalTrans
+            where ledgerJournalTrans.JournalNum     == _trcTransBatchTable.LedgerJournalId
+               && ledgerJournalTrans.PaymentStatus  != CustVendPaymStatus::Sent;
+
+        // If all checks have not been printed throw a warning.
+        if (ledgerJournalTrans)
+        {
+            throw warning("@MCR23736");
+        }
+
+        ttsBegin;
+        ledgerJournalTable      = LedgerJournalTable::find(_trcTransBatchTable.LedgerJournalId, true);
+
+        // Update ledgerJournalTrans with financial dimension information
+        select firstonly mcrrcSettlementTable
+            where mcrrcSettlementTable.MCRRCTRANSBATCHID == _trcTransBatchTable.MCRRCTransBatchID;
+            
+        salesTable = SalesTable::find(mcrrcSettlementTable.SalesId);
+
+        update_recordset ledgerJournalTrans
+            setting DefaultDimension = salesTable.DefaultDimension
+            where ledgerJournalTrans.JournalNum == _trcTransBatchTable.LedgerJournalId;
+
+        ledgerJournalCheckPost  = LedgerJournalCheckPost::newLedgerJournalTable(ledgerJournalTable, NoYes::Yes, NoYes::No);
+        // Hide messages and the progress bar.
+
+        ledgerJournalCheckPost.parmBeQuiet(true);
+        LedgerJournalCheckPost::processOperation(ledgerJournalCheckPost);
+
+        // Handle a currency conversion.
+        ledgerJournalTable =
+            LedgerJournalTable::find(ledgerJournalTable.JournalNum, true);
+
+        [ledgerJournalTable.JournalTotalDebit,
+             ledgerJournalTable.JournalTotalCredit,
+             ledgerJournalTable.JournalTotalOffsetBalance] = LedgerJournalTable::journalBalanceMST(ledgerJournalTable.JournalNum);
+        // validateWrite stops all updates after journal is posted, in order to correct
+        //  for currency conversions amount fields need to be updated after posting.
+        ledgerJournalTable.update();
+
+        // If the batch is posted and all settlement records are at a successful status then
+        // update the batch as closed.
+        if (ledgerJournalTable.Posted)
+        {
+            select firstonly mcrrcSettlementTable
+                where mcrrcSettlementTable.MCRrcTransBatchID        == _trcTransBatchTable.MCRrcTransBatchID
+                   && mcrrcSettlementTable.MCRrcSettlementStatus    != MCRRCSettlementStatus::Successful;
+
+            if (!mcrrcSettlementTable)
+            {
+                if (!_trcTransBatchTable.selectForUpdate())
+                {
+                    _trcTransBatchTable.selectForUpdate(true);
+                    _trcTransBatchTable.reread();
+                }
+
+                _trcTransBatchTable.MCRrcTransBatchStatus = MCRRCTransBatchStatus::Closed;
+                if (_trcTransBatchTable.validateWrite())
+                {
+                    _trcTransBatchTable.update();
+                }
+                else
+                {
+                    throw error("@SYS104318");
+                }
+            }
+
+            // Settle the payment records if the batch has been posted
+            while select mcrrcTransBatchID, SalesId, mcrCustPaymTableRecID, mcrSettlementAmount
+                from    mcrrcSettlementTable
+                where   mcrrcSettlementTable.MCRrcTransBatchID  == _trcTransBatchTable.MCRrcTransBatchID
+                join    SalesId, TableId, RecId
+                from    salesTable
+                where   mcrrcSettlementTable.SalesId            == salesTable.SalesId
+            {
+                mcrCustPaymTotals   = MCRCustPaymTotals::construct(salesTable.TableId, salesTable.RecId);
+                mcrCustPaymTotals.settlePayments();
+
+                mcrCustPaymTable    = MCRCustPaymTable::findByRecID(mcrrcSettlementTable.MCRCustPaymTableRecID, true);
+
+                eventSource.EventWriteMCRCustPaymSettleCustPayments(funcName(),
+                    tableStr(mcrCustPaymTable),
+                    mcrCustPaymTable.RecId,
+                    enum2Str(mcrCustPaymTable.Status),
+                    enum2Str(ledgerJournalTable.Posted),
+                    'Payment record settlement started');
+
+                ttsbegin;
+                mcrCustPaymTable.Status = MCRCustPaymStatus::Paid;
+                mcrCustPaymTable.update();
+                mcrCustPaymTable.updatePostedAmount(-mcrrcSettlementTable.MCRSettlementAmount);
+                ttscommit;
+
+                eventSource.EventWriteMCRCustPaymSettleCustPayments(funcName(),
+                    tableStr(mcrCustPaymTable),
+                    mcrCustPaymTable.RecId,
+                    enum2Str(mcrCustPaymTable.Status),
+                    enum2Str(ledgerJournalTable.Posted),
+                    'Payment record settlement ended');
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>printCheckBatchToSelectedPrinter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Prints all refund checks for the associated batch passed in with the option for selecting a printer.
+    /// </summary>
+    /// <param name="_trcTransBatchTable">
+    ///     A record in the <c>MCRRCTransBatchTable</c> table.
+    /// </param>
+    /// <param name="_allowUserInteractive">
+    ///     A boolean indicate if user is allowed to interactive on printing, by default set to NO.
+    /// </param>
+    public static void printCheckBatchToSelectedPrinter(MCRRCTransBatchTable _trcTransBatchTable,
+                                       UserInteractive _allowUserInteractive = UserInteractive::No)
+    {
+        CustPaymModeTable       custPaymModeTable;
+        CustSumForPaym          custSumForPaym;
+        LedgerJournalTrans      ledgerJournalTrans;
+        MCRRCSettlementTable    mcrrcSettlementTable;
+        PaymMode                paymMode;
+        boolean                 checkBatchCanceled;
+
+        select firstonly forupdate ledgerJournalTrans
+            where ledgerJournalTrans.JournalNum == _trcTransBatchTable.LedgerJournalId;
+
+        custSumForPaym = CustVendSumForPaym::newLedgerJournalTrans(ledgerJournalTrans);
+
+        if (custSumForPaym)
+        {
+            Args args = new Args();
+            args.parmEnumType(enumNum(UserInteractive));
+            args.parmEnum(_allowUserInteractive);
+
+            paymMode = ledgerJournalTrans.PaymMode;
+
+            custPaymModeTable = CustPaymModeTable::find(paymMode);
+            custSumForPaym.parmArgs(args);
+            custSumForPaym.parmPaymMode(paymMode);
+            custSumForPaym.parmBankAccountID(custPaymModeTable.parmPaymAccount());
+            custSumForPaym.parmLedgerJournalId(_trcTransBatchTable.LedgerJournalId);
+            custSumForPaym.MCRIncludeApproved();
+            custSumForPaym.runOperation();
+
+            // Check if the user canceled the check printing & if so, don't attempt to print
+            // checks for other refund check payment methods.
+            checkBatchCanceled = custSumForPaym.parmMCRUserCanceledPrint();
+            // If any other refund check payment modes exist in the batch that are different
+            // from the one set up in the AR parameters for returns, process those refund checks
+            // now.  For example, 2 refund check payment modes may exist RC1 & RC2 and the system
+            // could be setup so that returns uses RC1 and SO cancellation uses RC2.  This loop
+            // will catch RC2 checks and print them without re-prompting the user for print
+            // mediums, # of blank checks, etc.
+            while select PaymMode from ledgerJournalTrans
+                group by PaymMode
+                where ledgerJournalTrans.JournalNum == _trcTransBatchTable.LedgerJournalId
+                    && ledgerJournalTrans.PaymMode != paymMode
+                    && !checkBatchCanceled
+
+            {
+                custSumForPaym.parmPaymMode(ledgerJournalTrans.PaymMode);
+                custPaymModeTable = CustPaymModeTable::find(custSumForPaym.parmPaymMode());
+                custSumForPaym.parmBankAccountID(custPaymModeTable.parmPaymAccount());
+                custSumForPaym.parmLedgerJournalId(_trcTransBatchTable.LedgerJournalId);
+
+                custSumForPaym.runOperation();
+            }
+        }
+
+        eventSource.EventWriteMCRCustPaymUpdateSettlementStatus(funcName(),
+            _trcTransBatchTable.MCRRCTransBatchID,
+            _trcTransBatchTable.LedgerJournalId,
+            'Update settlement lines status started.');
+
+        ttsBegin;
+
+        // Update the status on the settlement lines for the ones that correspond to
+        // a LedgerJournalTrans record that has been sent.
+
+        update_recordset mcrrcSettlementTable
+            setting MCRrcSettlementStatus   = MCRRCSettlementStatus::Successful,
+                    MCRSettlementDateTime   = DateTimeUtil::getSystemDateTime()
+            where mcrrcSettlementTable.MCRrcTransBatchID        == _trcTransBatchTable.MCRrcTransBatchID
+               && mcrrcSettlementTable.MCRrcSettlementStatus    != MCRRCSettlementStatus::Successful
+            join  ledgerJournalTrans
+            where mcrrcSettlementTable.LedgerJournalTransRecId  == ledgerJournalTrans.RecId
+               && ledgerJournalTrans.PaymentStatus              == CustVendPaymStatus::Sent;
+        ttsCommit;
+
+        eventSource.EventWriteMCRCustPaymUpdateSettlementStatus(funcName(),
+            _trcTransBatchTable.MCRRCTransBatchID,
+            _trcTransBatchTable.LedgerJournalId,
+            'Update settlement lines status ended.');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCheckBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes the check batch.
+    /// </summary>
+    /// <param name="_trcTransBatchTable">
+    /// The <c>MCRRCTransBatchTable</c> record to be processed.
+    /// </param>
+    public static void processCheckBatch(MCRRCTransBatchTable _trcTransBatchTable)
+    {
+        MCRRefundCheckBatch::printCheckBatchToSelectedPrinter(_trcTransBatchTable);
+        MCRRefundCheckBatch::postCheckBatch(_trcTransBatchTable);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqPurchaseRequisitionsDemandGenerator</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     The <c>ReqPurchaseRequisitionsDemandGenerator</c> class generates ReqTrans records corresponding to purchase requisition lines.
+/// </summary>
+internal class ReqPurchaseRequisitionsDemandGenerator
+{   
+    private RecordInsertList                            reqTransInsertList;
+    private ReqCalc                                     reqCalc;
+    private ReqPlanData                                 reqPlanData;
+    private ReqPurchaseRequisitionsDemandGeneratorCache generatorCache;
+    private ReqRequisitionsHelper                       requisitionsHelper;
+
+    private boolean                                     timeFenceCoverageFixed;
+    private boolean                                     timeFenceRequisitionsFixed;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>newStandard</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instantiates an instance of the <c>ReqPurchaseRequisitionsDemandGenerator</c> class.
+    /// </summary>
+    /// <param name = "_reqCalc">An instance of <c>ReqCalc</c> to able to access its functionalities.</param>
+    /// <param name = "_reqPlanData">And instance of <c>ReqPlanData</c> contains data for the current master planning run.</param>
+    /// <returns>An instance of <c>ReqPurchaseRequisitionsDemandGenerator</c>.</returns>
+    [Hookable(false)]
+    internal static ReqPurchaseRequisitionsDemandGenerator newStandard(ReqCalc _reqCalc, ReqPlanData _reqPlanData)
+    {
+        ReqPurchaseRequisitionsDemandGenerator instance = new ReqPurchaseRequisitionsDemandGenerator();
+
+        instance.reqCalc                     = _reqCalc;
+        instance.reqPlanData                 = _reqPlanData;
+
+        instance.timeFenceRequisitionsFixed  = _reqCalc.isTimeFenceBackRequisitionFixed();
+        instance.timeFenceCoverageFixed      = _reqCalc.isTimeFenceCoverageFixed();
+        instance.requisitionsHelper          = ReqRequisitionsHelper::newReqPlanData(_reqPlanData);
+        instance.generatorCache              = ReqPurchaseRequisitionsDemandGeneratorCache::newStandard(_reqCalc);
+
+        instance.reqTransInsertList = new RecordInsertList(tableNum(ReqTrans), true);
+
+        return instance;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generatePurchaseRequisitionDemands</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates purchase requisition demand <c>ReqTrans</c> records.
+    /// </summary>
+    /// <param name = "queryForRequisitionLinesCoveredByFirmedOrders">Defines query that includes purchase requisition lines that are covered by firmed orders.</param>
+    /// <param name = "queryForRequisitionLinesNotCoveredByFirmedOrders">Defines query that includes purchase requisition lines that are not covered by firmed orders.</param>
+    /// <remarks>
+    /// Note, that it is expected that the queries return purchase requisition lines sorted by <c>ItemId</c> and then by <c>InventDimId</c>.
+    /// </remarks>
+    [Hookable(false)]
+    internal void generatePurchaseRequisitionDemands(
+        Query queryForRequisitionLinesCoveredByFirmedOrders, 
+        Query queryForRequisitionLinesNotCoveredByFirmedOrders)
+    {
+        // The order of processing matters. Purchase requisitions that are covered by firmed orders must be processed first.
+        this.generateRequisitionDemandsCoveredByFirmedOrderLines(queryForRequisitionLinesCoveredByFirmedOrders);
+
+        this.generateRequisitionDemandsNotCoveredByFirmedOrderLines(queryForRequisitionLinesNotCoveredByFirmedOrders);
+
+        this.insertRequisitionDemandsIntoDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateRequisitionDemandsCoveredByFirmedOrderLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates <c>ReqTrans</c> records for purchase requisition lines which are covered by firmed orders.
+    /// There is many-to-many relationship between <c>PurchReqLine</c> and <c>ReqTrans</c>. Therefore, we are running coverage calculation
+    /// between firmed orders and requisition lines.
+    /// </summary>
+    [Hookable(false)]
+    private void generateRequisitionDemandsCoveredByFirmedOrderLines(Query queryForRequisitionLinesCoveredByFirmedOrders)
+    {
+        var queryRun = new QueryRun(queryForRequisitionLinesCoveredByFirmedOrders);
+        queryRun = reqCalc.modifyQueryForItemFilter(queryRun);
+
+        Map requisitionLineReqTransByRequistionLineRecId = new Map(typeName2Type(extendedTypeStr(RecId)), Types::Record);
+        Map firmedSupplyAvailableQtyByReqTransRecId = new Map(typeName2Type(extendedTypeStr(RecId)), typeName2Type(extendedTypeStr(InventQty)));
+
+        while (queryRun.next())
+        {
+            InventDim inventDim = queryRun.get(tableNum(InventDim));
+            PurchReqLine purchaseRequisitionLine = queryRun.get(tableNum(PurchReqLine));
+            ReqTrans firmedSupplyReqTrans = queryRun.get(tableNum(ReqTrans));
+
+            if (purchaseRequisitionLine.ItemId != generatorCache.itemId())
+            {
+                this.flushMapIntoReqTransInsertListIfCapacityExceeded(requisitionLineReqTransByRequistionLineRecId);
+            }
+
+            ReqTrans pendingPurchRequisitionLineReqTrans;
+            // first we look this purchase requisition exist in our map.
+            if (requisitionLineReqTransByRequistionLineRecId.exists(purchaseRequisitionLine.RecId))
+            {
+                pendingPurchRequisitionLineReqTrans = requisitionLineReqTransByRequistionLineRecId.lookup(purchaseRequisitionLine.RecId);
+            }
+            else if (this.mustIncludePurchaseRequisitionLine(purchaseRequisitionLine, inventDim))
+            {
+                pendingPurchRequisitionLineReqTrans = this.initializeReqTransFromRequisitionLine(purchaseRequisitionLine, inventDim);
+                
+                // we are setting Qty to 0 beacuse in the beginning we do not know how much of Qty are covered by firmed orders.
+                pendingPurchRequisitionLineReqTrans.Qty = 0;
+            }
+            else 
+            {
+                continue;
+            }            
+
+            this.allocateAvailableFirmedSupplyQtyToRequisitionReqTrans(
+                    inventDim,
+                    requisitionLineReqTransByRequistionLineRecId,
+                    firmedSupplyAvailableQtyByReqTransRecId,
+                    purchaseRequisitionLine,
+                    pendingPurchRequisitionLineReqTrans,
+                    firmedSupplyReqTrans);                    
+        }
+
+        this.flushMapIntoReqTransInsertList(requisitionLineReqTransByRequistionLineRecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateRequisitionDemandsNotCoveredByFirmedOrderLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates <c>ReqTrans</c> records for purchase requisition lines which are not covered by firmed orders.
+    /// </summary>
+    [Hookable(false)]
+    private void generateRequisitionDemandsNotCoveredByFirmedOrderLines(Query queryForRequisitionLinesNotCoveredByFirmedOrders)
+    {
+        var queryRun = new QueryRun(queryForRequisitionLinesNotCoveredByFirmedOrders);
+        queryRun = reqCalc.modifyQueryForItemFilter(queryRun);
+
+        while (queryRun.next())
+        {
+            InventDim inventDim = queryRun.get(tableNum(InventDim));
+            PurchReqLine purchaseRequisitionLine = queryRun.get(tableNum(PurchReqLine));
+
+            if (this.mustIncludePurchaseRequisitionLine(purchaseRequisitionLine, inventDim))
+            {
+                ReqTrans purchaseRequisitionReqTrans = this.initializeReqTransFromRequisitionLine(purchaseRequisitionLine, inventDim);
+                purchaseRequisitionReqTrans.insertUsingInsertList(reqTransInsertList, reqPlanData);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRequisitionDemandsIntoDatabase</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts all <c>ReqTrans</c> records are generated from purchase requisition lines into database.
+    /// </summary>
+    [Hookable(false)]
+    internal void insertRequisitionDemandsIntoDatabase()
+    {
+        reqTransInsertList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeReqTransFromRequisitionLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize <c>ReqTrans</c> record from purchase requisition line.
+    /// </summary>
+    [Hookable(false)]
+    private ReqTrans initializeReqTransFromRequisitionLine(PurchReqLine _purchaseRequisitionLine, InventDim _inventDim)
+    {
+        reqCalc.cleanupInvalidRequisitionLineReferences(requisitionsHelper, _purchaseRequisitionLine.RecId);
+
+        var reqSetupDim = generatorCache.getReqSetupDim(_purchaseRequisitionLine.ItemId, _inventDim);
+        var inventDimGroupSetup = generatorCache.getInventDimGroupSetup(_purchaseRequisitionLine.ItemId, _inventDim);
+
+        return requisitionsHelper.reqTransForRequisitionLine(
+                   _purchaseRequisitionLine,
+                   reqSetupDim.itemLevel(),
+                   reqSetupDim,
+                   inventDimGroupSetup);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustIncludePurchaseRequisitionLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Verifies whether given purchase requisition line is considered as a demand or not.
+    /// </summary>
+    /// <returns>True if purchase requisition line is verified and can be considered as demand; otherwise, false.</returns>
+    [Hookable(false)]
+    private boolean mustIncludePurchaseRequisitionLine(PurchReqLine _purchaseRequisitionLine, InventDim _inventDim)
+    {
+        var reqSetupDim = generatorCache.getReqSetupDim(_purchaseRequisitionLine.itemId, _inventDim);
+
+        return this.verifyRequisitionRequiredDateForCoverage(reqSetupDim, _purchaseRequisitionLine.RequiredDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>verifyRequisitionRequiredDateForCoverage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Verify current Requisition line's required date whether it is covered by configuration parameters.
+    /// </summary>
+    /// <returns>True if Purchase Requisition's Required Date is covered; otherwise, false.</returns>
+    [Hookable(false)]
+    private boolean verifyRequisitionRequiredDateForCoverage(ReqSetupDim _reqSetupDim, PurchReqRequiredDate _purchReqRequiredDate)
+    {
+        var timeFenceBackRequisition = reqPlanData.timeFenceBackRequisition(_reqSetupDim);
+        var timeFenceCoverage = reqPlanData.timeFenceCoverage(_reqSetupDim);
+
+        var isTimeFenceCoverRequisitionFromBack = _purchReqRequiredDate >= (reqPlanData.todaysdate() - timeFenceBackRequisition);
+        var isTimeFenceCoverRequisitionFromFuture = _purchReqRequiredDate <= (reqPlanData.todaysdate() + timeFenceCoverage);
+
+        return (timeFenceRequisitionsFixed || isTimeFenceCoverRequisitionFromBack) && (timeFenceCoverageFixed || isTimeFenceCoverRequisitionFromFuture);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allocateAvailableFirmedSupplyQtyToRequisitionReqTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Allocates available firmed supply quantity to the specified purchase requisition line.
+    /// </summary>
+    [Hookable(false)]
+    private void allocateAvailableFirmedSupplyQtyToRequisitionReqTrans(
+        InventDim       _inventDim,
+        Map             _requisitionLineReqTransByRequistionLineRecId,
+        Map             _firmedSupplyAvailableQtyByReqTransRecId,
+        PurchReqLine    _purchaseRequisitionLine,
+        ReqTrans        _pendingPurchRequisitionLineReqTrans,
+        ReqTrans        _firmedSupplyReqTrans)
+    {
+        var inventTable = generatorCache.getInventTable(_purchaseRequisitionLine.ItemId, _inventDim);
+
+        var availableSupplyQty = this.getAvailableSupplyQty(_firmedSupplyAvailableQtyByReqTransRecId, _firmedSupplyReqTrans);
+        var remainingQtyFromPurchReq = this.getRemainingQtyFromPurchReqLine(_purchaseRequisitionLine, _pendingPurchRequisitionLineReqTrans, inventTable);
+        var allocatedSupplyQty = min(availableSupplyQty, remainingQtyFromPurchReq);
+        _pendingPurchRequisitionLineReqTrans.Qty -= allocatedSupplyQty;
+
+        _requisitionLineReqTransByRequistionLineRecId.insert(_purchaseRequisitionLine.RecId, _pendingPurchRequisitionLineReqTrans);
+        _firmedSupplyAvailableQtyByReqTransRecId.insert(_firmedSupplyReqTrans.RecId, availableSupplyQty - allocatedSupplyQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>flushMapIntoReqTransInsertListIfCapacityExceeded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Flushes the pending <c>ReqTrans</c> records to the record insert list
+    /// if all requisition lines for the items in the map have been fully processed
+    /// and the size of the map has exceeded the threshold.
+    /// </summary>
+    [Hookable(false)]
+    private void flushMapIntoReqTransInsertListIfCapacityExceeded(Map _requisitionLineReqTransByRequistionLineRecId)
+    {
+        if (_requisitionLineReqTransByRequistionLineRecId.elements() > ReqPurchaseRequisitionsDemandGenerator::getMaxCapacityOfMapToFlush())
+        {
+            this.flushMapIntoReqTransInsertList(_requisitionLineReqTransByRequistionLineRecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMaxCapacityOfMapToFlush</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns maximum capacity count for map to be flushed.
+    /// </summary>
+    /// <returns>Integer value for maximum capacity of Map.</returns>
+    private static int getMaxCapacityOfMapToFlush()
+    {
+        return 1000;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>flushMapIntoReqTransInsertList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Flushes the pending <c>ReqTrans</c> records to the record insert list and reset the map.
+    /// </summary>
+    [Hookable(false)]
+    private void flushMapIntoReqTransInsertList(Map _requisitionLineReqTransByRequistionLineRecId)
+    {
+        Set requisitionLineReqTransByRequistionLineRecIdSet = _requisitionLineReqTransByRequistionLineRecId.keySet();
+
+        MapEnumerator requisitionLineReqTransByRequistionLineRecIdEnumerator = _requisitionLineReqTransByRequistionLineRecId.getEnumerator();
+        while (requisitionLineReqTransByRequistionLineRecIdEnumerator.moveNext())
+        {
+            ReqTrans reqTransToBeInserted = requisitionLineReqTransByRequistionLineRecIdEnumerator.currentValue();
+            reqTransToBeInserted.insertUsingInsertList(reqTransInsertList, reqPlanData);
+        }
+
+        // Remove all items in _requisitionLineReqTransByRequistionLineRecId.
+        SetEnumerator requisitionLineReqTransByRequistionLineRecIdSetEnumerator = requisitionLineReqTransByRequistionLineRecIdSet.getEnumerator();
+        while(requisitionLineReqTransByRequistionLineRecIdSetEnumerator.moveNext())
+        {
+            _requisitionLineReqTransByRequistionLineRecId.remove(requisitionLineReqTransByRequistionLineRecIdSetEnumerator.current());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAvailableSupplyQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets quantity from firmed order requirement transaction which is linked by current Requisition line.
+    /// Checks there are already requirement transaction in the given map.
+    /// </summary>
+    /// <returns>Available quantity of firmed supply requirement transaction.</returns>
+    [Hookable(false)]
+    private real getAvailableSupplyQty(Map _firmedSupplyAvailableQtyByReqTransRecId, ReqTrans _firmedSupplyReqTrans)
+    {
+        if (_firmedSupplyAvailableQtyByReqTransRecId.exists(_firmedSupplyReqTrans.RecId))
+        {
+            return _firmedSupplyAvailableQtyByReqTransRecId.lookup(_firmedSupplyReqTrans.RecId);
+        }
+        else
+        {
+            return _firmedSupplyReqTrans.Qty;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRemainingQtyFromPurchReqLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates remaining quantity for given purchase requisition line by pending requirement transaction demand.
+    /// Pending requirement transaction must be correlated with PurchReqLine.
+    /// </summary>
+    /// <returns>Remaining quantity from given purchase requisition line.</returns>
+    [Hookable(false)]
+    private real getRemainingQtyFromPurchReqLine(PurchReqLine _purchReqLine, ReqTrans _pendingPurchRequisitionLineReqTrans, InventTable _inventTable)
+    {
+        var convertedReqTransQtyForPurchReqLine = this.requisitionsHelper.convertPurchQtyToReqTransQty(
+                                                        _inventTable,
+                                                        _purchReqLine);
+
+        var remainingPurchReqLineQty = convertedReqTransQtyForPurchReqLine - _pendingPurchRequisitionLineReqTrans.Qty;
+        
+        // purchase requisition lines Qty is being converted to negative in requirement transactions because they are demand.
+        // We shoud return positive remaining qty.      
+        return -remainingPurchReqLineQty;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

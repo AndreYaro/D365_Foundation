@@ -1,0 +1,367 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSShipmentCreatorSales</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[WHSShipmentCreatorAttribute(InventTransType::Sales)]
+internal class WHSShipmentCreatorSales extends WHSShipmentCreator
+{
+    private WHSInstrumentationLogger instrumentationLogger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        instrumentationLogger = WHSInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipments</Name>
+				<Source><![CDATA[
+    public int createShipments()
+    {
+        int                             numberOfShipmentsCreated;
+        WHSShipConsolidationPolicy      shipConsolidationPolicy;
+        WHSShipConsolidationPolicyData  shipConsolidationPolicyData;
+
+        using (var activityContext = instrumentationLogger.shipConsolidationPolicyActivities().salesOrderConsolidation())
+        {
+            while select shipConsolidationPolicy
+                order by ShipConsolidationPolicySeqNum asc
+                where shipConsolidationPolicy.ShipConsolidationPolicyType == WHSShipConsolidationPolicyType::Sales
+                &&    shipConsolidationPolicy.Valid
+            {
+                shipConsolidationPolicyData = WHSShipConsolidationPolicyData::construct(shipConsolidationPolicy);
+
+                numberOfShipmentsCreated += this.createShipmentsForSalesOrderPolicy(shipConsolidationPolicyData);
+            }
+
+            // If consolidation policies had not been created, we would mimic the legacy consolidation behaviour
+            if (!shipConsolidationPolicyData)
+            {
+                ListEnumerator listEnumerator = WHSShipConsolidationPolicyProvider::defaultConsolidationPolicyDataListToProcess(WHSShipConsolidationPolicyType::Sales, loadPostEngine ? WHSShipConsolidationPolicyCreateApproach::LoadPostEngine : WHSShipConsolidationPolicyCreateApproach::ReleaseToWarehouse).getEnumerator();
+
+                while (listEnumerator.moveNext())
+                {
+                    numberOfShipmentsCreated += this.createShipmentsForSalesOrderPolicy(listEnumerator.current());
+                }
+            }
+            else
+            {
+                numberOfShipmentsCreated += this.createShipmentsForSalesOrderPolicy(WHSShipConsolidationPolicyProvider::defaultConsolidationPolicyDataToProcess(WHSShipConsolidationPolicyType::Sales));
+            }
+        }
+
+        return numberOfShipmentsCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipmentsForSalesOrderPolicy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates sales order shipments for the <c>WHSShipmentTable</c>.
+    /// </summary>
+    /// <param name = "_shipConsolidationPolicyData">A shipment consolidation policy data object.</param>
+    /// <returns>The number of shipments created.</returns>
+    private int createShipmentsForSalesOrderPolicy(WHSShipConsolidationPolicyData _shipConsolidationPolicyData)
+    {
+        int     numberOfShipmentsCreated;
+        SalesId previousSalesId;
+        int     sourceLineUsed;
+
+        Map     shipmentCache = new Map(Types::Container, Types::Record);
+        Query   query;
+
+        if (loadPostEngine)
+        {
+            query = this.warehouseReleaseQueryBuilder().buildSalesOrderQueryForLoadIdAndPolicy(_shipConsolidationPolicyData, loadPostEngine.parmLoadTable().LoadId);
+        }
+        else
+        {
+            query = this.warehouseReleaseQueryBuilder().buildSalesOrderQueryForReleaseToWarehouseIdAndPolicy(_shipConsolidationPolicyData, releaseToWarehouseId);
+        }
+
+        QueryRun queryRun = new QueryRun(query);
+        
+        while (queryRun.next())
+        {
+            sourceLineUsed++;
+
+            SalesLine salesLine = queryRun.get(tableNum(SalesLine));
+
+            if (loadPostEngine)
+            {
+                LogisticsPostalAddress address = queryRun.get(tableNum(LogisticsPostalAddress));
+
+                if (!address.isEffective())
+                {
+                    if (this.warehouseReleaseQueryBuilder().parmUseSalesLineDeliveryAddress())
+                    {
+                        checkFailed(strFmt("@WAX:SalesOrderLineEffectiveAddressMessageShipmentNotCreated", salesLine.SalesId, salesLine.LineNum));
+                    }
+                    else
+                    {
+                        checkFailed(strFmt("@WAX:SalesOrderHeaderEffectiveAddressShipmentNotCreated", salesLine.SalesId));
+                    }
+
+                    continue;
+                }
+            }
+
+            if (this.createOrConsolidateShipmentForSalesOrderPolicy(_shipConsolidationPolicyData, queryRun, previousSalesId, shipmentCache))
+            {
+                numberOfShipmentsCreated++;
+            }
+            
+            previousSalesId = salesLine.SalesId;
+        }
+        
+        if (sourceLineUsed)
+        {
+            WHSShipConsolidationPolicy shipConsolidationPolicy = _shipConsolidationPolicyData.parmShipConsolidationPolicy();
+            
+            if (this.shouldCheckShipConsolidationPolicyLock(shipConsolidationPolicy))
+            {
+                this.tryShipConsolidationPolicyLock(shipConsolidationPolicy);
+            }
+        }
+
+        if (sourceLineUsed)
+        {
+            instrumentationLogger.logAttributeValueInformation(this.createParametersMap(_shipConsolidationPolicyData.parmShipConsolidationPolicy().ShipConsolidationPolicySeqNum,
+                                                                                        sourceLineUsed,
+                                                                                        numberOfShipmentsCreated));
+        }
+
+        return numberOfShipmentsCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createOrConsolidateShipmentForSalesOrderPolicy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates or consolidates shipments based on the records that are selected in the queryrun.
+    /// </summary>
+    /// <param name = "_shipConsolidationPolicyData">A shipment consolidation policy data object.</param>
+    /// <param name = "_queryRunReleaseLine">A query run that holds the selection of records for a sales line that should be used for the shipment creation.</param>
+    /// <param name = "_previousSalesId">The sales ID of the sales order that was previously processed.</param>
+    /// <param name = "_shipmentCache">A temporary shipment cache used to store the shipments that have previously been created or found.</param>
+    /// <returns>true if a new shipment was created; otherwise false.</returns>
+    private boolean createOrConsolidateShipmentForSalesOrderPolicy(
+        WHSShipConsolidationPolicyData  _shipConsolidationPolicyData,
+        QueryRun                        _queryRunReleaseLine,
+        SalesId                         _previousSalesId,
+        Map                             _shipmentCache)
+    {
+        WHSLoadLine             loadLine    = _queryRunReleaseLine.get(tableNum(WHSLoadLine));
+        SalesTable              salesTable  = _queryRunReleaseLine.get(tableNum(SalesTable));
+        SalesLine               salesLine   = _queryRunReleaseLine.get(tableNum(SalesLine));
+        LogisticsPostalAddress  address     = _queryRunReleaseLine.get(tableNum(LogisticsPostalAddress));
+        InventDim               inventDim   = _queryRunReleaseLine.get(tableNum(InventDim));
+
+        TMSSalesTable                   tmsSalesTable = TMSSalesTable::find(salesLine.SalesId);
+        TMSCarrierService               carrierService;
+        TMSModeCode                     modeCode;
+        boolean                         shipmentCreated;
+        container                       policyFieldValuesCacheKey;
+        WHSShipConsolidationPolicyData  shipConsolidationPolicyData;
+
+        if (loadLine.ShipConsolidationPolicy 
+        &&  loadLine.ShipConsolidationPolicy != _shipConsolidationPolicyData.parmShipConsolidationPolicy().RecId)
+        {
+            WHSShipConsolidationPolicy shipConsolidationPolicy;
+
+            select firstonly shipConsolidationPolicy
+                where shipConsolidationPolicy.RecId == loadLine.ShipConsolidationPolicy;
+
+            if (!shipConsolidationPolicy       ||
+                !shipConsolidationPolicy.Valid ||
+                shipConsolidationPolicy.ShipConsolidationPolicyType != WHSShipConsolidationPolicyType::Sales)
+            {
+                throw error("@SYS6144");
+            }
+
+            shipConsolidationPolicyData = WHSShipConsolidationPolicyData::construct(shipConsolidationPolicy);
+        }
+        else
+        {
+            shipConsolidationPolicyData = _shipConsolidationPolicyData;
+        }
+
+        WHSShipmentId crossDockShipmentId;
+
+        if (this.hasCrossDockWorkBuildId() && WHSWareReleaseUseCrossDockForShipConsPoliciesFlightV3::instance().isEnabled())
+        {
+            crossDockShipmentId = warehouseRelease.getAtSupplyReceiptCrossDockShipmentId(salesLine);
+    
+            if (crossDockShipmentId && !shipConsolidationPolicyData.shipConsolidationPolicyFields().empty())
+            {
+                WHSShipmentTable crossDockShipmentTable = WHSShipmentTable::find(crossDockShipmentId, true);
+                policyFieldValuesCacheKey = this.calcPolicyFieldValuesCacheKey(shipConsolidationPolicyData, _queryRunReleaseLine, crossDockShipmentTable);
+
+                if (!_shipmentCache.exists(policyFieldValuesCacheKey))
+                {
+                    _shipmentCache.insert(policyFieldValuesCacheKey, crossDockShipmentTable);
+                }
+            }
+        }
+
+        if (salesLine.DlvMode != '')
+        {
+            carrierService  = TMSCarrierService::findByDlvModeId(salesLine.DlvMode);
+            modeCode        = TMSCarrier::find(carrierService.CarrierCode).ModeCode;
+        }
+        else
+        {
+            modeCode = tmsSalesTable.ModeCode;
+        }
+
+        var shipmentParameters = WHSWarehouseReleaseSalesOrderParameters::newFromParameters(salesLine,
+                                                                                            salesTable,
+                                                                                            address,
+                                                                                            inventDim,
+                                                                                            false,
+                                                                                            modeCode,
+                                                                                            carrierService,
+                                                                                            tmsSalesTable);
+        
+        shipmentParameters.ShipConsolidationPolicyData = shipConsolidationPolicyData;
+
+        WHSShipmentTable shipmentTable = this.initShipmentWithoutIdForSalesOrder(shipmentParameters);
+        WHSShipmentTable shipmentTableFound;
+
+        if (loadPostEngine)
+        {
+            shipmentTable.LoadId = loadLine.LoadId;
+            shipmentTable.tmsInitCarrierServiceFromLoad();
+        }
+
+        if (!shipConsolidationPolicyData.shipConsolidationPolicyFields().empty())
+        {
+            policyFieldValuesCacheKey = this.calcPolicyFieldValuesCacheKey(shipConsolidationPolicyData, _queryRunReleaseLine, shipmentTable);
+
+            // Find any shipments for the current load that have matching consolidation criteria.
+            if (_shipmentCache.exists(policyFieldValuesCacheKey))
+            {
+                shipmentTableFound = _shipmentCache.lookup(policyFieldValuesCacheKey);
+            }
+            else if (shipConsolidationPolicyData.parmShipConsolidationPolicy().ConsolidateWithExistingShipments)
+            {
+                shipmentTableFound = this.findConsolidationShipmentForSalesOrderAndPolicy(
+                    shipConsolidationPolicyData,
+                    shipmentTable,
+                    shipmentParameters);
+            }
+        }
+        
+        // If consolidation is on then we consolidate to the shipment with like values
+        if (shipmentTableFound.RecId)
+        {
+            shipmentTableFound.consolidateSalesLineShipmentForPolicy2(shipmentTable, shipConsolidationPolicyData.parmShipConsolidationPolicy());
+            shipmentTableFound.update();
+            
+            if (salesLine.SalesId != _previousSalesId)
+            {
+                shipmentTableFound.createShipmentNotes(salesTable);
+            }
+
+            _shipmentCache.insert(policyFieldValuesCacheKey, shipmentTableFound);
+
+            this.updateLoadLineFromShipment(loadLine, shipmentTableFound);
+        }
+        else // New shipment
+        {
+            shipmentTable.initShipmentId();
+            shipmentTable.insert();
+
+            if (!shipConsolidationPolicyData.shipConsolidationPolicyFields().empty())
+            {
+                _shipmentCache.insert(policyFieldValuesCacheKey, shipmentTable);
+            }
+
+            shipmentTable.createShipmentNotes(salesTable);
+            shipmentCreated = true;
+
+            this.updateLoadLineFromShipment(loadLine, shipmentTable);
+        }
+
+        if (WHSWareReleaseUseCrossDockForShipConsPoliciesFlightV3::instance().isEnabled())
+        {
+            warehouseRelease.initializeLoadLineFromShipmentForSalesOrderInternal(loadLine, shipmentTableFound.RecId ? shipmentTableFound : shipmentTable, crossDockShipmentId);
+            loadLine.update();
+        }
+ 
+        return shipmentCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initShipmentWithoutIdForSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a new shipment for a sales order. The Shipment Id is not initialized.
+    /// </summary>
+    /// <param name = "_shipmentParameters">Sales order shipment parameters.</param>
+    /// <returns>The initialized shipment instance. The Shipment Id is not initialized.</returns>
+    private WHSShipmentTable initShipmentWithoutIdForSalesOrder(WHSWarehouseReleaseSalesOrderParameters _shipmentParameters)
+    {
+        WHSShipmentTable shipmentTable;
+
+        // Validate the shipment address
+        if (!_shipmentParameters.ShippingAddress.whsAddressFormatValidation())
+        {
+            if (loadPostEngine)
+            {
+                loadPostEngine.createError(loadPostEngine.parmLoadTable().LoadId,
+                                           literalStr("@WAX4824"),
+                                           _shipmentParameters.SalesOrder.SalesId,
+                                           '',
+                                           '',
+                                           '',
+                                           NoYes::Yes);
+            }
+
+            throw error(strFmt("@WAX:InvalidAddressError", _shipmentParameters.SalesOrder.SalesId, InventTransType::Sales));
+        }
+        
+        shipmentTable.initShipmentWithoutIdForSalesOrder(_shipmentParameters);
+
+        return shipmentTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findConsolidationShipmentForSalesOrderAndPolicy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds a consolidation shipment for a sales order.
+    /// </summary>
+    /// <param name = "_shipConsolidationPolicyData">A shipment consolidation policy data object.</param>
+    /// <param name = "_shipmentTable">A shipment instance is being consolidated.</param>
+    /// <param name = "_consolidationParameters">A sales order shipment parameters instance.</param>
+    /// <returns>The initialized shipment instance if found.</returns>
+    private WHSShipmentTable findConsolidationShipmentForSalesOrderAndPolicy(
+        WHSShipConsolidationPolicyData          _shipConsolidationPolicyData,
+        WHSShipmentTable                        _shipmentTable,
+        WHSWarehouseReleaseSalesOrderParameters _consolidationParameters)
+    {
+        return this.findConsolidationShipmentForPolicy(_shipConsolidationPolicyData, _shipmentTable);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

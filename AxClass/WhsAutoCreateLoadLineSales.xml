@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSAutoCreateLoadLineSales</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WHSAutoCreateLoadLineSales</c> is responsible for creating load lines automatically for sales lines.
+/// </summary>
+[WHSAutoCreateLoadLineAttribute(tableStr(SalesLine))]
+class WhsAutoCreateLoadLineSales extends WHSAutoCreateLoadLine
+{
+    SalesLine   salesLine;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>autoCreateLoadLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a load line for a sales line.
+    /// </summary>
+    public void autoCreateLoadLine()
+    {
+        using (var activityContext = this.instrumentationLogger().autoMaintainLoadLineActivities().maintainLoadLine(salesLine.SalesQty))
+        {
+            InventLocationId inventLocationId = salesLine.inventDim().InventLocationId;
+            WHSLoadLine      loadLine;
+
+            if (InventLocation::isAutoUpdateShipmentAlwaysEnabled(inventLocationId))
+            {
+                if (this.shouldAutoUpdateShipment(salesLine.SalesId, WHSWorkTransType::Sales, InventTransType::Sales) &&
+                    salesLine.deliveryAddress().whsAddressFormatValidation())
+                {
+                    WHSShipmentTable shipmentTable = this.locateAutoUpdateShipment(salesLine.SalesId, WHSWorkTransType::Sales, InventTransType::Sales);
+
+                    this.findOrCreateWaveForShipment(shipmentTable);
+
+                    loadLine.ShipmentId = shipmentTable.ShipmentId;
+
+                    this.updateWHSSalesLine();
+                }
+                else
+                {
+                    return;
+                }
+            }
+            else
+            {
+                if (!this.shouldAutoCreateLoadLine())
+                {
+                    return;
+                }
+
+                WHSLoadTemplateId loadTemplateId = this.findLoadTemplateId(TMSSalesTable::find(salesLine.SalesId).TransportationTemplateId, salesLine.ItemId);
+                TMSLoadPaysFreight loadPaysFreight = SalesTable::find(salesLine.SalesId).evaluateAddTmsChargeToSalesOrder();
+                WHSLoadTable loadTable;
+
+                // Try to find existing load for the order.
+                select firstonly LoadId from loadTable
+                    exists join loadLine
+                        where loadLine.LoadId               == loadTable.LoadId
+                        &&    loadLine.OrderNum             == salesLine.SalesId
+                        &&    loadLine.InventTransType      == InventTransType::Sales
+                        &&    loadLine.TransportRequest     == NoYes::No
+                        &&    loadTable.LoadTemplateId      == loadTemplateId
+                        &&    loadTable.LoadPaysFreight     == loadPaysFreight
+                        &&    loadTable.InventLocationId    == inventLocationId
+                        &&    loadTable.LoadStatus          != WHSLoadStatus::Shipped;
+
+                if (!loadTable.LoadId)
+                {
+                    loadTable = this.createLoadTable(loadTemplateId, WHSLoadDirection::Outbound, salesLine.ItemId, inventLocationId, loadPaysFreight);
+                }
+
+                // Create the Load Line record
+                loadLine.clear();
+                loadLine.LoadId = loadTable.LoadId;
+            }
+        
+            loadLine.initFromSalesLine(salesLine);
+        
+            loadLine.insert();
+
+            this.instrumentationLogger().autoMaintainLoadLineActivities().maintainedLoadLine(activityContext, SysAppCRUDOperation::Create);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromBuffer</Name>
+				<Source><![CDATA[
+    protected void initFromBuffer(Common _common)
+    {
+        if (!(_common is SalesLine))
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        salesLine = _common;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldAutoCreateLoadLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether or not a load line should be created automatically for a given sales order line
+    /// </summary>
+    /// <returns>
+    /// Returns a flag that indicates if the load line should be automatically generated
+    /// </returns>
+    protected boolean shouldAutoCreateLoadLine()
+    {
+        boolean         ret;
+        boolean         whsEnabled;
+        boolean         tmsEnabled;
+
+        ret = salesLine.SalesQty > 0 && salesLine.SalesType == SalesType::Sales;
+
+        if (ret)
+        {
+            whsEnabled = WHSInventEnabled::exist(salesLine.ItemId);
+            tmsEnabled = TMSInventEnabled::exist(salesLine.ItemId);
+
+            ret = (whsEnabled && WHSParameters::find().AutoCreateLoad) || (tmsEnabled && TMSParameters::find().AutoCreateLoadSO);
+
+            ret = ret && salesLine.inventDimAllowsWHSProcessing();
+
+            ret = ret && this.checkInventDim(salesLine.inventDim());
+
+            if (ret
+                && !salesLine.DeliveryPostalAddress
+                && !salesLine.salesTable().DeliveryPostalAddress)
+            {
+                ret = checkFailed(strFmt("@WAX4811", salesLine.LineNum, salesLine.SalesId));
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasOrderBeenReleasedToWarehouse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the sales order has been released to warehouse.
+    /// </summary>
+    /// <returns>
+    /// true if the sales order has been released; otherwise, false.
+    /// </returns>
+    [Hookable(false)]
+    internal boolean hasOrderBeenReleasedToWarehouse()
+    {
+        return SalesTable::find(salesLine.SalesId).hasSalesOrderBeenReleasedToWarehouse();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createNewShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new shipment for the load line based on the sales line.
+    /// </summary>
+    /// <returns>
+    /// <c>WHSShipmentTableRecord</c>
+    /// </returns>
+    [Hookable(false)]
+    internal WHSShipmentTable createNewShipment()
+    {
+        ttsbegin;
+
+        WHSShipmentTable shipmentTable;
+        SalesTable salesTable = SalesTable::find(salesLine.SalesId);
+        TMSSalesTable tmsSalesTable = TMSSalesTable::find(salesLine.SalesId);
+        TMSCarrierService tmsCarrierService = TMSCarrierService::findByDlvModeId(salesTable.DlvMode);
+
+        shipmentTable.initShipmentForSalesOrder(WHSWarehouseReleaseSalesOrderParameters::newFromParameters(salesLine,
+                                                                                                           salesTable,
+                                                                                                           salesTable.deliveryAddress(),
+                                                                                                           salesLine.inventDim(),
+                                                                                                           false,
+                                                                                                           tmsSalesTable.ModeCode,
+                                                                                                           tmsCarrierService,
+                                                                                                           tmsSalesTable));
+
+        shipmentTable.insert();
+        
+        ttscommit;
+
+        return shipmentTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateWHSSalesLine</Name>
+				<Source><![CDATA[
+    private void updateWHSSalesLine()
+    {
+        WHSSalesLine whsSalesLine = whsSalesLine::find(salesLine.InventTransId, true);
+
+        whsSalesLine.ReleasedQty = this.getHandlingQty();
+
+        whsSalesLine.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getHandlingQty</Name>
+				<Source><![CDATA[
+    private InventHandlingQty getHandlingQty()
+    {
+        if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+        {
+            return salesLine.PdsCWQty;
+        }
+        
+        return salesLine.QtyOrdered;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SourceDocumentCleanupForSalesOrderCreationTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Data maintenance task to remove unnecessary source document header and line records
+/// related to sales order.
+/// </summary>
+internal final class SourceDocumentCleanupForSalesOrderCreationTask implements IDataMaintenanceTask
+{
+    #OCCRetryCount
+    private DataMaintenanceTaskResult taskResult;
+    private utcdatetime fromDate;
+    private utcdatetime toDate;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new()
+    {
+        StartDate start;
+        EndDate end;
+
+        [start, end] = SourceDocumentCleanupForSalesOrderTaskHelper::getDateIntervalForJob();
+        fromDate = DateTimeUtil::newDateTime(start, 0);
+        toDate = DateTimeUtil::newDateTime(end, 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public DataMaintenanceTaskResult run()
+    {
+        System.Exception ex;
+        int64 totalDeletedRows = 0;
+        int totalSDLDeletedRows = 0;
+        int totalSDHDeletedRows = 0;
+
+        taskResult = DataMaintenanceTaskResult::construct();
+
+        ttsbegin;
+
+        using (SysInstrumentationActivityContext activityContext = SourceDocumentCleanupForSalesOrderTaskHelper::getActivityContext(
+                classStr(SourceDocumentCleanupForSalesOrderCreationTask),
+                SourceDocumentInstrumentationConstants::CleanupHeaderAndLineRecordsForSalesOrder))
+        {
+            try
+            {
+                totalSDLDeletedRows = this.deleteSourceDocumentLine(activityContext);
+                totalSDHDeletedRows = this.deleteSourceDocumentHeader(activityContext);
+                totalDeletedRows = totalSDLDeletedRows + totalSDHDeletedRows;
+
+                this.cleanPotentialSDLRecIdsForDeletingPrecalculatedByAction(totalSDLDeletedRows, activityContext);
+            }
+            catch (Exception::TransientSqlConnectionError)
+            {
+                if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+                {
+                    retry;
+                }
+                else
+                {
+                    activityContext.addCustomProperty(
+                        SourceDocumentInstrumentationConstants::DataMaintenanceTaskFinishedWithError,
+                        'TransientSqlConnectionError');
+                    throw Exception::Error;
+                }
+            }
+            catch(ex)
+            {
+                activityContext.addCustomProperty(
+                SourceDocumentInstrumentationConstants::DataMaintenanceTaskFinishedWithError,
+                any2Str(ex.ToString()));
+                throw ex;
+            }
+        }
+
+        ttscommit;
+
+        taskResult.parmCount(totalDeletedRows);
+
+        return taskResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateSourceDocumentHeaderForDelete</Name>
+				<Source><![CDATA[
+    private int populateSourceDocumentHeaderForDelete(SourceDocumentHeaderRecIdTmp _sourceDocumentHeaderRecIdTmp)
+    {
+        int impactedRows = 0;
+
+        str sqlStatement = strFmt(
+            @"INSERT INTO %1 (SOURCEDOCUMENTHEADERRECID, PARTITION)
+            SELECT TOP(@limitOnRecordsDeleting) SDH.RECID, SDH.PARTITION
+                FROM SALESTABLE ST
+                JOIN SOURCEDOCUMENTHEADER SDH ON ST.PARTITION = SDH.PARTITION AND ST.SOURCEDOCUMENTHEADER = SDH.RECID
+                WHERE
+                    ST.PARTITION = @partitionId
+                    AND ST.CREATEDDATETIME >= @fromDateTime
+                    AND ST.CREATEDDATETIME <= @toDateTime
+                    AND NOT EXISTS
+                        (SELECT 1 FROM SOURCEDOCUMENTLINE SDL WHERE SDL.PARTITION = SDH.PARTITION AND SDL.SOURCEDOCUMENTHEADER = SDH.RECID)
+            ",
+            _sourceDocumentHeaderRecIdTmp.getPhysicalTableName());
+
+        Map paramMap = SqlParams::create();
+        paramMap.add('limitOnRecordsDeleting', SourceDocumentCleanupForSalesOrderTaskHelper::MaxRecordsToFix);
+        paramMap.add('partitionId', getCurrentPartitionRecId());
+        paramMap.add('fromDateTime', DateTimeUtil::toStr(fromDate));
+        paramMap.add('toDateTime', DateTimeUtil::toStr(toDate));
+
+        impactedRows = SourceDocumentCleanupForSalesOrderTaskHelper::executeSQLWithParameters(sqlStatement, paramMap);
+
+        return impactedRows;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSourceDocumentHeader</Name>
+				<Source><![CDATA[
+    internal int deleteSourceDocumentHeader(SysInstrumentationActivityContext _actvityContext = null)
+    {
+        SourceDocumentHeaderRecIdTmp sourceDocumentHeaderRecIdTmp;
+        int impactedRows = 0;
+
+        try
+        {
+            impactedRows = this.populateSourceDocumentHeaderForDelete(sourceDocumentHeaderRecIdTmp);
+
+            if (impactedRows > 0)
+            {
+                SourceDocumentHeader sourceDocumentHeader;
+
+                sourceDocumentHeader.skipDataMethods(true);
+                sourceDocumentHeader.skipDeleteActions(true);
+                sourceDocumentHeader.skipEvents(true);
+                sourceDocumentHeader.skipDatabaseLog(true);
+
+                delete_from crosscompany sourceDocumentHeader
+                    exists join sourceDocumentHeaderRecIdTmp
+                    where sourceDocumentHeader.RecId == sourceDocumentHeaderRecIdTmp.SourceDocumentHeaderRecId;
+            }
+
+            if (_actvityContext)
+            {
+                _actvityContext.addCustomProperty(
+                    SourceDocumentInstrumentationConstants::NumberOfSourceDocumentHeadersDeletedForSalesOrder,
+                    int2Str(impactedRows));
+            }
+
+            if (taskResult)
+            {
+                taskResult.addMessage(DataMaintenanceMessageContract::constructForLabel(Exception::Info,
+                literalStr("@SourceDocumentAccountingFramework:SourceDocumentCleanupSourceDocumentHeaderDeletionInfoMessage"),
+                [int2Str(impactedRows)]));
+            }
+        }
+        finally
+        {
+            sourceDocumentHeaderRecIdTmp.dispose();
+        }
+
+        return impactedRows;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSourceDocumentLines</Name>
+				<Source><![CDATA[
+    private int deleteSourceDocumentLines()
+    {
+        int impactedRows = 0;
+
+        str sqlStatement = @"
+            DELETE FROM SOURCEDOCUMENTLINE
+            WHERE RECID IN
+            (
+                SELECT TOP(@limitOnRecordsDeleting) SDL.RECID
+                    FROM SOURCEDOCUMENTCLEANUPFORSALESORDERCREATIONREMOVEQUEUE PRECALCULATED
+                    JOIN SOURCEDOCUMENTLINE SDL ON SDL.PARTITION = PRECALCULATED.PARTITION AND SDL.RECID = PRECALCULATED.SOURCEDOCUMENTLINERECID AND SDL.PARTITION = @partitionId
+            )";
+
+        Map paramMap = SqlParams::create();
+        paramMap.add('limitOnRecordsDeleting', SourceDocumentCleanupForSalesOrderTaskHelper::MaxRecordsToFix);
+        paramMap.add('partitionId', getCurrentPartitionRecId());
+
+        impactedRows = SourceDocumentCleanupForSalesOrderTaskHelper::executeSQLWithParameters(sqlStatement, paramMap);
+
+        return impactedRows;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSourceDocumentLine</Name>
+				<Source><![CDATA[
+    internal int deleteSourceDocumentLine(SysInstrumentationActivityContext _actvityContext = null)
+    {
+        int impactedRows = 0;
+
+        impactedRows = this.deleteSourceDocumentLines();
+
+        if (_actvityContext)
+        {
+            _actvityContext.addCustomProperty(
+                SourceDocumentInstrumentationConstants::NumberOfSourceDocumentLinesDeletedForSalesOrder,
+                int2Str(impactedRows));
+        }
+
+        if (taskResult)
+        {
+            taskResult.addMessage(DataMaintenanceMessageContract::constructForLabel(Exception::Info,
+            literalStr("@SourceDocumentAccountingFramework:SourceDocumentCleanupSourceDocumentLineDeletionInfoMessage"),
+            [int2Str(impactedRows)]));
+        }
+
+        return impactedRows;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanPotentialSDLRecIdsForDeletingPrecalculatedByAction</Name>
+				<Source><![CDATA[
+    private void cleanPotentialSDLRecIdsForDeletingPrecalculatedByAction(int _totalSDLDeletedRows, SysInstrumentationActivityContext _actvityContext = null)
+    {
+        // This code is used to clean the helper table <c>SourceDocumentCleanupForSalesOrderCreationRemoveQueue</c> where we store SalesLine.SourceDocumentLine, table is created in Action.
+        // There is a limit on the number of records that could be deleted from <c>SourceDocumentLine</c> in one iteration.
+        // <c>SourceDocumentCleanupForSalesOrderCreationRemoveQueue</c> is created without any limits (because the join on <c>SourceDocumentLine</c> will be done later),
+        // so we would clean this table only when we have no records to delete in the next iteration (i.e., in this iteration, we deleted fewer records than allowed).
+        // These records won't be counted in total job's result.
+        boolean allSDLFromPrecalulatedDataAreDeleted = _totalSDLDeletedRows < SourceDocumentCleanupForSalesOrderTaskHelper::MaxRecordsToFix;
+        if (allSDLFromPrecalulatedDataAreDeleted)
+        {
+            SourceDocumentCleanupForSalesOrderCreationRemoveQueue sourceDocumentCleanupForSalesOrderCreationRemoveQueue;
+            delete_from sourceDocumentCleanupForSalesOrderCreationRemoveQueue;
+        }
+
+        if (_actvityContext)
+        {
+            _actvityContext.addCustomProperty(
+                SourceDocumentInstrumentationConstants::AllSourceDocumentLineFromPrecalculatedBatchDeletedForSalesOrder,
+                allSDLFromPrecalulatedDataAreDeleted ? 'Yes' : 'No');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    public DataMaintenanceCaption caption()
+    {
+        return literalStr("@SourceDocumentAccountingFramework:SourceDocumentCleanupForSalesOrderCreationTaskCaption");
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,279 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProjInvoiceProposalRulePeriodic</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>ProjInvoiceProposalRulePeriodic</c> class is used to create invoice proposals as a part of peridic process that can be batched.
+/// </summary>
+
+class ProjInvoiceProposalRulePeriodic extends ProjInvoiceProposalPeriodic implements BatchRetryable
+{
+    protected static ProjOpsFinancialsLogger logger = ProjOpsFinancialsLogger::createLogger(classStr(ProjInvoiceProposalRulePeriodic));
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the query to be used for fetching records to be processed.
+    /// </summary>
+    void initQuery()
+    {
+        Query query = new Query();
+
+        QueryBuildDataSource qbds = query.addDataSource(tableNum(ProjInvoiceTable));
+        qbds.addRange(fieldNum(ProjInvoiceTable, ProjInvoiceProjId));
+
+        QueryBuildDataSource qbdsProject = qbds.addDataSource(tableNum(ProjTable));
+        qbdsProject.addLink(fieldNum(ProjInvoiceTable, ProjInvoiceProjId), fieldNum(ProjTable, ProjInvoiceProjId));
+        qbdsProject.joinMode(JoinMode::InnerJoin);
+
+        //Hide the project index from the user
+        QueryBuildRange qbrProjId = qbdsProject.addRange(fieldNum(ProjTable, ProjId));
+        qbrProjId.status(RangeStatus::Hidden);
+
+        QueryBuildDataSource qbdsRule = qbdsProject.addDataSource(tableNum(ProjStatusTypeRule));
+        QueryBuildRange qbrProposal = qbdsRule.addRange(fieldNum(ProjStatusTypeRule, ProjStatusRule));
+        qbrProposal.value(queryValue(ProjStatusRule::CreateInvoiceProposal));
+        qbrProposal.status(RangeStatus::Hidden);
+
+        // Hide the other fields used as the primary index for table ProjStatusTypeRule
+        QueryBuildRange qbrStatus = qbdsRule.addRange(fieldNum(ProjStatusTypeRule, ProjStatus));
+        qbrStatus.status(RangeStatus::Hidden);
+        QueryBuildRange qbrProjType = qbdsRule.addRange(fieldNum(ProjStatusTypeRule, ProjType));
+        qbrProjType.status(RangeStatus::Hidden);
+
+        qbdsRule.addLink(fieldNum(ProjStatusTypeRule, ProjStatus), fieldNum(ProjTable, Status));
+        qbdsRule.addLink(fieldNum(ProjStatusTypeRule, ProjType), fieldNum(ProjTable, Type));
+        qbdsRule.joinMode(JoinMode::ExistsJoin);
+
+        if (ProjCDSLockingOptionTable::get(ProjCDSLockingOption::CreateInvoiceProposals))
+        {
+            QueryBuildRange projDSRange = qbdsProject.addRange(fieldNum(ProjTable, ProjDataSource));
+            projDSRange.value(SysQuery::value(0));
+            projDSRange.status(RangeStatus::Hidden);
+
+            QueryBuildRange contractDSRange = qbds.addRange(fieldNum(ProjInvoiceTable, ProjDataSource));
+            contractDSRange.value(SysQuery::value(0));
+            contractDSRange.status(RangeStatus::Hidden);
+        }
+
+        queryRun = new QueryRun(query);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Contains the code that does the actual job of the class.
+    /// </summary>
+    public void run()
+    {
+        Set                                  contractIds = new Set(Types::String);
+        ProjInvoiceProposalCreateLinesParams params       = this.createParameters();
+
+        using (var activityContext = logger.projOpsFinActivity().featureInstrumentationContext(methodStr(ProjInvoiceProposalRulePeriodic, run)))
+        {
+            int recordCount = 0;
+            int contractsProcessed = 0;
+            boolean isInBatch = this.isInBatch();
+            activityContext.addCustomProperty('isInBatch', any2Str(isInBatch));
+
+            while (queryRun.next())
+            {
+                recordCount++;
+                if (queryRun.changed(tableNum(ProjInvoiceTable)))
+                {
+                    ProjInvoiceTable contract = queryRun.get(tableNum(ProjInvoiceTable));
+
+                    if (contract.ProjInvoiceProjId                                        &&
+                    PSAContractLineItems::hasBillingRules(contract.ProjInvoiceProjId))
+                    {
+                        contractIds.add(contract.ProjInvoiceProjId);
+                    }
+                }
+            }
+
+            SetEnumerator contractsEnum = contractIds.getEnumerator();
+
+            if (isInBatch)
+            {
+                int maxBundleSize = (contractIds.elements() / projParameters.getMaxBundlesForInvoiceProposalCreation()) + 1;
+                ProjInvoiceProposalPeriodicBundle bundle = ProjInvoiceProposalPeriodicBundle::construct(maxBundleSize);
+                Batch batchInstance = this.parmCurrentBatch();
+                BatchHeader batchHeader = BatchHeader::getCurrentBatchHeader();
+                const boolean useBillingRules = true;
+
+                int createLinesBatchTaskCount = 0;
+
+                while (contractsEnum.moveNext())
+                {
+                    contractsProcessed++;
+                    ProjInvoiceProjId contractId = contractsEnum.current();
+
+                    Set projIds = new Set(Types::Class); // use empty set because it will match all projIds
+                    RunBaseBatch createLinesBatch = ProjInvoiceProposalCreateLinesTask::Construct(contractId, projIds, params, useBillingRules);
+                    bundle.addTask(createLinesBatch);
+                    createLinesBatchTaskCount++;
+
+                    if (bundle.isFull())
+                    {
+                        ProjInvoiceProposalRulePeriodic::addBundleToBatch(batchInstance, batchHeader, bundle);
+                        bundle = ProjInvoiceProposalPeriodicBundle::construct(maxBundleSize);
+                    }
+                }
+
+                if (!bundle.isEmpty())
+                {
+                    ProjInvoiceProposalRulePeriodic::addBundleToBatch(batchInstance, batchHeader, bundle);
+                }
+                
+                batchHeader.save();
+
+                activityContext.addCustomProperty('createLinesBatchTaskCount', any2Str(createLinesBatchTaskCount));
+            }
+            else
+            {
+                while (contractsEnum.moveNext())
+                {
+                    contractsProcessed++;
+                    ProjInvoiceProposalRulePeriodic::createInvoiceProposalLines(contractsEnum.current(), params);
+                }
+            }
+
+            activityContext.addCustomProperty('recordCount', any2Str(recordCount));
+            activityContext.addCustomProperty('contractsProcessed', any2Str(contractsProcessed));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInvoiceProposalLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create invoice proposal lines.
+    /// </summary>
+    /// <param name = "_contractId">Specifies which contract the proposal will be generated for.</param>
+    /// <param name = "_params">The other parameters from the dialog form that specify how to generate the proposals.</param>
+    public static void createInvoiceProposalLines(ProjInvoiceProjId _contractId, ProjInvoiceProposalCreateLinesParams _params)
+    {
+        using (var activityContext = logger.projOpsFinActivity().featureInstrumentationContext(staticMethodStr(ProjInvoiceProposalRulePeriodic, createInvoiceProposalLines)))
+        {
+            ttsbegin;
+
+            _params.parmProjInvoiceProjId(_contractId);
+
+            ProjInvoiceProposalRuleCreateLines proposalCreateLines = ProjInvoiceProposalRuleCreateLines::newStandard(_params.pack());
+            proposalCreateLines.run();
+
+            ProjInvoiceProposalInsertLines projInvoiceProposalInsertLines = new ProjInvoiceProposalInsertLines(proposalCreateLines, false);
+
+            projInvoiceProposalInsertLines.runOperation();
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs an instance of <c>ProjInvoiceProposalPeriodic</c> class.
+    /// </summary>
+    /// <returns>
+    /// Instance of <c>ProjInvoiceProposalPeriodic</c> class.
+    /// </returns>
+    public static ProjInvoiceProposalPeriodic construct()
+    {
+        return new ProjInvoiceProposalRulePeriodic();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static ClassDescription description()
+    {
+        if (ProjMultipleContractLinesForProjectFeatureHelper::isFeatureEnabled())
+        {
+            return "@GLS360095";
+        }
+        else
+        {
+            return "@GLS360084";
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        ProjInvoiceProposalRulePeriodic    projInvoiceProposalRulePeriodic = ProjInvoiceProposalRulePeriodic::construct();
+
+        if (projInvoiceProposalRulePeriodic.prompt())
+        {
+            projInvoiceProposalRulePeriodic.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addBundleToBatch</Name>
+				<Source><![CDATA[
+    private static void addBundleToBatch(Batch _batchInstance, BatchHeader _batchHeader, ProjInvoiceProposalPeriodicBundle _bundle)
+    {
+        if (ProjInvoiceProposalRulePeriodicBatchRuntimeTasksFlight::instance().isEnabled() && _batchInstance)
+        {
+            _batchHeader.addRuntimeTask(_bundle, _batchInstance.RecId);
+        }
+        else
+        {
+            _batchHeader.addTask(_bundle);
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

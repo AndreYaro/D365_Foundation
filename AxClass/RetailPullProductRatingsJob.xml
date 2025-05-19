@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailPullProductRatingsJob</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+using RnRProxy=Microsoft.Dynamics.Commerce.Proxies.RatingsAndReviewsConnector;
+using System.Reflection;
+using System.Collections;
+using System.IO;
+using System.Text;
+using System.Web;
+using System.Web.Script.Serialization;
+using Microsoft.Dynamics.ApplicationPlatform.Environment;
+
+/// <summary>
+/// The <c>RetailPullProductRatingsJob</c> class runs a job to ingest product ratings from a external ratings service.
+/// </summary>
+internal class RetailPullProductRatingsJob extends RunBaseBatch implements BatchRetryable
+{
+    private const str environmentIdPropertyName = 'EnvironmentId';
+    private const str continuationTokenPropertyName = 'ContinuationToken';
+    private const str urlPropertyName = 'Url';
+    private const str firstPartyRnRConnectorName = 'Microsoft Ratings and Reviews';
+
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Run the batch job by pulling ratings from the ratings and reviews service.
+    /// </summary>
+    public void run()
+    {
+       
+        str environmentId = RetailUtils::getEnvironmentId();
+        // Instantiate the connector
+        RnRProxy.IRatingsAndReviewsConnector connector;
+        try
+        {
+            connector = new RnRProxy.FirstPartyRatingsAndReviewsConnector();
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception ex = CLRInterop::getLastException();
+            str errorMessage;
+
+            if (ex.InnerException.InnerException)
+            {
+                // Use inner exception if it is available as it is often more descriptive.
+                errorMessage = ex.InnerException.InnerException.Message;
+            }
+            else
+            {
+                errorMessage = ex.InnerException.Message;
+            }
+
+            eventSource.EventWritePullProductRatingsJobError(classId2Name(ClassIdGet(this)), funcName(), strFmt("@Retail:ErrorInstantiatingRnRConnector", errorMessage));
+
+            throw error(strFmt("@Retail:ErrorInstantiatingRnRConnector", errorMessage));
+
+        }
+
+        // Fetch the ratings from the ratings and review service
+        RnRProxy.RatingsResult ratings;
+        RetailProductRating retailProductRating;
+        RetailRatingsAndReviewsConnector retailRatingsAndReviewsConnector;
+        do
+        {
+            try
+            {
+                // Note: These properties will be retrieved from the RetailRatingsAndReviewsConnector table once the UI for the connectors is built
+                select firstonly forupdate retailRatingsAndReviewsConnector
+                where retailRatingsAndReviewsConnector.Name == firstPartyRnRConnectorName;
+
+                str continuationToken;
+                str urlFormat;
+                if (retailRatingsAndReviewsConnector)
+                {
+                    continuationToken = retailRatingsAndReviewsConnector.ContinuationToken;
+                    urlFormat = retailRatingsAndReviewsConnector.Url;
+                }
+
+                IDictionary connectorProperties = new Generic.Dictionary<str, str>();
+                connectorProperties.Add(environmentIdPropertyName, environmentId);
+
+                if (continuationToken)
+                {
+                    connectorProperties.Add(continuationTokenPropertyName, continuationToken);
+                }
+
+                if (urlFormat)
+                {
+                    connectorProperties.Add(urlPropertyName, retailRatingsAndReviewsConnector.Url);
+                }
+
+                ratings = connector.GetRatings(connectorProperties);
+            }
+            catch (Exception::CLRError)
+            {
+                System.Exception ex = CLRInterop::getLastException();
+                str errorMessage;
+
+                if (ex.InnerException.InnerException)
+                {
+                    // Use inner exception if it is available as it is often more descriptive.
+                    errorMessage = ex.InnerException.InnerException.Message;
+                }
+                else
+                {
+                    errorMessage = ex.InnerException.Message;
+                }
+
+                eventSource.EventWritePullProductRatingsJobError(classId2Name(ClassIdGet(this)), funcName(), strFmt("@Retail:ErrorRetrievingRatings", errorMessage));
+
+                throw error(strFmt("@Retail:ErrorRetrievingRatings", errorMessage));
+            }
+
+            // Save the ratings into the HQ database
+            ttsbegin;
+            try
+            {
+                int productsCount = ratings.ProductRatings == null ? 0 : ratings.ProductRatings.get_Count();
+                for(int i = 0; i < productsCount; i++)
+                {
+                    RnRProxy.ProductRating productRating = ratings.ProductRatings.get_Item(i);
+                    if (RetailPullProductRatingsJob::isValidProductRating(productRating))
+                    {
+                        // Upsert the ratings information
+                        var ratingsEnumerator = productRating.Ratings.getEnumerator();
+                        while(ratingsEnumerator.moveNext()) {
+                            var currentRating = ratingsEnumerator.Current;
+                            real ratingsValue = currentRating.Key;
+                            int ratingsCount = currentRating.Value;
+                            int64 productId = any2Int64(productRating.ProductId);
+                            int64 channelId = any2Int64(productRating.ChannelId);
+
+                            select forupdate retailProductRating where retailProductRating.ProductId == productId
+                                && retailProductRating.Rating == ratingsValue
+                                && RetailProductRating.ChannelId == channelId;
+                            if (!retailProductRating)
+                            {
+                                retailProductRating.Rating = ratingsValue;
+                                retailProductRating.ProductId = productId;
+                                retailProductRating.TotalRatings = ratingsCount;
+                                RetailProductRating.ChannelId = channelId;
+                                retailProductRating.insert();
+                            }
+                            else
+                            {
+                                retailProductRating.TotalRatings = ratingsCount;
+                                retailProductRating.update();
+                            }
+                        }
+                    }
+                }
+
+                // Update the connector properties
+                if (retailRatingsAndReviewsConnector)
+                {
+                    retailRatingsAndReviewsConnector.ContinuationToken = ratings.ContinuationToken;
+                    retailRatingsAndReviewsConnector.update();
+                }
+                else
+                {
+                    retailRatingsAndReviewsConnector.ContinuationToken = ratings.ContinuationToken;
+                    retailRatingsAndReviewsConnector.Name = firstPartyRnRConnectorName;
+                    retailRatingsAndReviewsConnector.insert();
+                }
+
+                ttscommit;
+            }
+            catch
+            {
+                throw error("@Retail:ErrorSavingRatings");
+            }
+        }
+        while (ratings != null && ratings.HasNextPage);
+
+        info("@Retail:PullProductRatingsJobSuccessMessage");
+        eventSource.EventWritePullProductRatingsJobRanSuccessfully(this.parmCurrentBatch().BatchJobId);
+
+        return;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidProductRating</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Verifies if a product rating is valid.
+    /// </summary>
+    /// <returns>
+    /// A boolean indicating whether the product rating is valid.
+    /// </returns>
+    private static boolean isValidProductRating(RnRProxy.ProductRating productRating)
+    {
+        return RetailPullProductRatingsJob::isValidChannelId(productRating.ChannelId) && RetailPullProductRatingsJob::isValidProductId(productRating.ProductId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidProductId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Verifies if a string is a valid product ID.
+    /// </summary>
+    /// <returns>
+    /// A boolean indicating whether the string is a valid product ID.
+    /// </returns>
+    private static boolean isValidProductId(str strToValidate)
+    {
+        if (!RetailPullProductRatingsJob::isNumeric(strToValidate) || strToValidate == '0')
+        {
+            warning(strFmt("@Retail:InvalidProductRecIdFormat", strToValidate));
+            return false;
+        }
+
+        EcoResProduct ecoResProduct = EcoResProduct::find(any2Int64(strToValidate));
+        if (!ecoResProduct)
+        {
+            warning(strFmt("@Retail:InvalidProductRecId", strToValidate));
+            return false;
+        }
+  
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidChannelId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Verifies if a string is a valid channel ID.
+    /// </summary>
+    /// <returns>
+    /// A boolean indicating whether the string is a valid channel ID.
+    /// </returns>
+    private static boolean isValidChannelId(str strToValidate)
+    {
+        if (strToValidate != null && !RetailPullProductRatingsJob::isNumeric(strToValidate))
+        {
+            warning(strFmt("@Retail:InvalidChannelRecIdFormat", strToValidate));
+            return false;
+        }
+
+        RetailChannelTable retailChannelTable = RetailChannelTable::findByRecId(any2Int64(strToValidate));
+        if (strToValidate && !retailChannelTable)
+        {
+            warning(strFmt("@Retail:InvalidChannelRecId", strToValidate));
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isNumeric</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Verifies if a string is a numeric string.
+    /// </summary>
+    /// <returns>
+    /// A boolean indicating whether the string is numeric.
+    /// </returns>
+    private static boolean isNumeric(str strToValidate)
+    {
+        boolean ok = true;
+
+        ok = (strlen(strToValidate)) == strlen(strkeep(strToValidate,'1234567890'));
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the description of the class.
+    /// </summary>
+    /// <returns>
+    /// The description of the class.
+    /// </returns>
+    public static ClassDescription description()
+    {
+        return "@Retail:PullProductRatings";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instantiate an instance of the <b>RetailPullProductRatingsJob</b> and run the operation.
+    /// </summary>
+    public static void main(Args _args)
+    {
+        RetailPullProductRatingsJob scheduler = new RetailPullProductRatingsJob();
+
+        if (scheduler.prompt())
+        {
+            scheduler.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>RetailPullProductRatingsJob</c>
+    /// class can be run in a new session.
+    /// </summary>
+    /// <returns>true if the the class <c>RetailPullProductRatingsJob</c>
+    /// cannot be run in a new session; otherwise, false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		<Method><Name>isRetryable</Name><Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source></Method></Methods>
+	</SourceCode>
+</AxClass>

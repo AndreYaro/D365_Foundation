@@ -1,0 +1,314 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailCommerceValidatorAutomatedSchedulerJob</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The batch job that schedules merchandising configuration validator.
+/// This job maintains the list of validators, each time the job is triggered, it pick up a validator from the queue and runs the validator.
+/// Also, this job only runs next validator in the queue if the current one has completed. There is no parallel validator run to avoid performance impact.
+/// </summary>
+internal class RetailCommerceValidatorAutomatedSchedulerJob extends RunBaseBatch implements BatchRetryable
+{
+    // For unknown reason, the validator job may get stuck in "preparing" stage with 0% progress.
+    // This parameter is to detect the stuck job and restart it.
+    private const int ValidatorJobStuckDetectionTimeInMinutes = 20;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs next validaotr in the queue.
+    /// </summary>
+    public void run()
+    {
+        if (!FeatureStateProvider::isFeatureEnabled(RetailMerchandisingCopilotSummaryFeature::instance()) ||
+            !SysDataverseUtility::IsDataverseLinked())
+        {
+            return;
+        }
+
+        RetailCommerceValidatorAutomatedSchedulerParameters schedulerParameters = RetailCommerceValidatorAutomatedSchedulerParameters::findOrCreate(true);
+
+        if (!schedulerParameters)
+        {
+            return;
+        }
+
+        // Get the current state of validators queue.
+        container allValidations = schedulerParameters.AllValidations;
+        int currentValidationIndex = schedulerParameters.CurrentValidationIndex;
+
+        // If the queue is empty or all the validators in the queue have been run, then the queue should be re-populated.
+        if (currentValidationIndex == 0)
+        {
+            allValidations = this.initializeValidationsQueue();
+
+            ttsbegin;
+            schedulerParameters.AllValidations = allValidations;
+            schedulerParameters.update();
+            ttscommit;
+        }
+
+        RetailCommerceValidator runningValidator;
+
+        // Check the status of current validator,
+        // if it's still running, the batch job should return without running a new validator since we should not run validator in parallel to avoid performance impact.
+        if (currentValidationIndex > 0)
+        {
+            RetailCommerceValidatorId runningValidationId = conPeek(allValidations, currentValidationIndex);
+            select firstonly runningValidator
+                where runningValidator.ValidationId == runningValidationId
+                    && runningValidator.ValidationExecutionStatus == RetailCommerceValidatorExecutionStatus::InProgress;
+        }
+
+        if (runningValidator)
+        {
+            // For unknown reason, the validator job may get stuck in "preparing" stage with 0% progress.
+            // Restart the job if current validator is stuck.
+            if (runningValidator.ValidationProgressPercentage == 0 &&
+                runningValidator.ValidationExecutionPhase == RetailCommerceValidatorExecutionPhase::Setup &&
+                runningValidator.ModifiedDateTime < DateTimeUtil::addMinutes(DateTimeUtil::utcNow(), ValidatorJobStuckDetectionTimeInMinutes))
+            {
+                RetailCommerceValidator::execute(runningValidator.ValidationId, RetailCommerceValidatorExecutionMode::ExecuteAll);
+            }
+
+            return;
+        }
+
+        // If the previous validator already finished, we pick up next validator in the queue and run it.
+        currentValidationIndex += 1;
+
+        // If all the validators in the queue have been run, we reset the index indicating next batch job run should re-populate the queue.
+        if (currentValidationIndex > conLen(allValidations))
+        {
+            currentValidationIndex = 0;
+        }
+
+        // Update the index before scheduling the next validator, in case the validator has something wrong and cannot be scheduled. So that this problematic validator could be skipped.
+        ttsbegin;
+        schedulerParameters.CurrentValidationIndex = currentValidationIndex;
+        schedulerParameters.update();
+        ttscommit;
+
+        // Pick the next validator from the queue and runs it.
+        // Before running the validator, we should clean up the historical data for this validator because the validator job itself never cleans up the historical data.
+        // This is to avoid storage limitation issue in HQ DB.
+        if (currentValidationIndex > 0) 
+        {
+            RetailCommerceValidatorId nextValidatorId = conPeek(allValidations, currentValidationIndex);
+
+            this.cleanupValidationHistory(nextValidatorId);
+            this.scheduleValidation(nextValidatorId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the description of the class.
+    /// </summary>
+    /// <returns>
+    /// The description of the class.
+    /// </returns>
+    public static ClassDescription description()
+    {
+        return @"Retail:RetailCommerceValidatorAutomatedSchedulerJobDescription";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instantiate an instance of the <b>RetailSyncCmsJob</b> and run the operation.
+    /// </summary>
+    /// <param name = "_args">The arguments to run teh batch job.</param>
+    public static void main(Args _args)
+    {
+        RetailCommerceValidatorAutomatedSchedulerJob scheduler = new RetailCommerceValidatorAutomatedSchedulerJob();
+
+        if (scheduler.prompt())
+        {
+            scheduler.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>RetailSyncCmsJob</c> class can be run in a new session.
+    /// </summary>
+    /// <returns>true if the the class <c>RetailSyncCmsJob</c> cannot be run in a new session; otherwise, false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeValidationsQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create validators for all channels and push them to the queue.
+    /// </summary>
+    /// <returns>The list of validators.</returns>
+    private container initializeValidationsQueue()
+    {
+        container allValidations = conNull();
+
+        RetailCommerceValidator::createAllValidationsWithAutomatedRun(
+            false, // execute now?
+            NoYes::Yes // is automated run?
+        );
+
+        RetailCommerceValidator validator;
+
+        while select validator
+            order by validator.ValidationId asc
+            where validator.IsAutomatedRun
+        {
+            allValidations += validator.ValidationId;
+        }
+
+        return allValidations;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>scheduleValidation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Schedules the validation.
+    /// If the validation has been run in the recent past, the validator will not be scheduled.
+    /// </summary>
+    /// <param name = "validationId"></param>
+    private void scheduleValidation(RetailCommerceValidatorId validationId)
+    {
+        RetailCommerceValidator retailCommerceValidator = RetailCommerceValidator::find(validationId);
+        RetailCommerceValidatorAutomatedSchedulerParameters schedulerParameters = RetailCommerceValidatorAutomatedSchedulerParameters::findOrCreate(false);
+
+        if (!schedulerParameters)
+        {
+            return;
+        }
+
+        // Check if the validator has been run in the recent past.
+        if (retailCommerceValidator
+            && retailCommerceValidator.ModifiedDateTime > DateTimeUtil::addMinutes(DateTimeUtil::utcNow(), -schedulerParameters.MinimumIntervalInMinutes)
+            && retailCommerceValidator.ValidationExecutionPhase == RetailCommerceValidatorExecutionPhase::Completed)
+        {
+            return;
+        }
+
+        RetailCommerceValidator::execute(validationId, RetailCommerceValidatorExecutionMode::ExecuteAll);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanupValidationHistory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cleans up the historical data of the validator. Only the data from most recent completed run will be kept.
+    /// </summary>
+    /// <param name = "validationId">The validator to be cleaned up.</param>
+    private void cleanupValidationHistory(RetailCommerceValidatorId validationId)
+    {
+        RetailCommerceValidator retailCommerceValidator = RetailCommerceValidator::find(validationId);
+        RefRecId lastCompletedBatchJobId = retailCommerceValidator.LastCompletedBatchJobId;
+
+        RetailCommerceValidatorLog validatorLog;
+        RetailCommerceValidatorLogContext validatorLogContext;
+        RetailCommerceValidatorBatchJobs validatorBatchJobs;
+        RetailCommerceValidatorChartTotalizer validatorChartTotalizer;
+        RetailCommerceValidatorCounters validatorCounters;
+        RetailCommerceValidatorLogCountersByContext validatorLogCountersByContext;
+        RetailCommerceValidatorPassedAttributeGroups validatorPassedAttributeGroups;
+        RetailCommerceValidatorPassedAttributes validatorPassedAttributes;
+        RetailCommerceValidatorPassedCatalogs validatorPassedCatalogs;
+        RetailCommerceValidatorPassedCategories validatorPassedCategories;
+        RetailCommerceValidatorPassedCategoryHierarchies validatorPassedCategoryHierarchies;
+        RetailCommerceValidatorPassedProducts validatorPassedProducts;
+        RetailCommerceValidatorTimeStamp validatorTimestamp;
+
+        ttsbegin;
+
+        delete_from validatorLog
+            where validatorLog.ValidationId == validationId && validatorLog.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorLogContext
+            where validatorLogContext.ValidationId == validationId && validatorLogContext.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorBatchJobs
+            where validatorBatchJobs.ValidationId == validationId && validatorBatchJobs.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorChartTotalizer
+            where validatorChartTotalizer.ValidationId == validationId && validatorChartTotalizer.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorCounters
+            where validatorCounters.ValidationId == validationId && validatorCounters.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorLogCountersByContext
+            where validatorLogCountersByContext.ValidationId == validationId && validatorLogCountersByContext.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorPassedAttributeGroups
+            where validatorPassedAttributeGroups.ValidationId == validationId && validatorPassedAttributeGroups.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorPassedAttributes
+            where validatorPassedAttributes.ValidationId == validationId && validatorPassedAttributes.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorPassedCatalogs
+            where validatorPassedCatalogs.ValidationId == validationId && validatorPassedCatalogs.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorPassedCategories
+            where validatorPassedCategories.ValidationId == validationId && validatorPassedCategories.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorPassedCategoryHierarchies
+            where validatorPassedCategoryHierarchies.ValidationId == validationId && validatorPassedCategoryHierarchies.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorPassedProducts
+            where validatorPassedProducts.ValidationId == validationId && validatorPassedProducts.BatchJobId != lastCompletedBatchJobId;
+
+        delete_from validatorTimestamp
+            where validatorTimestamp.ValidationId == validationId
+        notexists join retailCommerceValidator
+            where retailCommerceValidator.ValidationId == validatorTimestamp.ValidationId;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

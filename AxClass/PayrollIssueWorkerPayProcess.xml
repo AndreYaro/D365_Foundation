@@ -1,0 +1,1501 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PayrollIssueWorkerPayProcess</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>PayrollIssueWorkerPayProcess</c> class handles the logic for generating the payment journals and vendor invoice for these payments.
+/// </summary>
+class PayrollIssueWorkerPayProcess extends PayrollIssueWorkerPayProcessBase implements BatchRetryable
+{
+    VendTransRefRecId           vendTransRecId;
+    LedgerJournalTable          ledgerJournalTable;
+    LedgerJournalId             ledgerJournalId;
+    boolean                     switchedToCheck;
+
+    // The following 3 variables are initialized in the preValidate() method
+    PayrollParameters           payrollParameters;
+    LedgerJournalName           ledgerJournalName;
+    NumberSequenceTable         numberSequenceTableJournalNum;
+
+    PayrollPayStatement         payStatement;
+    boolean                     issueSinglePay;
+    TransDate                   periodEndDate;
+    LedgerJournalTransPayrollDisbursement ledgerJournalTransPayrollDisbursement;
+    RecordInsertList            payrollDisbursementList;
+    LedgerJournalTrans          ledgerJournalTrans;
+    NumberSeq                   numberSeqLedgerJournal;
+    DimensionDynamicAccount     dynamicsAccount;
+    DimensionDefault            defaultDimension;
+
+    // This is used for to count the number of Journal lines created in the whole process
+    int                         counter;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createJournalBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new ledger journal for the pay run.
+    /// </summary>
+    /// <returns>
+    /// The journal number of the ledger journal created.
+    /// </returns>
+    private LedgerJournalId createJournalBatch()
+    {
+        NumberSeq           numberSeq;
+
+        // From GL parameters form Journal Batch Number
+        numberSeq = NumberSeq::newGetNumFromCode(numberSequenceTableJournalNum.NumberSequence, NumberSeqScopeFactory::createDefaultScope(), true, false);
+
+        ledgerJournalTable.JournalNum               = numberSeq.num();
+        // Matching the "Description" on the form
+        ledgerJournalTable.Name                     = ledgerJournalName.Name;
+        ledgerJournalTable.JournalType              = ledgerJournalName.JournalType;
+        // Matching the "Name" field on the form
+        ledgerJournalTable.JournalName              = ledgerJournalName.JournalName;
+        // Matching the "Posting layer" field on the form
+        ledgerJournalTable.CurrentOperationsTax     = ledgerJournalName.CurrentOperationsTax;
+        // Matching the "Detail level" field on the form
+        ledgerJournalTable.DetailSummaryPosting     = ledgerJournalName.DetailSummary;
+
+        ledgerJournalTable.LinesLimitBeforeDistribution = ledgerJournalName.LinesLimitBeforeDistribution;
+        ledgerJournalTable.OffsetAccountType        = ledgerJournalName.OffsetAccountType;
+
+        ledgerJournalTable.VoucherAllocatedAtPosting = NoYes::No;
+
+        ledgerJournalTable.NumberSequenceTable      = ledgerJournalName.NumberSequenceTable;
+
+        ledgerJournalTable.CurrencyCode             = Ledger::accountingCurrency();
+        ledgerJournalTable.ExchRate                 = 100;
+        ledgerJournalTable.ExchrateSecondary        = 0;
+
+        ledgerJournalTable.LedgerJournalInclTax     = ledgerJournalName.LedgerJournalInclTax;
+
+        if (vendTransRecId)
+        {
+            ledgerJournalTable.DocumentNum   = VendTrans::find(vendTransRecId).Invoice;
+        }
+
+        ledgerJournalTable.insert();
+
+        return ledgerJournalTable.JournalNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalPayrollDisbursement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new record in the <c>LedgerJournalTransPayrollDisbursement</c> table associated to the pay statement processed.
+    /// </summary>
+    /// <param name="_refRecId">
+    /// The RecId of the <c>LedgerJournalTransTable</c> record.
+    /// </param>
+    /// <param name="_bankRecId">
+    /// The RecId of the <c>HcmWorkerBankAccount</c> table if paid electronically, 0 if paid by check.
+    /// </param>
+    private void createJournalPayrollDisbursement(LedgerJournalTransRefRecId _refRecId, HcmWorkerBankAccountRecId _bankRecId = 0)
+    {
+        ledgerJournalTransPayrollDisbursement.clear();
+        ledgerJournalTransPayrollDisbursement.PayStatement = payStatement.RecId;
+        ledgerJournalTransPayrollDisbursement.RefRecId = _refRecId;
+        ledgerJournalTransPayrollDisbursement.WorkerBankAccount = _bankRecId;
+
+        if (issueSinglePay)
+        {
+            ledgerJournalTransPayrollDisbursement.insert();
+        }
+        else
+        {
+            payrollDisbursementList.add(ledgerJournalTransPayrollDisbursement);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalTransLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new record in the <c>LedgerJournalTrans</c> table.
+    /// </summary>
+    /// <param name="_amount">
+    /// The amount for the <c>LedgerJournalTrans</c> record.
+    /// </param>
+    /// <param name="_counter">
+    /// The line number of the <c>LedgerJournalTrans</c> record.
+    /// </param>
+    /// <param name="_paymMode">
+    /// The payment mode specified for the <c>LedgerJournalTrans</c> record.
+    /// </param>
+    /// <returns>
+    /// The recId of the record in the <c>LedgerJournalTrans</c> table created.
+    /// </returns>
+    private LedgerJournalTransRefRecId createJournalTransLine(Amount _amount,
+                                                                real _counter,
+                                                                PaymMode _paymMode)
+    {
+        VendPaymModeTable       paymModeTable;
+        DimensionAttributeValueCombination dimensionAttributeValueCombination;
+
+        paymModeTable = VendPaymModeTable::find(_paymMode);
+        select firstonly displayValue from dimensionAttributeValueCombination where dimensionAttributeValueCombination.RecId == paymModeTable.PaymentLedgerDimension;
+
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.Voucher                  = numberSeqLedgerJournal.voucher();
+
+        ledgerJournalTrans.TransDate                = payStatement.PaymentDate;
+
+        ledgerJournalTrans.Company                  = curext();
+        ledgerJournalTrans.AccountType              = LedgerJournalACType::Vend;
+        ledgerJournalTrans.LedgerDimension          = dynamicsAccount;
+        ledgerJournalTrans.DefaultDimension         = defaultDimension;
+        ledgerJournalTrans.Txt                      = strFmt("@Payroll:PayrollPayment1", ledgerJournalTrans.TransDate);
+        ledgerJournalTrans.PaymMode                 = _paymMode;
+
+        ledgerJournalTrans.DocumentNum              = payStatement.DocumentNumber;
+        ledgerJournalTrans.DocumentDate             = periodEndDate;
+
+        ledgerJournalTrans.BankTransType            = paymModeTable.BankTransType;
+        ledgerJournalTrans.OffsetCompany            = curext();
+        ledgerJournalTrans.OffsetAccountType        = paymModeTable.AccountType;
+        ledgerJournalTrans.OffsetLedgerDimension    = paymModeTable.PaymentLedgerDimension;
+        ledgerJournalTrans.OffsetDefaultDimension   = BankAccountTable::find(dimensionAttributeValueCombination.DisplayValue).DefaultDimension;
+        ledgerJournalTrans.OffsetTxt                = strFmt("@Payroll:PayrollPayment1", ledgerJournalTrans.TransDate);
+        ledgerJournalTrans.AmountCurDebit           = _amount;
+        ledgerJournalTrans.AmountCurCredit          = 0;
+        ledgerJournalTrans.CurrencyCode             = ledgerJournalTable.CurrencyCode;
+        ledgerJournalTrans.ExchRate                 = ledgerJournalTable.ExchRate;
+        ledgerJournalTrans.ExchRateSecond           = ledgerJournalTable.ExchrateSecondary;
+
+        ledgerJournalTrans.JournalNum               = ledgerJournalTable.JournalNum;
+        ledgerJournalTrans.LineNum                  = _counter;
+
+        ledgerJournalTrans.TransactionType          = LedgerTransType::Payment;
+        ledgerJournalTrans.Approved                 = true;
+
+        ledgerJournalTrans.insert();
+
+        return ledgerJournalTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates ledger journal lines and records in the <c>LedgerJournalTransPayrollDisbursement</c> table for a pay statement.
+    /// </summary>
+    /// <remarks>
+    /// A ledger journal line and a disbursement record are created for every worker payment by direct deposit or check.
+    /// More than one ledger journal lines and disbursement records may be created for the pay statement if the worker is receiving multiple direct deposits.
+    /// </remarks>
+    private void createLedgerJournal()
+    {
+        HcmWorkerBankAccount bankAccountRemainder, bankAccount;
+        PayrollBankAccountDisbursement bankDisbursement, bankDisbursementRemainder;
+        AmountMST paymAmount;
+        LedgerJournalTransRefRecId ledgerJournalTransRefRecId;
+
+        if (payStatement.NetAccountingCurrencyAmount <= 0)
+        {
+            return;
+        }
+
+        switchedToCheck = false;
+
+        if (payStatement.PaymentMethodType == PayrollPaymentMethodType::ElectronicPayment)
+        {
+            // Check if the employee has the bank disbursements with a remainder account setup
+            select firstonly RecId from bankDisbursementRemainder
+                join RecId, Worker from bankAccountRemainder
+                where bankDisbursementRemainder.WorkerBankAccount  == bankAccountRemainder.RecId
+                && bankAccountRemainder.Worker == payStatement.Worker
+                && bankDisbursementRemainder.IsInPreNoteStatus == NoYes::No
+                && bankDisbursementRemainder.IsRemainder == NoYes::Yes;
+
+            if (bankDisbursementRemainder.RecId)
+            {
+                paymAmount = payStatement.NetAccountingCurrencyAmount;
+                while select AccountingCurrencyAmount from bankDisbursement
+                    join RecId, Worker from bankAccount
+                    where bankDisbursement.WorkerBankAccount  == bankAccount.RecId
+                    && bankAccount.Worker == payStatement.Worker
+                    && bankDisbursement.IsInPreNoteStatus == NoYes::No
+                    && bankDisbursement.IsRemainder == NoYes::No
+                {
+                    if (bankDisbursement.AccountingCurrencyAmount > 0 && paymAmount > 0)
+                    {
+                        if (bankDisbursement.AccountingCurrencyAmount >= paymAmount)
+                        {
+                            ledgerJournalTransRefRecId = this.createJournalTransLine(paymAmount, counter, payrollParameters.ElectronicPaymMode);
+                            this.createJournalPayrollDisbursement(ledgerJournalTransRefRecId, bankAccount.RecId);
+                            counter++;
+                            paymAmount = 0;
+                        }
+                        else
+                        {
+                            ledgerJournalTransRefRecId = this.createJournalTransLine(bankDisbursement.AccountingCurrencyAmount, counter, payrollParameters.ElectronicPaymMode);
+                            this.createJournalPayrollDisbursement(ledgerJournalTransRefRecId, bankAccount.RecId);
+                            counter++;
+                            paymAmount -= bankDisbursement.AccountingCurrencyAmount ;
+                        }
+                    }
+                }
+
+                if (paymAmount > 0)
+                {
+                    ledgerJournalTransRefRecId = this.createJournalTransLine(paymAmount, counter, payrollParameters.ElectronicPaymMode);
+                    this.createJournalPayrollDisbursement(ledgerJournalTransRefRecId, bankAccountRemainder.RecId);
+                    counter++;
+                }
+            }
+            else
+            {
+                // No remainder disbursement account set up, issue check instead
+                ledgerJournalTransRefRecId = this.createJournalTransLine(payStatement.NetAccountingCurrencyAmount, counter, payrollParameters.PaymMode);
+                this.createJournalPayrollDisbursement(ledgerJournalTransRefRecId);
+                counter++;
+
+                switchedToCheck = true;
+            }
+        }
+        else
+        {
+            // Check issued for worker pay
+            ledgerJournalTransRefRecId = this.createJournalTransLine(payStatement.NetAccountingCurrencyAmount, counter, payrollParameters.PaymMode);
+            this.createJournalPayrollDisbursement(ledgerJournalTransRefRecId);
+            counter++;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createReversedVendorTran</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates vendor invoice for the reversed pay statement.
+    /// </summary>
+    /// <returns>
+    /// The recId of the vendor invoice created.
+    /// </returns>
+    private VendTransRefRecId createReversedVendorTran()
+    {
+        PayrollPayStatement         payStatementReversed;
+        VendInvoiceInfoSubTable     vendInvoiceInfoSubTable;
+        VendInvoiceInfoLine         vendInvoiceInfoLine;
+        VendInvoiceInfoTable        vendInvoiceInfoTable, vendInvoice_VendInvoiceInfoTable;
+        Num                         invoiceNum;
+        VendTrans                   vendTrans, vendTransReversed;
+        VendInvoiceInfoTableRecId   vendInvRecId;
+
+        payStatementReversed = PayrollPayStatement::find(payStatement.ReversedPayStatement);
+
+        invoiceNum = this.getVendorInvoiceNumberSeq().num();
+
+        ttsBegin;
+
+        vendInvoice_VendInvoiceInfoTable = this.createVendInvoiceInfoTable(
+                                                    PayrollPayPeriod::find(payStatement.PayPeriod).PeriodEndDate,
+                                                    payrollParameters.VendorAccountNum,
+                                                    CompanyInfo::current(),
+                                                    invoiceNum);
+
+        vendInvoiceInfoSubTable = VendInvoiceInfoSubTable::createFromVendInvoiceInfoTable(vendInvoice_VendInvoiceInfoTable);
+        this.createVendInvoiceInfoLineFromSubInfoLine(
+                 vendInvoiceInfoSubTable,
+                 payrollParameters.ProcurementCategory,
+                 payStatement.NetAccountingCurrencyAmount);
+
+        ttsCommit;
+
+        vendInvRecId = vendInvoice_VendInvoiceInfoTable.RecId;
+
+        if (vendInvRecId != 0)
+        {
+            vendInvoiceInfoTable = VendInvoiceInfoTable::findRecId(vendInvRecId);
+
+            select firstonly forupdate * from vendInvoiceInfoLine
+                where vendInvoiceInfoLine.TableRefId == vendInvoiceInfoTable.TableRefId
+                &&    vendInvoiceInfoLine.ParmId == vendInvoiceInfoTable.ParmId;
+
+            vendInvoiceInfoLine.PayrollLedgerDimension = payrollParameters.SalaryClearingAccountLedgerDimension;
+            vendInvoiceInfoLine.DefaultDimension = 0;
+            vendInvoiceInfoLine.update();
+
+            // Fully distribute the source document line
+            SourceDocumentProcessorFacade::submitSourceDocumentLineImplementation(vendInvoiceInfoLine,
+                            false, SourceDocumentLineAccountingStatus::FullyDistributed);
+
+            // Post the saved vendor invoice
+            VendInvoicePaymentAuthorizationTask::postSavedInvoice(vendInvoiceInfoTable);
+
+            // Find the posted vendor invoice by searching on account num, invoice number, and transaction date
+            select firstonly forupdate * from vendTrans
+                where vendTrans.AccountNum == vendInvoiceInfoTable.OrderAccount
+                &&    vendTrans.Invoice == vendInvoiceInfoTable.Num
+                &&    vendTrans.TransDate == vendInvoiceInfoTable.TransDate;
+
+            // Settlement integration point
+            vendTransReversed = VendTrans::find(payStatementReversed.VendTrans);
+
+            if (vendTransReversed.RecId != 0)
+            {
+                this.settleOpenVendTrans(vendTransReversed, vendTrans);
+            }
+            else
+            {
+                warning(strFmt("@SYS4090092", vendTrans.Invoice));
+            }
+        }
+
+        return vendTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVendInvoiceInfoLineFromSubInfoLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a <c>VendInvoiceInfoLine</c> record from a supplied <c>VendInvoiceInfoSubTable</c> record for a specified <c>EcoResCategoryId</c> value
+    /// and <c>AmountCur</c> value.
+    /// </summary>
+    /// <param name = "_vendInvoiceInfoSubTable">
+    /// The <c>VendInvoiceInfoSubTable</c> table record to be used as source to create a record of the <c>VendInvoiceInfoLine</c> table.
+    /// </param>
+    /// <param name = "_procurementCategoryId">
+    /// Value for the <c>ProcurementCategory</c> field of the <c>VendInvoiceInfoLine</c> table record to be created.
+    /// </param>
+    /// <param name = "_lineAmount">
+    /// Value for the <c>LineAmount</c> field of the <c>VendInvoiceInfoLine</c> table record to be created.
+    /// </param>
+    private void createVendInvoiceInfoLineFromSubInfoLine(
+                     VendInvoiceInfoSubTable _vendInvoiceInfoSubTable,
+                     EcoResCategoryId _procurementCategoryId,
+                     AmountCur _lineAmount)
+    {
+        VendInvoiceInfoLine vendInvoiceInfoLine;
+
+        vendInvoiceInfoLine.initValue();
+
+        vendInvoiceInfoLine.ParmId      = _vendInvoiceInfoSubTable.ParmId;
+        vendInvoiceInfoLine.TableRefId  = _vendInvoiceInfoSubTable.TableRefId;
+        vendInvoiceInfoLine.defaultRow();
+        vendInvoiceInfoLine.ReceiveNow = _lineAmount > 0 ? 1 : -1;
+        vendInvoiceInfoLine.ProcurementCategory = EcoResCategory::find(_procurementCategoryId).RecId;
+        vendInvoiceInfoLine.LineAmount = _lineAmount;
+
+        vendInvoiceInfoLine.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVendInvoiceInfoTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates vendor invoice data in the <c>VendInvoiceInfoTable</c> table .
+    /// </summary>
+    /// <param name = "_transactionDate">
+    /// The transaction date for the invoice.
+    /// </param>
+    /// <param name = "_vendorAccount">
+    /// The vendor account used on the invoice.
+    /// </param>
+    /// <param name = "_companyInfoRecId">
+    /// The company to create the invoice for.
+    /// </param>
+    /// <param name = "_invoiceNumber">
+    /// The unique number associated with the invoice.
+    /// </param>
+    /// <returns>
+    /// The fully populated <c>VendInvoiceInfoTable</c> object.
+    /// </returns>
+    private VendInvoiceInfoTable createVendInvoiceInfoTable(
+                                     TransDate _transactionDate,
+                                     VendAccount _vendorAccount,
+                                     CompanyInfoRecId _companyInfoRecId,
+                                     Num _invoiceNumber)
+    {
+        VendInvoiceInfoTable vendInvoiceInfoTable;
+
+        vendInvoiceInfoTable.initValue();
+
+        vendInvoiceInfoTable.Num = _invoiceNumber;
+        vendInvoiceInfoTable.InvoiceAccount = _vendorAccount;
+        vendInvoiceInfoTable.OrderAccount = _vendorAccount;
+        vendInvoiceInfoTable.CurrencyCode = Ledger::accountingCurrency(_companyInfoRecId);
+        vendInvoiceInfoTable.TransDate = _transactionDate;
+        vendInvoiceInfoTable.FixedDueDate = _transactionDate;
+        vendInvoiceInfoTable.DocumentDate = _transactionDate;
+        vendInvoiceInfoTable.VendInvoiceSaveStatus = VendInvoiceSaveStatus::Pending;
+        vendInvoiceInfoTable.ParmJobStatus = ParmJobStatus::Waiting;
+        vendInvoiceInfoTable.defaultRow();
+
+        // Set workflow status to approved to ensure workflow doesn't prevent posting this vendor invoice
+        vendInvoiceInfoTable.RequestStatus = VendInvoiceRequestStatus::Approved;
+
+        vendInvoiceInfoTable.insert();
+
+        return vendInvoiceInfoTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVendorTran</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates one vendor invoice for all the non-reversed pay statements
+    /// </summary>
+    /// <param name="_date">
+    /// The trans date for the vendor invoice.
+    /// </param>
+    /// <param name="_amount">
+    /// The amount for the vendor invoice.
+    /// </param>
+    /// <returns>
+    /// the vendor invoice recId
+    /// </returns>
+    private VendTransRefRecId createVendorTran(TransDate _date, AmountMST _amount)
+    {
+        LedgerDimensionDefaultAccount  salaryClearingAccount;
+        VendInvoiceInfoSubTable        vendInvoiceInfoSubTable;
+        VendInvoice                    vendInvoice;
+        VendInvoiceInfoTable           vendInvoiceInfoTable, vendInvoice_VendInvoiceInfoTable;
+        VendInvoiceInfoLine            vendInvoiceInfoLine;
+        Num                            invoiceNum;
+        VendTrans                      vendTrans;
+        VendInvoiceInfoTableRecId      vendInvRecId;
+
+        salaryClearingAccount = payrollParameters.SalaryClearingAccountLedgerDimension;
+
+        invoiceNum = this.getVendorInvoiceNumberSeq().num();
+
+        ttsBegin;
+
+        vendInvoice_VendInvoiceInfoTable = this.createVendInvoiceInfoTable(
+                                                    _date,
+                                                    payrollParameters.VendorAccountNum,
+                                                    CompanyInfo::current(),
+                                                    invoiceNum);
+
+        vendInvoiceInfoSubTable = VendInvoiceInfoSubTable::createFromVendInvoiceInfoTable(vendInvoice_VendInvoiceInfoTable);
+        this.createVendInvoiceInfoLineFromSubInfoLine(
+                 vendInvoiceInfoSubTable,
+                 payrollParameters.ProcurementCategory,
+                 _amount);
+
+        ttsCommit;
+
+        vendInvRecId = vendInvoice_VendInvoiceInfoTable.RecId;
+
+        if (vendInvRecId != 0)
+        {
+            vendInvoiceInfoTable = VendInvoiceInfoTable::findRecId(vendInvRecId);
+
+            select firstonly forupdate * from vendInvoiceInfoLine
+                where vendInvoiceInfoLine.TableRefId == vendInvoiceInfoTable.TableRefId
+                &&    vendInvoiceInfoLine.ParmId == vendInvoiceInfoTable.ParmId;
+
+            // Set the desired ledger dimension value and clear out any default dimensions set from Vendor Invoice logic
+            vendInvoiceInfoLine.PayrollLedgerDimension = payrollParameters.SalaryClearingAccountLedgerDimension;
+            vendInvoiceInfoLine.DefaultDimension = 0;
+            vendInvoiceInfoLine.update();
+
+            // Fully distribute the source document line
+            SourceDocumentProcessorFacade::submitSourceDocumentLineImplementation(vendInvoiceInfoLine,
+                            false, SourceDocumentLineAccountingStatus::FullyDistributed);
+
+            // Post the saved vendor invoice
+            VendInvoicePaymentAuthorizationTask::postSavedInvoice(vendInvoiceInfoTable);
+
+            // Find the posted vendor invoice by searching on account num, invoice number, and transaction date
+            select firstonly RecId from vendTrans
+                where vendTrans.AccountNum == vendInvoiceInfoTable.OrderAccount
+                &&    vendTrans.Invoice == vendInvoiceInfoTable.Num
+                &&    vendTrans.TransDate == vendInvoiceInfoTable.TransDate;
+        }
+
+        return vendTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getVendorInvoiceNumberSeq</Name>
+				<Source><![CDATA[
+    private NumberSeq getVendorInvoiceNumberSeq()
+    {
+        NumberSeq               numberSeq;
+        NumberSequenceReference numberSequenceReference;
+        NumberSequenceTable     numberSequenceTable;
+
+        numberSequenceReference = PayrollParameters::numRefVendorInvoiceNum();
+        numberSequenceTable = NumberSequenceTable::find(numberSequenceReference.NumberSequenceId);
+
+        if (numberSequenceReference)
+        {
+            numberSeq = NumberSeq::newGetNum(numberSequenceReference);
+        }
+
+        if (numberSeq == null)
+        {
+            throw error("@Payroll:YouCannotSubmitThePayStatementBecauseANumberSequenceIsNotAss");
+        }
+
+        return numberSeq;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>issueReversedPayProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates reversed vendor invoices for the revsered pay statements and settle to the original vendor invoice for each pay statement.
+    /// </summary>
+    /// <returns>
+    /// Returns true if the process succeeds without error.
+    /// </returns>
+    protected boolean issueReversedPayProcess()
+    {
+        PayrollPayStatement         payStatementCount;
+        VendTransRefRecId           vendTransRecIdReverted;
+        boolean                     ret = NoYes::Yes;
+
+        // Process the reverted pay statements
+        select firstonly RecId from payStatementCount
+                where payStatementCount.NetAccountingCurrencyAmount < 0
+                        && payStatementCount.IsReversed == true
+            join issueWorkerPayDB
+                where payStatementCount.RecId == issueWorkerPayDB.PayStatement;
+
+        if (payStatementCount.RecId > 0 )
+        {
+            // Create vendor invoices for the reverted pay statement
+            while select forupdate RecId, PayPeriod, ReversedPayStatement, NetAccountingCurrencyAmount, PaymentStatus from payStatement
+                join issueWorkerPayDB
+                where payStatement.RecId == issueWorkerPayDB.PayStatement
+                    && payStatement.NetAccountingCurrencyAmount < 0
+                    && payStatement.IsReversed == true
+            {
+                try
+                {
+                    ttsbegin;
+                    vendTransRecIdReverted = this.createReversedVendorTran();
+
+                    // Update the pay statement with the new VendTrans recIds
+                    payStatement.VendTrans = vendTransRecIdReverted;
+                    payStatement.update();
+
+                    ttscommit;
+
+                    info(strFmt("@Payroll:Invoice1WasPostedForReversedPayStatement2", VendTrans::find(vendTransRecIdReverted).Invoice, payStatement.DocumentNumber));
+                }
+                catch (Exception::Error)
+                {
+                    ttsbegin;
+                    payStatement.PaymentStatus = PayrollPaymentStatus::Calculated;
+                    payStatement.update();
+                    ttscommit;
+
+                    ret = ret && checkFailed(strFmt("@Payroll:TheReversedPayStatement1WasNotSubmittedForPaymentBecauseAnEr", payStatement.DocumentNumber));
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>issueReversedWorkerPay</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a reversed vendor invoice for the revsered pay statement and settle to the original vendor invoice for the pay statement.
+    /// </summary>
+    private void issueReversedWorkerPay()
+    {
+        VendTransRefRecId           vendTransRecIdReverted;
+
+        payStatement.selectForUpdate(true);
+
+        if (payStatement.NetAccountingCurrencyAmount < 0)
+        {
+            // Create one verdor invoice for the reversed pay statement
+            vendTransRecIdReverted = this.createReversedVendorTran();
+
+            // Update the pay statement with the new VendTrans recIds
+            payStatement.VendTrans = vendTransRecIdReverted;
+            payStatement.PaymentStatus = PayrollPaymentStatus::PaymentIssued;
+            payStatement.update();
+
+            info(strFmt("@Payroll:Invoice1WasPostedForReversedPayStatement2", VendTrans::find(vendTransRecIdReverted).Invoice, payStatement.DocumentNumber));
+        }
+        else if (payStatement.NetAccountingCurrencyAmount == 0)
+        {
+            payStatement.PaymentStatus = PayrollPaymentStatus::PaymentIssued;
+            payStatement.update();
+            info(strFmt("@Payroll:TheCalculatedPaymentIsZeroForWorker12NoPaymentWasCreated", HcmWorker::find(payStatement.Worker).PersonnelNumber, HcmWorker::find(payStatement.Worker).name()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>issueWorkerPay</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a vendor invoice and a payment journal with a payment journal line for the single pay statement processed.
+    /// </summary>
+    /// <remarks>
+    /// The accrual process is also called for updating the accrual data.
+    /// </remarks>
+    private void issueWorkerPay()
+    {
+        PayrollAccrualProcess payrollAccrualProcess = new PayrollAccrualProcess();
+
+        payStatement.selectForUpdate(true);
+
+        PayrollAccrualProcess.processAccrual(payStatement.RecId);
+
+        if (payStatement.NetAccountingCurrencyAmount > 0)
+        {
+            vendTransRecId = this.createVendorTran(PayrollPayPeriod::find(payStatement.PayPeriod).PeriodEndDate, payStatement.NetAccountingCurrencyAmount);
+
+            counter = 1;
+
+            // Create payment Jounal batch num
+            ledgerJournalId = this.createJournalBatch();
+
+            numberSeqLedgerJournal = NumberSeq::newGetVoucherFromId(ledgerJournalTable.NumberSequenceTable);
+
+            // Create individual lines for each pay statement and also populate the LedgerJournalTransPayrollDisbursement table
+            this.createLedgerJournal();
+
+            // Update all the pay statements with the VendTrans and LedgerJournalTable recIds
+            payStatement.VendTrans = vendTransRecId;
+            payStatement.PaymentJournalBatchNum = ledgerJournalId;
+            payStatement.PaymentStatus = PayrollPaymentStatus::SentToPaymentJournal;
+
+            if (switchedToCheck == true)
+            {
+                payStatement.PaymentMethodType = PayrollPaymentMethodType::Check;
+            }
+            payStatement.update();
+
+            info(strFmt("@Payroll:PayrollPaymentJournal1WasCreatedSuccessfully", ledgerJournalId));
+            info(strFmt("@Payroll:Num_1VouchersWereCreatedForThePayrollPaymentJournal", counter - 1));
+            info(strFmt("@Payroll:Invoice1WasPosted", VendTrans::find(vendTransRecId).Invoice));
+        }
+        else if (payStatement.NetAccountingCurrencyAmount == 0)
+        {
+            payStatement.PaymentStatus = PayrollPaymentStatus::PaymentIssued;
+            payStatement.update();
+            info(strFmt("@Payroll:TheCalculatedPaymentIsZeroForWorker12NoPaymentWasCreated", HcmWorker::find(payStatement.Worker).PersonnelNumber, HcmWorker::find(payStatement.Worker).name()));
+        }
+
+        if (switchedToCheck == true)
+        {
+            info(strFmt("@Payroll:ThePayStatementCouldNotBePaidElectronicallyForWorker1ACheckW", HcmWorker::find(payStatement.Worker).PersonnelNumber));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>issueWorkerPayProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a vendor invoice and a payment journal for the pay statements processed and a payment journal line for each pay statement.
+    /// </summary>
+    /// <returns>
+    /// Returns true if the process succeeds without error.
+    /// </returns>
+    /// <remarks>
+    /// The accrual process is also called for updating the accrual data.
+    /// </remarks>
+    protected boolean issueWorkerPayProcess()
+    {
+        #AviFiles
+        PayrollPayStatement         payStatementTotal, payStatementSet;
+        boolean                     ret = NoYes::Yes;
+
+        PayrollAccrualProcess       payrollAccrualProcess = new PayrollAccrualProcess();
+
+        try
+        {
+            ttsbegin;
+
+            // Get the pay total for all the non-reverted pay statement
+            select count(RecId), sum(NetAccountingCurrencyAmount) from payStatementTotal
+                    where payStatementTotal.NetAccountingCurrencyAmount >= 0
+                join issueWorkerPayDB
+                    where payStatementTotal.RecId == issueWorkerPayDB.PayStatement;
+
+            this.progressInit("@Payroll:SubmitPayStatements", payStatementTotal.RecId, #AviUpdate);
+
+            // Create VendTrans
+            if (payStatementTotal.NetAccountingCurrencyAmount > 0)
+            {
+                // Create one verdor invoice for all the non-reversed pay statements
+                vendTransRecId = this.createVendorTran(periodEndDate, payStatementTotal.NetAccountingCurrencyAmount);
+
+                // Create payment Jounal batch num
+                ledgerJournalId = this.createJournalBatch();
+                numberSeqLedgerJournal = NumberSeq::newGetVoucherFromId(ledgerJournalTable.NumberSequenceTable);
+
+                counter = 1;
+
+                while select forupdate * from issueWorkerPayDB
+                    where issueWorkerPayDB.IsReversed == NoYes::No
+                {
+                    progress.incCount();
+                    // The will process all pay statement with net amount greater and equal to 0
+                    payrollAccrualProcess.processAccrual(issueWorkerPayDB.PayStatement);
+
+                    // Create individual line for each pay statement, pay statement with 0 net amount will be excluded
+                    payStatement = PayrollPayStatement::find(issueWorkerPayDB.PayStatement);
+
+                    if (payStatement.NetAccountingCurrencyAmount > 0)
+                    {
+                        this.createLedgerJournal();
+
+                        if (switchedToCheck)
+                        {
+                            issueWorkerPayDB.ElectronicToCheck = NoYes::Yes;
+                            issueWorkerPayDB.doUpdate();
+                        }
+                    }
+                }
+
+                // Update all the pay statements with the VendTrans and LedgerJournalTable recIds
+                update_recordset payStatementSet
+                    setting PaymentJournalBatchNum = ledgerJournalId,
+                            VendTrans = vendTransRecId
+                join issueWorkerPayDB
+                    where payStatementSet.RecId == issueWorkerPayDB.PayStatement
+                        && payStatementSet.NetAccountingCurrencyAmount > 0;
+
+                // Update all the pay statements where the payment method type switched from electronic to check
+                update_recordset payStatementSet
+                    setting PaymentMethodType = PayrollPaymentMethodType::Check
+                join issueWorkerPayDB
+                    where payStatementSet.RecId == issueWorkerPayDB.PayStatement
+                        && payStatementSet.NetAccountingCurrencyAmount > 0
+                        && issueWorkerPayDB.ElectronicToCheck == NoYes::Yes;
+            }
+            else if (payStatementTotal.NetAccountingCurrencyAmount == 0)
+            {
+                // this is for the case where all the pay statements processed have 0 net amount
+                while select forupdate * from issueWorkerPayDB
+                    where issueWorkerPayDB.IsReversed == NoYes::No
+                {
+                    progress.incCount();
+                    payrollAccrualProcess.processAccrual(issueWorkerPayDB.PayStatement);
+                }
+            }
+
+            payrollDisbursementList.insertDatabase();
+
+            ttscommit;
+
+            this.showProcessInfoLogMessage();
+        }
+        catch
+        {
+            ttsbegin;
+            // Revert the payment status if the main transaction failed in the process
+            update_recordset payStatement
+                setting PaymentStatus = PayrollPaymentStatus::Calculated
+                join issueWorkerPayDB
+                where payStatement.RecId == issueWorkerPayDB.PayStatement;
+            ttscommit;
+
+            ret = checkFailed("@Payroll:ThePayStatementsWereNotSubmittedForPaymentBecauseAnErrorOccu");
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isVendorBlockedForPayStatement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the given vendor account is blocked for pay statement.
+    /// </summary>
+    /// <param name = "_vendAccount">The current vendor account.</param>
+    /// <returns>true if the vendor is blocked for pay statement; otherwise, false.</returns>
+    protected boolean isVendorBlockedForPayStatement(VendAccount _vendAccount)
+    {        
+        return (VendTable::isVendorBlocked(_vendAccount, CustVendorBlocked::All)
+            || VendTable::isVendorBlocked(_vendAccount, CustVendorBlocked::Invoice)
+            || VendTable::isVendorBlocked(_vendAccount, CustVendorBlocked::Payment));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preValidate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method is to check if the all the parameters for the process are set correctly
+    /// and provide warning messages to the user to set them up before the process runs.
+    /// </summary>
+    /// <returns>
+    /// Returns true if all the prerequisites are met.
+    /// </returns>
+    public boolean preValidate()
+    {
+        VendParameters vendParameters;
+        VendPaymModeTable paymMode;
+        BankAccountTable  bankAccount;
+        NumberSequenceTable numberSequenceTable;
+        boolean ret = true;
+
+        vendParameters = VendParameters::find();
+
+        if (!vendParameters.PostingProfile)
+        {
+            ret = checkFailed("@SYS27198");
+        }
+
+        // Set the class level variable to improve performance
+        payrollParameters = PayrollParameters::find();
+
+        if (!payrollParameters.VendorAccountNum)
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheVendorIsNotSpecified");
+        }
+        else if (this.isVendorBlockedForPayStatement(payrollParameters.VendorAccountNum))
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheVendorIsOnHoldReleas");
+        }
+
+        // Salary clearing account
+        if (!payrollParameters.SalaryClearingAccountLedgerDimension)
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseThePayrollClearingAccou");
+        }
+
+        // Payment Journal set up; Set the class level variable to improve performance
+        ledgerJournalName = LedgerJournalName::find(payrollParameters.PaymentJournalName);
+
+        if (!(payrollParameters.PaymentJournalName && ledgerJournalName.JournalType == LedgerJournalType::PayrollDisbursement))
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheJournalNameIsNotSpec");
+        }
+        else
+        {
+            numberSequenceTable = NumberSequenceTable::find(ledgerJournalName.NumberSequenceTable);
+            if (numberSequenceTable.Manual == true || numberSequenceTable.Blocked == true)
+            {
+                ret = checkFailed("@SYS4090081");
+            }
+        }
+
+        // Procurement category setup
+        if (!payrollParameters.ProcurementCategory)
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheProcurementCategoryI");
+        }
+
+        // check method of payment and condition (bank and payment account)
+        if (!payrollParameters.PaymMode)
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheCheckMethodOfPayment");
+        }
+        else
+        {
+            paymMode = VendPaymModeTable::find(payrollParameters.PaymMode);
+            if (paymMode.RecId == 0)
+            {
+                ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheCheckMethodOfPayment");
+            }
+            else
+            {
+                if (paymMode.AccountType != LedgerJournalACType::Bank )
+                {
+                    ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheCheckMethodOfPayment1");
+                }
+
+                if (!paymMode.PaymentLedgerDimension)
+                {
+                    ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseThePaymentAccountForThe");
+                }
+
+                if (paymMode.AccountType == LedgerJournalACType::Bank && paymMode.PaymentLedgerDimension)
+                {
+                    bankAccount = BankAccountTable::findByLedgerDimension(paymMode.PaymentLedgerDimension);
+                    if (bankAccount.CurrencyCode != Ledger::accountingCurrency(CompanyInfo::current()))
+                    {
+                        ret = checkFailed("@SYS4090001");
+                    }
+
+                    if (!BankAccountTable::isActive(bankAccount.AccountID))
+                    {
+                        ret = checkFailed(strFmt("@SYS4090031", bankAccount.AccountID));
+                    }
+                }
+            }
+        }
+
+        // Electrinonic method of payment and conditions (bank and payment account)
+        if (!payrollParameters.ElectronicPaymMode)
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheElectronicMethodOfPa");
+        }
+        else
+        {
+            paymMode = VendPaymModeTable::find(payrollParameters.ElectronicPaymMode);
+            if (paymMode.RecId == 0)
+            {
+                ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheElectronicMethodOfPa");
+            }
+            else
+            {
+                if (paymMode.AccountType != LedgerJournalACType::Bank )
+                {
+                    ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseTheElectronicMethodOfPa1");
+                }
+
+                if (!paymMode.PaymentLedgerDimension)
+                {
+                    ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseThePaymentAccountForThe1");
+                }
+
+                if (paymMode.AccountType == LedgerJournalACType::Bank && paymMode.PaymentLedgerDimension)
+                {
+                    bankAccount = BankAccountTable::findByLedgerDimension(paymMode.PaymentLedgerDimension);
+                    if (bankAccount.CurrencyCode != Ledger::accountingCurrency(CompanyInfo::current()))
+                    {
+                        ret = checkFailed("@SYS4090002");
+                    }
+
+                    if (!BankAccountTable::isActive(bankAccount.AccountID))
+                    {
+                        ret = checkFailed(strFmt("@SYS4090031", bankAccount.AccountID));
+                    }
+                }
+            }
+        }
+
+        // vendor invoice number sequence
+        if (!PayrollParameters::numRefVendorInvoiceNum().NumberSequenceId)
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseANumberSequenceIsNotAss");
+        }
+        else
+        {
+            numberSequenceTable = NumberSequenceTable::find(PayrollParameters::numRefVendorInvoiceNum().NumberSequenceId);
+            if (numberSequenceTable.Manual == true || numberSequenceTable.Blocked == true)
+            {
+                ret = checkFailed("@SYS4090080");
+            }
+        }
+
+        // vendor invouce voucher number sequence
+        if (!NumberSeqReference::findReference(extendedtypenum(PurchInvoiceVoucher)).NumberSequenceId)
+        {
+            ret = checkFailed("@SYS4090082");
+        }
+        else
+        {
+            numberSequenceTable = NumberSequenceTable::find(NumberSeqReference::findReference(extendedtypenum(PurchInvoiceVoucher)).NumberSequenceId);
+            if (numberSequenceTable.Manual == true || numberSequenceTable.Blocked == true)
+            {
+                ret = checkFailed("@SYS4090083");
+            }
+        }
+
+        // payment journal header batch number sequence
+        if (!LedgerParameters::numRefJournalNum().NumberSequenceId)
+        {
+            ret = checkFailed("@Payroll:YouCannotSubmitThePayStatementBecauseANumberSequenceIsNotAss1");
+        }
+        else
+        {
+            // Set the class level variable to improve performance
+            numberSequenceTableJournalNum = NumberSequenceTable::find(LedgerParameters::numRefJournalNum().NumberSequenceId);
+            if (numberSequenceTableJournalNum.Manual == true || numberSequenceTableJournalNum.Blocked == true)
+            {
+                ret = checkFailed("@SYS4090094");
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSinglePayStatement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// A wrapper method to call different methods to process a single pay statement.
+    /// </summary>
+    public void processSinglePayStatement()
+    {
+        boolean preValidate, isCalendarValid;
+        payStatement = callingRecord as PayrollPayStatement;
+
+        // Make sure all the related validation messages will be displayed.
+        isCalendarValid = LedgerFiscalCalendar::checkDateIsValid(Ledger::fiscalCalendar(CompanyInfo::current()), payStatement.PaymentDate);
+        preValidate = this.preValidate();
+
+        if (!preValidate || !isCalendarValid)
+        {
+            throw error("@Payroll:YouCannotSubmitThePayStatementBecauseOneOrMoreParametersAreN");
+        }
+
+        periodEndDate = PayrollPayPeriod::find(payStatement.PayPeriod).PeriodEndDate;
+        issueSinglePay = true;
+        dynamicsAccount = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(payrollParameters.VendorAccountNum, LedgerJournalACType::Vend);
+        defaultDimension = LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(payrollParameters.SalaryClearingAccountLedgerDimension);
+
+        try
+        {
+            ttsbegin;
+            if (payStatement.allowSubmitForPayment())
+            {
+                if (payStatement.IsReversed == false)
+                {
+                    this.issueWorkerPay();
+                }
+                else if (payStatement.IsReversed == true && payStatement.NetAccountingCurrencyAmount <= 0)
+                {
+                    this.issueReversedWorkerPay();
+                }
+            }
+            else if (payStatement.allowSubmitForReissue())
+            {
+                this.reissueWorkerPay();
+            }
+            ttscommit;
+        }
+        catch
+        {
+            throw error("@Payroll:ThePayStatementWasNotSubmittedForPaymentBecauseAnErrorOccurr");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reissueWorkerPay</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a payment journal for reissuing payment for a single pay statement processed.
+    /// </summary>
+    private void reissueWorkerPay()
+    {
+        payStatement.selectForUpdate(true);
+
+        if (payStatement.NetAccountingCurrencyAmount > 0)
+        {
+            vendTransRecId = payStatement.VendTrans;
+
+            // Mark the original records as newer payment is issued
+            while select forupdate * from ledgerJournalTransPayrollDisbursement
+                where ledgerJournalTransPayrollDisbursement.PayStatement == payStatement.RecId
+                && ledgerJournalTransPayrollDisbursement.IsNewPaymentIssued == false
+            {
+                ledgerJournalTransPayrollDisbursement.IsNewPaymentIssued = true;
+                ledgerJournalTransPayrollDisbursement.update();
+            }
+
+            // Create payment Jounal batch num
+            ledgerJournalId = this.createJournalBatch();
+
+            numberSeqLedgerJournal = NumberSeq::newGetVoucherFromId(ledgerJournalTable.NumberSequenceTable);
+
+            counter = 1;
+
+            // Create individual line for each pay statement and create the LedgerJournalTransPayrollDisbursement table
+            this.createLedgerJournal();
+
+            // Update the pay statement with the new LedgerJournalTable recIds
+            payStatement.PaymentJournalBatchNum = ledgerJournalId;
+            payStatement.PaymentStatus = PayrollPaymentStatus::SentToPaymentJournal;
+
+            if (switchedToCheck == true)
+            {
+                payStatement.PaymentMethodType = PayrollPaymentMethodType::Check;
+            }
+
+            payStatement.update();
+
+            info(strFmt("@Payroll:PayrollPaymentJournal1WasCreatedSuccessfully", ledgerJournalId));
+            info(strFmt("@Payroll:Num_1VouchersWereCreatedForThePayrollPaymentJournal", counter - 1));
+        }
+
+        if (switchedToCheck == true)
+        {
+            info(strFmt("@Payroll:ThePayStatementCouldNotBePaidElectronicallyForWorker1ACheckW", HcmWorker::find(payStatement.Worker).PersonnelNumber));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        #OCCRetryCount
+        #PayrollConstants
+        Set                         validPaymentDates;
+        boolean                     retRegular, retReversed, isPaymentDateValid;
+
+        queryRunPayStatement = new QueryRun(queryRun.query());
+
+        // adding the pay cycle and pay period to the query, so the queryRun would not save the pay cycle and pay period selection
+        this.setRangeFromDialog();
+        validPaymentDates = new Set(Types::Date);
+        periodEndDate = PayrollPayPeriod::find(payPeriodRecId).PeriodEndDate;
+        isPaymentDateValid = false;
+
+        this.setPaymentTypeRange();
+        //
+        // set the PaymentStatus to SentToPaymentJournal for pay statements with normal issue/reissue
+        // set the PaymentStatus to PaymentIssued for pay statements
+        // and save the pay statement recIds to the Temp table
+        //
+        ttsbegin;
+        while (queryRunPayStatement.next())
+        {
+            payStatement = queryRunPayStatement.get(tableNum(PayrollPayStatement));
+
+            // check the ledger calendar period for the payment date is valid
+            isPaymentDateValid = validPaymentDates.in(payStatement.PaymentDate);
+
+            if (!isPaymentDateValid && LedgerFiscalCalendar::checkDateIsValid(Ledger::fiscalCalendar(CompanyInfo::current()), payStatement.PaymentDate))
+            {
+                isPaymentDateValid = true;
+                validPaymentDates.add(payStatement.PaymentDate);
+            }
+
+            if (isPaymentDateValid)
+            {
+                if (payStatement.IsReversed == false && payStatement.PaymentStatus == PayrollPaymentStatus::Calculated && payStatement.NetAccountingCurrencyAmount > 0)
+                {
+                    payStatement.selectForUpdate(true);
+                    payStatement.PaymentStatus = PayrollPaymentStatus::SentToPaymentJournal;
+                    payStatement.doUpdate();
+
+                    issueWorkerPayDB.clear();
+                    issueWorkerPayDB.PayStatement = payStatement.RecId;
+                    issueWorkerPayDB.IsReversed = NoYes::No;
+                    issueWorkerPayDB.doInsert();
+                }
+                else if (payStatement.IsReversed == false && payStatement.PaymentStatus == PayrollPaymentStatus::Calculated && payStatement.NetAccountingCurrencyAmount == 0)
+                {
+                    payStatement.selectForUpdate(true);
+                    payStatement.PaymentStatus = PayrollPaymentStatus::PaymentIssued;
+                    payStatement.doUpdate();
+
+                    issueWorkerPayDB.clear();
+                    issueWorkerPayDB.PayStatement = payStatement.RecId;
+                    issueWorkerPayDB.IsReversed = NoYes::No;
+                    issueWorkerPayDB.doInsert();
+                }
+                else if (payStatement.IsReversed == true && payStatement.PaymentStatus == PayrollPaymentStatus::Calculated && payStatement.NetAccountingCurrencyAmount < 0)
+                {
+                    payStatement.selectForUpdate(true);
+                    payStatement.PaymentStatus = PayrollPaymentStatus::PaymentIssued;
+                    payStatement.doUpdate();
+
+                    issueWorkerPayDB.clear();
+                    issueWorkerPayDB.PayStatement = payStatement.RecId;
+                    issueWorkerPayDB.IsReversed = NoYes::Yes;
+                    issueWorkerPayDB.doInsert();
+                }
+            }
+            else
+            {
+                break;
+            }
+        }
+        ttscommit;
+
+        // no payment would be processed and exit here.
+        if (!isPaymentDateValid && !validPaymentDates.empty())
+        {
+            throw error("@Payroll:YouCannotSubmitThePayStatementBecauseOneOrMoreParametersAreN");
+        }
+
+        select firstonly RecId from issueWorkerPayDB;
+
+        if (issueWorkerPayDB.RecId > 0)
+        {
+            if (payrollParameters.RecId == 0)
+            {
+                // this code would only be hit when running in batch process to re-initialize the global parameters
+                // also catch any parameters changes which cause the process fail after the batch was sceduled.
+                if (!this.preValidate())
+                {
+                    throw error("@Payroll:YouCannotSubmitThePayStatementBecauseOneOrMoreParametersAreN");
+                }
+            }
+
+            payrollDisbursementList = new RecordInsertList(tableNum(LedgerJournalTransPayrollDisbursement));
+            issueSinglePay = false;
+            dynamicsAccount = LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(payrollParameters.VendorAccountNum, LedgerJournalACType::Vend);
+            defaultDimension = LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(payrollParameters.SalaryClearingAccountLedgerDimension);
+
+            select firstonly RecId from issueWorkerPayDB where issueWorkerPayDB.IsReversed == NoYes::No;
+            retRegular = NoYes::Yes;
+            if (issueWorkerPayDB.RecId > 0)
+            {
+                // This process the regular pay statements
+                retRegular = this.issueWorkerPayProcess();
+            }
+
+            select firstonly RecId from issueWorkerPayDB where issueWorkerPayDB.IsReversed == NoYes::Yes;
+            retReversed = NoYes::Yes;
+            if (issueWorkerPayDB.RecId > 0)
+            {
+                // process the reversed pay statements
+                retReversed = this.issueReversedPayProcess();
+            }
+
+            if (!this.isInBatch() && retRegular && retReversed)
+            {
+                info("@Payroll:TheProcessIsComplete");
+            }
+        }
+        else
+        {
+            // Show this message when not calling from pay statement form and the select is empty in the query list
+            info("@Payroll:TheSelectionCriteriaDidNotReturnAnyResults");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPaymentTypeRange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds a filter to not select manual pay statements.
+    /// </summary>
+    private void setPaymentTypeRange()
+    {
+        QueryBuildDataSource qbdsPayStatement;
+        QueryBuildRange range;
+
+        qbdsPayStatement = queryRunPayStatement.query().dataSourceTable(tableNum(PayrollPayStatement));
+        range = SysQuery::findOrCreateRange(qbdsPayStatement, fieldNum(PayrollPayStatement, PaymentType));
+
+        //
+        // Add range to generated manual pay statements
+        // ((PayrollPayStatement.PaymentType != 4) || (PayrollPayStatement.CreationType == 1))
+        //
+        range.value(strFmt('((%1.%2 != %3) || (%1.%4 == %5))', qbdsPayStatement.name(), fieldStr(PayrollPayStatement, PaymentType), enum2int(PayrollPaymentType::Manual), fieldStr(PayrollPayStatement, CreationType), enum2int(PayrollPayStatementCreationType::UserEntry)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>settleOpenVendTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Settles the new vendor transaction with the original vendor transaction.
+    /// </summary>
+    /// <param name="_vendTransOriginal">
+    /// The original vendor transaction to settle with.
+    /// </param>
+    /// <param name="_vendTrans">
+    ///  The new vendor transaction to settle.
+    /// </param>
+    /// <remarks>
+    /// This method is only used when issuing revsered payment for the pay statement.
+    /// </remarks>
+    private void settleOpenVendTrans(VendTrans _vendTransOriginal, VendTrans _vendTrans)
+    {
+        VendTable                   vendTable = VendTable::find(_vendTrans.AccountNum);
+        VendTransOpen               vendTransOpenFieldList;
+        SpecTransManager            specTransManager;
+        NoYes                       foundVendTransOpen = NoYes::No;
+
+        specTransManager = SpecTransManager::newFromSpec(vendTable);
+
+        if (specTransManager.getSpecTransCount() > 0)
+        {
+            specTransManager.deleteAll();
+        }
+
+        while select DataAreaId, TableId, RecId, AmountCur from vendTransOpenFieldList
+            where vendTransOpenFieldList.RefRecId == _vendTransOriginal.RecId
+        {
+            specTransManager.insert(vendTransOpenFieldList.DataAreaId, vendTransOpenFieldList.TableId, vendTransOpenFieldList.RecId, vendTransOpenFieldList.AmountCur, _vendTransOriginal.CurrencyCode);
+            foundVendTransOpen = NoYes::Yes;
+        }
+        if (!foundVendTransOpen)
+        {
+            warning(strFmt("@Payroll:Invoice1WasNotSettledBecauseTheOriginatingInvoice2IsNotOpenS", _vendTrans.Invoice, _vendTransOriginal.Invoice));
+        }
+        else
+        {
+            while select DataAreaId, TableId, RecId, AmountCur from vendTransOpenFieldList
+                where vendTransOpenFieldList.RefRecId == _vendTrans.RecId
+            {
+                specTransManager.insert(vendTransOpenFieldList.DataAreaId, vendTransOpenFieldList.TableId, vendTransOpenFieldList.RecId, vendTransOpenFieldList.AmountCur, _vendTrans.CurrencyCode);
+            }
+
+            try
+            {
+                VendTrans::settleTransact(vendTable);
+            }
+            catch
+            {
+                warning(strFmt("@Payroll:Invoice1WasNotSettledToTheOriginalInvoice2BecauseAnErrorOccu", _vendTrans.Invoice, _vendTransOriginal.Invoice));
+            }
+        }
+        specTransManager.deleteAll();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showProcessInfoLogMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Shows all the required info log messages after a complete pay run.
+    /// </summary>
+    private void showProcessInfoLogMessage()
+    {
+        PayrollPayStatement         payStatementCount;
+
+        // Info log the $0 dollar amount for pay statement
+        select firstonly RecId from payStatementCount
+                where payStatementCount.NetAccountingCurrencyAmount == 0
+            join issueWorkerPayDB
+                where payStatementCount.RecId == issueWorkerPayDB.PayStatement;
+
+        if (payStatementCount.RecId > 0)
+        {
+            while select RecId, Worker from payStatementCount
+                join issueWorkerPayDB
+                    where payStatementCount.RecId == issueWorkerPayDB.PayStatement
+                        && payStatementCount.NetAccountingCurrencyAmount == 0
+            {
+                info(strFmt("@Payroll:TheCalculatedPaymentIsZeroForWorker12NoPaymentWasCreated", HcmWorker::find(payStatementCount.Worker).PersonnelNumber, HcmWorker::find(payStatementCount.Worker).name()));
+            }
+        }
+
+        // Info log the regular pay statements with amount > 0
+        select firstonly RecId from payStatementCount
+                where payStatementCount.NetAccountingCurrencyAmount > 0
+            join issueWorkerPayDB
+                where issueWorkerPayDB.IsReversed == NoYes::No
+                && payStatementCount.RecId == issueWorkerPayDB.PayStatement;
+
+        if (payStatementCount.RecId > 0)
+        {
+            // infolog the payment journal created
+            info(strFmt("@Payroll:PayrollPaymentJournal1WasCreatedSuccessfully", ledgerJournalId));
+            info(strFmt("@Payroll:Num_1VouchersWereCreatedForThePayrollPaymentJournal", counter - 1));
+
+            // info log the vendor invoice created
+            info(strFmt("@Payroll:Invoice1WasPosted", VendTrans::find(vendTransRecId).Invoice));
+        }
+
+        // infolog the pay statement where the payment method switched to check
+        while select PayStatement from issueWorkerPayDB
+            where issueWorkerPayDB.ElectronicToCheck == NoYes::Yes
+        {
+            info(strFmt("@Payroll:ThePayStatementCouldNotBePaidElectronicallyForWorker1ACheckW", HcmWorker::find(PayrollPayStatement::find(issueWorkerPayDB.PayStatement).Worker).PersonnelNumber));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs an instance of the process class on server.
+    /// </summary>
+    /// <returns>
+    /// An instance of the process class on server.
+    /// </returns>
+    public static PayrollIssueWorkerPayProcess construct()
+    {
+        return (new PayrollIssueWorkerPayProcess());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static void main(Args _args)
+    {
+        PayrollIssueWorkerPayProcess issueWorkerPayProcess;
+
+        issueWorkerPayProcess = PayrollIssueWorkerPayProcess::construct();
+
+        if (!issueWorkerPayProcess.preValidate())
+        {
+            throw error("@Payroll:YouCannotSubmitThePayStatementBecauseOneOrMoreParametersAreN");
+        }
+
+        if (issueWorkerPayProcess.prompt())
+        {
+            issueWorkerPayProcess.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@Payroll:SubmitPayStatements";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public final boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

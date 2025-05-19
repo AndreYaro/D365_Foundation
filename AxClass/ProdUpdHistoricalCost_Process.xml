@@ -1,0 +1,1198 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProdUpdHistoricalCost_Process</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>ProdUpdHistoricalCost_Process</c> class is used for ending the batch order.
+/// </summary>
+/// <remarks>
+///    When batch is ended, all transactions for the production will be financially updated, and then the realized cost amount will be calculated.
+///    The batch order should have a status of "Report
+///    as Finished" before it will be ended.
+/// </remarks>
+class ProdUpdHistoricalCost_Process extends ProdUpdHistoricalCost
+{
+    #define.unAssignedPercent(-1)
+
+    LedgerVoucher           ledgerVoucher;
+    LedgerVoucherObject     ledgerVoucherObject;
+    Percent                 allocationPercentMainItem;
+    boolean                 burdenHeaderCreated;
+    Map                     mapCoProducts;
+    Percent                 totalAllocationPercent;
+    CostAmount              amountFinancialExclIndirectCosts;
+    private PmfProdCoBy     pmfProdCoByScrapForProductionOutput;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>allocationPercentMainItem</Name>
+				<Source><![CDATA[
+    protected Percent allocationPercentMainItem()
+    {
+        #define.decRound(4)
+
+        if (allocationPercentMainItem == #unAssignedPercent)
+        {
+            allocationPercentMainItem = prodTable.pmfRemainCostAlloc();
+            allocationPercentMainItem = decRound(allocationPercentMainItem, #decRound);
+
+            if (allocationPercentMainItem
+                && InventTable::find(prodTable.ItemId).PmfProductType == PmfProductType::MainItem)
+            {
+                throw error("@PRO997");
+            }
+        }
+
+        return allocationPercentMainItem;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkValidCoBy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates total batch order cost allocation.
+    /// </summary>
+    /// <returns>
+    /// Return flag.
+    /// </returns>
+    protected boolean checkValidCoBy()
+    {
+        PmfProdCoBy prodCoBy;
+        boolean     ret = true;
+
+        select firstonly RecId
+            from prodCoBy
+            where prodCoBy.ProdId == prodTable.ProdId
+                && ((prodCoBy.ProductType == PmfProductType::Co_Product
+                    && prodCoBy.CostAllocation == PmfCostAllocationMethod::Manual
+                    && prodCoBy.CostAllocationPct == 0)
+                || (prodCoBy.ProductType == PmfProductType::By_Product
+                    && prodCoBy.BurdenType != PmfBurdenType::None
+                    && prodCoBy.BurdenType != PmfBurdenType::Recycled
+                    && prodCoBy.OverheadAmt == 0));
+
+        if (prodCoBy.RecId)
+        {
+            ret = checkFailed("@PRO2318");
+        }
+
+        while select prodCoBy
+        where prodCoBy.ProdId == prodTable.ProdId
+           && prodCoBy.ProductType == PmfProductType::Co_Product
+           && (prodCoBy.CostAllocation == PmfCostAllocationMethod::Manual || prodCoBy.CostAllocation == PmfCostAllocationMethod::TCA)
+        {
+            InventTransIdSum transIdSum = prodCoBy.inventTransIdSum();
+            if (prodCoBy.CostAllocationPct != 0 && transIdSum.physical() == 0)
+            {
+                ret = checkFailed(strFmt("@SYS4001148",
+                            prodCoBy.ItemId,
+                            prodTable.ProdId));
+                break;
+            }
+        }
+
+        if (PmfProdCoBy::existProdId(prodTable.ProdId))
+        {
+            var totalCostAllocationPct = prodTable.pmfTotalCostAlloc();
+            
+            totalCostAllocationPct = decRound(totalCostAllocationPct, 0);
+
+            if (prodTable.inventTable().PmfProductType == PmfProductType::MainItem
+                && decRound(prodTable.pmfTotalCostAlloc(), 0) != 100)
+            {
+                ret = checkFailed("@PRO2320");
+            }
+            else if (totalCostAllocationPct > 100)
+            {
+                ret = checkFailed(strFmt("@PRO204",
+                        fieldId2pname(
+                            tableNum(PmfProdCoBy),
+                            fieldNum(PmfProdCoBy, CostAllocationPct))));
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>includeInMapCoProducts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if a <c>PmfProdCoBy</c> record should be included in the map of co products.
+    /// </summary>
+    /// <param name = "_pmfProdCoBy">The record to verify.</param>
+    /// <returns>true if the record should be included; otherwise, false.</returns>
+    protected boolean includeInMapCoProducts(PmfProdCoBy _pmfProdCoBy)
+    {
+        return _pmfProdCoBy.ProductType == PmfProductType::Co_Product
+            || _pmfProdCoBy.ProductType == PmfProductType::By_Product;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createMapCoProducts</Name>
+				<Source><![CDATA[
+    protected void createMapCoProducts()
+    {
+        PmfProdCoBy pmfProdCoBy;
+
+        if (!mapCoProducts)
+        {
+            mapCoProducts = new Map(Types::Record,Types::Record);  // [pmfProdCoBy, prodTableJour]
+
+            while select pmfProdCoBy
+                where pmfProdCoBy.ProdId == prodTable.ProdId
+            {
+                if (this.includeInMapCoProducts(pmfProdCoBy))
+                {
+                    InventTransIdSum transIdSum = pmfProdCoBy.inventTransIdSum();
+
+                    if (transIdSum.physical())
+                    {
+                        ProdTableJour prodTableJourCoBy = this.initProdTableJourCoBy(pmfProdCoBy, ledgerVoucherObject.parmVoucher());
+                        prodTableJourCoBy.QtyGood = transIdSum.physical();
+                        mapCoProducts.insert(pmfProdCoBy, prodTableJourCoBy);
+                    }
+                    //if there is remain RemainCoByPhysical but not physical qty to be financially posted, it should be remove from InventTrans as well.
+                    else if (pmfProdCoBy.RemainCoByPhysical)
+                    {
+                        pmfProdCoBy.selectForUpdate(true);
+                        pmfProdCoBy.updatePmfProdCoByRemainPhysical();
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRealBomConsumption</Name>
+				<Source><![CDATA[
+    protected Qty getRealBomConsumption(ProdBOM _prodBOM, InventUpd_Financial _financial, PmfCostAllocationPct _costAllocationPct)
+    {
+        Qty bomQty = - _financial.updFinancial();
+
+        PmfRecycledBpConsumptionCalc_ProdReal pmfRecycledBpConsumptionCalc = PmfRecycledBpConsumptionCalc_ProdReal::construct();
+        pmfRecycledBpConsumptionCalc.parmProdTable(prodTable);
+        pmfRecycledBpConsumptionCalc.parmProdBom(_prodBOM);
+        pmfRecycledBpConsumptionCalc.parmBomLineQty(bomQty);
+        pmfRecycledBpConsumptionCalc.calc();
+
+        return pmfRecycledBpConsumptionCalc.parmReducedQty() * _costAllocationPct / 100.00;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProdTableJour</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates batch order production journal.
+    /// </summary>
+    /// <param name="_voucher">
+    /// Related voucher.
+    /// </param>
+    public void initProdTableJour(Voucher _voucher)
+    {
+        PdsCWInventQty  cwQtyGood;
+        PdsCWInventQty  cwQtyError;
+
+        prodTableJour.clear();
+        prodTableJour.initFromProdTable(prodTable);
+
+        prodTableJour.JournalType    = ProdJourType::HistoricalCost;
+
+        prodTableJour.Voucher        = _voucher;
+        prodTableJour.TransDate      = prodParmHistoricalCost.CalcDate;
+
+        InventQty qtyGood = prodTable.reportedFinishedGood();
+        InventQty qtyError = prodTable.reportedFinishedError();
+
+        if (PdsGlobal::pdsIsCWItem(prodTable.ItemId))
+        {
+            cwQtyGood  = prodTable.pdsCWReportedFinishedGood();
+            cwQtyError = prodTable.pdsCWReportedFinishedErr();
+        }
+
+        if (prodTable.inventTable().PmfProductType != PmfProductType::MainItem
+            && (qtyGood + qtyError == 0
+                || (qtyGood == 0 && (prodParmHistoricalCost.ScrapMethod == ProdScrapMethod::Allocation ||
+                                       (prodTable.inventTable().modelGroup().inventModelType().stdCostBased() &&
+                                        (!ProdPostScrapStdCostModelFeature::instance().isEnabled() || prodTable.ProjId))))))
+        {
+            throw error("@SYS76448");
+        }
+
+        prodTableJour.QtyGood        = qtyGood  - prodTable.historicalCostQtyGood();
+        prodTableJour.QtyError       = qtyError - prodTable.historicalCostQtyError();
+
+        if (PdsGlobal::pdsIsCWItem(prodTable.ItemId))
+        {
+            prodTableJour.PdsCWBatchGood = cwQtyGood  - prodTable.pdsCWHistoricalCostQtyGood();
+            prodTableJour.PdsCWBatchErr  = cwQtyError - prodTable. pdsCWHistoricalCostQtyError();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProdTableJourCoBy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates batch order coby product production journal.
+    /// </summary>
+    /// <param name="_pmfProdCoByProduct">
+    /// Related coby product record.
+    /// </param>
+    /// <param name="_voucher">
+    /// Related voucher.
+    /// </param>
+    /// <returns>
+    /// The batch order co-by product production journal.
+    /// </returns>
+    public ProdTableJour initProdTableJourCoBy(
+        PmfProdCoBy         _pmfProdCoByProduct,
+        Voucher             _voucher)
+    {
+        ProdTableJour   prodTableJourCoBy;
+        PdsCWInventQty  cwQtyGood;
+        PdsCWInventQty  cwQtyError;
+
+        prodTableJourCoBy.clear();
+        prodTableJourCoBy.ProdId         = prodTable.ProdId;
+        prodTableJourCoBy.ItemId         = _pmfProdCoByProduct.ItemId;
+        prodTableJourCoBy.InventTransId  = _pmfProdCoByProduct.InventTransId;
+        prodTableJourCoBy.JournalType    = ProdJourType::HistoricalCost;
+        prodTableJourCoBy.Voucher        = _voucher;
+        prodTableJourCoBy.TransDate      = prodParmHistoricalCost.CalcDate;
+
+        InventQty qtyGood = _pmfProdCoByProduct.reportedFinishedGood();
+        InventQty qtyError = _pmfProdCoByProduct.reportedFinishedError();
+
+        if (PdsGlobal::pdsIsCWItem(_pmfProdCoByProduct.ItemId))
+        {
+            cwQtyGood  = _pmfProdCoByProduct.pdsCWReportedFinishedGood();
+            cwQtyError = _pmfProdCoByProduct.pdsCWReportedFinishedError();
+        }
+
+        prodTableJourCoBy.QtyGood        = qtyGood  - _pmfProdCoByProduct.historicalCostQtyGood();
+        prodTableJourCoBy.QtyError       = qtyError - _pmfProdCoByProduct.historicalCostQtyError();
+
+        if (PdsGlobal::pdsIsCWItem(_pmfProdCoByProduct.ItemId))
+        {
+            prodTableJourCoBy.PdsCWBatchGood  = cwQtyGood  - _pmfProdCoByProduct.pdsCWReportedFinishedGood();
+            prodTableJourCoBy.PdsCWBatchErr   = cwQtyError - _pmfProdCoByProduct.pdsCWReportedFinishedError();
+        }
+
+        return prodTableJourCoBy;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// substantiates the object
+    /// </summary>
+    protected void new()
+    {
+        super();
+
+        allocationPercentMainItem   = #unAssignedPercent;
+        totalAllocationPercent      = #unAssignedPercent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onUpdateProdCalculation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Provides the possibility to perform additional actions when the production order was calculated.
+    /// </summary>
+    /// <param name="_prodCalcTrans">
+    /// The production calculation record to be reset.
+    /// </param>
+    /// <remarks>
+    /// Burden item posting did set the real cost amount. Reset it here to avoid duplication
+    /// </remarks>
+    protected void onUpdateProdCalculation(ProdCalcTrans    _prodCalcTrans)
+    {
+        _prodCalcTrans.RealCostAmount = 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfUpdateTCA</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Updates the estimated total cost allocation percentage of the related <c>PmfProdCoBy</c> records.
+    /// </summary>
+    private void pmfUpdateTCA()
+    {
+        PmfProdCoBy     coby;
+        Price           cobyExtendedPrice, prodExtendedPrice, totalProdExtendedPrice, totalCobyExtendedPrice;
+
+        Map             cobyMap = new Map(Types::Real, Types::Record);
+        MapEnumerator   me_cobyMap;
+
+        #define.Percent(100)
+
+        if (appl.ttsLevel() == 0
+            && hasGUI())
+        {
+            while select coby
+                where coby.ProdId           == prodTable.ProdId
+                    && coby.CostAllocation  == PmfCostAllocationMethod::TCA
+            {
+                cobyExtendedPrice = coby.reportedFinishedGood() * coby.inventItemPrice().Price;
+
+                totalCobyExtendedPrice += cobyExtendedPrice;
+
+                cobyMap.insert(coby, cobyExtendedPrice);
+            }
+
+            if (prodTable.inventTable().PmfProductType == PmfProductType::Formula)
+            {
+                prodExtendedPrice = prodTable.reportedFinishedGood() * prodTable.inventItemPrice().Price;
+            }
+
+            totalProdExtendedPrice = prodExtendedPrice + totalCobyExtendedPrice;
+
+            if (cobyMap)
+            {
+                me_cobyMap = cobyMap.getEnumerator();
+            }
+
+            ttsbegin;
+
+            while (me_cobyMap && me_cobyMap.moveNext())
+            {
+                coby = me_cobyMap.currentValue();
+
+                coby.selectForUpdate(true);
+
+                coby.CostAllocationPct = me_cobyMap.currentKey() / totalProdExtendedPrice * #Percent;
+
+                coby.update();
+            }
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postUpdateProdJobType</Name>
+				<Source><![CDATA[
+    protected void postUpdateProdJobType(
+        ProdJobType     _prodJobType,
+        ProdRouteTrans  _prodRouteTrans)
+    {
+        MapEnumerator me = mapCoProducts.getEnumerator();
+
+        while (me.moveNext())
+        {
+            PmfProdCoBy pmfProdCoBy = me.currentKey();
+            if (pmfProdCoBy.ProductType == PmfProductType::Co_Product)
+            {
+                _prodJobType.updateRealConsumptionCoBy(prodTable, _prodRouteTrans, pmfProdCoBy.CostAllocationPct, pmfProdCoBy.RecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetCalcValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the batch order and co/by product calculation transactions.
+    /// </summary>
+    public void resetCalcValues()
+    {
+        PmfCoByProdCalcTrans pmfCoByProdCalcTrans;
+
+        super();
+
+        update_recordset pmfCoByProdCalcTrans
+            setting RealQty = 0, RealConsump = 0, RealCostAmount = 0, RealCostAdjustment = 0
+            where pmfCoByProdCalcTrans.TransRefId   == prodParmHistoricalCost.ProdId
+               && pmfCoByProdCalcTrans.TransRefType == ProdTransRefType::Production;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts ending batch order process.
+    /// </summary>
+    public void run()
+    {
+        #OCCRetryCount
+
+        setPrefix(ProdMultiHistoricalCost::description());
+        setPrefix(#PreFixField(ProdParmHistoricalCost,ProdId));
+
+        try
+        {
+            ttsbegin;
+            this.setParameters();
+
+            if (!ProdTable.status().runHistoricalCost(ProdParmHistoricalCost, true))
+            {
+                throw error(strFmt("@SYP4882028", prodTable.ProdId));
+            }
+
+            InventQualityManagementCreateHandler::createProductionEndBefore(prodTable);
+
+            InventQualityManagementBlockHandler::blockProductionEnd(prodTable);
+
+            if (! this.validate())
+            {
+                throw error("@SYS18447");
+            }
+
+            if (!ProdJournalTable::checkNotMissingPosting(prodTable.ProdId,''))
+            {
+                throw error("@SYS18447");
+            }
+
+            if (!ProdTableJour::isHistoricalCost(prodTable.ProdId)) // do not change cost accounted productions from 3.0
+            {
+                this.resetCalcValues();
+            }
+
+            if (prodTable.PmfTotalCostAllocation)
+            {
+                PmfTCAUpdate::construct(prodTable).updateTCA();
+            }
+
+            ledgerVoucher       = this.newLedgerVoucher();
+            ledgerVoucherObject = this.newLedgerVoucherObject(ledgerVoucher);
+
+            // the prodTableJour record is for the main item and will collect all cost (material, labor, burden and indirect)
+            // before posting it will be adjusted according to allocation percent
+
+            this.initProdTableJour(ledgerVoucherObject.parmVoucher());
+            this.createMapCoProducts();
+
+            // update the consumption
+            this.updateBOMConsumption(ledgerVoucher);
+            this.updateRouteConsumption(ledgerVoucher);
+            this.updateBurdenConsumption();
+            this.updateProdRouteTransactions(ledgerVoucher);
+
+            // Adjust the cost of the main item according to allocation percent
+            amountFinancialExclIndirectCosts = prodTableJour.AmountFinancial;
+            prodTableJour.AmountFinancial = prodTableJour.AmountFinancial * this.allocationPercentMainItem() / 100;
+
+            this.updateIndirectCost(ledgerVoucher);
+
+            this.updateProduction(ledgerVoucher);
+
+            prodTableJour.insert();
+
+            ledgerVoucher.end();
+
+            this.updateJobJournal(ParmJobStatus::Executed);
+
+            InventQualityManagementCreateHandler::createProductionEndAfter(prodTable);
+
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            this.updateJobJournal(ParmJobStatus::ContainErrors);
+
+            throw (Exception::Error);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCoByStandardVarianceList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Uses ProdStandardVarianceList_Process to create a inventCostTransVarianceList instance that will be passed to the inventory movement of
+    /// the co/by financial update.
+    /// </summary>
+    /// <param name="_coBy">
+    ///    The coby product.
+    /// </param>
+    /// <param name="_ledgerVoucher">
+    ///    The ledger voucher.
+    /// </param>
+    /// <param name="_prodTableJourCoProduct">
+    /// The journal table record for the co-product.
+    /// </param>
+    /// <param name="_movement">
+    ///     Inventory movement of the co/by financial update.
+    /// </param>
+    protected void setCoByStandardVarianceList(
+        PmfProdCoBy     _coBy,
+        LedgerVoucher   _ledgerVoucher,
+        ProdTableJour   _prodTableJourCoProduct,
+        InventMovement  _movement)
+    {
+        ProdStandardVarianceList_Process prodStandardVarianceList = ProdStandardVarianceList_Process::construct();
+        prodStandardVarianceList.parmPmfProdCoBy(_coBy);
+        prodStandardVarianceList.parmProdQty(_prodTableJourCoProduct.QtyGood);
+        prodStandardVarianceList.parmInventItemPrice(
+            InventItemPrice::stdCostFindDate(
+                _coBy.inventTable(),
+                _ledgerVoucher.lastTransDate(),
+                _coBy.InventDimId));
+        if (prodStandardVarianceList.run(true)
+            && prodStandardVarianceList.inventCostTransVarianceList().length() > 0)
+        {
+            _movement.parmInventCostTransVarianceList(
+                prodStandardVarianceList.inventCostTransVarianceList());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setProdStandardVarianceList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Uses ProdStandardVarianceList to create a inventCostTransVarianceList instance that will be passed to the inventory movement of
+    /// the production order financial update.
+    /// </summary>
+    /// <param name="_ledgerVoucher">
+    ///    The ledger voucher.
+    /// </param>
+    /// <param name="_movement">
+    ///     Inventory movement of the production order financial update.
+    /// </param>
+    protected void setProdStandardVarianceList(LedgerVoucher _ledgerVoucher, InventMovement _movement)
+    {
+        ProdStandardVarianceList prodStandardVarianceList = ProdStandardVarianceList::construct();
+        prodStandardVarianceList.parmProdTable(prodTable);
+        prodStandardVarianceList.parmProdQty(prodTableJour.QtyGood);
+        prodStandardVarianceList.parmProdTableJour(prodTableJour);
+        prodStandardVarianceList.parmInventItemPrice(InventItemPrice::stdCostFindDate(prodTable.inventTable(),
+                                                                                      _ledgerVoucher.lastTransDate(),
+                                                                                      prodTable.InventDimId));
+        if (prodStandardVarianceList.run(true) &&
+            prodStandardVarianceList.inventCostTransVarianceList().length() > 0)
+        {
+            _movement.parmInventCostTransVarianceList(prodStandardVarianceList.inventCostTransVarianceList());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>totalAllocationPercent</Name>
+				<Source><![CDATA[
+    protected Percent totalAllocationPercent()
+    {
+        #define.decRound(4)
+
+        if (totalAllocationPercent == #unassignedPercent)
+        {
+            totalAllocationPercent = 0;
+
+            if (!mapCoProducts)
+            {
+                this.createMapCoProducts();
+            }
+
+            MapEnumerator me = mapCoProducts.getEnumerator();
+
+            while (me.moveNext())
+            {
+                //co products in map have a good quantity
+                PmfProdCoBy pmfProdCoBy = me.currentKey();
+                totalAllocationPercent += pmfProdCoBy.CostAllocationPct;
+            }
+
+            if (InventTable::find(prodTable.ItemId).PmfProductType != PmfProductType::MainItem)
+            {
+                // if some good quantity
+                if (prodTable.remainInventFinancial())
+                {
+                    totalAllocationPercent += prodTable.pmfRemainCostAlloc();
+                }
+            }
+            totalAllocationPercent = decRound(totalAllocationPercent,#decRound);
+        }
+
+        return totalAllocationPercent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBOMConsumptionOfRecycledBp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates BOM consumptions for recycled byproduct.
+    /// </summary>
+    /// <param name="_pmfProdCoBy">
+    /// The recycled byproduct record.
+    /// </param>
+    /// <param name="_prodTableJour">
+    /// The corresponding <c>ProdTableJour</c> record.
+    /// </param>
+    private void updateBOMConsumptionOfRecycledBp(PmfProdCoBy _pmfProdCoBy, ProdTableJour _prodTableJour)
+    {
+        PmfCoByProdCalcTrans    pmfCoByProdCalcTrans;
+
+        select sum(RealCostAmount) from pmfCoByProdCalcTrans
+        where pmfCoByProdCalcTrans.PmfIdRefCoByRecId == _pmfProdCoBy.RecId
+           && pmfCoByProdCalcTrans.CollectRefLevel == prodTable.CollectRefLevel + 1;
+
+        _prodTableJour.AmountFinancial = pmfCoByProdCalcTrans.RealCostAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBurdenConsumption</Name>
+				<Source><![CDATA[
+    protected void updateBurdenConsumption()
+    {
+        PmfProdCoBy                 burden;
+
+        if (this.totalAllocationPercent() <= 0)
+        {
+            return;
+        }
+
+        prodTable.update();
+
+        while select burden
+            where burden.ProdId == prodTable.ProdId
+               && burden.ProductType == PmfProductType::By_Product
+        {
+            PmfBurdenProdRouteCardPost pmfBurdenProdRouteCardPost = PmfBurdenProdRouteCardPost::newFromProdTable(prodTable);
+            pmfBurdenProdRouteCardPost.parmCurrentProductionCost(prodTableJour.AmountFinancial);
+            pmfBurdenProdRouteCardPost.parmTransDate(prodTableJour.TransDate);
+            pmfBurdenProdRouteCardPost.parmByProduct(burden);
+            pmfBurdenProdRouteCardPost.parmSkipUpdateOfProdCalcTrans(true);
+            pmfBurdenProdRouteCardPost.post();
+        }
+
+        prodTable.reread();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCalcBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the cost calculation for a BOM.
+    /// </summary>
+    /// <param name="_prodBOM">
+    /// The production BOM.
+    /// </param>
+    /// <param name="_financial">
+    /// The inventory financial update object.
+    /// </param>
+    /// <param name="_priceDate">
+    /// The date for price calculation; optional.
+    /// </param>
+    /// <returns>
+    /// A container with 2 elements, first one is the calculated cost in the main currency, the second element is the cost in the secondary currency.
+    /// </returns>
+    /// <remarks>
+    /// The return type has been changed to a container to return calculated cost in the secondary currency in addition to the cost in the main currency.
+    /// </remarks>
+    public container updateCalcBOM(
+        ProdBOM             _prodBOM,
+        InventUpd_Financial _financial,
+        TransDate           _priceDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+    {
+        container retValue = super(_prodBOM, _financial, _priceDate);
+        CostAmount realTotalCostAmount = conPeek(retValue, 1);
+
+        this.updateCalcBOMCoBy(_prodBOM,_financial, realTotalCostAmount, _priceDate);
+
+        return retValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustUpdateCalcBOMCoBy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if a <c>PmfProdCoBy</c> record should be included when updating coby product calculations.
+    /// </summary>
+    /// <param name = "_pmfProdCoBy">The record to verify.</param>
+    /// <returns>true if the record should be included; otherwise, false.</returns>
+    protected boolean mustUpdateCalcBOMCoBy(PmfProdCoBy _pmfProdCoBy)
+    {
+        return _pmfProdCoBy.ProductType == PmfProductType::Co_Product;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCalcBOMCoBy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates coby product calculations.
+    /// </summary>
+    /// <param name="_prodBOM">
+    /// Related raw material record.
+    /// </param>
+    /// <param name="_financial">
+    /// The financial update class for the raw material.</param>
+    /// <param name="_realTotalCostAmount">
+    /// The total realized cost amount.
+    /// </param>
+    /// <param name="_priceDate">
+    /// The date for price calculation; optional.
+    /// </param>
+    public void updateCalcBOMCoBy(
+        ProdBOM             _prodBOM,
+        InventUpd_Financial _financial,
+        CostAmount          _realTotalCostAmount,
+        TransDate           _priceDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+    {
+        PmfProdCoBy             pmfProdCoBy;
+        PmfCoByProdCalcTrans    pmfCoByProdCalcTrans;
+        InventTable             inventTableChild = _prodBOM.inventTable();
+        InventItemPrice         inventItemPrice;
+
+        void setRealConsumption(PmfCoByProdCalcTrans    _pmfCoByProdCalcTrans)
+        {
+            _pmfCoByProdCalcTrans.RealConsump     = _pmfCoByProdCalcTrans.RealConsump    + this.getRealBomConsumption(_prodBOM, _financial, pmfProdCoBy.CostAllocationPct);
+            _pmfCoByProdCalcTrans.RealCostAmount  = _pmfCoByProdCalcTrans.RealCostAmount - (_realTotalCostAmount * pmfProdCoBy.CostAllocationPct / 100);
+        }
+
+        setPrefix(#PrefixField(_prodBOM,ItemId));
+
+        if (inventTableChild.modelGroup().inventModelType().stdCostBased())
+        {
+            inventItemPrice = InventItemPrice::stdCostFindDate(inventTableChild, _priceDate, _prodBOM.InventDimId);
+        }
+        ItemCalcType calcType = inventTableChild.inventItemType().calculationType();
+
+        // update existing records
+        while select forupdate pmfCoByProdCalcTrans
+            where pmfCoByProdCalcTrans.IdRefTableId         == _prodBOM.TableId
+               && pmfCoByProdCalcTrans.IdRefRecId           == _prodBOM.RecId
+               && pmfCoByProdCalcTrans.CalcType             == calcType
+            join RecId, CostAllocationPct, ProductType from pmfProdCoBy
+                where pmfProdCoBy.RecId       == pmfCoByProdCalcTrans.PmfIdRefCoByRecId
+                   && pmfProdCoBy.ProdId      == prodTable.ProdId
+        {
+            if (this.mustUpdateCalcBOMCoBy(pmfProdCoBy))
+            {
+                setRealConsumption(pmfCoByProdCalcTrans);
+                PmfCoByProdCalcTrans::updateRealCalcCostBreakdown(pmfCoByProdCalcTrans, _prodBOM, inventItemPrice);
+                pmfCoByProdCalcTrans.update();
+            }
+        }
+
+        // create new records if missing
+        while select RecId, CostAllocationPct, ProductType from pmfProdCoBy
+            where pmfProdCoBy.ProdId       == prodTable.ProdId
+            notexists join pmfCoByProdCalcTrans
+                where pmfCoByProdCalcTrans.IdRefTableId         == _prodBOM.TableId
+                    && pmfCoByProdCalcTrans.IdRefRecId          == _prodBOM.RecId
+                    && pmfCoByProdCalcTrans.CalcType            == calcType
+                    && pmfCoByProdCalcTrans.PmfIdRefCoByRecId   == pmfProdCoBy.RecId
+        {
+            if (this.mustUpdateCalcBOMCoBy(pmfProdCoBy))
+            {
+                pmfCoByProdCalcTrans.initFromProdTable(prodTable, calcType);
+
+                pmfCoByProdCalcTrans.LineNum                = PmfCoByProdCalcTrans::lastLineNum(pmfProdCoBy.RecId);
+
+                pmfCoByProdCalcTrans.IdRefTableId           = _prodBOM.TableId;
+                pmfCoByProdCalcTrans.IdRefRecId             = _prodBOM.RecId;
+                pmfCoByProdCalcTrans.CostGroupId            = inventTableChild.CostGroupId;
+                pmfCoByProdCalcTrans.Production             = NoYes::No;
+                pmfCoByProdCalcTrans.DerivedReference       = _prodBOM.InventRefType;
+                pmfCoByProdCalcTrans.DerivedRefNum          = _prodBOM.InventRefId;
+                pmfCoByProdCalcTrans.Resource               =  inventTableChild.ItemId;
+                pmfCoByProdCalcTrans.UnitId                 = InventTableModule::find(inventTableChild.ItemId, ModuleInventPurchSales::Invent).UnitId;
+                pmfCoByProdCalcTrans.bom                    = inventTableChild.inventItemType().canHaveBOM();
+                pmfCoByProdCalcTrans.PmfIdRefCoByRecId      = pmfProdCoBy.RecId;
+
+                setRealConsumption(pmfCoByProdCalcTrans);
+                PmfCoByProdCalcTrans::updateRealCalcCostBreakdown(pmfCoByProdCalcTrans, _prodBOM, inventItemPrice);
+                pmfCoByProdCalcTrans.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCalcCoBy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates coby product calculations.
+    /// </summary>
+    /// <param name="_pmfProdCoBy">
+    /// Coby product record.
+    /// </param>
+    /// <param name="_prodTableJourCoBy">
+    /// The journal record to update based on.
+    /// </param>
+    public void updateCalcCoBy(
+        PmfProdCoBy     _pmfProdCoBy,
+        ProdTableJour   _prodTableJourCoBy)
+    {
+        PmfCoByProdCalcTrans    pmfCoByProdCalcTrans;
+
+        if (ProdParametersDim::find(prodTable.InventDimId).SpecifyCalc == NoYes::Yes)
+        {
+            ItemCalcType calcType = ItemCalcType::Production;
+
+            select forupdate firstonly pmfCoByProdCalcTrans
+                where pmfCoByProdCalcTrans.IdRefTableId         == prodTable.TableId
+                    && pmfCoByProdCalcTrans.IdRefRecId          == prodTable.RecId
+                    && pmfCoByProdCalcTrans.CalcType            == calcType
+                    && pmfCoByProdCalcTrans.PmfIdRefCoByRecId   == _pmfProdCoBy.RecId;
+
+            if (!pmfCoByProdCalcTrans.RecId)
+            {
+                pmfCoByProdCalcTrans.initFromProdTable(prodTable, calcType);
+
+                pmfCoByProdCalcTrans.LineNum            = PmfCoByProdCalcTrans::lastLineNum(_pmfProdCoBy.RecId);
+                pmfCoByProdCalcTrans.CostGroupId        = prodTable.inventTable().CostGroupId;
+                pmfCoByProdCalcTrans.bom                = NoYes::Yes;
+                pmfCoByProdCalcTrans.Production         = NoYes::Yes;
+                pmfCoByProdCalcTrans.Resource           = prodTable.ItemId;
+                pmfCoByProdCalcTrans.UnitId             = InventTableModule::find(prodTable.ItemId, ModuleInventPurchSales::Invent).UnitId;
+                pmfCoByProdCalcTrans.PmfIdRefCoByRecId  = _pmfProdCoBy.RecId;
+            }
+
+            pmfCoByProdCalcTrans.RealQty                += _prodTableJourCoBy.QtyGood;
+            pmfCoByProdCalcTrans.RealCostAmount         += _prodTableJourCoBy.AmountFinancial;
+            pmfCoByProdCalcTrans.write();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPostScrapForProductionOutputMovement</Name>
+				<Source><![CDATA[
+    protected InventMov_Virtuel getPostScrapForProductionOutputMovement(
+        ProdReportedError   _quantityError,
+        InventTrans         _inventTrans)
+    {
+        if (pmfProdCoByScrapForProductionOutput == null)
+        {
+            return super(_quantityError, _inventTrans);
+        }
+
+        return InventMov_Virtuel::newPmfCoByProdTableScrap(prodTable, pmfProdCoByScrapForProductionOutput, _quantityError, prodParmHistoricalCost.CalcDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCoByTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the co/by product quantities based on actual consumption.
+    /// </summary>
+    /// <param name="_pmfProdCoBy">
+    /// A co/by product record.
+    /// </param>
+    /// <param name="_prodTableJourCoProduct">
+    /// The journal table record to update from.
+    /// </param>
+    /// <param name="_ledgerVoucher">
+    /// A related batch order ledger voucher.
+    /// </param>
+    public void updateCoByTrans(
+        PmfProdCoBy     _pmfProdCoBy,
+        ProdTableJour   _prodTableJourCoProduct,
+        LedgerVoucher   _ledgerVoucher)
+    {
+        InventMovement          movement =   InventMovement::construct(_pmfProdCoBy);
+
+        setPrefix("@SYS28546");
+
+        // Add percentage of raw material and other common costs from the main item
+
+        if (_pmfProdCoBy.ProductType == PmfProductType::By_Product &&
+            _pmfProdCoBy.BurdenType  == PmfBurdenType::Recycled)
+        {
+            this.updateBOMConsumptionOfRecycledBp(_pmfProdCoBy, _prodTableJourCoProduct);
+        }
+        else
+        {
+            _prodTableJourCoProduct.AmountFinancial += ((amountFinancialExclIndirectCosts * _pmfProdCoBy.CostAllocationPct / this.totalAllocationPercent()));
+        }
+        _prodTableJourCoProduct.AmountFinancial = CurrencyExchangeHelper::amount(_prodTableJourCoProduct.AmountFinancial);
+
+        this.updateCalcCoBy(_pmfProdCoBy,_prodTableJourCoProduct);
+
+        _pmfProdCoBy.RealDate = prodParmHistoricalCost.CalcDate;
+
+        // Set co-by product to ensure that getpostScrapForProductionOutputMovement have the pmfProduCoBy record when called from postScrapForProductionOutput
+        pmfProdCoByScrapForProductionOutput = _pmfProdCoBy;
+
+        this.postScrapForProductionOutput(_ledgerVoucher,
+                                          _pmfProdCoBy.inventTable(),
+                                          _prodTableJourCoProduct,
+                                          InventTransOriginPmfProdCoBy::findInventTransOriginId(prodTable.DataAreaId,
+                                                                                                _pmfProdCoBy.RecId));
+
+        pmfProdCoByScrapForProductionOutput = null;
+
+        if (_prodTableJourCoProduct.QtyGood != 0)
+        {
+            this.setCoByStandardVarianceList(_pmfProdCoBy, _ledgerVoucher, _prodTableJourCoProduct, movement);
+
+            InventUpd_Financial financial = InventUpd_Financial::pmfNewProdCoByHistoricalCost(_pmfProdCoBy, _ledgerVoucher, _prodTableJourCoProduct, movement);
+            financial.updateNow();
+
+            _prodTableJourCoProduct.insert();
+        }
+
+        this.addUpdateRec(_pmfProdCoBy);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateConsOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method updates the consolidated order to ended
+    /// </summary>
+    private void updateConsOrder()
+    {
+        ProdTable    orders;
+
+        select firstonly orders
+            where orders.PmfConsOrdId == prodTable.PmfConsOrdId
+                && orders.ProdStatus  != ProdStatus::Completed;
+
+        if (!orders)
+        {
+            PmfConsOrd consOrd = PmfConsOrd::find(prodTable.PmfConsOrdId,true);
+            consOrd.ProdStatus = ProdStatus::Completed;
+            consOrd.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIndirectCostCoBy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the indirect cost records for the co products.
+    /// </summary>
+    /// <param name="_pmfProdCoBy">The co-product for which to update.</param>
+    /// <param name="_prodTableJourCoProduct">The co-product journal to update with the indirect costs.</param>
+    /// <param name="_ledgerVoucher">An instance of the <c>LedgerVoucher</c> class that handles posting to ledger.</param>
+    void updateIndirectCostCoBy(PmfProdCoBy _pmfProdCoBy, ProdTableJour _prodTableJourCoProduct, LedgerVoucher _ledgerVoucher)
+    {
+        PmfCoByProdCalcTrans        pmfCoByProdCalcTrans;
+        CurrencyCode                currencyCode = CompanyInfoHelper::standardCurrency();
+        ProdIndirectTrans           prodIndirectTrans;
+
+        CostSheet costSheet = CostSheetFactory::construct().createCostSheet(CostSheetModeStrategyCalculate::newParameter(CostPriceType::COGM));
+        CurrencyExchangeHelper exchangeRateHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(curext()).RecId), _ledgerVoucher.findLedgerVoucherObject().parmAccountingDate());
+        
+        // Loop transactions and add to the voucher
+        while select pmfCoByProdCalcTrans
+            where pmfCoByProdCalcTrans.PmfIdRefCoByRecId == _pmfProdCoBy.RecId
+               && pmfCoByProdCalcTrans.CalcType in this.indirectProductionItemCalcTypes()
+        {
+            CostSheetNodeCalculation calculationNode = costSheet.findNodeByCode(pmfCoByProdCalcTrans.Resource);
+
+            if (calculationNode == null)
+            {
+                continue;
+            }
+
+            AmountMST indirectCostAmount = CurrencyExchangeHelper::amount(pmfCoByProdCalcTrans.realCostAmountTotal());
+
+            if (indirectCostAmount != 0.00
+             && calculationNode.getAcctEstimatedIndirectAbsorption()
+             && calculationNode.getAcctEstimatedIndirectAbsorptionOffset()
+             && calculationNode.getAcctIndirectAbsorption()
+             && calculationNode.getAcctIndirectAbsorptionOffset())
+            {
+                _prodTableJourCoProduct.AmountFinancial += pmfCoByProdCalcTrans.realCostAmountTotal();
+
+                DimensionDefault defaultDimension = prodIndirectTrans.mergeDimension(calculationNode.getDefaultDimension(), _pmfProdCoBy.DefaultDimension);
+
+                _ledgerVoucher.addTrans(
+                    LedgerVoucherTransObject::newTransactionAmountDefault(
+                    _ledgerVoucher.findLedgerVoucherObject(),
+                    LedgerPostingType::IndirectAbsorption,
+                    LedgerDimensionFacade::serviceCreateLedgerDimension(calculationNode.getAcctIndirectAbsorption(), defaultDimension),
+                    CompanyInfoHelper::standardCurrency(),
+                    -indirectCostAmount,
+                    exchangeRateHelper));
+
+                _ledgerVoucher.addTrans(
+                    LedgerVoucherTransObject::newTransactionAmountDefault(
+                        _ledgerVoucher.findLedgerVoucherObject(),
+                        LedgerPostingType::IndirectAbsorptionOffset,
+                        LedgerDimensionFacade::serviceCreateLedgerDimension(calculationNode.getAcctIndirectAbsorptionOffset(), defaultDimension),
+                        CompanyInfoHelper::standardCurrency(),
+                        indirectCostAmount,
+                        exchangeRateHelper));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateProduction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Makes the cost accounting for a production order.
+    /// </summary>
+    /// <param name="_ledgerVoucher">
+    ///    The ledger voucher.
+    /// </param>
+    /// <remarks>
+    ///    New transactions for a production order are created in General Ledger and then the total realized cost amount is calculated.
+    /// </remarks>
+    void updateProduction(LedgerVoucher _ledgerVoucher)
+    {
+        MapEnumerator me = mapCoProducts.getEnumerator();
+
+        // first update co products
+        while (me.moveNext())
+        {
+            PmfProdCoBy pmfProdCoBy = me.currentKey();
+            ProdTableJour prodTableJourCoProduct = me.currentValue();
+            ledgerVoucherObject.pmfInitLastCostAmt();
+
+            // Add co/by indirect costs
+            this.updateIndirectCostCoBy(pmfProdCoBy, prodTableJourCoProduct, _ledgerVoucher);
+            this.updateCoByTrans(pmfProdCoBy, prodTableJourCoProduct, _ledgerVoucher);
+        }
+
+        ledgerVoucherObject.pmfInitLastCostAmt();
+
+        // update main product
+        super(_ledgerVoucher);
+
+        if (prodTable.PmfConsOrdId)
+        {
+            this.updateConsOrder();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates batch order ending process.
+    /// </summary>
+    /// <returns>
+    /// Return flag.
+    /// </returns>
+    public boolean validate()
+    {
+        boolean ret = super();
+
+        ret = ret && this.checkValidCoBy();
+
+        ret = ret && prodTable.pmfValidateTCA();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns an instance of the class
+    /// </summary>
+    /// <returns>
+    /// returns instance
+    /// </returns>
+    public static ProdUpdHistoricalCost_Process construct()
+    {
+        return new ProdUpdHistoricalCost_Process();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newParmBuffer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns an initialized instance of the class
+    /// </summary>
+    /// <returns>
+    /// returns instance
+    /// </returns>
+    /// <param name="_prodParmHistoricalCost">
+    /// Costing parameter record.
+    /// </param>
+    public static ProdUpdHistoricalCost newParmBuffer(ProdParmHistoricalCost _prodParmHistoricalCost)
+    {
+        if (!_prodParmHistoricalCost.ParmId)
+        {
+            _prodParmHistoricalCost.skipTTSCheck(true);
+            _prodParmHistoricalCost.ParmBuffer::initParmId();
+            _prodParmHistoricalCost.insert();
+        }
+
+        ProdUpdHistoricalCost_Process prodUpdHistoricalCost = ProdUpdHistoricalCost_Process::construct();
+        prodUpdHistoricalCost.parmParmBuffer(_prodParmHistoricalCost);
+
+        return prodUpdHistoricalCost;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

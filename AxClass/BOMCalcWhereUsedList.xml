@@ -1,0 +1,857 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BomCalcWhereUsedList</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>BOMCalcWhereUsedList</c> class investigates relations between BOMs and their subcomponents
+///    and creates a list of items that should be recalculated.
+/// </summary>
+/// <remarks>
+///    The items in the output list are sorted according to BOM levels.
+/// </remarks>
+class BomCalcWhereUsedList implements Enumerable
+{
+    private Set         bomVersionIdLoadedSet;
+
+    guid                sessionGuid;
+    List                whereUsedList;
+
+    TransDate           calcDate;
+    InventSiteId        inventSiteId;
+    CostingVersionId    versionId;
+
+    const int TentativeDependencyGraph      = 0;
+    const int ConcreteDependencyGraph       = 1;
+    const int ElementaryDependencyLevel     = 1;
+    const int ItemDimsWithPendingPriceLevel = 0;
+    const int MaximumCalculationLevel       = 256;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers the items that have pending prices in the specified version id as the input of the calculation
+    /// of the list of items that should be recalculated.
+    /// </summary>
+    /// <remarks>
+    /// Creates the base relations in the tentative dependency graph (relation set 0). These relations will list
+    /// the specified item and dimention combination as both used and produced. This will be the starting point
+    /// for the logic in calculateTentativeUsageRelations.
+    /// The _versionId parameter has been removed, please provide the versionId using the <c>parmVersionId</c>
+    /// method instead.
+    /// </remarks>
+    protected void addItems()
+    {
+        ttsbegin;
+
+        this.addItemsFromItemDimensionCombinations();
+
+        this.addElementaryRelationsLevelItems();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addItemsFromItemDimensionCombinations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the records for item - dimension combinations with pending prices - relations where the end node is the same as the start node.
+    /// These records are in the tentative dependency graph (relation set 0) and indicate the fact that these items have pending prices.
+    /// </summary>
+    protected void addItemsFromItemDimensionCombinations()
+    {
+        BOMCalcWhereUsedListFromItemDimCombinationsPopulator::newPopulator(this).execute();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addElementaryRelationsLevelItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create one record per item on the elementary relations level - regardless of dimensions. This is an optimization
+    /// to avoid duplicate calculations as the filtering in the main loop is only by item as well.
+    /// </summary>
+    protected void addElementaryRelationsLevelItems()
+    {
+        BOMTmpUsedItem2ProducedItem autoRelation;
+        BOMTmpUsedItem2ProducedItem pendingPriceRelation;
+
+        insert_recordset autoRelation
+        (
+            Level,
+            RelationSetNumber,
+            SessionGuid,
+            ProducedItemId,
+            UsedItemId
+        )
+        select ElementaryDependencyLevel, RelationSetNumber, SessionGuid, ProducedItemId, UsedItemId
+            from pendingPriceRelation
+            group by ProducedItemId, UsedItemId, RelationSetNumber, Level, SessionGuid
+            where pendingPriceRelation.RelationSetNumber == TentativeDependencyGraph
+               && pendingPriceRelation.Level == ItemDimsWithPendingPriceLevel
+               && pendingPriceRelation.SessionGuid == sessionGuid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateDerivedDependencyRelations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the next level derived dependency relations based on elementary relations and relations from the current level.
+    /// </summary>
+    /// <param name="_level">The level of dependencies to calculate.</param>
+    /// <remarks>
+    /// If there is a relation on the current level n (=of length n) from A to B and there is an elementary relation (where level = 1)
+    /// from B to C and there is no relation already from A to C, a new relations of level n+1 is created.
+    /// If there are any new relations created on this level, we attempt to find relations on the following level.
+    /// The algorithm is based on the concepts of dynamic programming and has an O(n^3) complexity.
+    /// </remarks>
+    protected void calculateDerivedDependencyRelations(int _level = 1)
+    {
+        Debug::assert(_level < MaximumCalculationLevel);
+
+        ttsbegin;
+
+        var populator = BOMCalcWhereUsedListDerivedDependecyRelationsPopulator::newPopulator(_level, this);
+        populator.execute();
+
+        // If there are new relations on this level, try to calculate the next level
+        if (populator.rowCount() > 0)
+        {
+            this.calculateDerivedDependencyRelations(_level + 1);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateTentativeDependencyRelations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds produced items that may need to be recalculated based on the relations registered on the specified level; ignores dimensions.
+    /// </summary>
+    /// <param name="_level">The level of dependencies to calculate.</param>
+    /// <remarks>
+    /// The found items will be registered as new relations in the <c>BOMTmpUsedItem2ProducedItem</c> table. These relations
+    /// will be part of relation set 0 - the tentative dependency graph, that will be used as a filter for the precise calculation.
+    /// </remarks>
+    protected void calculateTentativeDependencyRelations(int _level = 1)
+    {
+        BOMVersion              bomVersion;
+        BOM                     bom;
+        InventTable             usedItemInventTable;
+        InventTable             producedItemInventTable;
+
+        int nextLevel = _level + 1;
+
+        BOMTmpUsedItem2ProducedItem tentativeConsumptionRelation;
+        BOMTmpUsedItem2ProducedItem derivedTentativeConsumptionRelation;
+        BOMTmpUsedItem2ProducedItem duplicateRelation;
+
+        Debug::assert(_level < MaximumCalculationLevel);
+
+        ttsbegin;
+        // Considering the produced items (ignoring item dimensions) on a certain level and the existing BOM definitions that
+        // list these items on the consumption side, insert the next level of produced items that might have to be recalculated.
+        // If a relation has already been created in previous levels, it's skipped.
+
+        // The goal here is to find a minimal superset of the produced items that will have to be recalculated, with the condition
+        // that we can filter upfront by starting from the modified items. A secondary condition is that we do all calculation
+        // inside set based operations. Therefore, the set of conditions is a subset of the one used in loadDependencies.
+
+        // These records are inserted into the tentative dependency graph. Level 1 of this graph contains the items that
+        // have pending prices (see addItems).
+        insert_recordset derivedTentativeConsumptionRelation
+        (
+            UsedItemId,
+            Level,
+            ProducedItemId,
+            RelationSetNumber,
+            SessionGuid
+        )
+        select ItemId, nextLevel from usedItemInventTable
+            group by ItemId
+        join bom
+            where usedItemInventTable.ItemId == bom.ItemId
+                && (bom.FromDate == dateNull() || bom.FromDate <= calcDate)
+                && (bom.ToDate == dateNull() || bom.ToDate >= calcDate)
+        join bomVersion
+            where bom.bomId == bomVersion.bomId
+        join ItemId from producedItemInventTable
+            group by ItemId
+            where producedItemInventTable.ItemId == bomVersion.ItemId
+        // limit to items that are listed as "produced" on the previous level. On level 1, these items are
+        // the modified items we start our calculation from.
+        join RelationSetNumber, SessionGuid from tentativeConsumptionRelation
+            group by RelationSetNumber, SessionGuid
+            where tentativeConsumptionRelation.ProducedItemId == usedItemInventTable.ItemId
+                && tentativeConsumptionRelation.Level == _level
+                && tentativeConsumptionRelation.RelationSetNumber == TentativeDependencyGraph
+                && tentativeConsumptionRelation.SessionGuid == sessionGuid
+        notExists join duplicateRelation
+            where duplicateRelation.RelationSetNumber == TentativeDependencyGraph
+                && duplicateRelation.SessionGuid == sessionGuid
+                && duplicateRelation.UsedItemId == usedItemInventTable.ItemId
+                && duplicateRelation.ProducedItemId == producedItemInventTable.ItemId;
+
+        if (derivedTentativeConsumptionRelation.RowCount() > 0)
+        {
+            this.calculateTentativeDependencyRelations(_level + 1);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cleans up data created by this session from the <c>BOMTmpUsedItem2ProducedItem</c> table.
+    /// </summary>
+    protected void cleanup()
+    {
+        BOMTmpUsedItem2ProducedItem relations;
+        delete_from relations where relations.SessionGuid == sessionGuid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>elements</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Returns the number of elements in the output list of BOMs.
+    /// </summary>
+    /// <returns>
+    ///    The number of BOMs that should be recalculated to propagate cost and price changes up the tree.
+    /// </returns>
+    public int elements()
+    {
+        return whereUsedList.elements();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWhereUsedListQuery</Name>
+				<Source><![CDATA[
+    protected Query buildWhereUsedListQuery()
+    {
+        const TableName AutoRelationDataSourceName = 'AutoRelation';
+        const TableName CalculatedRelationDataSourceName = 'CalculatedRelation';
+
+        Query query = new Query();
+        QueryBuildDataSource qbdsAutoRelation = query.addDataSource(tableNum(BOMTmpUsedItem2ProducedItem), AutoRelationDataSourceName);
+        qbdsAutoRelation.addSelectionField(fieldNum(BOMTmpUsedItem2ProducedItem, TableId));
+        qbdsAutoRelation.addRange(fieldNum(BOMTmpUsedItem2ProducedItem, RelationSetNumber)).value(queryValue(TentativeDependencyGraph));
+        qbdsAutoRelation.addRange(fieldNum(BOMTmpUsedItem2ProducedItem, Level)).value(queryValue(ItemDimsWithPendingPriceLevel));
+        qbdsAutoRelation.addRange(fieldNum(BOMTmpUsedItem2ProducedItem, SessionGuid)).value(queryValue(sessionGuid));
+
+        QueryBuildDataSource qbdsCalculatedRelation = qbdsAutoRelation.addDataSource(tableNum(BOMTmpUsedItem2ProducedItem), CalculatedRelationDataSourceName);
+        qbdsCalculatedRelation.addSelectionField(fieldNum(BOMTmpUsedItem2ProducedItem, ProducedItemId));
+        qbdsCalculatedRelation.addSelectionField(fieldNum(BOMTmpUsedItem2ProducedItem, ProducedItemSiteId));
+
+        qbdsCalculatedRelation.addLink(fieldNum(BOMTmpUsedItem2ProducedItem, UsedItemId), fieldNum(BOMTmpUsedItem2ProducedItem, UsedItemId), AutoRelationDataSourceName);
+        qbdsCalculatedRelation.addLink(fieldNum(BOMTmpUsedItem2ProducedItem, UsedItemSiteId), fieldNum(BOMTmpUsedItem2ProducedItem, UsedItemSiteId), AutoRelationDataSourceName);
+
+        qbdsCalculatedRelation.addRange(fieldNum(BOMTmpUsedItem2ProducedItem, RelationSetNumber)).value(queryValue(ConcreteDependencyGraph));
+        qbdsCalculatedRelation.addRange(fieldNum(BOMTmpUsedItem2ProducedItem, SessionGuid)).value(queryValue(sessionGuid));
+
+        QueryBuildDataSource qbdsProducedItem = qbdsCalculatedRelation.addDataSource(tableNum(InventTable));
+        qbdsProducedItem.addSelectionField(fieldNum(InventTable, TableId));
+        qbdsProducedItem.addLink(fieldNum(BOMTmpUsedItem2ProducedItem, ProducedItemId), fieldNum(InventTable, ItemId), CalculatedRelationDataSourceName);
+
+        // Higher BOM Level first
+        qbdsProducedItem.addOrderByField(fieldNum(InventTable, BOMLevel), SortOrder::Descending);
+        qbdsCalculatedRelation.addOrderByField(fieldNum(BOMTmpUsedItem2ProducedItem, ProducedItemId));
+
+        qbdsCalculatedRelation.addGroupByField(fieldNum(BOMTmpUsedItem2ProducedItem, ProducedItemId));
+
+        Enumerator enum = InventProductDimension::getEnumeratorForEnabledDimensions();
+        while (enum.moveNext())
+        {
+            InventProductDimension productDim = enum.current();
+            FieldId producedProductDimFieldId = BOMTmpUsedItem2ProducedItem::producedProductDimensionFieldId(productDim);
+            FieldId usedProductDimFieldId = BOMTmpUsedItem2ProducedItem::usedProductDimensionFieldId(productDim);
+
+            if (producedProductDimFieldId && usedProductDimFieldId)
+            {
+                qbdsCalculatedRelation.addSelectionField(producedProductDimFieldId);
+
+                qbdsCalculatedRelation.addLink(usedProductDimFieldId, usedProductDimFieldId, AutoRelationDataSourceName);
+
+                qbdsCalculatedRelation.addGroupByField(producedProductDimFieldId);
+            }
+        }
+        
+        qbdsCalculatedRelation.addGroupByField(fieldNum(BOMTmpUsedItem2ProducedItem, ProducedItemSiteId));
+        qbdsProducedItem.addGroupByField(fieldNum(InventTable, BOMLevel));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fillWhereUsedList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Fills in the list of BOMs to recalculate.
+    /// </summary>
+    /// <remarks>
+    ///    The items are added according to BOM level so that the lowest level BOMs will be calculated first.
+    /// </remarks>
+    protected void fillWhereUsedList()
+    {
+        // At this stage, we have the dependencies of all length registered in relation set 1.
+        // The item-dim combinations with pending price are registered in the tentative graph, on the lowest level.
+        // Use these two sets of records to create the list of items that need to be recalculated.
+        QueryRun queryRun = new QueryRun(this.buildWhereUsedListQuery());        
+        while (queryRun.next())
+        {
+            // Second occurance of this table in the query
+            BOMTmpUsedItem2ProducedItem calculatedRelation = queryRun.get(tableNum(BOMTmpUsedItem2ProducedItem), 2);
+
+            whereUsedList.addEnd(BOMCalcItemDimData::newFromParameters(
+                                            calculatedRelation.ProducedItemId,
+                                            calculatedRelation.ProducedItemSiteId,
+                                            this.buildProductInventDimFromCalculatedRelation(calculatedRelation)));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildProductInventDimFromCalculatedRelation</Name>
+				<Source><![CDATA[
+    protected InventDim buildProductInventDimFromCalculatedRelation(BOMTmpUsedItem2ProducedItem _calculdatedRelation)
+    {
+        InventDim inventDim;
+
+        Enumerator enum = InventProductDimension::getEnumeratorForEnabledDimensions();
+        while (enum.moveNext())
+        {
+            InventProductDimension productDim = enum.current();
+
+            FieldId producedProductDimFieldId = BOMTmpUsedItem2ProducedItem::producedProductDimensionFieldId(productDim);
+            if (producedProductDimFieldId)
+            {
+                inventDim.(productDim.parmInventDimFieldId()) = _calculdatedRelation.(producedProductDimFieldId);
+            }
+        }
+
+        return inventDim;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>fillWhereUsedListPurchased</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Fills in the list of purchased items to recalculate.
+    /// </summary>
+    /// <remarks>
+    ///    Purchased items are added before BOM items
+    /// </remarks>
+    protected void fillWhereUsedListPurchased()
+    {
+        InventItemPriceSim  inventItemPriceSim;
+        InventDim           inventDim;
+
+        while select ItemId
+            from inventItemPriceSim
+            where inventItemPriceSim.FromDate  <= calcDate
+               && inventItemPriceSim.VersionId == versionId
+               && inventItemPriceSim.PriceType == CostingVersionPriceType::Purch
+        join #InventDimGroupAllFields
+            from inventDim
+            where inventDim.InventDimId  == inventItemPriceSim.InventDimId
+               && (inventSiteId == '' || inventDim.InventSiteId == inventSiteId)
+        {
+            whereUsedList.addEnd(BOMCalcItemDimData::newFromParameters(
+                                                        inventItemPriceSim.ItemId,
+                                                        inventDim.InventSiteId,
+                                                        inventDim));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEnumerator</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Returns an enumerator for the output list of BOMs that should be recalculated.
+    /// </summary>
+    /// <returns>
+    ///    A<c> ListEnumerator</c> object.
+    /// </returns>
+    public Enumerator getEnumerator()
+    {
+        return whereUsedList.getEnumerator();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes member variables.
+    /// </summary>
+    protected void init()
+    {
+        whereUsedList = new List(Types::Class);
+        bomVersionIdLoadedSet = new Set(Types::Int64);
+        sessionGuid = newguid();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadDependencies</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Fills the <c>BOMTmpUsedItem2ProducedItem</c> table with elementary relations.
+    /// </summary>
+    /// <remarks>
+    ///    The method runs through all possible combinations of item IDs, inventory dimensions, and site IDs,
+    ///    filtered by items that appear as produced in the tentative graph (relation set 0) in the
+    ///    <c>BOMTmpUsedItem2ProducedItem</c> table. For each of the combinations there is an attempt to find
+    ///    an active BOM version. If there is a version, its lines will be also investigated and added to the
+    ///    relations. These relations will be inserted in the concrete dependency graph (relation set 1).
+    /// </remarks>
+    /// <exception cref="M:Exception::Error">
+    ///    Multisite is not enabled, but the site ID is used.
+    /// </exception>
+    protected void loadDependencies()
+    {
+        InventTable             bomInventTable;
+        InventDimCombination    bomInventDimCombination;
+        InventDim               bomInventDimFromInventDimCombination;
+        InventDim               bomInventDim;
+        InventDim               bomInventDimCriteria;
+
+        InventDimParm           dimParmProduct = InventDimParm::allProductDim();
+
+        BOMTmpUsedItem2ProducedItem nonAutoRelation;
+
+        if (BomCalcWhereUsedListGroupByFinancialDimensionFlight::instance().isEnabled())
+        {
+            while select ItemId, BOMLevel, Product, RecId //ProductDimensionGroup is needed when calling inventStandardQty method later - we can get ProductDimensionGroup from Product
+                from bomInventTable
+                    group by ItemId, BOMLevel, Product, RecId
+                where bomInventTable.ItemType == ItemType::Item
+                outer join TableId from bomInventDimCombination
+                    where bomInventDimCombination.ItemId == bomInventTable.ItemId
+                outer join TableId from bomInventDimFromInventDimCombination
+                    where bomInventDimFromInventDimCombination.InventDimId == bomInventDimCombination.InventDimId
+                outer join configId, InventColorId, InventStyleId, InventVersionId, InventSizeId,
+                    InventDimension1, InventDimension2, InventDimension3, InventDimension4, InventDimension5, InventDimension6,
+                    InventDimension7, InventDimension8, InventDimension9, InventDimension10, InventDimension11, InventDimension12
+                from bomInventDim
+                    group by configId, InventColorId, InventStyleId, InventVersionId, InventSizeId,
+                        InventDimension1, InventDimension2, InventDimension3, InventDimension4, InventDimension5, InventDimension6,
+                        InventDimension7, InventDimension8, InventDimension9, InventDimension10, InventDimension11, InventDimension12
+                    where bomInventDim.ConfigId        == bomInventDimFromInventDimCombination.ConfigId
+                       && bomInventDim.InventColorId   == bomInventDimFromInventDimCombination.InventColorId
+                       && bomInventDim.InventStyleId   == bomInventDimFromInventDimCombination.InventStyleId
+                       && bomInventDim.InventVersionId == bomInventDimFromInventDimCombination.InventVersionId
+                       && bomInventDim.InventSizeId    == bomInventDimFromInventDimCombination.InventSizeId
+                       && (!dimParmProduct.InventDimension1Flag  || bomInventDim.InventDimension1  == bomInventDimFromInventDimCombination.InventDimension1)
+                       && (!dimParmProduct.InventDimension2Flag  || bomInventDim.InventDimension2  == bomInventDimFromInventDimCombination.InventDimension2)
+                       && (!dimParmProduct.InventDimension3Flag  || bomInventDim.InventDimension3  == bomInventDimFromInventDimCombination.InventDimension3)
+                       && (!dimParmProduct.InventDimension4Flag  || bomInventDim.InventDimension4  == bomInventDimFromInventDimCombination.InventDimension4)
+                       && (!dimParmProduct.InventDimension5Flag  || bomInventDim.InventDimension5  == bomInventDimFromInventDimCombination.InventDimension5)
+                       && (!dimParmProduct.InventDimension6Flag  || bomInventDim.InventDimension6  == bomInventDimFromInventDimCombination.InventDimension6)
+                       && (!dimParmProduct.InventDimension7Flag  || bomInventDim.InventDimension7  == bomInventDimFromInventDimCombination.InventDimension7)
+                       && (!dimParmProduct.InventDimension8Flag  || bomInventDim.InventDimension8  == bomInventDimFromInventDimCombination.InventDimension8)
+                       && (!dimParmProduct.InventDimension9Flag  || bomInventDim.InventDimension9  == bomInventDimFromInventDimCombination.InventDimension9)
+                       && (!dimParmProduct.InventDimension10Flag || bomInventDim.InventDimension10 == bomInventDimFromInventDimCombination.InventDimension10)
+                       && (!dimParmProduct.InventDimension11Flag  || bomInventDim.InventDimension11  == bomInventDimFromInventDimCombination.InventDimension11)
+                       && (!dimParmProduct.InventDimension12Flag  || bomInventDim.InventDimension12  == bomInventDimFromInventDimCombination.InventDimension12)
+                       && (inventSiteId == '' || bomInventDim.InventSiteId == '' || bomInventDim.InventSiteId == inventSiteId)
+                // Filter by items that have been identified in calculateTentativeUsageRelations
+                // As the elementary level represents the items with pending prices, there is no point in trying to recalculate those
+                exists join nonAutoRelation
+                    where nonAutoRelation.ProducedItemId == bomInventTable.ItemId
+                       && nonAutoRelation.RelationSetNumber == TentativeDependencyGraph
+                       && nonAutoRelation.Level > ElementaryDependencyLevel
+                       && nonAutoRelation.SessionGuid == sessionGuid
+            {
+                bomInventDimCriteria.data(bomInventDim);
+
+                if (!bomInventDimCriteria.InventSiteId && inventSiteId)
+                {
+                    bomInventDimCriteria.InventSiteId = inventSiteId;
+                    bomInventDimCriteria = InventDim::findOrCreate(bomInventDimCriteria);
+                }
+
+                this.loadItem(bomInventTable, bomInventDimCriteria);
+            }
+        }
+        else
+        {
+            while select ItemId, bomLevel, Product //ProductDimensionGroup is needed when calling inventStandardQty method later - we can get ProductDimensionGroup from Product
+                from bomInventTable
+                where bomInventTable.ItemType == ItemType::Item
+                outer join TableId from bomInventDimCombination
+                    where bomInventDimCombination.ItemId == bomInventTable.ItemId
+                outer join TableId from bomInventDimFromInventDimCombination
+                    where bomInventDimFromInventDimCombination.InventDimId == bomInventDimCombination.InventDimId
+                outer join bomInventDim
+                    where bomInventDim.ConfigId        == bomInventDimFromInventDimCombination.ConfigId
+                       && bomInventDim.InventColorId   == bomInventDimFromInventDimCombination.InventColorId
+                       && bomInventDim.InventStyleId   == bomInventDimFromInventDimCombination.InventStyleId
+                       && bomInventDim.InventVersionId == bomInventDimFromInventDimCombination.InventVersionId
+                       && bomInventDim.InventSizeId    == bomInventDimFromInventDimCombination.InventSizeId
+                       && (!dimParmProduct.InventDimension1Flag  || bomInventDim.InventDimension1  == bomInventDimFromInventDimCombination.InventDimension1)
+                       && (!dimParmProduct.InventDimension2Flag  || bomInventDim.InventDimension2  == bomInventDimFromInventDimCombination.InventDimension2)
+                       && (!dimParmProduct.InventDimension3Flag  || bomInventDim.InventDimension3  == bomInventDimFromInventDimCombination.InventDimension3)
+                       && (!dimParmProduct.InventDimension4Flag  || bomInventDim.InventDimension4  == bomInventDimFromInventDimCombination.InventDimension4)
+                       && (!dimParmProduct.InventDimension5Flag  || bomInventDim.InventDimension5  == bomInventDimFromInventDimCombination.InventDimension5)
+                       && (!dimParmProduct.InventDimension6Flag  || bomInventDim.InventDimension6  == bomInventDimFromInventDimCombination.InventDimension6)
+                       && (!dimParmProduct.InventDimension7Flag  || bomInventDim.InventDimension7  == bomInventDimFromInventDimCombination.InventDimension7)
+                       && (!dimParmProduct.InventDimension8Flag  || bomInventDim.InventDimension8  == bomInventDimFromInventDimCombination.InventDimension8)
+                       && (!dimParmProduct.InventDimension9Flag  || bomInventDim.InventDimension9  == bomInventDimFromInventDimCombination.InventDimension9)
+                       && (!dimParmProduct.InventDimension10Flag || bomInventDim.InventDimension10 == bomInventDimFromInventDimCombination.InventDimension10)
+                       && (!dimParmProduct.InventDimension11Flag  || bomInventDim.InventDimension11  == bomInventDimFromInventDimCombination.InventDimension11)
+                       && (!dimParmProduct.InventDimension12Flag  || bomInventDim.InventDimension12  == bomInventDimFromInventDimCombination.InventDimension12)
+                       && (inventSiteId == '' || bomInventDim.InventSiteId == '' || bomInventDim.InventSiteId == inventSiteId)
+                // Filter by items that have been identified in calculateTentativeUsageRelations
+                // As the elementary level represents the items with pending prices, there is no point in trying to recalculate those
+                exists join nonAutoRelation
+                    where nonAutoRelation.ProducedItemId == bomInventTable.ItemId
+                       && nonAutoRelation.RelationSetNumber == TentativeDependencyGraph
+                       && nonAutoRelation.Level > ElementaryDependencyLevel
+                       && nonAutoRelation.SessionGuid == sessionGuid
+            {
+                bomInventDimCriteria.data(bomInventDim);
+
+                if (!bomInventDimCriteria.InventSiteId && inventSiteId)
+                {
+                    bomInventDimCriteria.InventSiteId = inventSiteId;
+                    bomInventDimCriteria = InventDim::findOrCreate(bomInventDimCriteria);
+                }
+
+                this.loadItem(bomInventTable, bomInventDimCriteria);
+            }
+        }
+
+        bomVersionIdLoadedSet = new Set(Types::Int64); // Clear set
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadDependenciesWithItemDimsDisable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Fills the <c>BOMTmpUsedItem2ProducedItem</c> table with elementary relations if all product dimensions are disabled.
+    /// </summary>
+    /// <remarks>
+    ///    The method runs through all item IDs filtered by items that appear as produced in the tentative
+    ///    graph (relation set 0) in the <c>BOMTmpUsedItem2ProducedItem</c> table. For each item there is an
+    ///    attempt to find an active BOM version. If there is a version, its lines will be also investigated
+    ///    and added to the relations. These relations will be inserted in the concrete dependency graph
+    ///    (relation set 1).
+    /// </remarks>
+    /// <exception cref="M:Exception::Error">
+    ///    Multisite is not activated, but the site ID is non-blank.
+    /// </exception>
+    protected void loadDependenciesWithItemDimsDisable()
+    {
+        InventTable             bomInventTable;
+        InventDim               bomInventDimCriteria;
+        BOMTmpUsedItem2ProducedItem nonAutoRelation;
+
+        while select ItemId, bomLevel, Product //ProductDimensionGroup is needed when calling inventStandardQty method later - we can get ProductDimensionGroup from Product
+            from bomInventTable
+            where bomInventTable.ItemType == ItemType::Item
+        // Filter by items that have been identified in calculateTentativeUsageRelations
+        // As the elementary level represents the items with pending prices, there is no point in trying to recalculate those
+        exists join nonAutoRelation
+            where nonAutoRelation.ProducedItemId == bomInventTable.ItemId
+               && nonAutoRelation.RelationSetNumber == TentativeDependencyGraph
+               && nonAutoRelation.Level > ElementaryDependencyLevel
+               && nonAutoRelation.SessionGuid == sessionGuid
+        {
+            if (inventSiteId == '')
+            {
+                bomInventDimCriteria = InventDim::findOrCreateBlank();
+            }
+            else
+            {
+                bomInventDimCriteria.InventSiteId = inventSiteId;
+                bomInventDimCriteria = InventDim::findOrCreate(bomInventDimCriteria);
+            }
+
+            this.loadItem(bomInventTable, bomInventDimCriteria);
+        }
+
+        bomVersionIdLoadedSet = new Set(Types::Int64); // Clear set
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Attempts to load dependencies for a produced item from its active bom version.
+    /// </summary>
+    /// <param name="_inventTable">A record from the <c>InventTable</c> table that represents the produced item.</param>
+    /// <param name="_inventDimCriteria">A record from the <c>InventDim</c> table that represents the dimension values to be used.</param>
+    protected void loadItem(
+        InventTable     _inventTable,
+        InventDim       _inventDimCriteria)
+    {
+        BOM         bom;
+        InventTable itemInventTable;
+        InventDim   itemInventDim;
+
+        BOMVersion  bomVersion = BOMVersion::findActive(_inventTable.ItemId,
+                                                        calcDate,
+                                                        _inventTable.inventStandardQty(_inventDimCriteria.InventDimId),
+                                                        _inventDimCriteria);
+        
+        if (!bomVersion)
+        {
+            return;
+        }
+        
+        if (bomVersionIdLoadedSet.in(bomVersion.RecId))
+        {
+            return;
+        }
+
+        bomVersionIdLoadedSet.add(bomVersion.RecId);
+
+        // Insert elementary (level 1) relations into record set 1 - the concrete dependency graph
+        // for each bom line from the active bom version
+        while select TableId from bom
+            where bom.bomId == bomVersion.bomId
+               && (bom.FromDate == dateNull() || bom.FromDate <= calcDate)
+               && (bom.ToDate   == dateNull() || bom.ToDate   >= calcDate)
+        join ItemId, ItemDimCostPrice from itemInventTable
+            where itemInventTable.ItemId == bom.ItemId
+        join itemInventDim
+            where itemInventDim.InventDimId == bom.InventDimId
+        {
+            if (!itemInventDim.InventSiteId && inventSiteId)
+            {
+                itemInventDim.InventSiteId = inventSiteId;
+            }
+
+            BOMTmpUsedItem2ProducedItem basicRelation;            
+
+            basicRelation.UsedItemId        = itemInventTable.ItemId;
+            basicRelation.UsedItemSiteId    = itemInventDim.InventSiteId;
+            basicRelation.ProducedItemId    = _inventTable.ItemId;
+
+            Enumerator enum = InventProductDimension::getEnumeratorForEnabledDimensions();
+            while (enum.moveNext())
+            {
+                InventProductDimension productDim = enum.current();
+                if (itemInventTable.ItemDimCostPrice)
+                {
+                    FieldId usedProductDimFieldId = BOMTmpUsedItem2ProducedItem::usedProductDimensionFieldId(productDim);
+                    if (usedProductDimFieldId)
+                    {
+                        basicRelation.(usedProductDimFieldId) = itemInventDim.(productDim.parmInventDimFieldId());
+                    }
+                }
+                FieldId producedProductDimFieldId = BOMTmpUsedItem2ProducedItem::producedProductDimensionFieldId(productDim);
+                if (producedProductDimFieldId)
+                {
+                    basicRelation.(producedProductDimFieldId) = _inventDimCriteria.(productDim.parmInventDimFieldId());
+                }
+            }
+
+            basicRelation.ProducedItemSiteId    = _inventDimCriteria.InventSiteId;
+            basicRelation.RelationSetNumber     = ConcreteDependencyGraph;
+            basicRelation.Level                 = ElementaryDependencyLevel;
+            basicRelation.SessionGuid           = sessionGuid;
+            basicRelation.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        this.init();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCalcDate</Name>
+				<Source><![CDATA[
+    public TransDate parmCalcDate(TransDate _calcDate = calcDate)
+    {
+        calcDate = _calcDate;
+
+        return calcDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventSiteId</Name>
+				<Source><![CDATA[
+    public InventSiteId parmInventSiteId(InventSiteId _inventSiteId = inventSiteId)
+    {
+        inventSiteId = _inventSiteId;
+
+        return inventSiteId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmVersionId</Name>
+				<Source><![CDATA[
+    public CostingVersionId parmVersionId(CostingVersionId _versionId = versionId)
+    {
+        versionId = _versionId;
+
+        return versionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSessionGuid</Name>
+				<Source><![CDATA[
+    public SysGuid parmSessionGuid()
+    {
+        return sessionGuid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Runs through a list of items that will be used as a basis for dependency investigations and
+    ///    generates a list of BOMs that will have to be recalculated so that cost and price changes will be
+    ///    propagated up the dependency tree.
+    /// </summary>
+    public void run()
+    {
+        // Find the relations that will be used as filters for the more precise calculation
+        this.calculateTentativeDependencyRelations();
+
+        // Perform the main loop with the complete set of conditions, filtering on results from the previous step
+        if (InventDim::dimProductDimensionEnabledFieldList().elements() == 0)
+        {
+            this.loadDependenciesWithItemDimsDisable();
+        }
+        else
+        {
+            InventDimCombination bomInventDimCombination;
+            select firstonly RecId from bomInventDimCombination;
+
+            if (!bomInventDimCombination.RecId && BomCalcLoadDependenciesWithProductDimNotExistsFlight::instance().isEnabled())
+            {
+                this.loadDependenciesWithItemDimsDisable();
+            }
+            else
+            {
+                this.loadDependencies();
+            }
+        }
+
+        // Calculate the dependencies of all lengths
+        this.calculateDerivedDependencyRelations();
+
+        // Fill in the list of purchased items to recalculate
+        this.fillWhereUsedListPurchased();
+
+        // Fill in the list of results
+        this.fillWhereUsedList();
+
+        // Clean up data from the table
+        this.cleanup();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static BOMCalcWhereUsedList construct()
+    {
+        return new BOMCalcWhereUsedList();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes an instance of the <c>BOMCalcWhereUsedList</c> class for the specified date and site
+    ///    and the list of pending prices from the specified costing version.
+    /// </summary>
+    /// <param name="_versionId">
+    ///    The ID of the costing version.
+    /// </param>
+    /// <param name="_calcDate">
+    ///    The BOM calculation date.
+    /// </param>
+    /// <param name="_inventSiteId">
+    ///    The site ID; optional.
+    /// </param>
+    /// <returns>
+    ///    An instance of the <c>BOMCalcWhereUsedList</c> class.
+    /// </returns>
+    /// <remarks>
+    ///    The site ID should be provided only if multisite is enabled.
+    /// </remarks>
+    /// <exception cref="M:Exception::Error">
+    ///    The calculation date is not specified.
+    /// </exception>
+    public static BOMCalcWhereUsedList newParameters(
+        CostingVersionId    _versionId,
+        TransDate           _calcDate,
+        InventSiteId        _inventSiteId = '')
+    {
+        BOMCalcWhereUsedList bomCalcWhereUsedList;
+
+        if (_calcDate == dateNull())
+            throw error(Error::wrongUseOfFunction(funcname()));
+
+        bomCalcWhereUsedList = BOMCalcWhereUsedList::construct();
+        bomCalcWhereUsedList.parmCalcDate(_calcDate);
+        bomCalcWhereUsedList.parmInventSiteId(_inventSiteId);
+        bomCalcWhereUsedList.parmVersionId(_versionId);
+
+        bomCalcWhereUsedList.addItems();
+
+        return bomCalcWhereUsedList;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

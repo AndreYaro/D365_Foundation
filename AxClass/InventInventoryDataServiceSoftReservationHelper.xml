@@ -1,0 +1,666 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventInventoryDataServiceSoftReservationHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+internal final class InventInventoryDataServiceSoftReservationHelper
+{
+    public static str dimensionDatasource = "fno";
+    public static str quantityDatasource = "fno";
+    public static str modifier = "softreserved";
+
+    public static int maxRetryCount = 5;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>softReserveSalesOrderInBatch</Name>
+				<Source><![CDATA[
+    public static void softReserveSalesOrderInBatch(SalesId _salesId, boolean _isRevert = false)
+    {
+        InventInventoryDataServiceParameters parameter = InventInventoryDataServiceParameters::find();
+
+        if (parameter.RecId)
+        {
+            SalesLine salesLine;
+            InventInventoryDataServiceSoftReserveHistory softReserveHistory;
+
+            ttsbegin;
+            if (InventInventoryDataServiceSoftReservationCompatibleV0V1Flight::instance().isEnabled())
+            {
+                while select forupdate salesLine
+                    where salesLine.SalesId == _salesId
+                {
+                    if (InventInventoryDataServiceSoftReservationHelper::hasBeenSoftReservedExternally(salesLine))
+                    {
+                        info(strFmt("@SCM:InventoryServiceShouldNotSoftReserveOrRevertOnExteranlSaleslineInfo", any2Str(salesLine.LineNum)));
+                        continue;
+                    }
+                    softReserveHistory = InventInventoryDataServiceSoftReserveHistory::findInventTransId(salesLine.InventTransId, true);
+                    if (!softReserveHistory)
+                    {
+                        if (_isRevert)
+                        {
+                            continue;
+                        }
+                        
+                        if (InventInventoryDataServiceSoftReservationHelper::hasBeenSoftReserved(salesLine))
+                        {
+                            info(strFmt("@SCM:InventoryServiceShouldNotSoftReserveOrRevertOnExteranlSaleslineInfo", any2Str(salesLine.LineNum)));
+                            continue;
+                        }
+
+                        softReserveHistory = InventInventoryDataServiceSoftReserveHistory::newFromSalesLine(SalesLine);
+                    }
+                    softReserveHistory.updateSoftReserveHistoryAndInsertSoftReserveQueue(parameter.IsProcessingQueueBackup, _isRevert);
+                }
+            }
+            else
+            {
+                while select InventTransId, IsSoftReservedExternally, LineNum
+                    from salesLine
+                    where salesLine.SalesId == _salesId
+                {
+                    if (salesLine.IsSoftReservedExternally)
+                    {
+                        info(strFmt("@SCM:InventoryServiceShouldNotSoftReserveOrRevertOnExteranlSaleslineInfo", any2Str(salesLine.LineNum)));
+                        continue;
+                    }
+                    softReserveHistory = InventInventoryDataServiceSoftReserveHistory::findInventTransId(salesLine.InventTransId, true);
+                    softReserveHistory.updateSoftReserveHistoryAndInsertSoftReserveQueue(parameter.IsProcessingQueueBackup, _isRevert);
+                }
+            }
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postSoftReservations</Name>
+				<Source><![CDATA[
+    public static void postSoftReservations(List _softReserveList, Map _softReserveMap)
+    {
+        if (_softReserveList.empty())
+        {
+            return;
+        }
+
+        try
+        {
+            InventInventoryDataServiceSoftReservationHelper::postSoftReservationRequests(_softReserveList, _softReserveMap, false);
+        }
+        catch
+        {
+            InventInventoryDataServiceParameters parameters = InventInventoryDataServiceParameters::find();
+            if (parameters.RecId)
+            {
+                ListEnumerator enumerator = _softReserveList.getEnumerator();
+                while (enumerator.moveNext())
+                {
+                    InventOnHandSoftReserveEvent reservEvent = enumerator.current();
+                    reservEvent.insertToSoftReserveQueue(parameters.IsProcessingQueueBackup);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postSoftReservationRequests</Name>
+				<Source><![CDATA[
+    public static InventInventoryDataServiceSoftReserveBulkPostingResponse postSoftReservationRequests(List softReserveList, Map softReserveMap, boolean isBatch = false)
+    {
+        int retryCount = 0;
+        int maxRetry = isBatch ? 1 : InventInventoryDataServiceSoftReservationHelper::maxRetryCount;
+        var inventoryServiceClient = new InventoryServiceClient(false);
+        InventInventoryDataServiceSoftReserveBulkPostingResponse response;
+
+        while (retryCount < maxRetry)
+        {
+            response = inventoryServiceClient.postSoftReserveList(softReserveList);
+
+            if (response.isOk())
+            {
+                ListEnumerator failures = response.parmFailure().getEnumerator();
+                while(failures.moveNext())
+                {
+                    InventInventoryDataServiceSoftReservePostingResponse resObj = failures.current();
+                    InventOnHandSoftReserveEvent request = softReserveMap.lookup(resObj.parmId());
+                    if (request)
+                    {
+                        if (resObj.parmAfrFailure())
+                        {
+                            request.parmStatus(InventInventoryDataServiceSoftReserveResponseStatus::ValidationFailed);
+                        }
+                        else
+                        {
+                            request.parmStatus(InventInventoryDataServiceSoftReserveResponseStatus::Failed);
+                        }
+
+                        request.parmResponseMessage(resObj.parmMessage());
+                    }
+                }
+
+                ListEnumerator successes =  (List::merge(response.parmSuccess(), response.parmConflict())).getEnumerator();
+                while(successes.moveNext())
+                {
+                    InventInventoryDataServiceSoftReservePostingResponse resObj = successes.current();
+                    InventOnHandSoftReserveEvent request = softReserveMap.lookup(resObj.parmId());
+                    if (request)
+                    {
+                        request.parmStatus(InventInventoryDataServiceSoftReserveResponseStatus::Success);
+                        request.parmReservationId(resObj.parmReservationId());
+                    }
+                }
+
+                MapEnumerator enumerator = softReserveMap.getEnumerator();
+                while (enumerator.moveNext())
+                {
+                    InventOnHandSoftReserveEvent reserveEvent = enumerator.currentValue();
+                    reserveEvent.updateSoftReserveHistory(isBatch);
+                }
+
+                return response;
+            }
+
+            retryCount++;
+        }
+
+        throw error(strFmt("@SCM:InventoryServiceSoftReserveRequestFailedError", enum2int(response.parmRawStatusCode()), response.parmRawBodyMessage()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postSoftReservation</Name>
+				<Source><![CDATA[
+    public static void postSoftReservation(InventOnHandSoftReserveEvent event, InventInventoryDataServiceSoftReserveHistory _softReserveHistory)
+    {
+        if (event == null)
+        {
+            return;
+        }
+
+        int retryCount = 0;
+        InventInventoryDataServiceSoftReservePostingResponse response;
+
+        try
+        {
+            while (retryCount < InventInventoryDataServiceSoftReservationHelper::maxRetryCount)
+            {
+                var inventoryServiceClient = new InventoryServiceClient(false);
+                response = inventoryServiceClient.postSoftReserve(event);
+            
+                if (response.isOk())
+                {
+                    var qty = event.parmQuantity();
+
+                    if (response.parmProcessingStatus()=="success" || response.parmProcessingStatus()=="conflict")
+                    {
+                        event.parmStatus(InventInventoryDataServiceSoftReserveResponseStatus::Success);
+                        event.parmReservationId(response.parmReservationId());
+                    }
+                    else if (response.parmProcessingStatus()=="failure")
+                    {
+                        if (response.parmAfrFailure())
+                        {
+                            event.parmStatus(InventInventoryDataServiceSoftReserveResponseStatus::ValidationFailed);
+                        }
+                        else
+                        {
+                            event.parmStatus(InventInventoryDataServiceSoftReserveResponseStatus::Failed);
+                        }
+                        
+                        event.parmResponseMessage(response.parmMessage());                       
+                    }
+                    else
+                    {
+                        // log unexpected response status???
+                    }
+
+                    _softReserveHistory.updateWithReservResult(event, qty, false);
+
+                    return;
+                }
+                
+                retryCount++;
+            }
+
+            throw error(strFmt("@SCM:InventoryServiceSoftReserveRequestFailedError", enum2int(response.parmRawStatusCode()), response.parmRawBodyMessage()));
+        }
+        catch
+        {
+            InventInventoryDataServiceParameters parameters = InventInventoryDataServiceParameters::find();
+
+            if (parameters.RecId)
+            {
+                event.insertToSoftReserveQueue(parameters.IsProcessingQueueBackup);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processReservEventsList</Name>
+				<Source><![CDATA[
+    public static void processReservEventsList(List _softReserveList)
+    {
+        InventInventoryDataServiceParameters parameters = InventInventoryDataServiceParameters::find();
+
+        if (parameters.RecId)
+        {
+            ListEnumerator enumerator = _softReserveList.getEnumerator();
+            while (enumerator.moveNext())
+            {
+                InventOnHandSoftReserveEvent reservEvent = enumerator.current();
+                InventInventoryDataServiceSoftReservationHelper::processReservEvent(reservEvent, parameters.IsProcessingQueueBackup);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processReservEvent</Name>
+				<Source><![CDATA[
+    public static void processReservEvent(InventOnHandSoftReserveEvent _reservEvent, boolean _isProcessingQueueBackup)
+    {
+        if (_reservEvent.parmStatus() != InventInventoryDataServiceSoftReserveResponseStatus::None)
+        {
+            _reservEvent.updateSoftReserveHistory(false);
+        }
+        else
+        {
+            _reservEvent.insertToSoftReserveQueue(_isProcessingQueueBackup);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSoftReserved</Name>
+				<Source><![CDATA[
+    public static boolean isSoftReserved(SalesLine _salesLine)
+    {
+        InventInventoryDataServiceSoftReserveHistory softReserveHistory = InventInventoryDataServiceSoftReserveHistory::findInventTransId(_salesLine.InventTransId);
+
+        return softReserveHistory.RecId && softReserveHistory.existsNonZereSoftReservedQuantity();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSoftReservationFinished</Name>
+				<Source><![CDATA[
+    public static boolean isSoftReservationFinished(SalesLine _salesLine)
+    {
+        InventInventoryDataServiceSoftReserveHistory softReserveHistory = InventInventoryDataServiceSoftReserveHistory::findInventTransId(_salesLine.InventTransId);
+
+        if (!softReserveHistory.RecId || softReserveHistory.isSoftReserveSuccessed())
+        {
+            return true;
+        }
+        
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showSoftReserveStatus</Name>
+				<Source><![CDATA[
+    public static str showSoftReserveStatus(SalesLine _salesLine)
+    {
+        InventInventoryDataServiceSoftReserveStatus softReserveStatus = InventInventoryDataServiceSoftReserveStatus::None;
+        InventInventoryDataServiceSoftReserveHistory softReserveHistory = InventInventoryDataServiceSoftReserveHistory::findInventTransId(_salesLine.InventTransId);
+
+        if (softReserveHistory.RecId)
+        {
+            if (softReserveHistory.isSoftReserveSuccessed())
+            {
+                softReserveStatus = InventInventoryDataServiceSoftReserveStatus::Successed;
+            }
+            else
+            {
+                if (!softReserveHistory.isSoftReserveStarted())
+                {
+                    softReserveStatus = InventInventoryDataServiceSoftReserveStatus::NotStarted;
+                }
+                else
+                {
+                    softReserveStatus = InventInventoryDataServiceSoftReserveStatus::Unfinished;
+                }
+            }
+        }
+
+        if (softReserveStatus != InventInventoryDataServiceSoftReserveStatus::None)
+        {
+            SysDictEnum softReserveEnum = new SysDictEnum(enumnum(InventInventoryDataServiceSoftReserveStatus));
+            return softReserveEnum.value2Label(softReserveStatus);
+        }
+
+        return "";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSoftReserveEnabled</Name>
+				<Source><![CDATA[
+    public static boolean isSoftReserveEnabled()
+    {
+        if (InventInventoryDataServiceSoftReservationFeature::isEnabled())
+        {
+            InventInventoryDataServiceParameters parameter = InventInventoryDataServiceParameters::find();
+            InventoryServiceStatus serviceStatus = parameter.InventoryServiceStatus;
+    
+            return serviceStatus != InventoryServiceStatus::Disabled &&
+                    serviceStatus != InventoryServiceStatus::Disabling;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSoftReservationForDelete</Name>
+				<Source><![CDATA[
+    public static void checkSoftReservationForDelete(SalesLine _salesLine)
+    {
+        if (InventInventoryDataServiceSoftReservationCompatibleV0V1Flight::instance().isEnabled())
+        {
+            if (InventInventoryDataServiceSoftReservationHelper::isSoftReserveEnabled())
+            {
+                if (_salesLine.IsSoftReservedExternally)
+                {
+                    InventInventoryDataServiceSoftReserveHistory softReserveHistory = InventInventoryDataServiceSoftReserveHistory::findInventTransId(_salesLine.InventTransId, true);
+                    if (softReserveHistory)
+                    {
+                        softReserveHistory.delete();
+                    }
+                }
+                else if (InventInventoryDataServiceSoftReservationHelper::isSoftReserved(_salesLine))
+                {
+                    throw error("@SCM:InventoryServiceRemoveSoftReservationBeforeDeleteSalesLineError");
+                }
+            }
+        }
+        else
+        {
+            if (InventInventoryDataServiceSoftReservationHelper::isSoftReserveEnabled())
+            {
+                if (_salesLine.IsSoftReservedExternally)
+                {
+                    InventInventoryDataServiceSoftReserveHistory softReserveHistory = InventInventoryDataServiceSoftReserveHistory::findInventTransId(_salesLine.InventTransId, true);
+                    softReserveHistory.UnprocessedQty += softReserveHistory.SuccessedQty;
+                    softReserveHistory.SuccessedQty = 0;
+                    softReserveHistory.update();
+                }
+                else if (InventInventoryDataServiceSoftReservationHelper::isSoftReserved(_salesLine))
+                {
+                    throw error("@SCM:InventoryServiceRemoveSoftReservationBeforeDeleteSalesLineError");
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSoftReservation</Name>
+				<Source><![CDATA[
+    public static void checkSoftReservation(InventMovement movement)
+    {
+        if ((movement is InventMov_Sales || movement is InventMov_WMSOrder) && InventInventoryDataServiceSoftReservationHelper::isSoftReserveEnabled())
+        {
+            InventTrans inventTrans;
+            select firstonly inventTrans where inventTrans.InventTransOrigin == movement.inventTransOriginId() &&
+                inventTrans.StatusIssue >= StatusIssue::OnOrder;
+            if (inventTrans.RecId == 0)
+            {
+                return;
+            }
+
+            SalesLine salesLine;
+            if (movement is InventMov_Sales)
+            {
+                salesLine = movement.buffer() as SalesLine;
+            }
+            else if (movement is InventMov_WMSOrder)
+            {
+                select firstonly salesLine where salesLine.InventTransId == movement.transId();
+            }
+
+            if (salesLine.RecId && salesLine.SoftReserveBlockLevel != SoftReserveBlockLevel::Ignore)
+            {
+                if (!InventInventoryDataServiceSoftReservationHelper::isSoftReservationFinished(salesLine))
+                {
+            
+                    if (salesLine.SoftReserveBlockLevel == SoftReserveBlockLevel::Block)
+                    {
+                        throw error('@SCM:InventoryServiceSoftReserationNotCompletedError');
+                    }
+
+                    if (salesLine.SoftReserveBlockLevel == SoftReserveBlockLevel::Warning)
+                    {
+                        warning('@SCM:InventoryServiceSoftReserationNotCompletedWarning');
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSoftReservationWhenUpdateDeliverRemainder</Name>
+				<Source><![CDATA[
+    public static void checkSoftReservationWhenUpdateDeliverRemainder(SalesLine _salesLine, InventQty _remainInventPhysical)
+    {
+        if (InventInventoryDataServiceSoftReservationHelper::isSoftReserveEnabled())
+        {
+            InventInventoryDataServiceSoftReserveHistory history = InventInventoryDataServiceSoftReserveHistory::findInventTransId(_salesLine.InventTransId);
+
+            if (_remainInventPhysical < history.getPostedQty())
+            {
+                throw error(strFmt('@SCM:InventoryServiceForbidActionsAfterSoftReservationInfo', any2Str(_salesLine.LineNum)));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addSoftReserveFilter</Name>
+				<Source><![CDATA[
+    public static void addSoftReserveFilter(Query _query)
+    {
+        QueryBuildDataSource qbdsSalesLine = _query.dataSourceTable(tableNum(SalesLine));
+        QueryBuildDataSource qbdsSoftReserveHistory;
+
+        if (!InventInventoryDataServiceSoftReserveFilterMissDatasourceFlight::instance().isEnabled())
+        {
+            qbdsSoftReserveHistory = _query.dataSourceTable(tableNum(InventTransOrigin)).addDataSource(tableNum(InventInventoryDataServiceSoftReserveHistory));
+        }
+
+        if (InventInventoryDataServiceSoftReserveFilterFlight::instance().isEnabled())
+        {
+            _query.dataSourceTable(tableNum(SalesLine)).addDataSource(tableNum(InventTransOrigin)).joinMode(JoinMode::OuterJoin);
+            _query.dataSourceTable(tableNum(InventTransOrigin)).fetchMode(QueryFetchMode::One2One);
+
+            _query.dataSourceTable(tableNum(InventTransOrigin)).addLink(fieldnum(SalesLine,InventTransId),fieldnum(InventTransOrigin,InventTransId));
+            _query.dataSourceTable(tableNum(InventTransOrigin)).addLink(fieldnum(SalesLine,DataAreaId),fieldnum(InventTransOrigin,DataAreaId));
+            
+            if (InventInventoryDataServiceSoftReserveFilterMissDatasourceFlight::instance().isEnabled())
+            {
+                qbdsSoftReserveHistory = _query.dataSourceTable(tableNum(InventTransOrigin)).addDataSource(tableNum(InventInventoryDataServiceSoftReserveHistory));
+            }
+
+            qbdsSoftReserveHistory.joinMode(JoinMode::NoExistsJoin);
+            qbdsSoftReserveHistory.fetchMode(QueryFetchMode::One2One);
+
+            qbdsSoftReserveHistory.addLink(fieldnum(InventTransOrigin,RecId),fieldnum(InventInventoryDataServiceSoftReserveHistory,InventTransOrigin));
+            qbdsSoftReserveHistory.addLink(fieldnum(InventTransOrigin,DataAreaId),fieldnum(InventInventoryDataServiceSoftReserveHistory,DataAreaId));
+            /*
+            SELECT * FROM SalesLine AS SL WITH (NOLOCK)
+                INNER JOIN InventTransOrigin AS ITO WITH (NOLOCK)
+                ON SL.InventTransId = ITO.InventTransId
+                AND SL.dataAreaId = ITO.dataAreaId
+                WHERE SL.SalesId = N'DAT-000001'
+                AND SL.Blocked = 0
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM InventInventoryDataServiceSoftReserveHistory AS IRH WITH (NOLOCK)
+                    WHERE ITO.RecId = IRH.InventTransOrigin
+                    AND ITO.dataAreaId = IRH.dataAreaId
+                    AND (
+                        SL.SoftReserveBlockLevel = 2
+                        AND (
+                            IRH.PendingQty != 0
+                            OR IRH.ProcessingQty != 0
+                            OR IRH.UnprocessedQty + IRH.ValidateFailedQty + IRH.FailedQty != 0)));
+            */
+            qbdsSoftReserveHistory.addRange(fieldNum(InventInventoryDataServiceSoftReserveHistory,ItemId)).
+                        value(strFmt('((%1.%3 == %6) && ((%2.%7 != 0) || (%2.%8 != 0) || (%2.%9 + %2.%10 + %2.%11 != 0)))',
+                        qbdsSalesLine.name(),
+                        qbdsSoftReserveHistory.name(),
+                        fieldStr(SalesLine, SoftReserveBlockLevel),
+                        any2int(SoftReserveBlockLevel::Ignore),
+                        any2int(SoftReserveBlockLevel::Warning),
+                        any2int(SoftReserveBlockLevel::Block),
+                        fieldStr(InventInventoryDataServiceSoftReserveHistory,PendingQty),
+                        fieldStr(InventInventoryDataServiceSoftReserveHistory,ProcessingQty),
+                        fieldStr(InventInventoryDataServiceSoftReserveHistory,UnprocessedQty),
+                        fieldStr(InventInventoryDataServiceSoftReserveHistory,ValidateFailedQty),
+                        fieldStr(InventInventoryDataServiceSoftReserveHistory,FailedQty)));
+        }
+        else
+        {
+            _query.dataSourceTable(tableNum(SalesLine)).addDataSource(tableNum(InventTransOrigin)).joinMode(JoinMode::ExistsJoin);
+            _query.dataSourceTable(tableNum(InventTransOrigin)).fetchMode(QueryFetchMode::One2One);
+
+            _query.dataSourceTable(tableNum(InventTransOrigin)).addLink(fieldnum(SalesLine,InventTransId),fieldnum(InventTransOrigin,InventTransId));
+            _query.dataSourceTable(tableNum(InventTransOrigin)).addLink(fieldnum(SalesLine,DataAreaId),fieldnum(InventTransOrigin,DataAreaId));
+
+            if (InventInventoryDataServiceSoftReserveFilterMissDatasourceFlight::instance().isEnabled())
+            {
+                qbdsSoftReserveHistory = _query.dataSourceTable(tableNum(InventTransOrigin)).addDataSource(tableNum(InventInventoryDataServiceSoftReserveHistory));
+            }
+        
+            qbdsSoftReserveHistory.joinMode(JoinMode::ExistsJoin);
+            qbdsSoftReserveHistory.fetchMode(QueryFetchMode::One2One);
+
+            qbdsSoftReserveHistory.addLink(fieldnum(InventTransOrigin,RecId),fieldnum(InventInventoryDataServiceSoftReserveHistory,InventTransOrigin));
+            qbdsSoftReserveHistory.addLink(fieldnum(InventTransOrigin,DataAreaId),fieldnum(InventInventoryDataServiceSoftReserveHistory,DataAreaId));
+        
+            qbdsSoftReserveHistory.addRange(fieldNum(InventInventoryDataServiceSoftReserveHistory,ItemId)).
+                    value(strFmt('((%1.%3 == %4) || (%1.%3 == %5) || ((%1.%3 == %6) && (%2.%7 == 0) && (%2.%8 == 0) && (%2.%9 + %2.%10 + %2.%11== 0)))',
+                    qbdsSalesLine.name(),
+                    qbdsSoftReserveHistory.name(),
+                    fieldStr(SalesLine, SoftReserveBlockLevel),
+                    any2int(SoftReserveBlockLevel::Ignore),
+                    any2int(SoftReserveBlockLevel::Warning),
+                    any2int(SoftReserveBlockLevel::Block),
+                    fieldStr(InventInventoryDataServiceSoftReserveHistory,PendingQty),
+                    fieldStr(InventInventoryDataServiceSoftReserveHistory,ProcessingQty),
+                    fieldStr(InventInventoryDataServiceSoftReserveHistory,UnprocessedQty),
+                    fieldStr(InventInventoryDataServiceSoftReserveHistory,ValidateFailedQty),
+                    fieldStr(InventInventoryDataServiceSoftReserveHistory,FailedQty)));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isStatusIssueExactMatched</Name>
+				<Source><![CDATA[
+    public static boolean isStatusIssueExactMatched(InventTrans _inventTrans, StatusIssue _triggerStatusIssue)
+    {
+        return InventInventoryDataServiceSoftReservationHelper::isStatusIssueMatched(_inventTrans, _triggerStatusIssue)
+            && _inventTrans.orig().StatusIssue == _inventTrans.StatusIssue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isStatusIssueMatched</Name>
+				<Source><![CDATA[
+    public static boolean isStatusIssueMatched(InventTrans _inventTrans, StatusIssue _triggerStatusIssue)
+    {
+        return _inventTrans.StatusIssue <= _triggerStatusIssue && _inventTrans.StatusIssue >= StatusIssue::Sold;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isStatusIssueMatchedForUpdatedInventTrans</Name>
+				<Source><![CDATA[
+    public static boolean isStatusIssueMatchedForUpdatedInventTrans(InventTrans _inventTrans, inventTrans origInventTrans, StatusIssue _triggerStatusIssue)
+    {
+        return InventInventoryDataServiceSoftReservationHelper::isStatusIssueMatched(_inventTrans, _triggerStatusIssue) &&
+               origInventTrans.StatusIssue > _triggerStatusIssue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isOffsetEnabled</Name>
+				<Source><![CDATA[
+    public static boolean isOffsetEnabled(InventInventoryDataServiceParameters parameter)
+    {
+        boolean isV1Enabled = InventInventoryDataServiceReservationOffsetFeature::isEnabled() && parameter.IsReservationOffsetEnabled;
+        boolean isV2Enabled = InventInventoryDataServiceSoftReservationFeature::isEnabled();
+
+        return isV1Enabled || isV2Enabled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasBeenSoftReserved</Name>
+				<Source><![CDATA[
+    internal static boolean hasBeenSoftReserved(SalesLine _salesLine)
+    {
+        return _salesLine.InventoryServiceReservationId != "" || _salesLine.InventoryServiceAutoOffset == true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasBeenSoftReservedExternally</Name>
+				<Source><![CDATA[
+    internal static boolean hasBeenSoftReservedExternally(SalesLine _salesLine)
+    {
+        return _salesLine.IsSoftReservedExternally && InventInventoryDataServiceSoftReservationHelper::hasBeenSoftReserved(_salesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isV0Enabled</Name>
+				<Source><![CDATA[
+    internal static boolean isV0Enabled(InventInventoryDataServiceParameters parameter)
+    {
+        return InventInventoryDataServiceReservationOffsetFeature::isEnabled() && parameter.IsReservationOffsetEnabled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isV1Enabled</Name>
+				<Source><![CDATA[
+    internal static boolean isV1Enabled()
+    {
+        return InventInventoryDataServiceSoftReservationFeature::isEnabled();        
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

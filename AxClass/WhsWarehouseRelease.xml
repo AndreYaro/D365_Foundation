@@ -1,0 +1,2863 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsWarehouseRelease</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WhsWarehouseRelease</c> class contains the logic of release to warehouse operation.
+/// </summary>
+public class WhsWarehouseRelease
+{
+    WHSReleaseToWarehouseId releaseToWarehouseId;
+    WHSWaveTable            waveTable;
+    boolean                 showInfo;
+    boolean                 auto;
+    Set                     waveSet;
+    private int             createdLoadLines;
+    private int             updatedLoadLines;
+    private int             createdCWLoadLines;
+    private int             updatedCWLoadLines;
+    private int             createdShipments;
+    private Set             updatedShipments = new Set(Types::String);
+    private WHSWarehouseReleaseQueryBuilder warehouseReleaseQueryBuilder;
+    private WHSInstrumentationLogger instrumentationLogger;
+    private WhsLoadPostEngine   loadPostEngine;
+    private WHSWorkBuildId      crossDockWorkBuildId;
+    private WHSLicensePlateId   targetLicensePlateId;
+    private WMSLocationId       startLocationId;
+    private int                 failedShipments;
+    private boolean             supressShipmentCreatedInfo;
+    private Set                 createdShipmentsSet = new Set(Types::String);
+    private ReqReaderWriterLock reqReaderWriterLock;
+    private boolean autoUpdateShipmentBeforeAutoReservationFlightEnabled = WHSAutoUpdateShipmentBeforeAutoReservationFlight::instance().isEnabled();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the <c>WHSLoadLine</c> records during a release to warehouse.
+    /// </summary>
+    /// <param name="_releaseToWarehouse">
+    /// The temporary <c>WHSTmpReleaseToWarehouse</c> table object.
+    /// </param>
+    protected void createLoadLines(WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        ttsbegin;
+
+        createdLoadLines    = 0;
+        updatedLoadLines    = 0;
+        createdCWLoadLines  = 0;
+        updatedCWLoadLines  = 0;
+
+        this.createSalesLineLoadLines(_releaseToWarehouse);
+
+        this.createTransferLineLoadLines(_releaseToWarehouse);
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findAndInitializeLoadLineFromInventTrans</Name>
+				<Source><![CDATA[
+    protected WHSLoadLine findAndInitializeLoadLineFromInventTrans(
+        InventLocationId _inventLocationId, 
+        InventTransId _inventTransId, 
+        InventTransType _inventTransType, 
+        WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        WHSLoadLine loadLine = this.findLoadLineFromInventTrans(_inventLocationId, _inventTransId, _inventTransType);
+
+        if (loadline)
+        {
+            loadLine.InventDimId = _releaseToWarehouse.InventDimId;
+        }
+
+        return loadLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findLoadLineFromInventTrans</Name>
+				<Source><![CDATA[
+    protected WHSLoadLine findLoadLineFromInventTrans(
+        InventLocationId _inventLocationId,
+        InventTransId _inventTransId,
+        InventTransType _inventTransType)
+    {
+        WHSLoadLine loadLine;
+
+        if (InventLocation::isAutoUpdateShipmentAlwaysEnabled(_inventLocationId))
+        {
+            WHSShipmentTable shipmentTable;
+
+            select forUpdate firstonly loadLine
+                where loadLine.InventTransId == _inventTransId
+                    && loadLine.InventTransType == _inventTransType
+                exists join shipmentTable
+                    where shipmentTable.LoadId == loadLine.LoadId
+                        && shipmentTable.ShipmentStatus == WHSShipmentStatus::Open
+                        && (!WHSWarehouseReleaseAutoUpdateShipmentAddShipmentIdLinkFlight::instance().isEnabled() || shipmentTable.ShipmentId == loadLine.ShipmentId);
+
+        }
+
+        return loadLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveLoadLine</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    protected void saveLoadLine(WHSLoadLine _loadLine)
+    {
+        if (!_loadLine.validateWrite())
+        {
+            throw error(strFmt("@WAX:WHSCannotInsertRecordInTable", tablePName(WHSLoadLine)));
+        }
+        else
+        {
+            if (_loadLine)
+            {
+                _loadLine.update();
+                updatedLoadLines++;
+                updatedShipments.add(_loadLine.ShipmentId);
+            }
+            else
+            {
+                _loadLine.insert();
+                createdLoadLines++;
+            }
+                        
+            if (PdsGlobal::pdsIsCWItem(_loadLine.ItemId))
+            {
+                if (_loadLine)
+                {
+                    updatedCWLoadLines++;
+                    updatedShipments.add(_loadLine.ShipmentId);
+                }
+                else
+                {
+                    createdCWLoadLines++;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSalesLineLoadLines</Name>
+				<Source><![CDATA[
+    private void createSalesLineLoadLines(WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        WHSTmpReleaseToWarehouse    releaseToWarehouse;
+        WHSLoadLine                 loadLine;
+        TMSInventEnabled            tmsInventEnabled;
+
+        releaseToWarehouse.linkPhysicalTableInstance(_releaseToWarehouse);
+
+        SalesLine salesLine;
+        boolean isKittingEnabled = FeatureStateProvider::IsFeatureEnabled(KittingFeature::instance());
+        while select ReleasedQty, InventTransId, ReleaseToWarehouseId, InventDimId, ShipConsolidationPolicy from releaseToWarehouse
+            join salesLine
+            where salesLine.InventTransId                   == releaseToWarehouse.InventTransId
+                && releaseToWarehouse.ReleaseToWarehouseId  == releaseToWarehouseId
+                && releaseToWarehouse.ReleasedQty           >  0
+            exists join tmsInventEnabled
+                where tmsInventEnabled.ItemId == salesLine.ItemId
+        {
+            if (!isKittingEnabled || !this.kittingIsKit(salesLine.InventTransId))
+            {
+                boolean shouldSave;
+
+                if (!autoUpdateShipmentBeforeAutoReservationFlightEnabled)
+                {
+                    loadLine = this.findAndInitializeLoadLineFromInventTrans(
+                                        salesLine.inventDim().InventLocationId,
+                                        salesLine.InventTransId,
+                                        InventTransType::Sales,
+                                        releaseToWarehouse);
+
+                    if (loadLine)
+                    {
+                        shouldSave = true;
+                    }
+                }
+
+                if ((!loadLine || autoUpdateShipmentBeforeAutoReservationFlightEnabled)
+                    && this.canCreateSaleLineLoadLine(salesLine, releaseToWarehouse))
+                {
+                    loadLine = this.initializeSaleLineLoadLine(salesLine, releaseToWarehouse);
+                    shouldSave = true;
+                }
+
+                if (shouldSave)
+                {
+                    this.saveLoadLine(loadLine);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>kittingIsKit</Name>
+				<Source><![CDATA[
+    private boolean kittingIsKit(InventTransId _inventTransId)
+    {
+        KittingIKitLineEnumerator ikitLineEnumerator = KittingClassDelegateHelper::createIKitLineEnumerator(_inventTransId);
+        return ikitLineEnumerator && ikitLineEnumerator.isKit();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTransferLineLoadLines</Name>
+				<Source><![CDATA[
+    private void createTransferLineLoadLines(WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        WHSTmpReleaseToWarehouse    releaseToWarehouse;
+        WHSLoadLine                 loadLine;
+        TMSInventEnabled            tmsInventEnabled;
+
+        releaseToWarehouse.linkPhysicalTableInstance(_releaseToWarehouse);
+
+        InventTransferLine inventTransferLine;
+        while select ReleasedQty, InventTransId, ReleaseToWarehouseId, InventDimId, ShipConsolidationPolicy from releaseToWarehouse
+            join inventTransferLine
+            where inventTransferLine.InventTransId          == releaseToWarehouse.InventTransId
+                && releaseToWarehouse.ReleaseToWarehouseId  == releaseToWarehouseId
+                && releaseToWarehouse.ReleasedQty           >  0
+            exists join tmsInventEnabled
+                where tmsInventEnabled.ItemId == inventTransferLine.ItemId
+        {  
+            boolean shouldSave;
+
+            if (!autoUpdateShipmentBeforeAutoReservationFlightEnabled)
+            {
+                loadLine = this.findAndInitializeLoadLineFromInventTrans(
+                                    inventTransferLine.inventTransferTable().InventLocationIdFrom,
+                                    inventTransferLine.InventTransId,
+                                    InventTransType::TransferOrderShip,
+                                    releaseToWarehouse);
+
+                if (loadLine)
+                {
+                    shouldSave = true;
+                }
+            }
+
+            if ((!loadLine || autoUpdateShipmentBeforeAutoReservationFlightEnabled)
+                && this.canCreateTransferLineLoadLine(inventTransferLine, releaseToWarehouse))
+            {
+                loadLine = this.initializeTransferLineLoadLine(inventTransferLine, releaseToWarehouse);
+                shouldSave = true;
+            }
+
+            if (shouldSave)
+            {
+                this.saveLoadLine(loadLine);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCreateSaleLineLoadLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the <c>WHSLoadLine</c> record can be created for the specified <c>SalesLine</c> record.
+    /// </summary>
+    /// <param name = "_salesLine">The <c>SalesLine</c> for which the <c>WHSLoadLine</c> is created.</param>
+    /// <param name = "_releaseToWarehouse">The temporary <c>WHSTmpReleaseToWarehouse</c> table object.</param>
+    /// <returns>true if the <c>WHSLoadLine</c> can be created; otherwise, false.</returns>
+    protected boolean canCreateSaleLineLoadLine(SalesLine _salesLine, WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        // make sure that the delivery address is effective
+        LogisticsPostalAddress address =
+                LogisticsPostalAddress::findRecId(_salesLine.DeliveryPostalAddress ? _salesLine.DeliveryPostalAddress : SalesTable::find(_salesLine.SalesId).DeliveryPostalAddress);
+        if (!address.RecId || !address.isEffective())
+        {
+            throw error(strFmt("@SCM:AddressNoLongerEffective", _salesLine.SalesId));
+        }
+
+        // Make sure we aren't releasing more than we should.
+        if (!WHSWarehouseReleaseValidator::canOrderQuantityBeReleased(_salesLine.maxReleaseHandlingQuantity(), _releaseToWarehouse))
+        {
+            throw error(strFmt("@SCM:CannotReleaseMoreThanOrderLineQuantity_Error", _salesLine.LineNum, _salesLine.SalesId));
+        }
+        
+        // Make sure the item is not on hold for inventory or sales operations
+        setPrefix(strFmt("@SCM:FieldValuesPrefixInfo", fieldPName(SalesLine, SalesId), _salesLine.SalesId, fieldPName(SalesLine, LineNum), _salesLine.LineNum, fieldPName(SalesLine, ItemId), _salesLine.ItemId));
+    
+        if (!this.canCreateSalesLineForDefaultOrderSettings(_salesLine))
+        {
+            throw error("@SYS18447");
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCreateSalesLineForDefaultOrderSettings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if sales order line can be created based on default order settings.
+    /// </summary>
+    /// <param name = "_salesLine">The sales order line record.</param>
+    /// <returns>true if sales order line cannot be created; otherwise, false.</returns>
+    protected boolean canCreateSalesLineForDefaultOrderSettings(SalesLine _salesLine)
+    {
+        return WhsWarehouseRelease::checkItemNotStoppedForInventOrSales(_salesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkItemNotStoppedForInventOrSales</Name>
+				<Source><![CDATA[
+    internal static boolean checkItemNotStoppedForInventOrSales(SalesLine _salesLine)
+    {
+        return InventItemInventSetup::find(_salesLine.ItemId, _salesLine.InventDimId).checkNotStopped()
+            && InventItemSalesSetup::find(_salesLine.ItemId, _salesLine.InventDimId).checkNotStopped();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCreateTransferLineLoadLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the <c>WHSLoadLine</c> record can be created for the specified <c>InventTransferLine</c> record.
+    /// </summary>
+    /// <param name = "_transferLine">The <c>InventTransferLine</c> for which the <c>WHSLoadLine</c> is created.</param>
+    /// <param name = "_releaseToWarehouse">The temporary <c>WHSTmpReleaseToWarehouse</c> table object.</param>
+    /// <returns>true if the <c>WHSLoadLine</c> can be created; otherwise, false.</returns>
+    protected boolean canCreateTransferLineLoadLine(InventTransferLine _transferLine, WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        // Make sure we aren't releasing more than we should.
+        InventTransferQty maxTransferQuantity = WHSInventTransferLine::maxTransferLineReleaseQty(_transferLine);
+
+        if (!WHSWarehouseReleaseValidator::canOrderQuantityBeReleased(maxTransferQuantity, _releaseToWarehouse))
+        {
+            throw error(strFmt("@WAX:ReleaseMoreThanOrderLineQuantity", _transferLine.TransferId));
+        }
+
+        // Make sure the item is not on hold for inventory operations
+        setPrefix(strFmt("@SCM:FieldValuesPrefixInfo", fieldPName(InventTransferLine, TransferId), _transferLine.TransferId, fieldPName(InventTransferLine, LineNum), _transferLine.LineNum, fieldPName(InventTransferLine, ItemId), _transferLine.ItemId));
+        if (!InventItemInventSetup::find(_transferLine.ItemId, _transferLine.InventDimid).checkNotStopped())
+        {
+            throw error("@SYS18447");
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeSaleLineLoadLine</Name>
+				<Source><![CDATA[
+    protected WHSLoadLine initializeSaleLineLoadLine(SalesLine _salesLine, WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        WHSLoadLine loadLine;
+        loadLine.initFromSalesLine(_salesLine);
+        this.initLoadLineFromTmpReleaseToWarehouse(loadLine, _salesLine.ItemId, _releaseToWarehouse);
+        return loadLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initLoadLineFromTmpReleaseToWarehouse</Name>
+				<Source><![CDATA[
+    internal void initLoadLineFromTmpReleaseToWarehouse(WHSLoadLine _loadLine, ItemId _itemId, WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        boolean isCWItem = PdsGlobal::pdsIsCWItem(_itemId);
+        
+        _loadLine.ReleaseToWarehouseId = _releaseToWarehouse.ReleaseToWarehouseId;
+        _loadLine.InventDimId = _releaseToWarehouse.InventDimId;
+        _loadLine.ShipConsolidationPolicy = _releaseToWarehouse.ShipConsolidationPolicy;
+        
+        if (isCWItem)
+        {
+            // ReleasedQty and loadLine Qty will both be stored in the catch weight UOM.
+            _loadLine.Qty = _releaseToWarehouse.ReleasedQty;
+            _loadLine.uom = PdsCatchWeight::cwUnitId(_itemId);
+        }
+        else
+        {
+            RefRecId fromRecId = UnitOfMeasure::unitOfMeasureIdBySymbol(InventTableModule::find(_loadLine.ItemId, ModuleInventPurchSales::Invent).UnitId);
+            RefRecId toRecId = UnitOfMeasure::unitOfMeasureIdBySymbol(_loadLine.uom);
+            RefRecId productRecId = InventTable::itemProduct(_loadLine.ItemId);
+            
+            WHSInventQty loadLineInventQty = InventTableModule::unitConvert(_loadLine.ItemId,
+                                                                            ModuleInventPurchSales::Invent,
+                                                                            _loadLine.UOM,
+                                                                            _loadLine.Qty,
+                                                                            _loadLine.InventDimId);
+
+            if (loadLineInventQty != _releaseToWarehouse.ReleasedQty)
+            {
+                _loadLine.Qty = EcoResProductUnitConverter::convertForReleasedProduct(_loadLine.ItemId,
+                                                                                    _loadLine.InventDimId,
+                                                                                    _releaseToWarehouse.ReleasedQty,
+                                                                                    fromRecId,
+                                                                                    toRecId,
+                                                                                    NoYes::No,
+                                                                                    NoYes::No);
+            }
+
+            if (_loadLine.Qty <= _releaseToWarehouse.ReleasedQty &&
+                this.shouldRoundDown(_loadLine.ItemId))
+            {
+                _loadLine.Qty = this.calcQtyWithRounding(_loadLine.Qty);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldRoundDown</Name>
+				<Source><![CDATA[
+    private boolean shouldRoundDown(ItemId _itemId)
+    {
+        WHSInventTable whsInventTable = WHSInventTable::find(_itemId);
+                     
+        return whsInventTable.SalesUnitRestricted == WHSSalesUnitRestricted::SalesUnitRestricted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeTransferLineLoadLine</Name>
+				<Source><![CDATA[
+    private WHSLoadLine initializeTransferLineLoadLine(InventTransferLine _transferLine, WHSTmpReleaseToWarehouse _releaseToWarehouse)
+    {
+        WHSLoadLine loadLine;
+        boolean		isCWItem = PdsGlobal::pdsIsCWItem(_transferLine.ItemId);
+
+        loadLine.ReleaseToWarehouseId = _releaseToWarehouse.ReleaseToWarehouseId;
+        loadLine.initFromTransferLine(_transferLine);
+        loadLine.InventDimId    = _releaseToWarehouse.InventDimId;
+        loadLine.uom            = isCWItem ? _transferLine.pdsCWUnitId() : _transferLine.UnitId;
+        loadLine.ShipConsolidationPolicy = _releaseToWarehouse.ShipConsolidationPolicy;
+
+        if (isCWItem)
+        {
+            // ReleasedQty and loadLine Qty will both be stored in the catch weight UOM.
+            loadLine.Qty = _releaseToWarehouse.ReleasedQty;
+        }
+        else
+        {
+            loadLine.Qty = InventTableModule::unitConvert(loadLine.ItemId,
+                                                            ModuleInventPurchSales::Invent,
+                                                            loadLine.UOM,
+                                                            _releaseToWarehouse.ReleasedQty,
+                                                            loadLine.InventDimId);
+        }
+
+        return loadLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createOrConsolidateShipmentForSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates or consolidates shipments based on the records that are selected in the queryrun.
+    /// </summary>
+    /// <param name = "_queryRunReleaseLine">A query run that holds the selection of records for a sales line that should be used for the shipment creation.</param>
+    /// <param name = "_previousSalesId">The sales ID of the sales order that was previously processed.</param>
+    /// <param name = "_tmpShipment">A temporary shipment buffer used to store the shipments that have previously been created.</param>
+    /// <returns>true if a new shipment was created; otherwise false.</returns>
+    [SysObsolete('Please use createShipmentsByInventTransType instead.', false, 31\10\2022)]
+    protected boolean createOrConsolidateShipmentForSalesOrder(
+        QueryRun            _queryRunReleaseLine,
+        SalesId             _previousSalesId,
+        WHSShipmentTable    _tmpShipment)
+    {
+        WHSLoadLine             loadLine    = _queryRunReleaseLine.get(tableNum(WHSLoadLine));
+        SalesTable              salesTable  = _queryRunReleaseLine.get(tableNum(SalesTable));
+        SalesLine               salesLine   = _queryRunReleaseLine.get(tableNum(SalesLine));
+        LogisticsPostalAddress  address     = _queryRunReleaseLine.get(tableNum(LogisticsPostalAddress));
+        InventDim               inventDim   = _queryRunReleaseLine.get(tableNum(InventDim));
+
+        WHSConsolidateShipAtRTW consolidate = InventLocation::find(inventDim.InventLocationId).ConsolidateShipAtRTW;
+
+        TMSSalesTable tmsSalesTable = TMSSalesTable::find(salesLine.SalesId);
+        TMSCarrierService carrierService;
+        TMSModeCode modeCode;
+        boolean shipmentCreated;
+
+        if (salesLine.DlvMode != '')
+        {
+            carrierService  = TMSCarrierService::findByDlvModeId(salesLine.DlvMode);
+            modeCode        = TMSCarrier::find(carrierService.CarrierCode).ModeCode;
+        }
+        else
+        {
+            modeCode = tmsSalesTable.ModeCode;
+        }
+
+        WHSShipmentId crossDockShipmentId;
+
+        if (crossDockWorkBuildId)
+        {
+            crossDockShipmentId = this.getAtSupplyReceiptCrossDockShipmentId(salesLine);
+    
+            if (crossDockShipmentId)
+            {
+                _tmpShipment.data(WHSShipmentTable::find(crossDockShipmentId));
+                _tmpShipment.insert();
+            }
+        }
+
+        // Find any shipments for the current load that have matching consolidation criteria.
+        var shipmentParameters = WHSWarehouseReleaseSalesOrderParameters::newFromParameters(
+            salesLine,
+            salesTable,
+            address,
+            inventDim,
+            consolidate,
+            modeCode,
+            carrierService,
+            tmsSalesTable);
+        
+        WHSShipmentId whsShipmentId = this.findConsolidationShipmentIdForSalesOrder(
+            _tmpShipment,
+            shipmentParameters);
+        
+        WHSShipmentTable shipmentTable;
+        
+        // If consolidation is on or this line is for the same order then we consolidate to the shipment with like values
+        if (whsShipmentId)
+        {
+            shipmentTable = WHSShipmentTable::find(whsShipmentId, true);
+            shipmentTable.consolidateSalesLine(salesLine, salesTable);
+            shipmentTable.update();
+
+            if (salesLine.SalesId != _previousSalesId)
+            {
+                shipmentTable.createShipmentNotes(salesTable);
+            }
+        }
+        else // Create new shipment
+        {
+            shipmentTable = this.initShipmentForSalesOrder(shipmentParameters);
+
+            if (!shipmentTable.validateWrite())
+            {
+                throw error("@WAX:ReleaseToWarehouseError_ShipmentCreationValidationsFailed");
+            }
+
+            shipmentTable.insert();
+            shipmentTable.createShipmentNotes(salesTable);
+            shipmentCreated = true;
+
+            _tmpShipment.data(shipmentTable);
+            _tmpShipment.insert();
+        }
+
+        this.initializeLoadLineFromShipmentForSalesOrder(loadLine, shipmentTable, crossDockShipmentId);
+        loadLine.write();
+ 
+        return shipmentCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeLoadLineFromShipmentForSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes load line from shipment for a sales order.
+    /// </summary>
+    /// <param name = "_loadLine">Load line to be initialized.</param>
+    /// <param name = "_shipmentTable">Shipment table used for initialization.</param>
+    /// <param name = "_crossDockShipmentId">The shipment id used for consolidation at cross dock release.</param>
+    protected void initializeLoadLineFromShipmentForSalesOrder(WHSLoadLine _loadLine, WHSShipmentTable _shipmentTable, WHSShipmentId _crossDockShipmentId)
+    {
+        this.initializeLoadLineFromShipment(_loadLine, _shipmentTable, _crossDockShipmentId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeLoadLineFromShipmentForSalesOrderInternal</Name>
+				<Source><![CDATA[
+    internal void initializeLoadLineFromShipmentForSalesOrderInternal(WHSLoadLine _loadLine, WHSShipmentTable _shipmentTable, WHSShipmentId _crossDockShipmentId)
+    {
+        this.initializeLoadLineFromShipmentForSalesOrder(_loadLine, _shipmentTable, _crossDockShipmentId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeLoadLineFromShipment</Name>
+				<Source><![CDATA[
+    private void initializeLoadLineFromShipment(WHSLoadLine _loadLine, WHSShipmentTable _shipmentTable, WHSShipmentId _crossDockShipmentId)
+    {
+        _loadLine.ShipmentId = _shipmentTable.ShipmentId;
+
+        if (_crossDockShipmentId)
+        {
+            _loadLine.LoadId = WHSShipmentTable::find(_shipmentTable.ShipmentId).LoadId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAtSupplyReceiptCrossDockShipmentId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a shipment Id used for consolidation of at supply receipt cross dock release.
+    /// </summary>
+    /// <param name="_common">
+    /// Demand buffer being released. Either a sales line or a transfer line.
+    /// </param>
+    /// <returns>
+    /// The shipment ID to be used for consolidation.
+    /// </returns>
+    [Hookable(false)]
+    internal WHSSHipmentId getAtSupplyReceiptCrossDockShipmentId(Common _common)
+    {
+        WHSShipmentTable    shipmentTable;
+    
+        switch (_common.TableId)
+        {
+            case tableNum(SalesLine):
+                SalesLine salesLine = _common as SalesLine;
+
+                select firstonly ShipmentId from shipmentTable
+                    where shipmentTable.InventLocationId == salesLine.inventDim().InventLocationId
+                    &&    shipmentTable.ShipmentStatus < WHSShipmentStatus::Shipped
+                    &&    shipmentTable.OrderNum == salesLine.SalesId;
+
+                break;
+    
+            case tableNum(InventTransferLine):
+                InventTransferLine transferLine = _common as InventTransferLine;
+    
+                select firstonly ShipmentId from shipmentTable
+                    where shipmentTable.InventLocationId == transferLine.inventTransferTable().InventLocationIdFrom
+                    &&    shipmentTable.ShipmentStatus < WHSShipmentStatus::Shipped
+                    &&    shipmentTable.OrderNum == transferLine.TransferId;
+
+                break;
+        }
+    
+        return shipmentTable.ShipmentId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initShipmentForSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a new shipment for a sales order.
+    /// </summary>
+    /// <param name = "_shipmentParameters">Sales order shipment parameters.</param>
+    /// <returns>The initialized shipment instance.</returns>
+    protected WHSShipmentTable initShipmentForSalesOrder(WHSWarehouseReleaseSalesOrderParameters _shipmentParameters)
+    {
+        WHSShipmentTable shipmentTable;
+
+        // Validate the shipment address
+        if (!_shipmentParameters.ShippingAddress.whsAddressFormatValidation())
+        {
+            throw error(strFmt("@WAX:InvalidAddressError", _shipmentParameters.SalesOrder.SalesId, InventTransType::Sales));
+        }
+
+        shipmentTable.initShipmentForSalesOrder(_shipmentParameters);
+
+        return shipmentTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findConsolidationShipmentForSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds a consolidation shipment for a sales order.
+    /// </summary>
+    /// <param name = "_tmpShipment">A shipment instance.</param>
+    /// <param name = "_consolidationParameters">A sales order shipment parameters instance.</param>
+    [Replaceable, SysObsolete('This method is deprecated please use findConsolidationShipmentIdForSalesOrder instead. The assignment to the parameter _tmpShipment is not valid.', false, 30\06\2020)]
+    protected void findConsolidationShipmentForSalesOrder(WHSShipmentTable _tmpShipment, WHSWarehouseReleaseSalesOrderParameters _consolidationParameters)
+    {
+        Query whsShipmentTableQuery = WhsWarehouseRelease::buildWHSShipmentTableQuery(_consolidationParameters);
+        QueryRun queryRun = new QueryRun(whsShipmentTableQuery);
+        queryRun.setRecord(_tmpShipment);
+        if (queryRun.next())
+        {
+            WHSShipmentTable localShipmentTable = queryRun.get(tablenum(WHSShipmentTable));
+            _tmpShipment.data(localShipmentTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findConsolidationShipmentIdForSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds a consolidation shipment id for a sales order.
+    /// </summary>
+    /// <param name = "_tmpShipment">A shipment instance.</param>
+    /// <param name = "_consolidationParameters">A sales order shipment parameters instance.</param>
+    /// <returns>The shipment id if found; otherwise empty.</returns>
+    [Replaceable]
+    protected WHSShipmentId findConsolidationShipmentIdForSalesOrder(WHSShipmentTable _tmpShipment, WHSWarehouseReleaseSalesOrderParameters _consolidationParameters)
+    {
+        Query whsShipmentTableQuery = WhsWarehouseRelease::buildWHSShipmentTableQuery(_consolidationParameters);
+        QueryRun queryRun = new QueryRun(whsShipmentTableQuery);
+        queryRun.setRecord(_tmpShipment);
+
+        WHSShipmentId whsShipmentId;
+        if (queryRun.next())
+        {
+            WHSShipmentTable shipmentTable = queryRun.get(tablenum(WHSShipmentTable));
+            if (shipmentTable.RecId)
+            {
+                whsShipmentId = shipmentTable.ShipmentId;
+            }
+        }
+
+        return whsShipmentId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWHSShipmentTableQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds the query for finding shipment based on the parameters.
+    /// </summary>
+    /// <param name = "_consolidationParameters">
+    /// A sales order shipment parameters that have matching consolidation criteria.
+    /// </param>
+    /// <returns>
+    /// A <c>Query</c> object.
+    /// </returns>
+    protected static Query buildWHSShipmentTableQuery(WHSWarehouseReleaseSalesOrderParameters _consolidationParameters)
+    {
+        Query query = new Query();
+
+        QueryBuildDataSource whsShipmentTableDataSource = query.addDataSource(tableNum(WHSShipmentTable));
+
+        whsShipmentTableDataSource.update(true);
+        whsShipmentTableDataSource.firstOnly(true);
+
+        whsShipmentTableDataSource.addRange(fieldNum(WHSShipmentTable, AccountNum)).value(queryValue(_consolidationParameters.SalesLine.CustAccount));
+        whsShipmentTableDataSource.addRange(fieldNum(WHSShipmentTable, DeliveryName)).value(queryValue(_consolidationParameters.SalesLine.DeliveryName));
+        whsShipmentTableDataSource.addRange(fieldNum(WHSShipmentTable, DeliveryPostalAddress)).value(queryValue(_consolidationParameters.ShippingAddress.RecId));
+        whsShipmentTableDataSource.addRange(fieldNum(WHSShipmentTable, InventLocationId)).value(queryValue(_consolidationParameters.InventDim.InventLocationId));
+        whsShipmentTableDataSource.addRange(fieldNum(WHSShipmentTable, ShipmentStatus)).value(queryRange(WHSShipmentStatus::Open, WHSShipmentStatus::Loaded));
+        
+        if (!_consolidationParameters.MustConsolidateSalesOrderLineShipment)
+        {
+            whsShipmentTableDataSource.addRange(fieldNum(WHSShipmentTable, OrderNum)).value(queryValue(_consolidationParameters.SalesLine.SalesId));
+        }
+
+        whsShipmentTableDataSource.addRange(fieldNum(WHSShipmentTable, ModeCode)).value(queryValue(_consolidationParameters.TransportationModeCode));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>warehouseReleaseQueryBuilder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns a <c>WHSWarehouseReleaseQueryBuilder</c> instance used for building the query to select load lines that can be released to the warehouse.
+    /// </summary>
+    /// <returns>A <c>WHSWarehouseReleaseQueryBuilder</c> instance.s</returns>
+    [Hookable(true)]
+    protected WHSWarehouseReleaseQueryBuilder warehouseReleaseQueryBuilder()
+    {
+        if (!warehouseReleaseQueryBuilder)
+        {
+            warehouseReleaseQueryBuilder = WHSWarehouseReleaseQueryBuilder::construct();
+        }
+
+        return warehouseReleaseQueryBuilder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipmentsForAllSalesOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates sales order shipments for the <c>WHSShipmentTable</c>.
+    /// </summary>
+    /// <param name = "_tmpShipment">A shipment instance.</param>
+    /// <returns>The number of shipments created.</returns>
+    [SysObsolete('Please use createShipmentsByInventTransType instead.', false, 31\10\2022)]
+    protected int createShipmentsForAllSalesOrders(WHSShipmentTable _tmpShipment)
+    {
+        int numberOfShipmentsCreated;
+        SalesId previousSalesId;
+        
+        Query query = this.warehouseReleaseQueryBuilder().buildSalesOrderQueryForReleaseToWarehouseId(releaseToWarehouseId);
+
+        QueryRun queryRun = new QueryRun(query);
+        
+        while (queryRun.next())
+        {
+            SalesLine salesLine = queryRun.get(tableNum(SalesLine));
+            if (this.createOrConsolidateShipmentForSalesOrder(queryRun, previousSalesId, _tmpShipment))
+            {
+                ++numberOfShipmentsCreated;
+            }
+            
+            previousSalesId = salesLine.SalesId;
+        }
+       
+        return numberOfShipmentsCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildTransferOrdersWithoutShipmentQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds the query for finding transfer orders without shipments that should be released.
+    /// </summary>
+    /// <returns>The query.</returns>
+    protected Query buildTransferOrdersWithoutShipmentQuery()
+    {
+        Query query = new Query();
+        QueryBuildDataSource qbdsLoadLine = query.addDataSource(tableNum(WHSLoadLine));
+        qbdsLoadLine.update(true);
+        qbdsLoadLine.addRange(fieldNum(WHSLoadLine, ReleaseToWarehouseId)).value(queryValue(releaseToWarehouseId));
+        qbdsLoadLine.addRange(fieldNum(WHSLoadLine, ShipmentId)).value(queryValue(''));
+
+        QueryBuildDataSource qbdsTransferLine = qbdsLoadLine.addDataSource(tableNum(InventTransferLine));
+        qbdsTransferLine.addSortField(fieldNum(InventTransferLine, TransferId));
+        qbdsTransferLine.relations(true);
+
+        QueryBuildDataSource qbdsTransferTable = qbdsTransferLine.addDataSource(tableNum(InventTransferTable));
+        qbdsTransferTable.relations(true);
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipmentsForTransferOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates transfer order shipments for the <c>WHSShipmentTable</c>.
+    /// </summary>
+    /// <param name = "_tmpShipment">A shipment instance.</param>
+    /// <returns>The number of shipments created.</returns>
+    [SysObsolete('Please use createShipmentsByInventTransType instead.', false, 31\10\2022)]
+    protected int createShipmentsForTransferOrders(WHSShipmentTable _tmpShipment)
+    {
+        int shipmentsCreated;
+
+        Query query = this.buildTransferOrdersWithoutShipmentQuery();
+        QueryRun queryRun = new QueryRun(query);
+
+        while (queryRun.next())
+        {
+            WHSLoadLine             loadLine = queryRun.get(tableNum(WHSLoadLine));
+            InventTransferLine      inventTransferLine = queryRun.get(tableNum(InventTransferLine));
+            InventTransferTable     transfer = queryRun.get(tableNum(InventTransferTable));
+
+            // Variable to see whether the shipment should be consolidated or not
+            WHSConsolidateShipAtRTW consolidate = InventLocation::find(transfer.InventLocationIdFrom).ConsolidateShipAtRTW;
+            WHSShipmentId           crossDockShipmentId;
+
+            if (crossDockWorkBuildId)
+            {
+                crossDockShipmentId = this.getAtSupplyReceiptCrossDockShipmentId(inventTransferLine);
+    
+                if (crossDockShipmentId)
+                {
+                    _tmpShipment.data(WHSShipmentTable::find(crossDockShipmentId));
+                    _tmpShipment.insert();
+                }
+            }
+
+            var shipmentParameters = WHSWarehouseReleaseTransferOrderParameters::newFromParameters(consolidate, transfer, inventTransferLine);
+            this.findShipmentForTransferOrder(_tmpShipment, shipmentParameters);
+            
+            WHSShipmentTable shipmentTable;
+            if (_tmpShipment.RecId)
+            {
+                shipmentTable = WHSShipmentTable::find(_tmpShipment.ShipmentId, true);
+                shipmentTable.OrderNum = shipmentTable.OrderNum != transfer.TransferId ? '' : transfer.TransferId;
+                shipmentTable.update();
+            }
+            else
+            {
+                shipmentTable = this.initShipmentForTransferOrder(shipmentParameters);
+
+                shipmentTable.insert();
+                shipmentTable.createShipmentNotes(transfer);
+
+                this.insertTmpShipmentForTransferOrderFromShipmentTable(_tmpShipment, shipmentTable);
+                ++shipmentsCreated;
+            }
+
+            this.initializeLoadLineFromShipmentForTransferOrder(loadLine, shipmentTable, crossDockShipmentId);
+            loadLine.update();
+        }
+    
+        return shipmentsCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeLoadLineFromShipmentForTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes load line from shipment for a transfer order.
+    /// </summary>
+    /// <param name = "_loadLine">Load line to be initialized.</param>
+    /// <param name = "_shipmentTable">Shipment table used for initialization.</param>
+    /// <param name = "_crossDockShipmentId">The shipment id used for consolidation at cross dock release.</param>
+    protected void initializeLoadLineFromShipmentForTransferOrder(WHSLoadLine _loadLine, WHSShipmentTable _shipmentTable, WHSShipmentId _crossDockShipmentId)
+    {
+        this.initializeLoadLineFromShipment(_loadLine, _shipmentTable, _crossDockShipmentId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeLoadLineFromShipmentForTransferOrderInternal</Name>
+				<Source><![CDATA[
+    internal void initializeLoadLineFromShipmentForTransferOrderInternal(WHSLoadLine _loadLine, WHSShipmentTable _shipmentTable, WHSShipmentId _crossDockShipmentId)
+    {
+        this.initializeLoadLineFromShipmentForTransferOrder(_loadLine, _shipmentTable, _crossDockShipmentId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTmpShipmentForTransferOrderFromShipmentTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts a transfer order shipment.
+    /// </summary>
+    /// <param name = "_tmpShipment">A shipment record.</param>
+    /// <param name = "_newShipment">A shipment buffer for the <c>_tmpShipment</c> data.</param>
+    [SysObsolete('Please use createShipmentsByInventTransType instead.', false, 31\10\2022)]
+    protected void insertTmpShipmentForTransferOrderFromShipmentTable(WHSShipmentTable _tmpShipment, WHSShipmentTable _newShipment)
+    {
+        _tmpShipment.data(_newShipment);
+        _tmpShipment.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initShipmentForTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a new shipment for a transfer order.
+    /// </summary>
+    /// <param name = "_transferParameters">Transfer order shipment parameters.</param>
+    /// <returns>The initialized shipment instance.</returns>
+    [SysObsolete('Please use createShipmentsByInventTransType instead.', false, 31\10\2022)]
+    protected WHSShipmentTable initShipmentForTransferOrder(WHSWarehouseReleaseTransferOrderParameters _transferParameters)
+    {
+        WHSShipmentTable shipmentTable;
+
+        shipmentTable.initShipmentForTransferOrder(_transferParameters);
+
+        return shipmentTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findShipmentForTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds a consolidation shipment for a transfer order.
+    /// </summary>
+    /// <param name = "_tmpShipment">A shipment instance.</param>
+    /// <param name = "_transferParameters">A transfer order shipment parameters instance.</param>
+    [Replaceable, SysObsolete('Please use createShipmentsByInventTransType instead.', false, 31\10\2022)]
+    protected void findShipmentForTransferOrder(WHSShipmentTable _tmpShipment, WHSWarehouseReleaseTransferOrderParameters _transferParameters)
+    {
+        WHSLoadLine         shipLoadLine;
+        InventTransferTable transferTableExists;
+
+        select firstonly RecId, ShipmentId from _tmpShipment
+            exists join shipLoadLine
+            where shipLoadLine.ShipmentId == _tmpShipment.ShipmentId
+                && shipLoadLine.InventTransType          == InventTransType::TransferOrderShip
+                && shipLoadLine.TransportRequest         == NoYes::No
+                exists join transferTableExists
+                where transferTableExists.TransferId               == shipLoadLine.OrderNum
+                    && transferTableExists.InventLocationIdFrom    == _transferParameters.TransferOrder.InventLocationIdFrom
+                    && transferTableExists.InventLocationIdTo      == _transferParameters.TransferOrder.InventLocationIdTo
+                    && (_transferParameters.MustConsolidateTransferOrderLineShipment
+                        || transferTableExists.TransferId          == _transferParameters.TransferOrder.TransferId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    On release to warehouse, method called to create shipments
+    /// </summary>
+    /// <remarks>
+    ///    Changes made to this method should also be considered for the WHSLoadPostEngineBase.createShipment method.
+    /// </remarks>
+    /// <exception cref="Exception::Error">
+    ///   Throws error when sales order is missing a delivery address
+    /// </exception>
+    public void createShipments()
+    {
+        using (var appInsightsActivity = WHSWarehouseReleaseCreateShipmentsApplicationInsightsActivity::construct())
+        {
+            ttsbegin;
+
+            reqReaderWriterLock = ReqReaderWriterLock::construct();
+
+            createdShipments = this.createShipmentsByInventTransType();
+            appInsightsActivity.addShipmentsCreatedProperty(createdShipments);        
+
+            if (!loadPostEngine)
+            {
+                WHSLoadLine loadLine;
+                WHSLoadLine previousloadLine;
+
+                while select loadLine
+                    group by ShipmentId
+                    where loadLine.ReleaseToWarehouseId == releaseToWarehouseId
+                    &&    loadLine.ShipmentId
+                exists join previousloadLine
+                    where previousloadLine.ShipmentId           == loadLine.ShipmentId
+                    &&    previousloadLine.ReleaseToWarehouseId != releaseToWarehouseId
+                {
+                    info(strFmt("@WAX:NewLoadLinesHaveBeenCreatedForShipment", loadLine.ShipmentId));
+                }
+            }
+        
+            ttscommit;
+
+            if (showInfo && !supressShipmentCreatedInfo)
+            {
+                WhsWarehouseRelease::logInfoAboutNumberOfShipmentsCreated(createdShipments);
+
+                if (!updatedShipments.empty())
+                {
+                    info(strFmt("@WAX:ShipmentsHaveBeenUpdated", updatedShipments.elements()));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipmentsByInventTransType</Name>
+				<Source><![CDATA[
+    private int createShipmentsByInventTransType()
+    {
+        WHSLoadLine             loadLine;
+        int                     createdShipmentsLocal;
+        SysDaQueryObjectBuilder loadLineQueryBuilder = SysDaQueryObjectBuilder::from(loadLine)
+                                                            .groupBy(fieldStr(WHSLoadLine, InventTransType));
+
+        if (loadPostEngine)
+        {
+            loadLineQueryBuilder.where(loadLine, fieldStr(WHSLoadLine, LoadId))
+                                    .isEqualToLiteral(loadPostEngine.parmLoadTable().LoadId);
+        }
+        else
+        {
+            loadLineQueryBuilder.where(loadLine, fieldStr(WHSLoadLine, ReleaseToWarehouseId))
+                                    .isEqualToLiteral(releaseToWarehouseId);
+        }
+
+        var loadLineQueryObject     = loadLineQueryBuilder.toSysDaQueryObject();
+        var loadLineSearchObject    = new SysDaSearchObject(loadLineQueryObject);
+        var loadLineSearchStatement = new SysDaSearchStatement();
+
+        // Loop through each distinct InventTransType on applicable load lines, and initiate shipment creation for each.
+        while(loadLineSearchStatement.findNext(loadLineSearchObject))
+        {
+            WHSShipmentCreator shipmentCreator = WHSShipmentCreator::newFromInventTransType(loadLine.InventTransType);
+            
+            shipmentCreator.parmWarehouseRelease(this);
+            shipmentCreator.parmLoadPostEngine(loadPostEngine);
+            shipmentCreator.parmReleaseToWarehouseId(releaseToWarehouseId);
+
+            if (reqReaderWriterLock)
+            {
+                shipmentCreator.parmReqReaderWriterLock(reqReaderWriterLock);
+            }
+
+            createdShipmentsLocal += shipmentCreator.createShipments();
+        }
+
+        return createdShipmentsLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWave</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates wave for applicable loads during the process of release to warehouse.
+    /// </summary>
+    /// <returns>
+    /// <c>WHSWaveId</c> for created wave
+    /// </returns>
+    /// <remarks>
+    /// Wave is not created for loads containing exclusively transportation-only enabled items.
+    /// </remarks>
+    WHSWaveId createWave()
+    {
+        WHSShipmentTable    shipmentTable;
+        WHSLoadLine         loadLine;
+
+        ttsbegin;
+
+        while select forupdate shipmentTable
+            exists join loadLine
+                where loadLine.ShipmentId        == shipmentTable.ShipmentId
+                && loadLine.ReleaseToWarehouseId == releaseToWarehouseId
+        {
+            waveTable = WHSWaveTable::findOrCreateWaveForShipment(shipmentTable, waveSet, false, false);
+        }
+
+        ttscommit;
+
+        // Execute waves that should be autoExecuted.
+        WHSWaveTable::autoExecuteWaves(waveSet, releaseToWarehouseId);
+
+        return waveTable.WaveId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        waveSet = new Set(Types::String);
+        instrumentationLogger = WHSInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAuto</Name>
+				<Source><![CDATA[
+    public boolean parmAuto(boolean _auto = auto)
+    {
+        auto = _auto;
+
+        return auto;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCrossDockWorkBuildId</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public final WHSWorkBuildId parmCrossDockWorkBuildId(WHSWorkBuildId _crossDockWorkBuildId = crossDockWorkBuildId)
+    {
+        crossDockWorkBuildId = _crossDockWorkBuildId;
+    
+        return crossDockWorkBuildId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTargetLicensePlateId</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public final WHSLicensePlateId parmTargetLicensePlateId(WHSLicensePlateId _targetLicensePlateId = targetLicensePlateId)
+    {
+        targetLicensePlateId = _targetLicensePlateId;
+
+        return targetLicensePlateId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReleaseToWarehouseId</Name>
+				<Source><![CDATA[
+    public WHSReleaseToWarehouseId parmReleaseToWarehouseId(WHSReleaseToWarehouseId _releaseToWarehouseId = releaseToWarehouseId)
+    {
+        releaseToWarehouseId = _releaseToWarehouseId;
+
+        return releaseToWarehouseId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmShowInfo</Name>
+				<Source><![CDATA[
+    public boolean parmShowInfo(boolean _showInfo = showInfo)
+    {
+        showInfo = _showInfo;
+
+        return showInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSupressShipmentCreatedInfo</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    protected boolean parmSupressShipmentCreatedInfo(boolean _supressShipmentCreatedInfo = supressShipmentCreatedInfo)
+    {
+        supressShipmentCreatedInfo = _supressShipmentCreatedInfo;
+
+        return supressShipmentCreatedInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStartLocationId</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal WMSLocationId parmStartLocationId(WMSLocationId _startLocationId = startLocationId)
+    {
+        startLocationId = _startLocationId;
+        return startLocationId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmLoadPostEngine</Name>
+				<Source><![CDATA[
+    public WhsLoadPostEngine parmLoadPostEngine(WhsLoadPostEngine _loadPostEngine = loadPostEngine)
+    {
+        loadPostEngine = _loadPostEngine;
+
+        return loadPostEngine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static WHSWarehouseRelease construct()
+    {
+        return new WHSWarehouseRelease();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>whsReleaseToWarehouse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Releases orders to the warehouse.
+    /// </summary>
+    /// <param name="_formDataSource">
+    ///     An instance of form data source.
+    /// </param>
+    [Replaceable]
+    protected static void whsReleaseToWarehouse(FormDataSource _formDataSource)
+    {
+        switch (_formDataSource.table())
+        {
+            case tableNum(SalesTable):
+            case tableNum(SalesLine):
+                WHSWarehouseRelease::whsReleaseSalesToWarehouseClient(_formDataSource);
+                return;
+
+            case tableNum(InventTransferTable):
+                WHSWarehouseRelease::whsReleaseTransferToWarehouseClient(_formDataSource);
+                return;
+        }
+
+        throw error(error::wrongUseOfFunction(funcName()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isOrderOnLoadAndNotOnShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the order is on a load but not on a shipment.
+    /// </summary>
+    /// <param name="_orderNum">
+    /// The order number.
+    /// </param>
+    /// <param name="_inventTransType">
+    /// The inventTransType for the order.
+    /// </param>
+    /// <returns>
+    /// true if the order is on a load but not on a shipment; Otherwise, false.
+    /// </returns>
+    /// <remarks>
+    /// The check can not be performed for transport requests.
+    /// The check is needed to prevent flows from being mixed.
+    /// </remarks>
+    public static boolean isOrderOnLoadAndNotOnShipment(
+        WHSOrderNum         _orderNum,
+        InventTransType     _inventTransType)
+    {
+        WHSLoadLine loadLine;
+
+        select firstonly RecId from loadLine
+            where loadLine.OrderNum         == _orderNum
+            &&    loadLine.InventTransType  == _inventTransType
+            &&    loadLine.TransportRequest == NoYes::No
+            &&    loadLine.LoadId       != ''
+            &&    loadLine.ShipmentId   == '';
+
+        return (loadLine.RecId  ? true : false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        if (_args != null && _args.record())
+        {
+            FormDataSource formDataSource = FormDataUtil::getFormDataSource(_args.record());
+
+            if (formDataSource)
+            {
+                using (SysErrorMessageHelpScope scope = SysErrorMessageHelpScope::newErrorContext(_args))
+                {
+                    WhsWarehouseRelease::whsReleaseToWarehouse(formDataSource);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>releaseToWarehouseFromCrossDockAtSupplyReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the load lines, shipment details, and wave information for the
+    /// <c>WHSTmpReleaseToWarehouse</c> records, when using at supply receipt cross docking.
+    /// </summary>
+    /// <param name="_releaseToWarehouse">
+    /// The temporary <c>WHSTmpReleaseToWarehouse</c> table object
+    /// </param>
+    /// <param name="_releaseToWarehouseId">
+    /// The release to warehouse identifier
+    /// </param>
+    /// <param name="_simulate">
+    /// A Boolean value to identify whether the release to warehouse process should be simulated
+    /// </param>
+    /// <param name="_showInfo">
+    /// A Boolean value to indicate whether information should be displayed regarding the shipments that have been created
+    /// </param>
+    /// <param name="_auto">
+    /// A Boolean value that indicates whether the created wave should be executed automatically
+    /// </param>
+    /// <param name="_crossDockWorkBuildId">
+    /// Work build Id if doing an at supply receipt cross dock.
+    /// </param>
+    /// <param name="_targetLicensePlateId">
+    /// Target license plate used if executing an at supply receipt cross dock release.
+    /// </param>
+    public static void releaseToWarehouseFromCrossDockAtSupplyReceipt(
+        WHSTmpReleaseToWarehouse    _releaseToWarehouse,
+        WHSReleaseToWarehouseId     _releaseToWarehouseId,
+        boolean                     _simulate,
+        boolean                     _showInfo,
+        boolean                     _auto,
+        WHSWorkBuildId              _crossDockWorkBuildId,
+        WHSLicensePlateId           _targetLicensePlateId,
+        WHSCrossDockTemplateId      _crossDockTemplateId)
+    {
+        WHSWarehouseRelease         warehouseRelease = WHSWarehouseRelease::construct();
+        WHSParameters               parameters = WHSParameters::find();
+        WHSTmpReleaseToWarehouse    releaseToWarehouse;
+        WHSTmpWorkLine              tmpWorkLine;
+
+        void handleException()
+        {
+            // Delete TmpWorkLines that still exist for this releaseToWarehouseId
+            delete_from tmpWorkLine
+                where tmpWorkLine.ReleaseToWarehouseId == _releaseToWarehouseId;
+
+            if (_showInfo)
+            {
+                warning("@WAX1895");
+            }
+        }
+
+        try
+        {
+            if (!_crossDockWorkBuildId)
+            {
+                throw Error("@WAX:NoCrossDockBuildId");
+            }
+
+            ttsbegin;
+
+            releaseToWarehouse.linkPhysicalTableInstance(_releaseToWarehouse);
+
+            warehouseRelease.parmReleaseToWarehouseId(_releaseToWarehouseId);
+            warehouseRelease.parmShowInfo(_showInfo);
+            warehouseRelease.parmAuto(_auto);
+            warehouseRelease.parmCrossDockWorkBuildId(_crossDockWorkBuildId);
+            warehouseRelease.parmTargetLicensePlateId(_targetLicensePlateId);
+
+            WHSCrossDockingStartLocationContex context = WHSCrossDockingStartLocationContex::current();
+
+            if (context)
+            {
+                warehouseRelease.parmStartLocationId(context.parmStartLocationId());
+            }
+            
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(_releaseToWarehouseId, 'createLoads'))
+            {
+                warehouseRelease.createLoadLines(releaseToWarehouse);
+                perfTask.setCreatedLoadLines(warehouseRelease.createdLoadLines());
+                perfTask.setUpdatedLoadLines(warehouseRelease.updatedLoadLines());
+                perfTask.setCreatedCWLoadLines(warehouseRelease.createdCWLoadLines());
+                perfTask.setUpdatedCWLoadLines(warehouseRelease.updatedCWLoadLines());
+            }
+
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(_releaseToWarehouseId, 'createShipments'))
+            {
+                warehouseRelease.createShipments();
+                perfTask.setCreatedShipments(warehouseRelease.createdShipments());
+            }
+
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(_releaseToWarehouseId, 'planCrossDock'))
+            {
+                warehouseRelease.planCrossDock();
+            }
+    
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(_releaseToWarehouseId, 'createSupplyReceiptCrossDockWork'))
+            {
+                warehouseRelease.createAtSupplyReceiptCrossDockWork(_crossDockTemplateId);
+            }
+
+            ttscommit;
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            if (appl.ttsLevel() != 0)
+            {
+                throw Exception::DuplicateKeyException;
+            }
+            handleException();
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() != 0)
+            {
+                throw Exception::UpdateConflict;
+            }
+            handleException();
+        }
+        catch
+        {
+            handleException();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAtSupplyReceiptCrossDockLoad</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new load ID and assigns shipment and load lines to load.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// The load line at supply receipt cross docking work is being created for.
+    /// </param>
+    private void createAtSupplyReceiptCrossDockLoad(WHSLoadLine _loadLine)
+    {
+        WHSShipmentTable shipmentTable = WHSShipmentTable::find(_loadLine.ShipmentId, true);
+        
+        WHSLoadTable loadTable;
+    
+        loadTable.initFromItem(_loadLine.ItemId);
+        loadTable.initFromShipment(shipmentTable);
+        loadTable.LoadDirection = WHSLoadDirection::Outbound;
+        loadTable.LoadStatus = WHSLoadStatus::InProcess;
+    
+        loadTable.insert();
+    
+        shipmentTable.LoadId = loadTable.LoadId;
+    
+        shipmentTable.update();
+            
+        WHSLoadLine loadLine;
+
+        update_recordset loadLine
+            setting LoadId = loadTable.LoadId
+            where loadLine.ShipmentId == _loadline.ShipmentId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAtSupplyReceiptCrossDockWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates at supply receipt cross dock work during warehouse release process.
+    /// </summary>
+    private void createAtSupplyReceiptCrossDockWork(WHSCrossDockTemplateId _crossDockTemplateId)
+    {
+        WHSLoadLine loadLine;
+    
+        while select loadLine
+            where loadLine.ReleaseToWarehouseId == releaseToWarehouseId
+        {
+            InventDim inventDim = loadLine.inventDim();
+
+            inventDim.wMSLocationId = startLocationId != '' ? startLocationId : inventDim.inventLocation().DefaultProductionFinishGoodsLocation;
+                
+            inventDim.LicensePlateId = targetLicensePlateId;
+            inventDim = InventDim::findOrCreate(inventDim);
+    
+            // If load line not assigned to a load, create one.
+            if (!loadLine.LoadId)
+            {
+                this.createAtSupplyReceiptCrossDockLoad(loadLine);
+            }
+    
+            // Re select load line in case it was updated.
+            WHSLoadLine tmpLoadLine = WHSLoadLine::findbyRecId(loadLine.RecId);
+    
+            ttsbegin;
+
+            WHSCrossDockLoadLine crossDockLoadLine;
+            crossDockLoadLine.LoadLineRecId = tmpLoadLine.RecId;
+            crossDockloadline.CrossDockTemplateId = _crossDockTemplateId;
+            crossDockLoadLine.insert();
+            
+            ttscommit;
+
+            WHSWorkCreateCrossDocking workCreateCrossDocking = WHSWorkCreateCrossDocking::newFromParms(tmpLoadLine, crossDockWorkBuildId);
+            workCreateCrossDocking.parmCrossDockingQuantity(tmpLoadLine.InventQty);
+            workCreateCrossDocking.parmSourceTransType(InventTransType::Production);
+            workCreateCrossDocking.parmRegisteredInventDim(inventDim);
+            workCreateCrossDocking.parmTargetLicensePlateId(targetLicensePlateId);
+            workCreateCrossDocking.parmCrossDockLoadLine(crossDockLoadLine);
+            workCreateCrossDocking.parmStartLocationId(startLocationId);
+            workCreateCrossDocking.createWork();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>releaseToWarehouse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the load lines, shipment details, and wave information for the <c>WHSTmpReleaseToWarehouse</c> records
+    /// </summary>
+    /// <param name="_releaseToWarehouse">
+    /// The temporary <c>WHSTmpReleaseToWarehouse</c> table object
+    /// </param>
+    /// <param name="_releaseToWarehouseId">
+    /// The release to warehouse identifier
+    /// </param>
+    /// <param name="_simulate">
+    /// A Boolean value to identify whether the release to warehouse process should be simulated
+    /// </param>
+    /// <param name="_showInfo">
+    /// A Boolean value to indicate whether information should be displayed regarding the shipments that have been created
+    /// </param>
+    /// <param name="_auto">
+    /// A Boolean value that indicates whether the created wave should be executed automatically
+    /// </param>
+    /// <returns>
+    /// Returns the generated wave identifier
+    /// </returns>
+    public static WHSWaveId releaseToWarehouse(
+        WHSTmpReleaseToWarehouse    _releaseToWarehouse,
+        WHSReleaseToWarehouseId     _releaseToWarehouseId,
+        boolean                     _simulate = false,
+        boolean                     _showInfo = false,
+        boolean                     _auto     = false)
+    {     
+        return WhsWarehouseRelease::releaseLinesToWarehouse(_releaseToWarehouse, _releaseToWarehouseId, _simulate, _showInfo, _auto);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>releaseLinesToWarehouse</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal static WHSWaveId releaseLinesToWarehouse(
+        WHSTmpReleaseToWarehouse    _releaseToWarehouse,
+        WHSReleaseToWarehouseId     _releaseToWarehouseId,
+        boolean                     _simulate,
+        boolean                     _showInfo,
+        boolean                     _auto)
+    {
+        WHSWarehouseRelease         warehouseRelease = WHSWarehouseRelease::construct();
+        WHSParameters               parameters = WHSParameters::find();
+        WHSWaveId                   waveId;
+        WHSTmpReleaseToWarehouse    releaseToWarehouse;
+        WHSTmpWorkLine              tmpWorkLine;
+
+        void handleException()
+        {
+            WHSTmpWorkLine::cleanupTmpWorkLinesForReleaseToWarehouseId(_releaseToWarehouseId);
+
+            if (_showInfo)
+            {
+                warning("@WAX1895");
+            }
+        }
+
+        try
+        {
+            ttsbegin;
+
+            releaseToWarehouse.linkPhysicalTableInstance(_releaseToWarehouse);
+
+            warehouseRelease.parmReleaseToWarehouseId(_releaseToWarehouseId);
+            warehouseRelease.parmShowInfo(_showInfo);
+            warehouseRelease.parmAuto(_auto);
+            warehouseRelease.parmSupressShipmentCreatedInfo(_showInfo);
+
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(_releaseToWarehouseId, 'createLoads'))
+            {
+                warehouseRelease.createLoadLines(releaseToWarehouse);
+                perfTask.setCreatedLoadLines(warehouseRelease.createdLoadLines());
+                perfTask.setUpdatedLoadLines(warehouseRelease.updatedLoadLines());
+                perfTask.setCreatedCWLoadLines(warehouseRelease.createdCWLoadLines());
+                perfTask.setUpdatedCWLoadLines(warehouseRelease.updatedCWLoadLines());
+            }
+            
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(_releaseToWarehouseId, 'createShipments'))
+            {
+                warehouseRelease.createShipments();
+                perfTask.setCreatedShipments(warehouseRelease.createdShipments());
+            }
+
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(_releaseToWarehouseId, 'planCrossDock'))
+            {
+                warehouseRelease.planCrossDock();
+            }
+
+            if (warehouseRelease.parmSupressShipmentCreatedInfo())
+            {
+                info(strFmt("@WAX3433", warehouseRelease.createdShipments() - warehouseRelease.failedShipments()));
+            }
+
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(_releaseToWarehouseId, 'createWave'))
+            {
+                waveId = warehouseRelease.createWave();
+                perfTask.setCreatedWaveId(waveId);             
+            }
+
+            ttscommit;
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            if (appl.ttsLevel() != 0)
+            {
+                throw Exception::DuplicateKeyException;
+            }
+            handleException();
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() != 0)
+            {
+                throw Exception::UpdateConflict;
+            }
+            handleException();
+        }
+        catch
+        {
+            handleException();
+        }
+
+        return waveId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logInfoAboutNumberOfShipmentsCreated</Name>
+				<Source><![CDATA[
+    private static void logInfoAboutNumberOfShipmentsCreated(int _numOfShipmentsCreated)
+    { 
+        str message = WhsWarehouseRelease::retrieveMessageAboutNumberOfShipmentsCreated(_numOfShipmentsCreated);
+        if (message != '')
+        {
+            info(message);
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveMessageAboutNumberOfShipmentsCreated</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal static str retrieveMessageAboutNumberOfShipmentsCreated(int _numOfShipmentsCreated)
+    {
+        return strFmt("@WAX3433", _numOfShipmentsCreated);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipmentsForLoadPostEngine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a shipment for a load header.
+    /// </summary>
+    /// <param name="_loadPostEngine">
+    /// An instance of the <c>WhsLoadPostEngine</c> class.
+    /// </param>
+    /// <returns>
+    /// Boolean value indicating if errors occurred.
+    /// </returns>
+    public static boolean createShipmentsForLoadPostEngine(WhsLoadPostEngine _loadPostEngine)
+    {
+        WHSWarehouseRelease warehouseRelease = WHSWarehouseRelease::construct();
+
+        ttsbegin;
+
+        warehouseRelease.parmReleaseToWarehouseId('');
+        warehouseRelease.parmShowInfo(false);
+        warehouseRelease.parmAuto(false);
+        warehouseRelease.parmLoadPostEngine(_loadPostEngine);
+
+        warehouseRelease.createShipments();
+
+        ttscommit;
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSalesOrderDeliveryAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the delivery addresses on the sales orders and its associated lines.
+    /// </summary>
+    /// <param name = "_salesTable">The sales order that will be validated.</param>
+    /// <exception cref="Exception::Error">
+    /// The sales order or the sales lines does not have the expected delivery addresses.
+    /// </exception>
+    public static void checkSalesOrderDeliveryAddress(SalesTable _salesTable)
+    {
+        if (WhsWarehouseRelease::useSalesLineDeliveryAddress())
+        {
+            if (!_salesTable.whsCheckSalesLineDeliveryPostalAddress())
+            {
+                throw error(strFmt("@WAX4810", _salesTable.SalesId));
+            }
+        }
+        else if (!_salesTable.DeliveryPostalAddress)
+        {
+            throw error(strFmt("@WAX:ReleaseToWarehouseError_SalesOrderMissingDeliveryAddress", _salesTable.SalesId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSalesOrderDeliveryName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the delivery names on the sales order associated lines.
+    /// </summary>
+    /// <param name = "_salesTable">The sales order that will be validated.</param>
+    /// <exception cref="Exception::Error">
+    /// The sales lines does not have the expected delivery name.
+    /// </exception>
+    private static void checkSalesOrderDeliveryName(SalesTable _salesTable)
+    {
+        if (WhsWarehouseRelease::useSalesLineDeliveryAddress())
+        {
+            if (SalesLine::existBySalesIdAndDeliveryName(_salesTable.SalesId, ''))
+            {
+                throw error(strFmt("@WAX:ReleaseToWarehouseError_SalesOrderMissingDeliveryName", _salesTable.SalesId));
+            }
+        }
+        else if (!_salesTable.DeliveryName)
+        {
+            throw error(strFmt("@WAX:ReleaseToWarehouseError_SalesOrderMissingDeliveryName", _salesTable.SalesId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>useSalesLineDeliveryAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if addresses from the sales lines or sales order should be used.
+    /// </summary>
+    /// <returns>True if the sales lines addresses should be used, false if the sales order address should be used.</returns>
+    public static boolean useSalesLineDeliveryAddress()
+    {
+        return isConfigurationkeyEnabled(configurationKeyNum(TradeMultiShipTo));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>salesFormRelease</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Releases a sales order to warehouse.
+    /// </summary>
+    /// <param name="_salesTable">
+    /// Sales order to be released.
+    /// </param>
+    /// <param name = "_creditMaxCheck">
+    /// A flag to ensure that credit check happens.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// Exception is thrown when valid delivery postal code is not set for sales lines.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// Exception is thrown when sales line is already on a load.
+    /// </exception>
+    public static void salesFormRelease(SalesTable _salesTable, CustCreditMaxCheck _creditMaxCheck = CustParameters::find().CreditMaxCheck)
+    {
+        WHSTmpReleaseToWarehouse        releaseToWarehouse;
+        
+        WHSReleaseToWarehouseId releaseToWarehouseId = WHSTmpReleaseToWarehouse::getNextReleaseToWarehouseId();
+        
+        if (!_salesTable.canReleaseToWarehouse())
+        {
+            throw error(strFmt("@WAX2951", _salesTable.SalesId));
+        }
+
+        WHSWarehouseRelease::checkSalesOrderDeliveryAddress(_salesTable);
+        WHSWarehouseRelease::checkSalesOrderDeliveryName(_salesTable);
+
+        if (WHSWarehouseRelease::isOrderOnLoadAndNotOnShipment(_salesTable.SalesId, InventTransType::Sales))
+        {
+            throw error("@WAX4240");
+        }
+
+        WHSFulfillmentRateValidator::checkFulfillmentRateForSales(_salesTable);
+
+        WHSWarehouseRelease::interCompanyUpdateSalesPrice(_salesTable);
+        WHSWarehouseRelease::creditLimitCheck(_salesTable, false, _creditMaxCheck);
+
+        WHSInventTransSumDimEnumerator inventTransSumDimEnumerator = WhsWarehouseRelease::buildReleaseQuery(_salesTable.SalesId).forNotWMSOrder(WMSOrderStatus::New, WMSOrderStatus::InExpedition).getEnumerator();
+
+        boolean lineReleased = WhsWarehouseRelease::createTmpReleaseToWarehouseLines(inventTransSumDimEnumerator, releaseToWarehouse, releaseToWarehouseId, WHSModule::Sales);
+
+        if (lineReleased)
+        {
+            using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(releaseToWarehouseId, 'releaseSingleSalesOrder'))
+            {
+                WHSWarehouseRelease::releaseToWarehouse(releaseToWarehouse, releaseToWarehouseId, false, true);
+            }
+        }
+
+        if (WHSWarehouseRelease::wmsOrderExists(_salesTable))
+        {
+            warning("@WAX5826");
+        }
+        else if (!lineReleased)
+        {
+            info(strFmt("@WAX:WHSWarehouseRelease_NoNewLinesReleased_Info", _salesTable.SalesId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transferOrderFormRelease</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes a release to warehouse from the transfer order screen
+    /// </summary>
+    /// <param name="_transferTable">
+    /// The <c>InventTransferTable</c> record
+    /// </param>
+    public static void transferOrderFormRelease(InventTransferTable _transferTable)
+    {
+        WHSWarehouseReleaseProcessingResult processingResult = new WHSWarehouseReleaseProcessingResult();
+        
+        WHSFulfillmentRateValidator::checkFulfillmentRateForTransfer(_transferTable);
+        
+        WhsWarehouseRelease::transferOrderRelease(_transferTable, processingResult);
+
+        processingResult.displayOrderLevelMessages();
+
+        if (processingResult.hasOrderLevelErrors())
+        {
+            throw error(WhsWarehouseRelease::cannotReleaseTransferMessage(_transferTable));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>whsReleaseSalesToWarehouseClient</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Releases sales orders to the warehouse in CIL in order to maximize efficiency.
+    /// </summary>
+    /// <param name="_salesDataSource">
+    ///     Release to warehouse will be run for the sales orders selected in the provided form datasource.
+    /// </param>
+    public static void whsReleaseSalesToWarehouseClient(FormDataSource _salesDataSource)
+    {
+        int releasedSalesOrders = 0;
+        CustCreditMaxCheck creditMaxCheck = WHSParameters::getCreditMaxCheck();
+
+        using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromAction('releaseToWarehouseFromSalesOrderForm'))
+        {
+            if (_salesDataSource.table() == tableNum(SalesTable))
+            {
+                releasedSalesOrders = WhsWarehouseRelease::whsReleaseSalesOrdersToWarehouse(_salesDataSource, creditMaxCheck);
+            }
+            else if (_salesDataSource.table() == tableNum(SalesLine))
+            {
+                releasedSalesOrders = WhsWarehouseRelease::whsReleaseSalesLinesToWarehouse(_salesDataSource, creditMaxCheck);
+            }
+            else
+            {
+                throw error(Error::wrongUseOfFunction(funcName()));
+            }
+
+            perfTask.setReleasedSalesOrders(releasedSalesOrders);
+        }
+
+        if (releasedSalesOrders != 0)
+        {
+            _salesDataSource.research(true);
+        }
+        else
+        {
+            _salesDataSource.reread();
+            _salesDataSource.refresh();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>whsReleaseSalesOrdersToWarehouse</Name>
+				<Source><![CDATA[
+    private static int whsReleaseSalesOrdersToWarehouse(FormDataSource _salesDataSource, CustCreditMaxCheck _creditMaxCheck)
+    {
+        int releasedSalesOrders = 0;
+
+        for (SalesTable salesTable = WhsWarehouseRelease::getBufferFromDataSource(_salesDataSource);
+        salesTable;
+        salesTable = _salesDataSource.getNext())
+        {
+            WHSWarehouseRelease::salesFormRelease(salesTable, _creditMaxCheck);
+            releasedSalesOrders++;
+        }
+
+        return releasedSalesOrders;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>whsReleaseSalesLinesToWarehouse</Name>
+				<Source><![CDATA[
+    private static int whsReleaseSalesLinesToWarehouse(FormDataSource _salesDataSource, CustCreditMaxCheck _creditMaxCheck)
+    {
+        int     releasedSalesOrders = 0;
+        SalesId prevSalesId = '';
+
+        for (SalesLine salesLine = WhsWarehouseRelease::getBufferFromDataSource(_salesDataSource);
+        salesLine;
+        salesLine = _salesDataSource.getNext())
+        {
+            if (salesLine.SalesId != prevSalesId)
+            {
+                WHSWarehouseRelease::salesFormRelease(salesLine.salesTable(), _creditMaxCheck);
+                prevSalesId = salesLine.SalesId;
+                releasedSalesOrders++;
+            }
+        }
+
+        return releasedSalesOrders;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBufferFromDataSource</Name>
+				<Source><![CDATA[
+    private static Common getBufferFromDataSource(FormDataSource _dataSource)
+    {
+        return _dataSource.getFirst(true) ? _dataSource.getFirst(true) : _dataSource.cursor();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>whsReleaseTransferToWarehouseClient</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Releases inventory transfer orders to the warehouse.
+    /// </summary>
+    /// <param name="_inventTransferTable_ds">
+    ///     Release to warehouse will be run for the inventory transfer orders selected in the provided form datasource.
+    /// </param>
+    public static void whsReleaseTransferToWarehouseClient(FormDataSource _inventTransferTable_ds)
+    {
+        InventTransferTable     inventTransferTable;
+        int                     numberOfRowsUpdated;
+
+        using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromAction('releaseToWarehouseFromTransferOrderForm'))
+        {
+            for (inventTransferTable = _inventTransferTable_ds.getFirst(true) ? _inventTransferTable_ds.getFirst(true) : _inventTransferTable_ds.cursor();
+            inventTransferTable;
+            inventTransferTable = _inventTransferTable_ds.getNext())
+            {
+                WHSWarehouseRelease::transferOrderFormRelease(inventTransferTable);
+                numberOfRowsUpdated++;
+            }
+
+            perfTask.setReleasedTransferOrders(numberOfRowsUpdated);
+        }
+
+        if (numberOfRowsUpdated > 1)
+        {
+            _inventTransferTable_ds.research(true);
+        }
+        else
+        {
+            _inventTransferTable_ds.reread();
+            _inventTransferTable_ds.refresh();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildReleaseQuery</Name>
+				<Source><![CDATA[
+    protected static  WHSInventTransSumDimQuery buildReleaseQuery(SalesId _salesId)
+    {
+        return new WHSInventTransSumDimQuery().forSalesId(_salesId)
+                                              .fromWHSEnabledWarehouse()
+                                              .onlyTMSItems();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cannotReleaseTransferMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the error message that should be displayed when a transfer order could not be released to warehouse.
+    /// </summary>
+    /// <param name="_transferTable">
+    /// The transfer order record.
+    /// </param>
+    /// <returns>
+    /// The error message that should be displayed when a transfer order could not be released to warehouse.
+    /// </returns>
+    public static str cannotReleaseTransferMessage(InventTransferTable _transferTable)
+    {
+        return strFmt("@SYP4860551", _transferTable.TransferId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReleasedNotPickedQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the quantity that was released to warehouse but for which the pick work was not completed yet.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// The transaction for which the quantity needs to be provided.
+    /// </param>
+    /// <param name="_inventDimId">
+    /// The dimensions for which the quantity needs to be provided.
+    /// </param>
+    /// <returns>
+    /// A quantity in the inventory unit.
+    /// </returns>
+    public static InventQty getReleasedNotPickedQty(InventTransId _inventTransId, InventDimId _inventDimId)
+    {
+        return WhsWarehouseRelease::releasedNotPickedQty(_inventTransId, _inventDimId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>releasedNotPickedQty</Name>
+				<Source><![CDATA[
+    [Wrappable(true), Replaceable(true)]
+    internal static InventQty releasedNotPickedQty(InventTransId _inventTransId, InventDimId _inventDimId)
+    {
+        WHSReleasedQtyView releasedQtyView;
+
+        select firstonly SumOfInventQty, SumOfPickedQty from releasedQtyView
+            where releasedQtyView.InventDimId == _inventDimId
+                && releasedQtyView.InventTransId == _inventTransId;
+
+        return releasedQtyView.SumOfInventQty - releasedQtyView.SumOfPickedQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReservedPhysicalQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the quantity that was physically reserved.
+    /// </summary>
+    /// <param name="_inventTable">
+    /// The item for which to provide the quantity.
+    /// </param>
+    /// <param name="_inventTransId">
+    /// The transaction for which the quantity needs to be provided.
+    /// </param>
+    /// <param name="_inventDimId">
+    /// The dimensions for which the quantity needs to be provided.
+    /// </param>
+    /// <returns>
+    /// A quantity in the inventory unit.
+    /// </returns>
+    [SysObsolete('Method is obsoleted to support catch weight items. Callers should redirect their calls to the getReservedPhysicalHandlingQty method. Please file an extensibility request if other access is required.', false, 30\9\2019)]
+    public static InventQty getReservedPhysicalQty(InventTable _inventTable, InventTransId _inventTransId, InventDimId _inventDimId)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), _inventTable.ItemId);
+
+        InventDim inventDim = InventDim::find(_inventDimId);
+        InventDimParm inventDimParm = WhsReservationHierarchyInventDimUtil::initInventDimParmAboveLocation(_inventTable);
+
+        return -InventTransIdSumSingleStatus::newTransOriginIdStatusDimension(
+                    InventTransOrigin::findByInventTransId(_inventTransId).RecId,
+                    StatusReceipt::None,
+                    StatusIssue::ReservPhysical,
+                    inventDim,
+                    inventDimParm).reservPhysical();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReservedPhysicalHandlingQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the handling quantity that was physically reserved.
+    /// </summary>
+    /// <param name="_inventTable">
+    /// The item for which to provide the quantity.
+    /// </param>
+    /// <param name="_inventTransId">
+    /// The transaction for which the quantity needs to be provided.
+    /// </param>
+    /// <param name="_inventDimId">
+    /// The dimensions for which the quantity needs to be provided.
+    /// </param>
+    /// <returns>
+    /// A quantity in the inventory handling unit.
+    /// </returns>
+    [Hookable(false)]
+    public static InventHandlingQty getReservedPhysicalHandlingQty(InventTable _inventTable, InventTransId _inventTransId, InventDimId _inventDimId)
+    {
+        InventDim inventDim = InventDim::find(_inventDimId);
+        InventDimParm inventDimParm = WhsReservationHierarchyInventDimUtil::initInventDimParmAboveLocation(_inventTable);
+
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightItemLogic(funcName(), _inventTable.ItemId))
+        {
+            return -InventTransIdSumSingleStatus::newTransOriginIdStatusDimension(
+                        InventTransOrigin::findByInventTransId(_inventTransId).RecId,
+                        StatusReceipt::None,
+                        StatusIssue::ReservPhysical,
+                        inventDim,
+                        inventDimParm).pdsCWReservPhysical();
+        }
+
+        return WhsWarehouseRelease::getReservedPhysicalQty(_inventTable, _inventTransId, _inventDimId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserve</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reserves inventory before releasing to warehouse.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// The transaction for which the inventory is reserved.
+    /// </param>
+    /// <param name="_inventDimId">
+    /// The dimensions for which the inventory is reserved.
+    /// </param>
+    /// <param name="_onlyReserveOnWHSEnabledWarehouses">
+    /// Whether to allow reservation on non-WHS enabled warehouses.
+    /// </param>
+    public static void reserve(
+        InventTransId   _inventTransId,
+        InventDimId     _inventDimId,
+        boolean         _onlyReserveOnWHSEnabledWarehouses = false)
+    {
+        WHSReservation whsReservation = WHSReservation::construct();
+        whsReservation.parmOnlyReserveOnWHSEnabledWarehouses(_onlyReserveOnWHSEnabledWarehouses);
+
+        InventTrans         inventTrans;
+
+        SysDaSearchObject searchObject = new SysDaSearchObject(WhsWarehouseRelease::buildInventoryHandlingQuantityReserveQuery(inventTrans, _inventTransId, _inventDimId));
+        SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+
+        while (searchStatement.findNext(searchObject))
+        {
+            // Pass in negative qty
+            whsReservation.reserveInventoryHandlingQty(inventTrans,
+                PdsGlobal::pdsIsCWItem(inventTrans.ItemId) ? inventTrans.PdsCWQty : inventTrans.Qty);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildInventoryHandlingQuantityReserveQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a query object for the inventory to reserve.
+    /// </summary>
+    /// <param name = "_inventTrans">An <c>InventTrans</c> buffer.</param>
+    /// <param name = "_inventTransId">The transaction for which the inventory should be reserved.</param>
+    /// <param name = "_inventDimId">The dimensions for which the inventory should be reserved.</param>
+    /// <returns>A query object of the inventory that should be reserved</returns>
+    protected static SysDaQueryObject buildInventoryHandlingQuantityReserveQuery(InventTrans _inventTrans, InventTransId _inventTransId, InventDimId _inventDimId)
+    {
+        InventTransOrigin   inventTransOrigin;
+        SysDaQueryObject inventTransQueryObj = new SysDaQueryObject(_inventTrans);
+        SysDaQueryObject inventTransOriginQueryObj = new SysDaQueryObject(inventTransOrigin);
+
+        inventTransQueryObj.whereClause(new SysDaEqualsExpression(new SysDaFieldExpression(_inventTrans, fieldStr(inventTrans, InventDimId)),
+                                                                  new SysDaValueExpression(_inventDimId))
+                                   .and(new SysDaEqualsExpression(new SysDaFieldExpression(_inventTrans, fieldStr(inventTrans, StatusIssue)),
+                                                                  new SysDaValueExpression(StatusIssue::OnOrder))
+                                                        .or(new SysDaEqualsExpression(new SysDaFieldExpression(_inventTrans, fieldStr(inventTrans, StatusIssue)),
+                                                                                      new SysDaValueExpression(StatusIssue::ReservOrdered))))
+                                   .and(new SysDaEqualsExpression(new SysDaFieldExpression(_inventTrans, fieldStr(inventTrans, StatusReceipt)),
+                                                                  new SysDaValueExpression(StatusReceipt::None))));
+
+        inventTransOriginQueryObj.whereClause(new SysDaEqualsExpression(new SysDaFieldExpression(_inventTrans, fieldStr(InventTrans, InventTransOrigin)),
+                                                                  new SysDaFieldExpression(inventTransOrigin, fieldStr(InventTransOrigin, RecId)))
+                                   .and(new SysDaEqualsExpression(new SysDaFieldExpression(inventTransOrigin, fieldStr(InventTransOrigin, InventTransId)),
+                                                                  new SysDaValueExpression(_inventTransId))));
+
+        inventTransQueryObj.joinClause(SysDaJoinKind::ExistsJoin, inventTransOriginQueryObj);
+        
+        return inventTransQueryObj;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transferOrderRelease</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Releases the specified transfer order to warehouse.
+    /// </summary>
+    /// <param name="_transferTable">
+    /// The <c>InventTransferTable</c> record.
+    /// </param>
+    /// <param name="_processingResult">
+    /// The object that is used to store the errors, warnings and information messages that occurred as part of the release to warehouse process.
+    /// </param>
+    public static void transferOrderRelease(
+        InventTransferTable                 _transferTable,
+        WHSWarehouseReleaseProcessingResult _processingResult)
+    {
+        WHSTmpReleaseToWarehouse        releaseToWarehouse;
+
+        WHSReleaseToWarehouseId releaseToWarehouseId = WHSTmpReleaseToWarehouse::getNextReleaseToWarehouseId();
+
+        using (WHSInstrumentationReleaseToWarehousePerformanceTask perfTask = WHSInstrumentationReleaseToWarehousePerformanceTask::newFromReleaseToWarehouseId(releaseToWarehouseId, 'releaseSingleTransferOrder'))
+        {
+            // Create and validate the temporary release to warehouse lines;
+            boolean releaseLinesCreated = WHSWarehouseRelease::createTransferTmpReleaseToWarehouseRecs(releaseToWarehouseId, releaseToWarehouse, _transferTable, _processingResult);
+
+            if (releaseLinesCreated)
+            {
+                WHSWarehouseRelease::releaseToWarehouse(releaseToWarehouse, releaseToWarehouseId, false, true);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wmsOrderExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if there is a pending output order for the specified sales order.
+    /// </summary>
+    /// <param name="_salesTable">
+    /// The sales order.
+    /// </param>
+    /// <returns>
+    /// true if there is a pending output order; otherwise, false.
+    /// </returns>
+    private static boolean wmsOrderExists(SalesTable _salesTable)
+    {
+        WHSInventTransSumDimEnumerator inventTransSumDimWithWMSOrder = WhsWarehouseRelease::buildReleaseQuery(_salesTable.SalesId).forWMSOrder(WMSOrderStatus::New, WMSOrderStatus::InExpedition).getEnumerator();
+
+        return inventTransSumDimWithWMSOrder.moveNext();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTmpReleaseToWarehouseLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Releases the specified order to warehouse.
+    /// </summary>
+    /// <param name="_inventTransSumDimEnumerator">
+    /// An enumerator object that allows iterating over the query.
+    /// </param>
+    /// <param name="_releaseToWarehouse">
+    /// The <c>WHSTmpReleaseToWarehouse</c> record.
+    /// </param>
+    /// <param name="_releaseToWarehouseId">
+    /// The identifier of the release to warehouse process.
+    /// </param>
+    /// <param name="_whsModule">
+    /// The module the transaction relates to.
+    /// </param>
+    /// <returns>
+    /// true if at least one line got released; otherwise, false.
+    /// </returns>
+    protected static boolean createTmpReleaseToWarehouseLines(
+        WHSInventTransSumDimEnumerator _inventTransSumDimEnumerator,
+        WHSTmpReleaseToWarehouse       _releaseToWarehouse,
+        WHSReleaseToWarehouseId        _releaseToWarehouseId,
+        WHSModule                      _whsModule)
+    {
+        boolean lineReleased = false;
+        boolean warehouseHasCrossDockTemplate;
+        InventLocationId prevInventLocationId;
+
+        while (_inventTransSumDimEnumerator.moveNext())
+        {
+            WHSInventTransSumDim inventTransSumDim = _inventTransSumDimEnumerator.inventTransSumDim();
+        
+            InventLocationId inventLocationId = InventDim::find(inventTransSumDim.inventDimId).InventLocationId;
+
+            if (prevInventLocationId != inventLocationId)
+            {
+                warehouseHasCrossDockTemplate = WHSCrossDockTemplate::beforeSupplyReceiptPolicyCrossDockingTemplateExists(inventLocationId);
+                prevInventLocationId = inventLocationId;
+            }
+
+            WhsWarehouseReleaseLineCreator lineCreator = WhsWarehouseReleaseLineCreator::construct();
+            lineCreator.parmReleaseToWarehouse(_releaseToWarehouse);
+            lineCreator.parmReleaseToWarehouseId(_releaseToWarehouseId);
+            lineCreator.parmWhsModule(_whsModule);
+            lineCreator.parmInventTransSumDim(inventTransSumDim);
+
+            // For performance reasons we should check to see if cross docking is setup for the warehouse before allowing non-reserved inventory to be released.
+            // Planned cross docking does not support catch weight items.
+            lineCreator.parmReleaseAllQuantity(warehouseHasCrossDockTemplate && !PdsGlobal::pdsIsCWItem(inventTransSumDim.ItemId));
+
+            if (lineCreator.releaseLine())
+            {
+                lineReleased = true;
+            }
+        }
+
+        return lineReleased;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTransferTmpReleaseToWarehouseRecs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create and validate temporary release to warehouse records for a transfer order.
+    /// </summary>
+    /// <param name="_releaseToWarehouseId">
+    /// The release to warehouse number for the transfer order.
+    /// </param>
+    /// <param name="_releaseToWarehouse">
+    /// The <c>WHSTmpReleaseToWarehouse</c> buffer to use when creating records.
+    /// </param>
+    /// <param name="_transferTable">
+    /// The transfer order header record to be released.
+    /// </param>
+    /// <param name="_processingResult">
+    /// The class that stores processing details.
+    /// </param>
+    /// <returns>
+    /// true if lines were created that can be released; otherwise, false.
+    /// </returns>
+    public static boolean createTransferTmpReleaseToWarehouseRecs(
+                            WHSReleaseToWarehouseId             _releaseToWarehouseId,
+                            WHSTmpReleaseToWarehouse            _releaseToWarehouse,
+                            InventTransferTable                 _transferTable,
+                            WHSWarehouseReleaseProcessingResult _processingResult)
+    {
+        if (!_transferTable || !_processingResult)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        if (WHSWarehouseRelease::isOrderOnLoadAndNotOnShipment(_transferTable.TransferId, InventTransType::TransferOrderShip))
+        {
+            _processingResult.addOrderLevelError("@WAX4240");
+            return false;
+        }
+
+        WHSInventTransSumDimEnumerator inventTransSumDimEnumerator = new WHSInventTransSumDimQuery().forIssueOfTransferId(_transferTable.TransferId)
+                                                                 .fromWHSEnabledWarehouse()
+                                                                 .onlyTMSItems()
+                                                                 .forNotWMSOrder(WMSOrderStatus::New, WMSOrderStatus::InExpedition)
+                                                                 .getEnumerator();
+    
+        boolean lineReleased = WHSWarehouseRelease::createTmpReleaseToWarehouseLines(inventTransSumDimEnumerator, _releaseToWarehouse, _releaseToWarehouseId, WHSModule::Transfer);
+
+        if (WHSReleaseToWarehouseService::anyUnprocessedOutputOrdersForTransferOrder(_transferTable))
+        {
+            _processingResult.addOrderLevelWarning("@WAX5826");
+        }
+        else if (!lineReleased)
+        {
+            _processingResult.addOrderLevelInfo(strFmt("@WAX:WHSWarehouseReleaseTO_NoNewLinesReleased_Info", _transferTable.TransferId));
+        }
+
+        return lineReleased;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditLimitCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks a customer's credit limit for a sales order that is being released to warehouse.
+    /// </summary>
+    /// <param name="_salesTable">
+    /// The sales order to check a customer's credit limit against.
+    /// </param>
+    /// <param name="_skipThrowError">
+    /// True if an error should not be thrown if a credit limit is exceeded, otherwise false.
+    /// </param>
+    /// <param name="_creditMaxCheck">
+    /// The credit limit validation parameter that has been applied to the sales order.
+    /// </param>
+    /// <returns>
+    /// true if the credit limit is acceptable; otherwise, false.
+    /// </returns>
+    public static boolean creditLimitCheck(
+        SalesTable         _salesTable,
+        boolean            _skipThrowError = false,
+        CustCreditMaxCheck _creditMaxCheck = CustParameters::find().CreditMaxCheck)
+    {
+        WHSInstrumentationLogger logger = WHSInstrumentationLogger::createLogger(classStr(WhsWarehouseRelease));
+        WHSWarehouseReleaseInstrumentationActivities instrumentationActivities = logger.warehouseRelease();
+
+        boolean result = true;
+
+        using (var activityContext = instrumentationActivities.creditLimitCheck(_salesTable.RecId))
+        {
+            if (CustCreditLimit::mustCheckCreditLimit(_salesTable, _creditMaxCheck))
+            {
+                CustCreditLimit custCreditLimit = CustCreditLimit::construct(_salesTable);
+                custCreditLimit.typeOfCreditMaxCheck(_creditMaxCheck);
+                if (!custCreditLimit.check()) // credit limit exceeded
+                {
+                    if (WhsWarehouseRelease::mustFailOnExceededCreditLimit())
+                    {
+                        if (!_skipThrowError)
+                        {
+                            throw error(strFmt("@WAX2951", _salesTable.SalesId));
+                        }
+
+                        result = false;
+                    }
+                }
+            }
+
+            instrumentationActivities.parmIsCreditLimitCheckPassed(activityContext, result);
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustFailOnExceededCreditLimit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Consider the credit limit check as failed when the limit is exceeded?
+    /// </summary>
+    /// <returns>true, if the check failure is considered an error; otherwise, false.</returns>
+    protected static boolean mustFailOnExceededCreditLimit()
+    {
+        return CustParameters::find().CreditLineError == CreditLineErrorType::Error;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>interCompanyUpdateSalesPrice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update sales price for intercompany sales lines.
+    /// </summary>
+    /// <param name="_salesTable">
+    /// Sales order to be updated on sales price of its sales lines.
+    /// </param>
+    public static void interCompanyUpdateSalesPrice(SalesTable _salesTable)
+    {
+        if (_salesTable.isInterCompanyOrder()
+        &&  _salesTable.interCompanyEndpointActionPolicy().UnitPriceEqualsCostPrice)
+        {
+            IntercompanySalesAtCostPriceFormLetterHandler intercompanySalesAtCostPriceHandler = IntercompanySalesAtCostPriceFormLetterHandler::construct();
+            intercompanySalesAtCostPriceHandler.onSalesLinesSelectionStarted();
+
+            SalesLine  salesLine;
+
+            while select salesLine
+                where salesLine.SalesId == _salesTable.SalesId
+                   && SalesLine.InterCompanyInventTransId
+            {
+                intercompanySalesAtCostPriceHandler.onSalesLineSelected(salesLine);
+            }
+            intercompanySalesAtCostPriceHandler.onSalesLinesSelectionFinished();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createdLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the number of created load lines.
+    /// </summary>
+    /// <returns>Number of created load lines.</returns>
+    [Hookable(false)]
+    internal int createdLoadLines()
+    {
+        return createdLoadLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatedLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the number of updated load lines.
+    /// </summary>
+    /// <returns>Number of updated load lines.</returns>
+    [Hookable(false)]
+    internal int updatedLoadLines()
+    {
+        return updatedLoadLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createdCWLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the number of created catch weight load lines.
+    /// </summary>
+    /// <returns>Number of created catch weight load lines.</returns>
+    [Hookable(false)]
+    internal int createdCWLoadLines()
+    {
+        return createdCWLoadLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatedCWLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the number of updated catch weight load lines.
+    /// </summary>
+    /// <returns>Number of updated catch weight load lines.</returns>
+    [Hookable(false)]
+    internal int updatedCWLoadLines()
+    {
+        return updatedCWLoadLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createdShipments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the number of created shipments.
+    /// </summary>
+    /// <returns>Number of created shipments.</returns>
+    [Hookable(false)]
+    internal int createdShipments()
+    {
+        return createdShipments;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>failedShipments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the number of failed shipments.
+    /// </summary>
+    /// <returns>Number of failed shipments.</returns>
+    [Hookable(false)]
+    internal int failedShipments()
+    {
+        return failedShipments;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcFailedShipments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the number of failed shipments.
+    /// </summary>
+    private void calcFailedShipments()
+    {
+        SetEnumerator se = createdShipmentsSet.getEnumerator();
+        while (se.movenext())
+        {
+            if (!WHSShipmentTable::exist(se.current()))
+            {
+                failedShipments++;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planCrossDock</Name>
+				<Source><![CDATA[
+    private void planCrossDock()
+    {
+        boolean shouldReduceLoadLineIfCrossDockFailed = WHSShouldReduceLoadLineWhenCrossDockFailedContext::shouldReduceLoadLineWhenCrossDockFailed();
+        boolean foundLoadLineFailingReservationRequirement = false;
+
+        ttsbegin;
+
+        WHSLoadLine         loadLine;
+        PdsCatchWeightItem  cwItem;
+            
+        while select forupdate loadLine
+            where loadLine.ReleaseToWarehouseId == releaseToWarehouseId
+            notexists join cwItem
+                where cwItem.ItemId == loadLine.ItemId
+        {
+            this.onPlanCrossDockForLoadLine(loadLine);
+
+            if (!WHSCrossDockingPlanned::crossDock(loadLine))
+            {
+                InventLocation warehouse = InventLocation::find(loadLine.inventDim().InventLocationId);
+
+                if (warehouse.ReleaseToWarehouseRule == WHSReleaseToWarehouseRule::RequireFullReservation)
+                {
+                    warning(strFmt("@WAX:Error_LoadLineRTWFailureForFullReservation", loadLine.InventTransId, loadLine.OrderNum, warehouse.InventLocationId));
+
+                    // reread and delete to align with the other branch - there could be load line fields changed as part of cross docking execution.
+                    loadLine.reread();
+                    loadLine.delete();
+
+                    // it is needed to report properly the failed shipments.
+                    createdShipmentsSet.add(loadLine.ShipmentId);
+
+                    foundLoadLineFailingReservationRequirement = true;
+                }
+                else if (shouldReduceLoadLineIfCrossDockFailed)
+                {
+                    loadLine.reread();
+                    this.removeUnworkableQuantityFromLoadLines(loadLine);
+                }
+            }
+        }
+
+        ttscommit;
+
+        if (createdShipmentsSet.elements())
+        {
+            this.calcFailedShipments();
+        }
+
+        // if we have removed some load lines not meeting the reservation requirement, we should check
+        // if any more load lines left in the current process. If none are left, can throw an exception right away to stop the process
+        // and keep the same behavior as before.
+        if (foundLoadLineFailingReservationRequirement
+            && !WHSLoadLine::existsForReleaseToWarehouseId(releaseToWarehouseId))
+        {
+            throw error("@WAX:LoadPostFailureForFullReservation");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>onPlanCrossDockForLoadLine</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal void onPlanCrossDockForLoadLine(WHSLoadLine _loadLine)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeUnworkableQuantityFromLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes any released quantity from load lines that is neither reserved quantity or planned for cross docking.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// The load line being evaluated.
+    /// </param>
+    /// <remarks>
+    /// This should only be called after checking the shipment is in a warehouse that allows partial release and planned cross docking was run.
+    /// </remarks>
+    protected void removeUnworkableQuantityFromLoadLines(WHSLoadLine _loadLine)
+    {
+        WHSLoadLine loadLine = _loadLine;
+
+        InventQty unWorkableQty = loadLine.InventQty - (loadLine.CrossDockQuantity + loadLine.CrossDockReservedPhysical);
+
+        if (unWorkableQty > 0)
+        {
+            loadLine.InventQty -= unWorkableQty;
+
+            if (loadLine.InventQty > 0)
+            {
+                UnitOfMeasureSymbol inventUnit = InventTableModule::find(loadLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
+
+                if (loadLine.UOM == inventUnit)
+                {
+                    loadLine.Qty = loadLine.InventQty;
+                }
+                else
+                {
+                    //If the feature is enabled, we will not apply rounding to align this with no-cross dock scenario.
+                    loadLine.Qty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(loadLine.ItemId,
+                                                                                        loadLine.InventDimId,
+                                                                                        loadLine.InventQty,
+                                                                                        inventUnit,
+                                                                                        loadLine.UOM,
+                                                                                        NoYes::No,
+                                                                                        NoYes::No);
+
+                    if (loadLine.Qty <= loadLine.InventQty
+                        && this.shouldRoundDown(loadLine.ItemId))
+                    {
+                        loadLine.Qty = this.calcQtyWithRounding(loadLine.Qty);
+                    }
+
+                    loadLine.setInventAndCrossDockQty();
+                }
+
+                loadLine.update();
+            }
+            else
+            {
+                createdShipmentsSet.add(loadLine.ShipmentId);
+                loadLine.delete();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustThrowWhenRoundingQuantityToZero</Name>
+				<Source><![CDATA[
+    protected boolean mustThrowWhenRoundingQuantityToZero()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcQtyWithRounding</Name>
+				<Source><![CDATA[
+    private ProductQuantity calcQtyWithRounding(ProductQuantity _loadLineQty)
+    {
+        ProductQuantity qtyWithRounding = roundDown(_loadLineQty, 1);
+
+        if (qtyWithRounding || !this.mustThrowWhenRoundingQuantityToZero())
+        {
+            if (_loadLineQty != qtyWithRounding)
+            {
+                warning("@WAX:SalesUnitRestrictedWarning");
+            }
+        }
+        else
+        {
+            throw error("@WAX:SalesUnitRestrictedError");
+        }
+
+        return qtyWithRounding;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

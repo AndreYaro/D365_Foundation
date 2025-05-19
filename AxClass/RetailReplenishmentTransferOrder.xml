@@ -1,0 +1,648 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailReplenishmentTransferOrder</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// The <c>RetailReplenishmentTransferOrder</c> class creates a transfer order
+/// and sets the quantity for transfer.
+/// </summary>
+class RetailReplenishmentTransferOrder
+{
+    [SysObsolete('The unitOfMeasureConverter variable is deprecated, used productUnitOfMeasureConverter instead', false, 30\06\2020)]
+    UnitOfMeasureConverter_Product  unitOfMeasureConverter;
+
+    EcoResProductUnitConverter      productUnitOfMeasureConverter;
+    InventAvailabilityFormCache     inventAvailabilityFormCache;
+    CommerceHQEventSource           eventSource = CommerceHQEventSource::Log;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createFromBuyersPush</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a transfer order for the buyers push.
+    /// </summary>
+    /// <param name="_pushId">
+    /// Reference number for BuyersPush.
+    /// </param>
+    /// <param name="manualRespectsAssortments">
+    /// When RespectAssortments is Manual true indicates assortments should be respected
+    /// </param>
+    void createFromBuyersPush(RetailBuyersPushId _pushId, boolean manualRespectsAssortments = true)
+    {
+        RetailBuyersPushTable      buyersPushTable;
+        RetailBuyersPushLine       buyersPushLine;
+        RetailBuyersPushLineQty    buyersPushLineQty;
+        InventTable                inventTable;
+        InventDim                  inventDim;
+        InventLocation             inventLocationFrom;
+        InventLocation             inventLocationTo;
+        InventTransferTable        inventTransferTable;
+        RetailTransferOrderHandler fshTransferOrderHandler;
+        Qty                        transferQty, availOnHandQty, availCrossDockingQty;
+        InterCompanyTradingPartner tradingPartner;
+        CustAccount                custAccount;
+        boolean                    promptWhenIntercompanyTradeNotConfigured = true;
+        boolean                    orderCreated = NoYes::No;
+        Map                        packageLinkedTransferLines = new Map(Types::Container, Types::Int64);
+
+        RetailParameters           parameters = RetailParameters::find();
+        RetailReplenishmentRespectAssortments respectAssortments;
+        RetailReplAssortmentsCoverageDays      coverageDays;
+        date                       validToDate;
+
+        PurchLine                   purchLine;
+
+        SysOperationProgress       progress = new SysOperationProgress();
+        Counter                    counter;
+
+        #MACROLIB.AviFiles
+
+        eventSource.EventWriteReplenishmentTransferOrderCreationStart(funcName(), _pushId, DateTimeUtil::toStr(DateTimeUtil::getSystemDateTime()));
+
+        progress.setCaption("@RET795");
+
+        try
+        {
+            ttsbegin;
+
+            buyersPushTable = RetailBuyersPushTable::find(_pushId, true);
+
+            if (buyersPushTable.TransferOrderCreated)
+            {
+                eventSource.EventWriteReplenishmentTransferOrderExistForBuyerPush(funcName(), _pushId);
+                ttsabort;
+                return;
+            }
+
+            select count(RecId) from buyersPushLineQty
+                where buyersPushLineQty.BuyersPushId == _pushId
+                   && buyersPushLineQty.Qty > 0;
+
+            progress.setTotal(buyersPushLineQty.RecId);
+            eventSource.EventWriteReplenishmentBuyersPushLineQtyCount(funcName(), buyersPushLineQty.RecId);
+
+            while select * from buyersPushLine
+                where buyersPushLine.BuyersPushId == _pushId
+                join forUpdate buyersPushLineQty
+                    where buyersPushLineQty.BuyersPushId == buyersPushLine.BuyersPushId
+                       && buyersPushLineQty.LineNum      == buyersPushLine.LineNum
+                       && buyersPushLineQty.Qty    > 0
+            {
+                inventDim = InventDim::find(buyersPushLine.InventDimId);
+
+                inventTransferTable = RetailReplenishmentTransferOrder::findTransferOrder(tablenum(RetailBuyersPushTable),
+                                                                                          buyersPushTable.RecId,
+                                                                                          inventDim.InventLocationId,
+                                                                                          buyersPushLineQty.InventLocationId,
+                                                                                          buyersPushLineQty.WarehouseDataAreaId);
+
+                if (inventTransferTable && !inventTransferTable.isCreated())
+                {
+                    eventSource.EventWriteReplenishmentJournalIsPostedError(funcName(), _pushId);
+                    error(strfmt("@RET1081", _pushId));
+                    ttsabort;
+                    return;
+                }
+
+                if (buyersPushLineQty.WarehouseDataAreaId != inventDim.dataAreaId ||
+                    buyersPushLineQty.InventLocationId != inventDim.InventLocationId)
+                {
+                    inventTable = buyersPushLine.inventTable();
+                    productUnitOfMeasureConverter.parmFromUnitOfMeasureSymbol(buyersPushLine.UnitID);
+                    productUnitOfMeasureConverter.parmToUnitOfMeasureSymbol(inventTable.inventUnitId());
+                    productUnitOfMeasureConverter.parmItemId(buyersPushLine.ItemId);
+                    productUnitOfMeasureConverter.parmInventDimId(buyersPushLine.InventDimId);
+
+                    // Quantity has to be transferred in the item's inventory unit
+                    transferQty = productUnitOfMeasureConverter.convertValue(buyersPushLineQty.Qty);
+
+                    if (buyersPushTable.isCrossdock())
+                    {
+                        availCrossDockingQty = buyersPushLine.availCrossDocking(inventTable.inventUnitId());
+
+                         // if transfer qty exceeds available cross docking quantity, order should not be created
+                        if (transferQty > availCrossDockingQty)
+                        {
+                            eventSource.EventWriteTransferQuantityExceedsAvailableCrossDockingWarning(funcName(), buyersPushLine.ItemId, availCrossDockingQty);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        availOnHandQty = buyersPushLine.onHandQty(buyersPushTable.InventLocationId, buyersPushLine.DataAreaId, inventAvailabilityFormCache);
+
+                        // if the item has not enough on hand quantity, order should not be created
+                        if (transferQty > availOnHandQty)
+                        {
+                            eventSource.EventWriteTransferOrderNotEnoughItemOnhandWarning(funcName(), buyersPushLine.ItemId, availOnHandQty);
+                            continue;
+                        }
+                    }
+
+                    // Get inventLocation Source (From) and Destination (To)
+                    inventLocationFrom = InventLocation::find(inventDim.InventLocationId);
+                    if (inventLocationFrom.RecId == 0)
+                    {
+                        eventSource.EventWriteTransferOrderInvalidSourceWarehouseError(funcName(), inventDim.InventLocationId);
+                    }
+                    inventLocationTo = InventLocation::findInLegalEntity(buyersPushLineQty.InventLocationId, buyersPushLineQty.WarehouseDataAreaId);
+                    if (inventLocationTo.RecId == 0)
+                    {
+                        eventSource.EventWriteTransferOrderInvalidTargetWarehouseError(funcName(), buyersPushLineQty.InventLocationId, buyersPushLineQty.WarehouseDataAreaId);
+                    }
+
+                    // Logic to filter by assortments (if required)
+                    coverageDays = parameters.ReplenishmentAssortmentsCoverageDays;
+
+                    // Assortment table uses date (not utcDateTime)
+
+                    // We will use today() + coverageDays as we need date, but
+                    // BP: Use DateTimeUtil::getSystemDateTime instead of systemDateGet or today. The today function uses the date of the machine.
+                    // The systemDateGet method uses the system date in Microsoft Dynamics AX. Only DateTimeUtil::getSystemDateTime compensates for the
+                    // time zone of the user.
+                    validToDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()) + coverageDays; // DateTimeUtil::addDays(localUserDate, coverageDays);  // Today to Today + coverageDays
+                    respectAssortments = (buyersPushTable.isCrossdock()) ? parameters.BuyersPushRespectAssortments : parameters.CrossDockingRespectAssortments;
+
+                    switch (respectAssortments)
+                    {
+                        case RetailReplenishmentRespectAssortments::Never:
+                            // No special processing required...
+                            break;
+                        case RetailReplenishmentRespectAssortments::Always:
+                            if (!this.isAssortmentAvailable(buyersPushLine, inventLocationTo, validToDate))
+                            {   // No assortment for this item.... Abort
+                                eventSource.EventWriteReplenishmentNoItemAssortmentError(funcName(), buyersPushLine.ItemId, enum2str(respectAssortments));
+                                error("@RET6409");  // One or more of the products are not available in the distribution location
+                                ttsAbort;
+                                return;
+                            }
+                            break;
+                        case RetailReplenishmentRespectAssortments::Manual:
+                            if (manualRespectsAssortments)
+                            {   // User clicked option to respect assortments
+                                if (!this.isAssortmentAvailable(buyersPushLine, inventLocationTo, validToDate))
+                                {   // No assortment for this item.... Abort
+                                    eventSource.EventWriteReplenishmentNoItemAssortmentError(funcName(), buyersPushLine.ItemId, enum2str(respectAssortments));
+                                    error("@RET6409");  // One or more of the products are not available in the distribution location
+                                    ttsAbort;
+                                    return;
+                                }
+                            }
+                            break;
+                    }
+
+                    if (inventLocationFrom.dataAreaId == inventLocationTo.dataAreaId)
+                    {   // Transfer order...
+
+                        // Find or create TO
+                        fshTransferOrderHandler = RetailTransferOrderHandler::newTransfer(buyersPushLineQty,
+                                                                                       inventLocationFrom,
+                                                                                       inventLocationTo,
+                                                                                       buyersPushLine.ItemId,
+                                                                                       InventDim::find(buyersPushLine.InventDimId),
+                                                                                       transferQty,
+                                                                                       packageLinkedTransferLines);
+
+                        if (inventTransferTable)
+                        {
+                            fshTransferOrderHandler.parmInventTransferTable(inventTransferTable);
+                        }
+                        else
+                        {
+                            fshTransferOrderHandler.setTransferTable();
+                            fshTransferOrderHandler.createTransferTable();
+                        }
+
+                        fshTransferOrderHandler.setTransferLine();
+                        fshTransferOrderHandler.createTransferLine(buyersPushTable.isCrossdock());
+                        purchLine = purchLine::findRecId(buyersPushLine.RefRecId);
+                        if (purchLine)
+                        {
+                            purchLine.updateWhsCrossDock(NoYes::Yes);
+                        }
+                    }
+                    else
+                    {   // Sales Order...
+
+                        // Find Inter-Company trading partner
+                        tradingPartner = InterCompanyTradingPartner::findTradingCustomer(inventLocationFrom.dataAreaId, inventLocationTo.dataAreaId);
+                        custAccount = tradingPartner.custTable().AccountNum;
+
+                        if (tradingPartner && (custAccount != ""))
+                        {   // Create the Sales Order given the specified trading customer
+                            buyersPushLineQty.createOrUpdateSalesOrder(buyersPushLine, custAccount,  inventLocationTo);
+                            purchLine = purchLine::findRecId(buyersPushLine.RefRecId);
+                            if (purchLine)
+                            {
+                                purchLine.updateWhsCrossDock(NoYes::Yes);
+                            }
+                        }
+                        else
+                        {   // No valid trading customer
+
+                            if (promptWhenIntercompanyTradeNotConfigured)
+                            {   // First time error occurs - prompt the user to
+
+                                if (Box::yesNo("@RET5768", DialogButton::Yes) != DialogButton::Yes)
+                                {   // Abort the operation...
+                                    eventSource.EventWriteReplenishmentNoTradingCustomerError(funcName(), inventLocationTo.dataAreaId);
+                                    error(strFmt("@RET5767", inventLocationTo.dataAreaId));
+                                    ttsAbort;
+                                    return;
+                                }
+                                else
+                                {   // Don't bother to prompt any more...
+                                    promptWhenIntercompanyTradeNotConfigured = false;
+                                }
+                            }
+
+                            info(strFmt("@RET5767", inventLocationTo.dataAreaId));
+                        }
+                    }
+
+                    // flag showing that at least one order is created
+                    orderCreated = NoYes::Yes;
+                }
+
+                progress.setText(strfmt("%1-%2-%3-%4 %5",buyersPushLine.ItemId, inventDim.InventColorId,inventDim.InventSizeId,
+                                                         inventDim.InventStyleId ,
+                                                         buyersPushLineQty.InventLocationId));
+                counter++;
+                progress.setCount(counter);
+            }
+
+            // if at least one order is created, update current buyers push
+            if (orderCreated)
+            {
+                buyersPushTable.TransferOrderCreated = NoYes::Yes;
+                buyersPushTable.update();
+            }
+            else
+            {
+                warning("@RET260762");  // No orders were created
+            }
+
+            ttscommit;
+            eventSource.EventWriteReplenishmentTransferOrderCreationEnd(funcName(), _pushId, DateTimeUtil::toStr(DateTimeUtil::getSystemDateTime()));
+        }
+        catch (Exception::Error)
+        {
+            eventSource.EventWriteReplenishmentTransferOrderCreationAbortedError(funcName(), _pushId);
+            error("@RET260762");  // No orders were created
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isAssortmentAvailable</Name>
+				<Source><![CDATA[
+    private boolean isAssortmentAvailable(RetailBuyersPushLine _retailBuyersPushLine, InventLocation _inventLocation, date validToDate)
+    {
+        return _retailBuyersPushLine.isAssortedTo(_inventLocation.InventLocationId, _inventLocation.dataAreaId, validToDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        productUnitOfMeasureConverter   = EcoResProductUnitConverter::construct();
+        inventAvailabilityFormCache     = InventAvailabilityFormCache::construct();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkOrCreateTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates or updates the transfer orders for the cross docking line.
+    /// </summary>
+    /// <param name="_purchLine">
+    /// An instance of <c>PurchLine</c> table.
+    /// </param>
+    /// <returns>
+    /// true if quantity is positive and not more than received.
+    /// </returns>
+    static boolean checkOrCreateTransferOrder(PurchLine _purchLine)
+    {
+        RetailBuyersPushTable   buyersPushTable;
+        RetailBuyersPushLine    buyersPushLine;
+        RetailBuyersPushLineQty buyersPushLineQty;
+        boolean                 ret = false;
+        CommerceHQEventSource   eventSource = CommerceHQEventSource::Log;
+
+        if (_purchLine.RecId > 0)
+        {
+            select firstonly forupdate buyersPushTable
+                where buyersPushTable.PurchId == _purchLine.PurchId;
+
+            if (buyersPushTable)
+            {
+                select buyersPushLine
+                    where buyersPushLine.RefRecId == _purchLine.RecId;
+
+                select sum(Qty) from buyersPushLineQty
+                    where buyersPushLineQty.BuyersPushId == buyersPushLine.BuyersPushId &&
+                          buyersPushLineQty.LineNum      == buyersPushLine.LineNum;
+
+                if (buyersPushLineQty.Qty > 0)
+                {
+                    if (buyersPushLineQty.Qty <= _purchLine.receivedInTotal())
+                    {
+                        ret = true;
+                    }
+                    else
+                    {
+                        // show information message if cross docking quantity for the line is greater than received quantity
+                        info(strFmt("@RET1361", buyersPushLine.ItemId, _purchLine.PurchId));
+                    }
+
+                    buyersPushLine.crossdockQtyForTransfer();
+                }
+                else if (buyersPushLineQty.Qty == 0)
+                {
+                    // if there is no cross docking quantity, it should be no message
+                    eventSource.EventWriteReplenishmentDistributeZeroItemWarning(funcName());
+                    ret = true;
+                }
+            }
+            else
+            {
+                eventSource.EventWriteReplenishmentNoCrossDockingForPurchaseOrder(funcName(), _purchLine.PurchId);
+                ret = true;
+            }
+        }
+        else
+        {
+            eventSource.EventWriteReplenishmentInvalidPurchaseOrderLine(funcName());
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the transfer quantity.
+    /// </summary>
+    /// <param name="_purchId">
+    /// Reference number for the purchase order.
+    /// </param>
+    /// <returns>
+    /// false if the transfer quantity is greater than received; else true.
+    /// </returns>
+    public static boolean checkTransferOrder(PurchId    _purchId)
+    {
+        PurchLine       purchLine;
+        Qty             qty;
+        boolean         ret = true;
+        CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+        while select * from purchLine
+            where purchLine.PurchId == _purchId
+        {
+            qty = RetailReplenishmentTransferOrder::findTransferOrderLine(tablenum(PurchLine), purchLine.RecId).QtyTransfer;
+
+            if (purchLine.PurchReceivedNow && qty > purchLine.PurchReceivedNow)
+            {
+                eventSource.EventWriteTransferQuantityGreaterThanReceived(funcName());
+                ret = false;
+            }
+            else if (qty > purchLine.PurchQty)
+            {
+                eventSource.EventWriteTransferQuantityGreaterThanOrdered(funcName());
+                ret = false;
+            }
+
+            if (!ret)
+            {
+                return false;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static RetailReplenishmentTransferOrder construct()
+    {
+        return new RetailReplenishmentTransferOrder();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>crossDocking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the total quantity for a given dimension.
+    /// </summary>
+    /// <param name="_tPurchLine">
+    /// An instance of <c>PurchLine</c> table.
+    /// </param>
+    /// <returns>
+    /// Quantity to be crossdocked.
+    /// </returns>
+    static PurchQty crossDocking(PurchLine _tPurchLine)
+    {
+        real                rQty;
+
+        InventJournalTable      tInventJournalTable;
+        InventJournalTrans      tInventJournalTrans;
+        InventDim               tInventDim;
+
+        InventLocation          tInventLocation;
+
+        while select * from tInventLocation
+            index InventLocationIdx
+        {
+            tInventDim.data(_tPurchLine.inventDim());
+            tInventDim.InventLocationId = tInventLocation.InventLocationId;
+            tInventDim.InventSiteId = tInventLocation.InventSiteId;
+            tInventDim = InventDim::findDim(tInventDim);
+
+            select firstonly * from tInventJournalTable
+                index FSHPurchIdx
+                where tInventJournalTable.fshReplenishmentRef == _tPurchLine.PurchId
+                   && tInventJournalTable.Posted == NoYes::No
+                join JournalId, ItemId, ToInventDimId, Qty from tInventJournalTrans
+                where tInventJournalTrans.JournalId ==  tInventJournalTable.JournalId
+                   && tInventJournalTrans.ItemId    ==  _tPurchLine.ItemId
+                   && tInventJournalTrans.ToInventDimId == tInventDim.InventDimId;
+
+            rQty += abs(tInventJournalTrans.Qty);
+        }
+
+        return rQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>existsTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks for the existance of transfer order.
+    /// </summary>
+    /// <param name="_refTableId">
+    /// Reference number for the table.
+    /// </param>
+    /// <param name="_refRecId">
+    /// Reference number for the table record.
+    /// </param>
+    /// <param name="_inventLocationIdTo">
+    /// The value for the To location.
+    /// </param>
+    /// <returns>
+    /// true if the transfer order exists;otherwise false
+    /// </returns>
+    public static boolean existsTransferOrder(RefTableId       _refTableId,
+                                              RefRecId         _refRecId,
+                                              InventLocationId _inventLocationIdTo)
+
+    {
+        InventTransferTable     inventTransferTable;
+        InventTransferLine      inventTransferLine;
+        boolean                 ret;
+        ;
+
+        if (_refTableId && _refRecId && _inventLocationIdTo)
+        {
+            select firstonly RecId from inventTransferTable
+                where inventTransferTable.InventLocationIdTo    ==  _inventLocationIdTo
+            exists join inventTransferLine
+                where inventTransferLine.TransferId             == inventTransferTable.TransferId   &&
+                      inventTransferLine.RetailReplenishRefTableId == _refTableId                      &&
+                      inventTransferLine.RetailReplenishRefRecId   == _refRecId;
+
+            ret = inventTransferTable.RecId != 0;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks for the existance of transfer order.
+    /// </summary>
+    /// <param name="_refTableId">
+    /// Reference number for the table.
+    /// </param>
+    /// <param name="_refRecId">
+    /// Reference number for the table record.
+    /// </param>
+    /// <param name="_inventLocationIdFrom">
+    /// The value for the From location.
+    /// </param>
+    /// <param name="_inventLocationIdTo">
+    /// The value for the To location.
+    /// </param>
+    /// <param name="_inventLocationDataAreaIdTo">
+    /// The data area for the To location.
+    /// </param>
+    /// <param name="_forUpdate">
+    /// Boolean value which indicates whether to select the record for update or not.
+    /// </param>
+    /// <returns>
+    /// An instance of <c>InventTransferTable</c> table if a matching record exists.
+    /// </returns>
+    public static InventTransferTable findTransferOrder(RefTableId          _refTableId,
+                                                        RefRecId            _refRecId,
+                                                        InventLocationId    _inventLocationIdFrom,
+                                                        InventLocationId    _inventLocationIdTo,
+                                                        DataAreaId          _inventLocationDataAreaIdTo = curext(),
+                                                        boolean             _forUpdate = false)
+    {
+        InventTransferTable     inventTransferTable;
+        ;
+
+        inventTransferTable.selectForUpdate(_forUpdate);
+
+        if (_refTableId && _refRecId && _inventLocationIdTo)
+        {
+            select firstonly crossCompany inventTransferTable
+                where inventTransferTable.RetailReplenishRefTableId    == _refTableId  &&
+                      inventTransferTable.RetailReplenishRefRecId      == _refRecId    &&
+                      inventTransferTable.InventLocationIdFrom         == _inventLocationIdFrom &&
+                      inventTransferTable.InventLocationIdTo           == _inventLocationIdTo &&
+                      inventTransferTable.dataAreaId                   == _inventLocationDataAreaIdTo;
+        }
+
+        return inventTransferTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findTransferOrderLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks for the transfer order line.
+    /// </summary>
+    /// <param name="_refTableId">
+    /// Reference number for the table.
+    /// </param>
+    /// <param name="_refRecId">
+    /// Reference number for the table record.
+    /// </param>
+    /// <param name="_inventLocationIdTo">
+    /// The value for the To location.
+    /// </param>
+    /// <param name="_forUpdate">
+    /// Boolean value which indicates whether to select the record for update or not.
+    /// </param>
+    /// <returns>
+    /// An instance of <c>InventTransferLine</c> table if a matching record exists.
+    /// </returns>
+    public static InventTransferLine findTransferOrderLine(RefTableId       _refTableId,
+                                                           RefRecId         _refRecId,
+                                                           InventLocationId _inventLocationIdTo = "",
+                                                           boolean          _forUpdate          = false)
+    {
+        InventTransferLine      inventTransferLine;
+        InventTransferTable     inventTransferTable;
+        ;
+
+        inventTransferLine.selectForUpdate(_forUpdate);
+
+        if (_refTableId && _refRecId)
+        {
+            select firstonly inventTransferLine
+                where inventTransferLine.RetailReplenishRefTableId == _refTableId  &&
+                      inventTransferLine.RetailReplenishRefRecId   == _refRecId
+            exists join inventTransferTable
+                where inventTransferTable.TransferId            == inventTransferLine.TransferId   &&
+                     (inventTransferTable.InventLocationIdTo    == _inventLocationIdTo             ||
+                      !_inventLocationIdTo);
+        }
+
+        return inventTransferLine;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

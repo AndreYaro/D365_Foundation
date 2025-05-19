@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>LedgerFiscalCalendarPeriodEventHandler</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Handles <c>LedgerFiscalCalendarPeriod</c> events.
+/// </summary>
+public class LedgerFiscalCalendarPeriodEventHandler
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>LedgerFiscalCalendarPeriod_onValidatingField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handles the <c>LedgerFiscalCalendarPeriod</c> validating field event.
+    /// </summary>
+    /// <param name="_sender">The <c>LedgerFiscalCalendarPeriod</c> record.</param>
+    /// <param name="_e">The event arguments.</param>
+    [DataEventHandler(tableStr(LedgerFiscalCalendarPeriod), DataEventType::ValidatingField), Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void LedgerFiscalCalendarPeriod_onValidatingField(Common _sender, DataEventArgs _e)
+    {
+        SubledgerJournalEntryNotTransferred sljNotTransferred;
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntry;
+        SubledgerJournalEntry subledgerJournalEntry;
+        AccountingEvent accountingEvent;
+
+        LedgerFiscalCalendarPeriod ledgerFiscalCalendarPeriod = _sender as LedgerFiscalCalendarPeriod;
+        FiscalCalendarPeriod currentPeriod = FiscalCalendarPeriod::find(ledgerFiscalCalendarPeriod.FiscalCalendarPeriod);
+        ValidateFieldEventArgs ve = _e;
+        boolean isValid = true;
+                
+        if (ledgerFiscalCalendarPeriod.Status == FiscalPeriodStatus::Closed ||
+            ledgerFiscalCalendarPeriod.Status == FiscalPeriodStatus::OnHold)
+        {
+            select firstOnly recId, SourceDocumentHeader, Voucher, JournalNumber, AccountingDate from sljNotTransferred
+            where sljNotTransferred.FiscalCalendarPeriod == currentPeriod.RecId &&
+                sljNotTransferred.Ledger == ledgerFiscalCalendarPeriod.Ledger;
+
+            if (sljNotTransferred.recId)
+            {
+                isValid = checkFailed(strFmt("@GLS222739", currentPeriod.Name));
+
+                // Collect and show additional info on blocking document type
+                SourceDocumentHeader untransferredHeader = SourceDocumentHeader::find(sljNotTransferred.SourceDocumentHeader);
+                isValid = checkFailed(strFmt("@LedgerJournal:UntransferredAtPeriodClose", untransferredHeader.TypeEnumName, sljNotTransferred.Voucher));
+            }
+
+            //Only do additional check for data issue if we find that we do not have any record that is pending already. As below query will look for transfers
+            //that are stuck
+            if (isValid)
+            {
+                select firstonly RecId, TransferId from subledgerJournalEntry
+                    where subledgerJournalEntry.FiscalCalendarPeriod == currentPeriod.RecId &&
+                        subledgerJournalEntry.Ledger == ledgerFiscalCalendarPeriod.Ledger
+                exists join accountingEvent
+                    where accountingEvent.RecId == subledgerJournalEntry.AccountingEvent &&
+                        accountingEvent.IsAccountingRequired == NoYes::Yes
+                notexists join subledgerVoucherGeneralJournalEntry
+                    where subledgerVoucherGeneralJournalEntry.SubledgerJournalEntry == subledgerJournalEntry.RecId;
+
+                if (subledgerJournalEntry.RecId)
+                {
+                    //We may have encountered a scenario where we have two subledger journal entry with same voucher
+                    //Do a secondary check just to make sure the voucher is in the system and is populated correctly
+
+                    select firstonly RecId, TransferId from subledgerJournalEntry
+                    where subledgerJournalEntry.FiscalCalendarPeriod == currentPeriod.RecId &&
+                        subledgerJournalEntry.Ledger == ledgerFiscalCalendarPeriod.Ledger
+                    exists join accountingEvent
+                        where accountingEvent.RecId == subledgerJournalEntry.AccountingEvent &&
+                            accountingEvent.IsAccountingRequired == NoYes::Yes
+                    notexists join subledgerVoucherGeneralJournalEntry
+                        where subledgerVoucherGeneralJournalEntry.Voucher == subledgerJournalEntry.Voucher &&
+                            subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == subledgerJournalEntry.VoucherDataAreaId &&
+                            subledgerVoucherGeneralJournalEntry.AccountingDate == accountingEvent.AccountingDate;
+                    
+                    if (subledgerJournalEntry.RecId)
+                    {
+                        isValid = checkFailed(strFmt("@GLS222739", currentPeriod.Name));
+
+                        using (SysInstrumentationActivityContext activityContext = SourceDocumentAccountingFrameworkInstrumentationLogger::getActivityContext(
+                            'LedgerFiscalCalendarLedgerPeriodClose',
+                            classStr(LedgerFiscalCalendarEventHandler),
+                            'LedgerPeriodCloseSelfHealingOpportunity'))
+                        {
+                            activityContext.addCustomProperty('SelfHealingOpportunity for SJE.RecId', strFmt('%1', subledgerJournalEntry.RecId));
+
+                            if (LedgerPeriodCloseUntransferredSelfHealFlight::instance().isEnabled())
+                            {
+                                if (LedgerFiscalCalendarPeriodCloseUntransferredSelfHeal::periodQualifiesForSelfHealing(ledgerFiscalCalendarPeriod))
+                                {
+                                    LedgerFiscalCalendarPeriodCloseUntransferredSelfHeal::applyHealing(ledgerFiscalCalendarPeriod);
+                                    Info("@LedgerJournal:UntransferredAutoHealApplied");
+
+                                    activityContext.addCustomProperty('SelfHealingOpportunity outcome', 'applied');
+                                }
+                                else
+                                {
+                                    activityContext.addCustomProperty('SelfHealingOpportunity outcome', 'impossible');
+                                }
+                            }                            
+                        }
+                    }
+                    
+                }
+            }
+        }
+
+        ve.parmValidateResult(isValid);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSubledgerVoucherGeneralJournalEntryTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method populates the newely added field in 10.0.15 to tightly trace the subledger that get transferred into General ledger
+    /// </summary>
+    /// <param name = "_ledgerFiscalCalendarPeriod">Ledger fiscal calendar period record</param>
+    /// <param name = "_currentPeriod">the current period that is being modified for the ledger</param>
+    [SysObsolete('This method is obsolete and has no replacement. It was intended to update legacy data and is now scheduled to be removed.', false, 21\07\2022)]
+    public static void updateSubledgerVoucherGeneralJournalEntryTable(LedgerFiscalCalendarPeriod _ledgerFiscalCalendarPeriod , FiscalCalendarPeriod _currentPeriod)
+    {
+        const int MaximumRetries = 4;
+        int backOffWait = RandomGenerate::construct().randomInt(50, 500);
+
+        //The field subledgerJournalEntry and TransferId was added later in 10.0.15 so we need to populate the records for existing data before .15
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntryToUpdate;
+        SubledgerJournalEntry subledgerJournalEntryLocal;
+        AccountingEvent accountingEventLocal;
+        GeneralJournalEntry generalJournalEntry;
+
+        try
+        {
+            ttsbegin;
+
+            update_recordset subledgerVoucherGeneralJournalEntryToUpdate
+                Setting SubledgerJournalEntry = subledgerJournalEntryLocal.RecId,
+                    TransferId = subledgerJournalEntryLocal.TransferId
+                join TransferId,RecId from subledgerJournalEntryLocal
+                    where subledgerJournalEntryLocal.Voucher == subledgerVoucherGeneralJournalEntryToUpdate.Voucher &&
+                        subledgerJournalEntryLocal.VoucherDataAreaId == subledgerVoucherGeneralJournalEntryToUpdate.VoucherDataAreaId &&
+                        subledgerJournalEntryLocal.Ledger == _ledgerFiscalCalendarPeriod.Ledger &&
+                        subledgerJournalEntryLocal.FiscalCalendarPeriod == _currentPeriod.RecId &&
+                        subledgerVoucherGeneralJournalEntryToUpdate.TransferId == 0 &&
+                        subledgerVoucherGeneralJournalEntryToUpdate.SubledgerJournalEntry == 0
+                exists join accountingEventLocal
+                    where accountingEventLocal.RecId == subledgerJournalEntryLocal.AccountingEvent &&
+                        accountingEventLocal.AccountingDate == subledgerVoucherGeneralJournalEntryToUpdate.AccountingDate
+                exists join generalJournalEntry
+                    where generalJournalEntry.RecId == subledgerVoucherGeneralJournalEntryToUpdate.GeneralJournalEntry &&
+                        generalJournalEntry.AccountingDate == subledgerVoucherGeneralJournalEntryToUpdate.AccountingDate &&
+                        generalJournalEntry.TransferId == subledgerJournalEntryLocal.TransferId;
+
+            ttscommit;
+        }
+        catch(Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                int currentRetryCount = xSession::currentRetryCount();
+
+                if (currentRetryCount <= MaximumRetries)
+                {
+                    sleep(currentRetryCount * backOffWait);
+
+                    retry;
+                }
+            }
+        }
+        catch(Exception::TransientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            int currentRetryCount = xSession::currentRetryCount();
+
+            if (currentRetryCount <= MaximumRetries)
+            {
+                sleep(currentRetryCount * backOffWait);
+
+                retry;
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

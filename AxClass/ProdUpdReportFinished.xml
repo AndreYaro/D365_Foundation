@@ -1,0 +1,1597 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProdUpdReportFinished</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>ProdUpdReportFinished</c> class is used for reporting a production order as finished.
+/// </summary>
+/// <remarks>
+/// Using this class, production orders can be reported as finished and physically received available.
+/// </remarks>
+class ProdUpdReportFinished extends ProdUpd
+{
+    ProdParmReportFinished      prodParmReportFinished;
+    BOMCalcData                 bomCalcData;
+    boolean                     hasPostedRAF;
+    ProdReportedError           qtyErrorProductionReceipt;
+    ProdReportedGood            qtyGoodProductionReceipt;
+    boolean                     calledFromWorkCreation;
+    Set                         whsCoByRAFCanBePosted;
+    ProdJournalId               rafJournalId;
+    internal boolean            createWorkForWaitingCoByProducts;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>canUpdateProdReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Indicates whether a <c>ProdParmReportFinished</c> record can update the production receipt.
+    /// </summary>
+    /// <returns>
+    /// true if the <c>ProdParmReportFinished</c> record can update the production receipt; otherwise,
+    /// false.
+    /// </returns>
+    protected boolean canUpdateProdReceipt()
+    {
+        if (   prodParmReportFinished
+            && (!prodParmReportFinished.ToOprNum
+            ||  prodParmReportFinished.ToOprNum == ProdRoute::lastOprNum(prodParmReportFinished.ProdId)))
+        {
+            return prodParmReportFinished.ReportFinishProd;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmParmBuffer</Name>
+				<Source><![CDATA[
+    ParmBuffer parmParmBuffer(ParmBuffer _prodParmReportFinished = prodParmReportFinished)
+    {
+        if (!_prodParmReportFinished.RecId)
+        {
+            throw error("@SYS25332");
+        }
+        prodParmReportFinished = _prodParmReportFinished;
+
+        return prodParmReportFinished;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Starts reporting a production order as finished.
+    /// </summary>
+    /// <remarks>
+    ///    Before the method is started, you should set up the report as finished parameters by using one of
+    ///    the following methods:
+    ///    <list type="bullet">
+    ///       <item>
+    ///          <description>
+    ///             The <c>newParmBuffer</c> method.
+    ///          </description>
+    ///       </item>
+    ///       <item>
+    ///          <description>
+    ///             The <c>initParmBufferFromHistCost</c> method.
+    ///          </description>
+    ///       </item>
+    ///    </list>
+    /// </remarks>
+    void run()
+    {
+        #OCCRetryCount
+
+        setPrefix(ProdMultiReportFinished::description());
+        setPrefix(#PreFixField(ProdParmReportFinished,ProdId));
+
+        try
+        {
+            using (var m = ProdInstrumentationSegmentFactory::create(ProdInstrumentationActivities::UpdateReportAsFinishedRun, prodParmReportFinished.RecId))
+            {
+                if (this.deferPosting())
+                {
+                    m.addAdditionalParameterToStopEvent(ProdInstrumentationActivities::UpdateReportAsFinishedDeferredPosting, "true");
+                    return;
+                }
+
+                WHSQualityManagementCreateBeforeReportAsFinishedContext qualityManagementCreateBeforeReportAsFinishedContext = WHSQualityManagementCreateBeforeReportAsFinishedContext::current();
+        
+                // We cannot update the quantities inside a transaction if test associations exist, as this needs to happen
+                // before the quality orders are created. That in turn needs to happen outside of the transaction, so that
+                // the quality order is persisted even if RAF posting fails.
+                boolean shouldUpdateQuantitiesInTransaction = qualityManagementCreateBeforeReportAsFinishedContext != null ||
+                    !InventParameters::find().UseQualityManagement ||
+                    InventTestAssociationTable::recordCountForOrderType(InventTestReferenceType::Production) == 0;
+
+                if (shouldUpdateQuantitiesInTransaction)
+                {
+                    ttsbegin;
+                }
+
+                using (var context = new WHSRunningFromRAFContext())
+                {
+                    // If we're RAF'ing more than we have quantity for, try to Pick more, or if we are reversing a License Plate (negative RAF)
+                    if (this.shouldStartMoreInventory())
+                    {
+                        if (prodParmReportFinished.RespectFlushingPrincipleForWHSReportedOverproduction)
+                        {
+                            SysInstrumentationLoggerFactory::CreateLogger(classStr(ProdUpdReportFinished))
+                            .logInformation("The RespectFlushingPrincipleForWHSReportedOverproduction parameter is set to true");
+                        }
+                        else
+                        {
+                            this.whsOverReportQty(PdsGlobal::pdsIsCWItem(prodParmReportFinished.ItemId) ? prodParmReportFinished.PdsCWBatchGood : prodParmReportFinished.QtyGood);
+                        }
+                    }
+                }
+                
+                if (! this.validate())
+                {
+                    throw error("@SYS18447");
+                }
+
+                this.setParameters();
+
+                if (isProdUpdProductionTypeTelemetryFlightEnabled)
+                {
+                    this.addInstrumentationAdditionalParametersToStopEvent(m);
+                }
+                
+                if (!calledFromWorkCreation)
+                {
+                    this.collectWHSCoByRAFCanBePosted();
+                }
+                
+                if (!qualityManagementCreateBeforeReportAsFinishedContext)
+                {
+                    InventQualityManagementCreateHandler::createProductionReportFinishedBefore(
+                        prodTable,
+                        prodParmReportFinished.QtyGood,
+                        prodParmReportFinished.PdsCWBatchGood);
+                }
+
+                if (!shouldUpdateQuantitiesInTransaction)
+                {
+                    ttsbegin;
+                }
+                
+                this.updateBOMConsumption();
+
+                // Production order is marked as ended, therefore unpick inventory that is not being deducted.
+                if (prodParmReportFinished.EndJob
+                    && WHSInventEnabled::exist(prodParmReportFinished.ItemId))
+                {
+                    // Verify any pick work associated with the production order is completed or canceled
+                    if (WHSWorkTable::isProdPickWorkComplete(prodParmReportFinished.ProdId))
+                    {
+                        WHSProdTable::stopAndUnpick(prodParmReportFinished.ProdId);
+                        WHSProdTable::removeStop(prodParmReportFinished.ProdId);
+                    }
+                    else
+                    {
+                        throw error(strFmt("@WAX:ErrorProdOrderPickingWorkNotCompleteOrCanceled", prodParmReportFinished.ProdId));
+                    }
+                }
+
+                this.updateRouteConsumption();
+
+                if (this.canUpdateProdReceipt() && !hasPostedRAF)
+                {
+                    this.updateProdReceipt();
+                }
+                this.updateJobJournal(ParmJobStatus::Executed);
+
+                TransactionLog::create(TransactionLogType::ProdReportFinished,  strFmt("@SYS76498", prodTable.ProdId, "@SYS8338"));
+
+                if (prodTable.PmfTotalCostAllocation)
+                {
+                    PmfTCAUpdate::construct(prodTable).updateTCA();
+                }
+
+                if (!calledFromWorkCreation)
+                {
+                    this.createPutWork();
+                }
+                
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            InventCleanOrphanChildReference::clearChildReference(InventCleanOrphanChildReference::getFromCache(InventTransOrigin::findByInventTransId(prodTable.InventTransId)));
+
+            this.updateJobJournal(ParmJobStatus::ContainErrors);
+            throw (Exception::Error);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldStartMoreInventory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if more inventory should be started.
+    /// </summary>
+    /// <returns>true if more inventory should be started, otherwise, false.</returns>
+    protected boolean shouldStartMoreInventory()
+    {
+        return this.isExtraQuantitesPicked() || prodParmReportFinished.QtyGood < 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isExtraQuantitesPicked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if extra quantities were picked.
+    /// </summary>
+    /// <returns>True if extra quantities were picked; otherwise, false.</returns>
+    protected boolean isExtraQuantitesPicked()
+    {
+        if (ProdReportFinishCwWhsItemPostFlight::instance().isEnabled())
+        {
+            using (WHSReportFinishedHandlingQtyContext context = WHSReportFinishedHandlingQtyContext::construct())
+            {
+                context.parmInventoryQty(prodParmReportFinished.QtyGood + prodParmReportFinished.QtyError);
+
+                return this.pickHandlingQty();
+            }
+        }
+        else
+        {
+            return this.pickHandlingQty();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pickHandlingQty</Name>
+				<Source><![CDATA[
+    private boolean pickHandlingQty()
+    {
+        return (prodParmReportFinished.BOMAutoConsump == BOMAutoConsump::Always
+                || prodParmReportFinished.BOMAutoConsump == BOMAutoConsump::FlushingPrincip)
+                && WHSProdTable::pickMoreHandlingQty(prodParmReportFinished.ProdId,
+                    PdsGlobal::pdsIsCWItem(prodParmReportFinished.ItemId) ?
+                                                                                prodParmReportFinished.PdsCWBatchGood + prodParmReportFinished.PdsCWBatchErr :
+                                                                                prodParmReportFinished.QtyGood        + prodParmReportFinished.QtyError,
+                    prodParmReportFinished.FromOprNum,
+                    prodParmReportFinished.ToOprNum,
+                    prodParmReportFinished.bomAutoConsump == BOMAutoConsump::FlushingPrincip,
+                    prodParmReportFinished.EndJob,
+                    ProdFlushingPrincipBOM::Finish,
+                    prodParmReportFinished.PostNow);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setParameters</Name>
+				<Source><![CDATA[
+    void setParameters()
+    {
+        this.initProdTable(true);
+
+        bomCalcData = BOMCalcData::newProdTable(
+            prodParmReportFinished.QtyGood + prodParmReportFinished.QtyError,
+            prodTable,
+            PdsGlobal::pdsIsCWItem(prodParmReportFinished.ItemId)
+                ? prodParmReportFinished.PdsCWBatchGood + prodParmReportFinished.PdsCWBatchErr
+                : 0);
+
+        qtyGoodProductionReceipt  = prodParmReportFinished.QtyGood;
+        qtyErrorProductionReceipt = prodParmReportFinished.QtyError;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveConstantReleasedFromProdBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the constant released value from production BOM record.
+    /// </summary>
+    /// <param name = "_prodBOM">The production BOM record.</param>
+    /// <returns>The constant released.</returns>
+    protected ProdConstantReleased retrieveConstantReleasedFromProdBOM(ProdBOM _prodBOM)
+    {
+        return _prodBOM.ConstantReleased;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeConstantReleasedOnProdBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the constant release on the production BOM record.
+    /// </summary>
+    /// <param name = "_prodBOM">The production BOM record.</param>
+    /// <param name = "_constantReleased">The constant released.</param>
+    protected void initializeConstantReleasedOnProdBOM(ProdBOM _prodBOM, ProdConstantReleased _constantReleased)
+    {
+        _prodBOM.ConstantReleased = _constantReleased;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the production journal.
+    /// </summary>
+    /// <returns>The created production journal.</returns>
+    protected ProdJournalTable createJournal()
+    {
+        ProdJournalTable            prodJournalTable;
+        ProdJournalTableData        prodJournalTableData = JournalTableData::newTable(prodJournalTable);
+        ProdJournalBOM              prodJournalBOM;
+        ProdJournalTransData        prodJournalTransData = prodJournalTableData.journalStatic().newJournalTransData(prodJournalBOM, prodJournalTableData);
+
+        ProdBOM                     prodBOM;
+        boolean                     addRefPurch = true;
+        OprNum                      operNum;
+        boolean                     isProdAsBuiltBOMFeatureEnabled = BOMParameters::find().EnableTrackedComponents;
+
+        prodJournalTableData.initBuffer(prodParmReportFinished.bomJournalNameId, prodParmReportFinished.ProdId, ProdJournalType::Picklist);
+            
+        while select forupdate prodBOM
+            where prodBOM.ProdId    == prodTable.ProdId                  &&
+                  prodBOM.OprNum    >= prodParmReportFinished.FromOprNum &&
+                  (prodBOM.OprNum   <= prodParmReportFinished.ToOprNum   || !prodParmReportFinished.ToOprNum)
+        {
+            using (var m = ProdInstrumentationSegmentFactory::create(ProdInstrumentationActivities::UpdateReportAsFinishedBOMConsumption, prodBOM.RecId))
+            {
+                ProdBOMCalc prodBOMCalc = ProdBOMCalc::newBOMCalcData(bomCalcData,
+                                                                        prodBOM,
+                                                                        ProdBOMConsumpProposal::Qty,
+                                                                        prodParmReportFinished.bomAutoConsump,
+                                                                        !this.retrieveConstantReleasedFromProdBOM(prodBOM),
+                                                                        NoYes::Yes,                         // Route scrap should be disregarded, because we manually
+                                                                                                            // specify the scrap by setting Error Quantity of produced items.
+                                                                                                            false,
+                                                                        true);
+
+                if (this.shouldCreateJournalLineForBOMConsumption(prodBOM, prodBOMCalc))
+                {
+                    this.initializeProdJournalBOM(prodJournalBOM, prodJournalTableData, prodJournalTransData, prodBOM, prodBOMCalc);
+
+                    this.initializeConstantReleasedOnProdBOM(prodBOM, NoYes::Yes);
+
+                    if (isProdAsBuiltBOMFeatureEnabled)
+                    {
+                        ProdAsBuiltBOMCreatePickingListBuilder::construct()
+                            .setProdJournalTransData(prodJournalTransData)
+                            .setProdBOM(prodBOM)
+                            .setProdJournalBOM(prodJournalBOM)
+                            .setFlushingPrinciple(ProdFlushingPrincipBOM::Finish)
+                            .setIsEndJob(prodParmReportFinished.EndJob)
+                            .setIsPickingListDerivedJournal(false)
+                            .setIsAutoPick(true)
+                            .setProductLot(prodParmReportFinished.InventTransId)
+                            .setProductInventDimId(prodParmReportFinished.InventDimId).createPickingListLine();
+                    }
+                    else
+                    {
+                        if (!WHSInventEnabled::exist(prodTable.ItemId))
+                        {
+                            prodJournalBOM.pickMaterialFromWarehouse(prodBOM, ProdFlushingPrincipBOM::Finish);
+                        }
+
+                        prodJournalBOM.insertJournalCreate(prodJournalTransData, prodBOM, prodParmReportFinished.EndJob);
+                    }
+                    this.updateProdBOMConsumption(prodBOM);
+
+                    if ((operNum && operNum != prodBOM.OprNum) || !prodBOM.OprNum)
+                    {
+                        addRefPurch = false;
+                    }
+
+                    operNum = prodBOM.OprNum;
+                }
+            }
+        }
+
+        if (this.mustWriteProductionBOMJournalTable(prodJournalTable))
+        {
+            if (addRefPurch)
+            {
+                if (ProdRoute::find(prodParmReportFinished.ProdId, operNum, RouteOprPriority::Primary).RouteType == RouteOprType::Vendor)
+                {
+                    prodJournalTable.RefPurchId = ProdBOM::findVendorRefPurchId(prodParmReportFinished.ProdId, operNum);
+                }
+            }
+            prodJournalTable.write();
+        }
+        return prodJournalTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustWriteProductionBOMJournalTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if production BOM journal table can be written.
+    /// </summary>
+    /// <param name = "_prodJournalTable">The production journal table record.</param>
+    /// <returns>true if criteria is valid; otherwise, false.</returns>
+    [Replaceable]
+    protected boolean mustWriteProductionBOMJournalTable(ProdJournalTable _prodJournalTable)
+    {
+        return _prodJournalTable.JournalId ? true : false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeProdJournalBOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the production BOM journal transactions.
+    /// </summary>
+    /// <param name = "_prodJournalBOM">The BOM journal transactions record.</param>
+    /// <param name = "_prodJournalTableData">An instance of the <c>ProdJournalTableData</c> object.</param>
+    /// <param name = "_prodJournalTransData">An instance of the <c>ProdJournalTransData</c> object.</param>
+    /// <param name = "_prodBOM">The production BOM record.</param>
+    /// <param name = "_prodBOMCalc">An instance of the <c>ProdBOMCalc</c> object.</param>
+    protected void initializeProdJournalBOM(
+        ProdJournalBOM          _prodJournalBOM,
+        ProdJournalTableData    _prodJournalTableData,
+        ProdJournalTransData    _prodJournalTransData,
+        ProdBOM                 _prodBOM,
+        ProdBOMCalc             _prodBOMCalc)
+    {
+        _prodJournalTableData.initJournalId();
+
+        _prodJournalBOM.initValue();
+
+        _prodJournalTransData.initFromJournalTable();
+
+        _prodJournalBOM.initFromProdBOM(_prodBOM);
+
+        this.initProdJournalBOMFromReportFinished(_prodJournalBOM);
+
+        _prodBOMCalc.setProdJournalBOM(_prodJournalBOM);
+
+        _prodJournalBOM.bomProposal          = _prodJournalBOM.bomConsump;
+        _prodJournalBOM.InventProposal       = _prodJournalBOM.InventConsump;
+        _prodJournalBOM.PdsCWInventProposal  = _prodJournalBOM.PdsCWInventConsump;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateBOMConsumption</Name>
+				<Source><![CDATA[
+    void updateBOMConsumption()
+    {
+        if (prodParmReportFinished.bomAutoConsump != BOMAutoConsump::Never || prodParmReportFinished.EndPicklist)
+        {
+            setPrefix("@SYS28536");
+
+            ProdJournalTable prodJournalTable = this.createJournal();
+
+            if (this.canPostBOMJournal(prodJournalTable))
+            {
+                ProdJournalCheckPostBOM prodJournalCheckPostBOM = ProdJournalCheckPostBOM::newPostJournal(prodJournalTable.JournalId,prodParmReportFinished.JournalShowInfo);
+                prodJournalCheckPostBOM.runOperation();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProdJournalBOMFromReportFinished</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the production journal line from the finished.
+    /// </summary>
+    /// <param name = "_prodJournalBOM">
+    /// The <c>ProdJournalBOM</c> record to initialize.
+    /// </param>
+    protected void initProdJournalBOMFromReportFinished(ProdJournalBOM _prodJournalBOM)
+    {
+        _prodJournalBOM.TransDate      = prodParmReportFinished.TransDate;
+        _prodJournalBOM.EndConsump     = prodParmReportFinished.EndPicklist;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateProdBOMConsumption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the production BOM consumption.
+    /// </summary>
+    /// <param name = "_prodBOM">The <c>ProdBOM</c> record to update.</param>
+    protected void updateProdBOMConsumption(ProdBOM _prodBOM)
+    {
+        if (_prodBOM.ConstantReleased != _prodBOM.orig().ConstantReleased)
+        {
+            _prodBOM.doUpdate();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canPostBOMJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the BOM journal can be posted.
+    /// </summary>
+    /// <param name = "_prodJournalTable">
+    /// The <c>ProdJournalTable</c> record to check for.
+    /// </param>
+    /// <returns>
+    /// true if we can post the BOM journal; otherwise, false.
+    /// </returns>
+    protected boolean canPostBOMJournal(ProdJournalTable _prodJournalTable)
+    {
+        if (_prodJournalTable.RecId)
+        {
+            return true;
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldCreateJournalLineForBOMConsumption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if a journal line should be created for a BOM consumption line.
+    /// </summary>
+    /// <param name = "_prodBOMCalc">A BOM consumption line calculation.</param>
+    /// <param name = "_prodBOM">A BOM consumption line.</param>
+    /// <returns>true if should create a journal line; otherwise false.</returns>
+    protected boolean shouldCreateJournalLineForBOMConsumption(ProdBOM _prodBOM, ProdBOMCalc _prodBOMCalc)
+    {
+        return _prodBOMCalc.bomConsump()           ||
+               _prodBOMCalc.inventConsump()        ||
+               (prodParmReportFinished.EndPicklist && _prodBOM.BackorderStatus == ProdBackStatus::Release);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>collectWHSCoByRAFCanBePosted</Name>
+				<Source><![CDATA[
+    private void collectWHSCoByRAFCanBePosted()
+    {
+        ProdParmReportFinished whsProdParmReportFinishedCoBy;
+        WHSInventTable         whsInventTable;
+        InventDim              inventDim;
+        Inventlocation         inventLocation;
+
+        whsCoByRAFCanBePosted = new Set(Types::Int64);
+
+        while select RecId from whsProdParmReportFinishedCoBy
+            where whsProdParmReportFinishedCoBy.ParmId              == prodParmReportFinished.ParmId
+               && whsProdParmReportFinishedCoBy.QtyGood             > 0
+               && whsProdParmReportFinishedCoBy.ReportFinishProd    == NoYes::Yes
+               && whsProdParmReportFinishedCoBy.ProdId              == prodTable.ProdId
+               && whsProdParmReportFinishedCoBy.JobStatus           != ParmJobStatus::Executed
+               && (whsProdParmReportFinishedCoBy.PmfProductType     == PmfProductType::Co_Product
+               || whsProdParmReportFinishedCoBy.PmfProductType  == PmfProductType::By_Product)
+        exists join InventDim
+            where inventDim.inventDimId == whsProdParmReportFinishedCoBy.InventDimId
+        exists join inventLocation
+            where inventLocation.InventLocationId == inventDim.InventLocationId
+                && inventLocation.WHSEnabled
+        exists join whsInventTable
+            where whsInventTable.ItemId == whsProdParmReportFinishedCoBy.ItemId
+        {
+            whsCoByRAFCanBePosted.add(whsProdParmReportFinishedCoBy.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateProdReceipt</Name>
+				<Source><![CDATA[
+    void updateProdReceipt()
+    {
+        ProdJournalCreateProd prodJournalCreate = ProdJournalCreateProd::newReportFinished(prodParmReportFinished,
+                                                                                           qtyGoodProductionReceipt,
+                                                                                           qtyErrorProductionReceipt);
+        prodJournalCreate.runOperation();
+
+        ProdJournalTable prodJournalTable = prodJournalCreate.usedProdJournalTable();
+
+        rafJournalId = prodJournalTable.JournalId;
+
+        if (!prodParmReportFinished.InventTransId)
+        {
+            ProdJournalProd prodJournalProd;
+
+            select firstonly InventTransId from prodJournalProd
+                where prodJournalProd.JournalId == prodJournalTable.JournalId
+                    && prodJournalProd.ItemId   == prodParmReportFinished.ItemId
+                    && prodJournalProd.InventTransId;
+
+            if (prodJournalProd.InventTransId)
+            {
+                prodParmReportFinished.selectForUpdate(true);
+                prodParmReportFinished.InventTransId = prodJournalProd.InventTransId;
+                prodParmReportFinished.doUpdate();
+            }
+        }
+
+        if (prodJournalTable.canPostJournal())
+        {
+            ProdJournalCheckPostProd prodJournalCheckPostProd = ProdJournalCheckPostProd::newPostJournal(prodJournalTable.JournalId,prodParmReportFinished.JournalShowInfo);
+            prodJournalCheckPostProd.runOperation();
+
+            prodJournalTable.doUpdate();
+        }
+        if (prodTable.ProdType == ProdType::Process
+            && prodTable.status().isBefore(ProdStatus::ReportedFinished)
+            && ( prodParmReportFinished.EndJob
+                 || (InventTable::find(prodParmReportFinished.ItemId).PmfProductType == PmfProductType::MainItem
+                     && !FeatureStateProvider::isFeatureEnabled(ProdPlanningItemAutoReportAsFinishedToggle::instance()))))
+        {
+            PmfProdCoBy coBy;
+
+            select firstonly TableId from coBy
+                where coBy.ProdId == prodTable.ProdId
+                && coBy.RemainCoByPhysical > 0;
+            if (!coBy)
+            {
+                if (prodTable.prodParametersDim().DeleteCapReservReportFinish)
+                {
+                    WrkCtrCapResHandler::construct().deleteOrderReservations(
+                                    WrkCtrCapRefType::Production,
+                                    prodTable.ProdId);
+                }
+
+                ProdRoute::reportOprAsFinished(prodTable.ProdId);
+                ProdRouteJob::reportJobAsFinished(prodTable.ProdId);
+
+                if (!prodJournalTable.ProdAutoPickList)
+                {
+                    if (ProdJournalBOM::checkNotMissingPosting(prodTable.ProdId))
+                    {
+                        ProdBOM::updateNonePhysicalRemain(prodTable.ProdId);
+                    }
+                    else
+                    {
+                        throw error("@SYS18447");
+                    }
+                }
+                ttsbegin;
+
+                // Re-read the production order since other methods might have changed the buffer
+                prodTable = ProdTable::find(prodTable.ProdId, true);
+
+                // Set the status and update
+                prodTable.ProdStatus = ProdStatus::ReportedFinished;
+                prodTable.update();
+
+                ttscommit;
+            }
+        }
+
+        this.addUpdateRec(ProdTable::find(prodParmReportFinished.ProdId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRouteConsumption</Name>
+				<Source><![CDATA[
+    void updateRouteConsumption()
+    {
+        if (prodParmReportFinished.RouteAutoConsump != RouteAutoConsump::Never || prodParmReportFinished.EndRouteCard)
+        {
+            using (var m = ProdInstrumentationSegmentFactory::create(ProdInstrumentationActivities::UpdateReportAsFinishedRouteConsumption))
+            {
+                ProdJournalCreateRoute prodJournalCreate = ProdJournalCreateRoute::newReportFinished(prodParmReportFinished);
+                prodJournalCreate.runOperation();
+
+                ProdJournalTable prodJournalTable = prodJournalCreate.usedProdJournalTable();
+
+                if (prodJournalTable.canPostJournal())
+                {
+                    ProdJournalCheckPostRoute prodJournalCheckPostRoute = ProdJournalCheckPostRoute::newPostJournal(prodJournalTable.JournalId,prodParmReportFinished.JournalShowInfo);
+                    prodJournalCheckPostRoute.runOperation();
+
+                    hasPostedRAF = prodJournalCheckPostRoute.hasPostedRAF();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    boolean validate()
+    {
+        boolean ret = super();
+
+        if (ret)
+        {
+            InventDim inventDim = InventDim::find(prodParmReportFinished.InventDimId);
+            ret = inventDim.checkDimFieldsValid(prodParmReportFinished.ItemId, inventDim);
+
+            ret = ret && this.checkWHSWorkTableWithSameLicensePlate(inventDim);
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustCheckWHSWorkTableWithSameLicensePlate</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal boolean mustCheckWHSWorkTableWithSameLicensePlate(InventDim _inventDim)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkWHSWorkTableWithSameLicensePlate</Name>
+				<Source><![CDATA[
+    private boolean checkWHSWorkTableWithSameLicensePlate(InventDim _inventDim)
+    {
+        if (this.mustCheckWHSWorkTableWithSameLicensePlate(_inventDim) && _inventDim.LicensePlateId)
+        {
+            WHSWorkTable whsWorkTable = WHSWorkTable::findWHSWorkTableWithSameLicensePlate(prodParmReportFinished.ProdId, _inventDim.LicensePlateId);
+        
+            if (whsWorkTable)
+            {
+                return checkFailed(strFmt("@WAX:Error_RepeatedTargetLicensePlateNotAllowedForWHSWorkTable", _inventDim.LicensePlateId));
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>whsOverReportQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts more inventory if overProducing.
+    /// </summary>
+    /// <param name="_qty">
+    /// The quantity we are reporting as finished.
+    /// </param>
+    protected void whsOverReportQty(Qty _qty)
+    {
+        // If the started quantity is less than started quantity, start the difference
+        if (   WHSInventEnabled::exist(prodTable.ItemId)
+            && ((!PdsGlobal::pdsIsCWItem(prodTable.ItemId) && prodTable.reportedFinishedGood() + _qty > prodTable.QtySched)
+            ||  (PdsGlobal::pdsIsCWItem(prodTable.ItemId)  && prodTable.pdsCWReportedFinishedGood() + _qty > prodTable.PdsCWBatchSched)))
+        {
+            ProdMultiStartUp prodMultiStartUp = new ProdMultiStartUp();
+            ParmUpdate       parmUpdate       = prodMultiStartUp.defaultParmUpdate();
+            ParmBuffer       parmBuffer       = prodMultiStartUp.defaultParmBuffer();
+
+            RunBaseMultiParm::initParm(prodMultiStartUp);
+
+            prodMultiStartUp.insertParmUpdate(parmUpdate);
+
+            parmBuffer.Linenum = 1;
+
+            ProdParmStartUp prodParmStartUp = parmBuffer;
+
+            prodParmStartUp.ParmId = prodMultiStartUp.parmId();
+            prodParmStartUp.initValue();
+            prodMultiStartUp.initParmBuffer(prodParmStartUp);
+
+            InventQty       addStartQty;
+            PdsCWInventQty  cwAddStartQty;
+            if(PdsGlobal::pdsIsCWItem(prodTable.ItemId))
+            {
+                cwAddStartQty = _qty + prodTable.pdsCWReportedFinishedGood() - prodTable.PdsCWBatchStup;
+                addStartQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(prodTable.ItemId,
+                                                                                                prodTable.InventDimId,
+                                                                                                cwAddStartQty,
+                                                                                                PdsCatchWeight::cwUnitId(prodTable.ItemId),
+                                                                                                InventTableModule::find(prodTable.ItemId, ModuleInventPurchSales::Invent).UnitId,
+                                                                                                NoYes::Yes);
+            }
+            else
+            {
+                addStartQty = _qty + prodTable.reportedFinishedGood() - prodTable.QtyStUp;
+            }
+            prodParmStartUp.StartUpQty          = addStartQty;
+            prodParmStartUp.PdsCWStartupQty     = cwAddStartQty;
+            prodParmStartUp.ProdId              = prodTable.ProdId;
+            prodParmStartUp.BOMJournalNameId    = prodParmReportFinished.BOMJournalNameId;
+            prodParmStartUp.RouteJournalNameId  = prodParmReportFinished.RouteJournalNameId;
+            prodParmStartUp.insert();
+
+            prodMultiStartUp.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deferPosting</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal boolean deferPosting()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs the <c>ProdUpdReportFinished</c> object.
+    /// </summary>
+    /// <returns>
+    /// The <c>ProdUpdReportFinished</c> object that was constructed.
+    /// </returns>
+    public static ProdUpdReportFinished construct()
+    {
+        ProdUpdReportFinished prodUpdReportFinished = new ProdUpdReportFinished();
+
+        return prodUpdReportFinished;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmBufferFromHistCost</Name>
+				<Source><![CDATA[
+    static ProdParmReportFinished initParmBufferFromHistCost(ProdParmHistoricalCost prodParmHistoricalCost)
+    {
+        ProdParmReportFinished  prodParmReportFinished;
+
+        ProdTable prodTable = ProdTable::find(prodParmHistoricalCost.ProdId);
+        ProdParametersDim prodParametersDim = prodTable.prodParametersDim();
+
+        prodParmReportFinished.ParmBuffer::initParmId();
+        prodParmReportFinished.initParmDefault();
+        prodParmReportFinished.initFromProdParametersDim(prodParametersDim);
+        prodParmReportFinished.initFromProdTable(prodTable);
+        prodParmReportFinished.ProdId           = prodTable.ProdId;
+        prodParmReportFinished.AutoUpdate       = NoYes::Yes;
+        prodParmReportFinished.QtyGood          = ProdUpdReportFinished::proposalQtyGood(prodParmHistoricalCost.ProdId);
+        prodParmReportFinished.QtyError         = ProdUpdReportFinished::proposalQtyError(prodParmHistoricalCost.ProdId);
+        if (PdsGlobal::pdsIsCWItem(prodParmReportFinished.ItemId))
+        {
+            prodParmReportFinished.PdsCWBatchGood =
+                ProdUpdReportFinished::pdsCWProposalQtyGood(
+                    prodParmHistoricalCost.ProdId);
+            prodParmReportFinished.PdsCWBatchErr  =
+                ProdUpdReportFinished::pdsCWProposalQtyError(
+                    prodParmHistoricalCost.ProdId);
+        }
+        prodParmReportFinished.PostNow          = NoYes::Yes;
+
+        prodParmReportFinished.AcceptError = ProdParameters::find().JournalAcceptError;
+  
+        prodParmReportFinished.EndJob           = NoYes::Yes;
+        prodParmReportFinished.bomAutoConsump   = prodParametersDim.bomAutoConsumpRepFin;
+        prodParmReportFinished.RouteAutoConsump = prodParametersDim.RouteAutoConsumpRepFin;
+        prodParmReportFinished.TransDate        = prodParmHistoricalCost.CalcDate;
+
+        if (#PDSPotencyEnabled)
+        {
+            InventTable inventTable = prodTable.inventTable();
+
+            if (inventTable.pdsBaseAttributeId           != ''
+                && inventTable.pdsPotencyAttribRecording == PDSPotencyAttribRecordingEnum::PurchProdReceipt)
+            {
+                prodParmReportFinished.pdsBaseValue = prodTable.inventTable().pdsBaseValueDisplay();
+            }
+        }
+
+        return prodParmReportFinished;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newParmBuffer</Name>
+				<Source><![CDATA[
+    static ProdUpdReportFinished newParmBuffer(ProdParmReportFinished prodParmReportFinished)
+    {
+        if (! prodParmReportFinished.ParmId)
+        {
+            prodParmReportFinished.skipTTSCheck(true);
+            prodParmReportFinished.ParmBuffer::initParmId();
+            prodParmReportFinished.write();
+        }
+
+        ProdUpdReportFinished prodUpdReportFinished = ProdUpdReportFinished::construct();
+        prodUpdReportFinished.parmParmBuffer(prodParmReportFinished);
+
+        return prodUpdReportFinished;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pdsCWProposalQtyError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Proposes a catch-weight error quantity for reporting as finished the production order.
+    /// </summary>
+    /// <param name="_prodId">
+    ///    The ID of the production order.
+    /// </param>
+    /// <returns>
+    ///    A catch-weight error quantity for reporting as finished the production order.
+    /// </returns>
+    public static PdsCWInventQty pdsCWProposalQtyError(ProdId _prodId)
+    {
+        PdsCWInventQty   cwQtyError;
+
+        ProdTable prodTable= ProdTable::find(_prodId);
+
+        if (prodTable.mandatoryRegister())
+        {
+            return 0;
+        }
+        else
+        {
+            cwQtyError = prodTable.cwRouteReportedError() - prodTable.cwReportedFinishedError();
+
+            if (cwQtyError < 0)
+            {
+                cwQtyError = 0;
+            }
+        }
+
+        return cwQtyError;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pdsCWProposalQtyGood</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates and returns the Proposal quantity good in catch weight units.
+    /// </summary>
+    /// <param name="_prodId">
+    /// Production order used to calculate the proposal quantity.
+    /// </param>
+    /// <returns>
+    /// Returns the proposal good quantity in catch weight units.
+    /// </returns>
+    public static PdsCWInventQty pdsCWProposalQtyGood(ProdId _prodId)
+    {
+        ProdTable prodTable                  = ProdTable::find(_prodId);
+        PdsCWInventQty reportedFinishedGood  = prodTable.pdsCWReportedFinishedGood();
+        PdsCWInventQty reportedFinishedError = prodTable.pdsCWReportedFinishedErr();
+
+        PdsCWInventQty routeReportedGood     = conPeek(ProdRouteTrans::qtyGoodAtOrBeforeOprWithCWQty(_prodId,ProdRoute::lastOprNum(_prodId)), 2);
+        PdsCWInventQty routeReportedError    = prodTable.cwRouteReportedError();
+        PdsCWInventQty maxReportedError      = (reportedFinishedError < routeReportedError) ? routeReportedError : reportedFinishedError;
+
+        InventQty plannedOrder;
+
+        if (prodTable.mandatoryRegister())
+        {
+            InventTransOriginId inventTransOriginId = InventTransOriginProdTable::findInventTransOriginId(prodTable.DataAreaId, prodTable.ProdId);
+            plannedOrder = InventTransSum::newStandard().pdsCWidRegistered(inventTransOriginId);
+        }
+        else
+        {
+            if (PdsGlobal::pdsIsCWItem(prodTable.ItemId) && InventTransIdSumSingleStatus::pdsCWQtyRegistered(InventTransOrigin::findByInventTransId(prodTable.InventTransId).RecId))
+            {
+                plannedOrder = InventTransIdSumSingleStatus::pdsCWQtyRegistered(InventTransOrigin::findByInventTransId(prodTable.InventTransId).RecId);
+            }
+            else
+            {
+                // if there is a different between the total reported CW quantity from route cards and the total reported CW quantity of RaF journals
+                // then the new RaF journal will be initialized based on this difference
+                if (routeReportedGood)
+                {
+                    plannedOrder = routeReportedGood + routeReportedError - reportedFinishedGood - maxReportedError;
+                }
+
+                // alternatively the new RAF journal will be initialized based on the difference between the started/scheduled CW quantity
+                // and the current total reported as finished CW quantity
+                if (!plannedOrder)
+                {
+                    plannedOrder = prodTable.PdsCWBatchStup ? prodTable.PdsCWBatchStup : prodTable.PdsCWBatchSched;
+                    plannedOrder = plannedOrder - reportedFinishedGood - maxReportedError;
+                }
+
+                if (plannedOrder < 0)
+                {
+                    plannedOrder = 0;
+                }
+            }
+        }
+
+        return plannedOrder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pdsCWProposalQtyGoodRoute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Proposes a catch weight quantity that should be reported as finished for an operation, based on what was reported
+    /// on the previous operation or on the production order.
+    /// </summary>
+    /// <param name="_prodRoute">
+    /// The route operation for which to get the proposal.
+    /// </param>
+    /// <returns>
+    /// A proposed catch weight quantity that should be reported as finished.
+    /// </returns>
+    /// <remarks>
+    /// This method has similar logic as the non-CW ProposalQtyGoodRoute so if that is changed this should also be changed!
+    /// </remarks>
+    public static PdsCWInventQty pdsCWProposalQtyGoodRoute(ProdRoute _prodRoute)
+    {
+        ProdRoute           prodRoutePrevious;
+        ProdRouteTrans      prodRouteTrans;
+        ProdTable           prodTable               = _prodRoute.prodTable();
+        PdsCWInventQty      proposal;
+        boolean             hasPreviousOperations   = false;
+
+        PdsCWInventQty currentGood = _prodRoute.pdsCWQtyGood();
+        PdsCWInventQty currentError = _prodRoute.pdsCWQtyError();
+
+        // Get the minimum reported good sum from the previous operations
+        while select sum(PdsCWQtyGood), sum(PdsCWQtyError), OprNum from prodRouteTrans
+            group by OprNum
+            exists join prodRoutePrevious
+            where prodRoutePrevious.ProdId      == _prodRoute.ProdId
+               && prodRoutePrevious.OprPriority == RouteOprPriority::Primary
+               && prodRoutePrevious.OprNumNext  == _prodRoute.OprNum
+               && prodRouteTrans.TransRefId     == _prodRoute.ProdId
+               && prodRouteTrans.TransRefType   == ProdTransRefType::Production
+               && prodRouteTrans.TransType      == ProdRouteTransType::Qty
+               && prodRouteTrans.OprNum         == prodRoutePrevious.OprNum
+               && prodRouteTrans.OprPriority    == RouteOprPriority::Primary
+        {
+            if (   (prodRouteTrans.PdsCWQtyGood != 0 || prodRouteTrans.PdsCWQtyError != 0)
+                && (prodRouteTrans.PdsCWQtyGood < proposal || !hasPreviousOperations))
+            {
+                // When something has been reported on the previous operation then the proposal for the
+                // current operation cannot be greater than that
+                proposal = prodRouteTrans.PdsCWQtyGood;
+                hasPreviousOperations = true;
+            }
+        }
+
+        if (!hasPreviousOperations)
+        {
+            // Nothing has been previously reported so use entire started or scheduled quantity
+            if (prodTable.PdsCWBatchStup != 0)
+            {
+                proposal = prodTable.PdsCWBatchStup;
+            }
+            else
+            {
+                proposal = prodTable.PdsCWBatchSched;
+            }
+        }
+
+        if (!_prodRoute.OprNumNext)
+        {
+            // Last operation should take into account previously reported finished on the production order
+            proposal = proposal - max(currentGood, prodTable.pdsCWReportedFinishedGood()) - max(currentError, prodTable.pdsCWReportedFinishedErr());
+        }
+        else
+        {
+            proposal = proposal - currentGood - currentError;
+        }
+
+        return proposal > 0 ? proposal : 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfCoByProposalQtyGood</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes proposal quantity good for Co/By products.   If registered transactions exist,
+    /// returns the registered quantity, otherwise return the standard Proposal Quantity Good.
+    /// </summary>
+    /// <param name="_prod">
+    /// Production order which ProposalQty will be calculated for.
+    /// </param>
+    /// <returns>
+    /// CW proposal good quantity.  Returns registered
+    /// CW quantity, or returns value calculated the same as standard proposalQtyGood.
+    /// </returns>
+    public static InventQty pmfCoByProposalQtyGood(PmfProdCoBy _prod)
+    {
+        InventQty           reportedFinishedGood   = _prod.reportedFinishedGood();
+        InventQty           reportedFinishedError  = _prod.reportedFinishedError();
+        InventQty           plannedOrder;
+
+        if (_prod.inventTable().modelGroup().MandatoryRegister)
+        {
+            InventTransOriginId inventTransOriginId = InventTransOriginProdTable::findInventTransOriginId(_prod.DataAreaId, _prod.ProdId);
+            plannedOrder = InventTransSum::newStandard().originRegistered(inventTransOriginId);
+        }
+        else
+        {
+            if (PdsGlobal::pdsIsCWItem(_prod.ItemId) && InventTransIdSumSingleStatus::pdsCWQtyRegistered(InventTransOrigin::findByInventTransId(_prod.InventTransId).RecId))
+            {
+                plannedOrder = InventTransIdSumSingleStatus::pdsCWQtyRegistered(InventTransOrigin::findByInventTransId(_prod.InventTransId).RecId);
+            }
+            else
+            {
+                plannedOrder = _prod.QtyCoByStUp;
+                if (!plannedOrder)
+                {
+                    plannedOrder = _prod.type().qtyCoBySched();
+                }
+
+                plannedOrder = plannedOrder - reportedFinishedGood - reportedFinishedError;
+
+                if (plannedOrder < 0)
+                {
+                    plannedOrder = 0;
+                }
+            }
+        }
+
+        return plannedOrder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfCWCoByProposalQtyGood</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates and returns the Proposal quantity for Co/By products in catch weight units.
+    /// </summary>
+    /// <param name="_prod">
+    /// The production co/by product used to calculate the proposal quantity.
+    /// </param>
+    /// <returns>
+    /// Returns the proposal good quantity in catch weight units.
+    /// </returns>
+    public static PdsCWInventQty pmfCWCoByProposalQtyGood(PmfProdCoBy _prod)
+    {
+        InventQty           reportedFinishedGood   = _prod.pdsCWReportedFinishedGood();
+        InventQty           reportedFinishedError  = _prod.pdsCWReportedFinishedError();
+        PdsCWInventQty      plannedOrder;
+
+        if (_prod.inventTable().modelGroup().MandatoryRegister)
+        {
+            InventTransOriginId inventTransOriginId = InventTransOriginProdTable::findInventTransOriginId(_prod.DataAreaId, _prod.ProdId);
+            plannedOrder = InventTransSum::newStandard().pdsCWidRegistered(inventTransOriginId);
+        }
+        else
+        {
+            if (PdsGlobal::pdsIsCWItem(_prod.ItemId) && InventTransIdSumSingleStatus::pdsCWQtyRegistered(InventTransOrigin::findByInventTransId(_prod.InventTransId).RecId))
+            {
+                plannedOrder = InventTransIdSumSingleStatus::pdsCWQtyRegistered(InventTransOrigin::findByInventTransId(_prod.InventTransId).RecId);
+            }
+            else
+            {
+                plannedOrder = _prod.PdsCWInventStup;
+                if (!plannedOrder)
+                {
+                    plannedOrder = PdsCatchWeight::cwQty( _prod.ItemId, _prod.type().qtyCoBySched());
+                }
+
+                plannedOrder = plannedOrder - reportedFinishedGood - reportedFinishedError;
+
+                if (plannedOrder < 0)
+                {
+                    plannedOrder = 0;
+                }
+            }
+        }
+
+        return plannedOrder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>proposalQtyError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Proposes an error quantity for reporting as finished the production order.
+    /// </summary>
+    /// <param name="_prodId">
+    ///    The ID of the production order.
+    /// </param>
+    /// <returns>
+    ///    An error quantity for reporting as finished the production order.
+    /// </returns>
+    public static InventQty proposalQtyError(ProdId _prodId)
+    {
+        InventQty   qtyError;
+
+        ProdTable prodTable = ProdTable::find(_prodId);
+        #ISOCountryRegionCodes
+
+        if (!prodTable.mandatoryRegister())
+        {
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]))
+            {
+                qtyError = max(prodTable.routeReportedError() - prodTable.reportedFinishedError() - prodTable.releasedError_RU(), 0);
+            }
+            else
+            {
+                if (prodTable.prodParametersDim().IncreaseRemainQtyWithErrorQty)
+                {
+                    qtyError = prodTable.routeReportedError();
+                }
+                else
+                {
+                    qtyError = prodTable.routeReportedError() - prodTable.reportedFinishedError();
+                }
+            }
+        }
+
+        return qtyError;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>proposalQtyGood</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Proposes a good quantity for reporting as finished on the production order.
+    /// </summary>
+    /// <param name="_prodId">
+    ///    The ID of the production order.
+    /// </param>
+    /// <returns>
+    ///    A good quantity for reporting as finished on the production order.
+    /// </returns>
+    public static InventQty proposalQtyGood(ProdId _prodId)
+    {
+        InventQty               qtyGood;
+        ProdTable               prodTable             = ProdTable::find(_prodId);
+        InventQty               routeReportedError    = prodTable.routeReportedError();
+        InventQty               routeReportedGood     = conPeek(ProdRouteTrans::qtyGoodAtOrBeforeOprWithCWQty(_prodId,ProdRoute::lastOprNum(_prodId)), 1);
+        InventQty               routeReportedTotal    = routeReportedGood + routeReportedError;
+        InventQty               reportedFinishedGood  = prodTable.reportedFinishedGood();
+        InventQty               reportedFinishedError = prodTable.reportedFinishedError();
+        InventQty               maxReportedError      = (reportedFinishedError < routeReportedError) ? routeReportedError : reportedFinishedError;
+        #ISOCOuntryRegionCodes
+
+        if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]))
+        {
+            reportedFinishedError += prodTable.releasedError_RU();
+            maxReportedError       = (reportedFinishedError < routeReportedError) ? routeReportedError : reportedFinishedError;
+        }
+
+        if (prodTable.mandatoryRegister())
+        {
+            InventTransOriginId inventTransOriginId = InventTransOriginProdTable::findInventTransOriginId(prodTable.DataAreaId, prodTable.ProdId);
+            qtyGood = InventTransSum::newStandard().originRegistered(inventTransOriginId);
+        }
+        else
+        {
+            if (PdsGlobal::pdsIsCWItem(prodTable.ItemId) && InventTransIdSumSingleStatus::pdsCWQtyRegistered(InventTransOrigin::findByInventTransId(prodTable.InventTransId).RecId))
+            {
+                qtyGood = InventTransIdSumSingleStatus::qtyRegistered(InventTransOrigin::findByInventTransId(prodTable.InventTransId).RecId);
+            }
+            else
+            {
+                // if there is a different between the total reported quantity from route cards and the total reported quantity of RaF journals
+                // then the new RaF journal will be initialized based on this difference
+                if (routeReportedTotal)
+                {
+                    qtyGood = routeReportedTotal - reportedFinishedGood - maxReportedError;
+                }
+
+                // alternatively the new RAF journal will be initialized based on the difference between the started/scheduled quantity
+                // and the current total reported as finished quantity
+                if (!qtyGood)
+                {
+                    if (prodTable.prodParametersDim().IncreaseRemainQtyWithErrorQty)
+                    {
+                        qtyGood = prodTable.QtyStUp ? prodTable.QtyStUp : prodTable.QtySched;
+                        qtyGood = qtyGood - reportedFinishedGood;
+                    }
+                    else
+                    {
+                        qtyGood = prodTable.QtyStUp ? prodTable.QtyStUp : prodTable.QtySched;
+                        qtyGood = qtyGood - reportedFinishedGood - maxReportedError;
+                    }
+                }
+            }
+        }
+
+        return qtyGood;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>proposalQtyGoodRoute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Proposes a quantity to report as finished for an operation, depending on what was reported on the
+    ///    previous operation or on the production order.
+    /// </summary>
+    /// <param name="_prodRoute">
+    ///    The route operation for which to get the proposal.
+    /// </param>
+    /// <returns>
+    ///    A proposed quantity that should be reported as finished.
+    /// </returns>
+    public static InventQty proposalQtyGoodRoute(ProdRoute _prodRoute)
+    {
+        ProdRoute       prodRoutePrevious;
+        ProdRouteTrans  prodRouteTrans;
+        ProdTable       prodTable               = _prodRoute.prodTable();
+        InventQty       proposal;
+        boolean         hasPreviousOperations   = false;
+
+        InventQty currentGood = _prodRoute.qtyGood();
+        InventQty currentError = _prodRoute.qtyError();
+
+        // Get the minimum reported good sum from the previous operations
+        while select sum(QtyGood), sum(QtyError), OprNum from prodRouteTrans
+            group by OprNum
+            exists join prodRoutePrevious
+            where prodRoutePrevious.ProdId      == _prodRoute.ProdId
+               && prodRoutePrevious.OprPriority == RouteOprPriority::Primary
+               && prodRoutePrevious.OprNumNext  == _prodRoute.OprNum
+               && prodRouteTrans.TransRefId     == _prodRoute.ProdId
+               && prodRouteTrans.TransRefType   == ProdTransRefType::Production
+               && prodRouteTrans.TransType      == ProdRouteTransType::Qty
+               && prodRouteTrans.OprNum         == prodRoutePrevious.OprNum
+               && prodRouteTrans.OprPriority    == RouteOprPriority::Primary
+        {
+            if (   (prodRouteTrans.QtyGood != 0 || prodRouteTrans.QtyError != 0)
+                && (prodRouteTrans.QtyGood < proposal || !hasPreviousOperations))
+            {
+                // When something has been reported on the previous operation then the proposal for the
+                // current operation cannot be greater than that
+                proposal = prodRouteTrans.QtyGood;
+                hasPreviousOperations = true;
+            }
+        }
+
+        if (!hasPreviousOperations)
+        {
+            // Nothing has been previously reported so use entire started or scheduled quantity
+            if (prodTable.QtyStUp != 0)
+            {
+                proposal = prodTable.QtyStUp;
+            }
+            else
+            {
+                proposal = prodTable.QtySched;
+            }
+        }
+
+        proposal = proposal - currentGood - currentError;
+
+        return proposal > 0 ? proposal : 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runPreviousJob</Name>
+				<Source><![CDATA[
+    static void runPreviousJob(
+        ProdParmReportFinished  prodParmReportFinished,
+        RunbaseRecsMapable      _multi = null)
+    {
+        ProdParmStartUp prodParmStartUp = ProdUpdStartUp::initParmBufferFromRepFin(prodParmReportFinished);
+
+        prodParmStartUp.insert();
+        ProdTable::find(prodParmStartUp.ProdId).status().runStartUp(prodParmStartUp,false,null,_multi,true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPutWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates Put-away work for the items when doing report as finished.
+    /// </summary>
+    /// <remarks>
+    /// Work is created only for items that are enabled for advanced warehouse processes and
+    /// have Good Quantity > 0
+    /// </remarks>
+    public void createPutWork()
+    {
+        if (prodParmReportFinished
+            && prodParmReportFinished.QtyGood > 0
+            && prodParmReportFinished.ReportFinishProd == NoYes::Yes
+            && WHSInventTable::find(prodParmReportFinished.ItemId)
+            && InventDim::find(prodParmReportFinished.InventDimId).inventLocation().WHSEnabled
+            && prodParmReportFinished.PmfProductType != PmfProductType::MainItem)
+        {
+            this.doCreatePutWork(prodParmReportFinished);
+        }
+
+        this.createPutWorkForCoAndByProducts();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPutWorkForCoAndByProducts</Name>
+				<Source><![CDATA[
+    private void createPutWorkForCoAndByProducts()
+    {
+        if (!createWorkForWaitingCoByProducts && (!whsCoByRAFCanBePosted || !whsCoByRAFCanBePosted.elements()))
+        {
+            return;
+        }
+
+        ProdParmReportFinished whsProdParmReportFinishedCoBy;
+        WHSInventTable         whsInventTable;
+        InventDim              inventDim;
+        InventLocation         inventLocation;
+
+        // Create work for posted CoBy RAF, unless posting is async
+        ParmJobStatus createWorkForStatus
+            = !createWorkForWaitingCoByProducts ? ParmJobStatus::Executed : ParmJobStatus::Waiting;
+
+        while select whsProdParmReportFinishedCoBy
+            where whsProdParmReportFinishedCoBy.ParmId              == prodParmReportFinished.ParmId
+               && whsProdParmReportFinishedCoBy.QtyGood             > 0
+               && whsProdParmReportFinishedCoBy.ReportFinishProd    == NoYes::Yes
+               && whsProdParmReportFinishedCoBy.ProdId              == prodTable.ProdId
+               && whsProdParmReportFinishedCoBy.JobStatus           == createWorkForStatus
+               && (whsProdParmReportFinishedCoBy.PmfProductType     == PmfProductType::Co_Product
+               || whsProdParmReportFinishedCoBy.PmfProductType      == PmfProductType::By_Product)
+        exists join inventDim
+            where inventDim.inventDimId == whsProdParmReportFinishedCoBy.InventDimId
+        exists join inventLocation
+            where inventLocation.InventLocationId == inventDim.InventLocationId
+                && inventLocation.whsEnabled
+        exists join whsInventTable
+            where whsInventTable.ItemId == whsProdParmReportFinishedCoBy.ItemId
+        {
+            if (createWorkForWaitingCoByProducts || whsCoByRAFCanBePosted.in(whsProdParmReportFinishedCoBy.RecId))
+            {
+                this.doCreatePutWork(whsProdParmReportFinishedCoBy);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doCreatePutWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates work for a RAF Journal line and executes auto-executable work among them.
+    /// </summary>
+    /// <param name="_prodParmReportFinishedreportedProduct">
+    /// <c>ProdParmReportFinished</c> record containing item for which work should be created.
+    /// </param>
+    protected void doCreatePutWork(ProdParmReportFinished _prodParmReportFinishedreportedProduct)
+    {
+        if (WHSWorkLineFindInventTransDimFromPickReceiptForPutRAFOnlyFlight::instance().isEnabled())
+        {
+            using (var context = ProdPutWorkCreationContext::construct())
+            {
+                WHSWorkCreateProdPut workCreateProdPut = new WHSWorkCreateProdPut(ProdTable::find(_prodParmReportFinishedreportedProduct.ProdId));
+                workCreateProdPut.parmRAFJournalId(this.parmRAFJournalId());
+                WHSWorkTable::autoExecuteWorkInWorkBuildId(workCreateProdPut.createWorkFromProdParmReportFinished(_prodParmReportFinishedreportedProduct));
+            }
+        }
+        else
+        {
+            WHSWorkCreateProdPut workCreateProdPut = new WHSWorkCreateProdPut(ProdTable::find(_prodParmReportFinishedreportedProduct.ProdId));
+            workCreateProdPut.parmRAFJournalId(this.parmRAFJournalId());
+            WHSWorkTable::autoExecuteWorkInWorkBuildId(workCreateProdPut.createWorkFromProdParmReportFinished(_prodParmReportFinishedreportedProduct));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCalledFromWorkCreation</Name>
+				<Source><![CDATA[
+    public boolean parmCalledFromWorkCreation(boolean _calledFromWorkCreation = calledFromWorkCreation)
+    {
+        calledFromWorkCreation = _calledFromWorkCreation;
+        return calledFromWorkCreation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRAFJournalId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Gets or sets RAFJournalId.
+    /// </summary>
+    /// <param name = "_rafJOurnalId">
+    ///     ProdJournalId that sets RAFJournalId, Optional.
+    /// </param>
+    /// <returns>
+    ///     The updated ProdJournalId.
+    /// </returns>
+    public ProdJournalId parmRAFJournalId(ProdJournalId _rafJOurnalId = rafJournalId)
+    {
+        rafJournalId = _rafJOurnalId;
+        return rafJournalId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reportFinished</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Run RAF. Using for warehouse app
+    /// </summary>
+    /// <param name = "_prodParmReportFinished">Record containing item for which work should be created.</param>
+    /// <returns>The updated ProdJournalId</returns>
+    public static ProdJournalId reportFinished(ProdParmReportFinished _prodParmReportFinished)
+    {
+        ProdUpdReportFinished prodUpdReportFinished = ProdUpdReportFinished::construct();
+
+        prodUpdReportFinished.parmParmBuffer(_prodParmReportFinished);
+        prodUpdReportFinished.initProdTable();
+        prodUpdReportFinished.parmCalledFromWorkCreation(true);
+        prodUpdReportFinished.run();
+        ProdJournalId prodRafJournalId = prodUpdReportFinished.parmRAFJournalId();
+
+        return prodRafJournalId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

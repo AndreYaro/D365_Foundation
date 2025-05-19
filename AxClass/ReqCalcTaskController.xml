@@ -1,0 +1,2221 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ReqCalcTaskController</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The class ReqCalcTaskController handles assigning master planning tasks to master planning threads while
+/// taking into account synchronization of the tasks being assigned.
+/// </summary>
+class ReqCalcTaskController implements System.IDisposable
+{
+    #OCCRetryCount
+    #TimeConstants
+    #Req
+
+    const int DefaultPollingInterval = 1000;   // ms
+    const int DefaultAssignBundleTelemetryIntervalSeconds = 10; // ms
+    private int resetAssignedNotCompletedBundlesMaximumRetryCount; 
+
+    private utcdatetime nextEarliestAssignBundleTelemetryEnabledDateTime;
+
+    ReqProcessId        processId;
+    ReqProcessThreadId  threadId;
+    ReqPlanId           reqPlanId;
+
+    int                 pollingInterval;
+    UserConnection      connection;
+
+    boolean             safeLevelsDefined;
+    ReqProcessStatus    safeStatus;
+    BOMLevel            safeLevel;
+    ReqLevelState       safeLevelState;
+
+    Set                 taskGroupIds;
+    RecordInsertList    taskTraceRIL;
+
+    ReqCalcTasksBundle  currentBundle;
+    ReqCalcTask         currentBundleTask;
+    private UnitofWork  taskUoWInsertList;
+
+    private ReqProcessStatus prevStatus;
+    private BOMLevel         prevLevel;
+    private ReqLevelState    prevLevelState;
+    private readonly boolean isReqCalcTaskControllerClearTaskAndBundleListEnabled;
+
+    private readonly boolean isReqCalcTaskControllerTryFetchFromSafeLevelsFirstToggleEnabled;
+    private boolean tryFetchingNextBundleFromSafeLevelsFirst;
+
+    private readonly boolean reqCalcTaskControllerTryFetchSamePreviousNotEndedBundleFirstToggleEnabled;
+    private RecId lastFoundPreviousNotEndedBundleRecId;
+
+    private readonly boolean reqCalcTaskControllerTryFetchSameNotEndedBundleFirstToggleEnabled;
+    private RecId lastFoundNotEndedBundleRecId;
+
+    private readonly boolean reqResetAssignedNotCompletedTasksSameTtsScopeFlightEnabled;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>assignBundle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns a bundle to the thread.
+    /// </summary>
+    /// <param name="_reqCalcTasksBundle">
+    /// The bundle record which will contain the assigned bundle.
+    /// </param>
+    /// <returns>
+    /// true if bundle has been assigned; otherwise, false.
+    /// </returns>
+    public boolean assignBundle(ReqCalcTasksBundle _reqCalcTasksBundle)
+    {
+        ReqCalcTasksBundle reqCalcTasksBundle = _reqCalcTasksBundle;
+        ReqCalcTasksBundle reqCalcTasksBundleOther;
+
+        boolean enableTelemetry = this.enablePeriodicTelemetryForAssigningBundles();
+        SysInstrumentationActivityContext activityContext;
+        
+        try
+        {
+            if (enableTelemetry)
+            {
+                var instrumentationLogger = ReqInstrumentationLogger::createLogger(classStr(ReqCalcTaskController));
+                activityContext = instrumentationLogger.calcTaskController().assignBundlePeriodic(processId, threadId);
+            }
+
+            this.validateUserConnection();
+
+            reqCalcTasksBundle.clear();
+            reqCalcTasksBundle.setConnection(connection);
+            reqCalcTasksBundleOther.setConnection(connection);
+
+            reqCalcTasksBundle.readPast(true);
+
+            this.tryAssignBundleFromSafeLevels(reqCalcTasksBundle);
+
+            if (!reqCalcTasksBundle)
+            {
+                select firstOnly pessimisticLock reqCalcTasksBundle
+                    order by Status, Level, LevelState, ListNum
+                    where reqCalcTasksBundle.ProcessDataAreaId == curext() &&
+                        reqCalcTasksBundle.ProcessId == processId &&
+                        reqCalcTasksBundle.ProcessingState == ReqCalcTaskState::Waiting;
+            }
+
+            if (reqCalcTasksBundle)
+            {
+                var validReqCalcTaskFound = true;
+
+                if (!safeLevelsDefined
+                    || (reqCalcTasksBundle.Status != safeStatus)
+                    || (reqCalcTasksBundle.Level != safeLevel)
+                    || (reqCalcTasksBundle.LevelState != safeLevelState))
+                {
+                    // check that all previous tasks have completed
+                    this.selectPreviousTaskBundleNotEnded(reqCalcTasksBundle, reqCalcTasksBundleOther);
+                    validReqCalcTaskFound = !reqCalcTasksBundleOther;
+                }
+
+                if (validReqCalcTaskFound)
+                {
+                    reqCalcTasksBundle.ThreadId = threadId;
+                    reqCalcTasksBundle.StartTime = DateTimeUtil::utcNow();
+
+                    safeStatus = reqCalcTasksBundle.Status;
+                    safeLevel = reqCalcTasksBundle.Level;
+                    safeLevelState = reqCalcTasksBundle.LevelState;
+                    safeLevelsDefined = true;
+                    lastFoundPreviousNotEndedBundleRecId = 0;
+                    tryFetchingNextBundleFromSafeLevelsFirst = true;
+
+                    return true;
+                }
+
+                // since a valid next bundle was not found it is unlikely a bundle will be found on safe levels next time
+                tryFetchingNextBundleFromSafeLevelsFirst = false;
+            }
+            else
+            {
+                // since a valid next bundle was not found it is unlikely a bundle will be found on safe levels next time
+                tryFetchingNextBundleFromSafeLevelsFirst = false;
+
+                // check if all tasks are completed
+                this.selectBundleNotEnded(reqCalcTasksBundleOther);
+
+                if (!reqCalcTasksBundleOther || ReqProcessList::findWithCacheDisabledWithoutParameters(processId, false).Cancelled)
+                {
+                    if (enableTelemetry)
+                    {
+                        activityContext.addCustomProperty(ReqCalcTaskControllerInstrumentationActivities::FoundBundle, any2Str(false));
+                        activityContext.addCustomProperty(ReqCalcTaskControllerInstrumentationActivities::MoreTasks, any2Str(false));
+                    }
+
+                    return false;
+                }
+            }
+
+            reqCalcTasksBundle.clear();
+
+            sleep(pollingInterval);
+
+            if (enableTelemetry)
+            {
+                activityContext.addCustomProperty(ReqCalcTaskControllerInstrumentationActivities::FoundBundle, any2Str(false));
+                activityContext.addCustomProperty(ReqCalcTaskControllerInstrumentationActivities::MoreTasks, any2Str(true));
+            }
+
+            return true;
+        }
+        finally
+        {
+            if (activityContext)
+            {
+                activityContext.dispose();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>continueTaskQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves a boolean value indicating whether the task query should continue or not when assigning tasks.
+    /// </summary>
+    /// <returns>
+    /// true if the task query should continue; otherwise, false.
+    /// </returns>
+    protected boolean continueTaskQuery()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBundle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the bundle record.
+    /// </summary>
+    /// <param name="_status">
+    /// The bundle status.
+    /// </param>
+    /// <param name="_level">
+    /// The bundle level.
+    /// </param>
+    /// <param name="_levelState">
+    /// The bundle level state.
+    /// </param>
+    /// <param name="_listNum">
+    /// The bundle list number.
+    /// </param>
+    /// <returns>
+    /// The bundle record.
+    /// </returns>
+    public ReqCalcTasksBundle createBundle(
+        ReqProcessStatus     _status,
+        BOMLevel             _level      = 0,
+        ReqLevelState        _levelState = ReqLevelState::NotApplicable,
+        ReqProcessListNum    _listNum = -1)
+    {
+        return ReqCalcTasksBundle::saveBundle(processId, _status, _level, _levelState, _listNum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initBundle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the bundle record.
+    /// </summary>
+    /// <param name="_status">
+    /// The bundle status.
+    /// </param>
+    /// <param name="_level">
+    /// The bundle level.
+    /// </param>
+    /// <param name="_levelState">
+    /// The bundle level state.
+    /// </param>
+    /// <param name="_listNum">
+    /// The bundle list number.
+    /// </param>
+    /// <returns>
+    /// The bundle record.
+    /// </returns>
+    public ReqCalcTasksBundle initBundle(
+        ReqProcessStatus     _status,
+        BOMLevel             _level      = 0,
+        ReqLevelState        _levelState = ReqLevelState::NotApplicable,
+        ReqProcessListNum    _listNum = -1)
+    {
+        return ReqCalcTasksBundle::initBundle(processId, _status, _level, _levelState, _listNum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteAllBundlesAndTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes all bundles and associated tasks.
+    /// </summary>
+    public void deleteAllBundlesAndTasks()
+    {
+        this.deleteAllTasks();
+
+        ReqCalcTasksBundle::cleanUpProcess(processId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteAllTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes all the tasks for a given process.
+    /// </summary>
+    public void deleteAllTasks()
+    {
+        var instrumentationLogger = ReqInstrumentationLogger::createLogger(classStr(ReqCalcTaskController));
+        
+        using (var activityContext = instrumentationLogger.calcTaskController().deleteAllTasks())
+        {
+            try
+            {
+                ttsbegin;
+                ReqCalcTask::cleanUpProcess(processId);
+                ttscommit;
+            }
+            catch(Exception::Break)
+            {
+                throw;
+            }
+            catch
+            {
+                if (this.retryTasksCleanupErrors())
+                {
+                    retry;
+                }
+                else
+                {
+                    throw;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts a task by setting the start time to the current time, and state to processing.
+    /// </summary>
+    /// <param name="_reqCalcTask">
+    /// A <c>ReqCalcTask</c> identifying the task to start.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// Thrown in case an invalid task or a not assigned task is passed as parameter.
+    /// </exception>
+    public void startTask(ReqCalcTask _reqCalcTask)
+    {
+        if (!_reqCalcTask)
+        {
+            throw error(strFmt("@SYS118115", funcName()));
+        }
+
+        try
+        {
+            ttsbegin;
+            _reqCalcTask.ProcessingState = ReqCalcTaskState::Processing;
+            _reqCalcTask.update();
+            ttscommit;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+
+        _reqCalcTask.StartTime = DateTimeUtil::utcNow();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Ends a task by setting the end time to the current time.
+    /// </summary>
+    /// <param name="_reqCalcTask">
+    /// A <c>ReqCalcTask</c> identifying the task to end.
+    /// </param>
+    /// <param name="_copyTaskToTrace">
+    /// A boolean that indicates whether the task should be copied to the task trace.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// Thrown in case an invalid task or a not assigned task is passed as parameter.
+    /// </exception>
+    public void endTask(ReqCalcTask _reqCalcTask,
+                        boolean     _copyTaskToTrace = false)
+    {
+        if (!_reqCalcTask)
+        {
+            throw error(strFmt("@SYS118115", funcName()));
+        }
+
+        if (_reqCalcTask.ProcessDataAreaId   != curext()
+        ||  _reqCalcTask.ProcessId           != processId
+        )
+        {
+            throw error(strFmt("@SYS118115", funcName()));
+        }
+
+        try
+        {
+            ttsbegin;
+            _reqCalcTask.ProcessingState = ReqCalcTaskState::Ended;
+            _reqCalcTask.update();
+            ttscommit;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+
+        _reqCalcTask.EndTime = DateTimeUtil::utcNow();
+
+        if (_copyTaskToTrace)
+        {
+            this.saveTaskToTrace(_reqCalcTask);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endTaskBundle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Ends the task bundle.
+    /// </summary>
+    /// <param name="_reqCalcTasksBundle">
+    /// The bundle to end.
+    /// </param>
+    public void endTaskBundle(ReqCalcTasksBundle _reqCalcTasksBundle)
+    {
+        if (!_reqCalcTasksBundle)
+        {
+            throw error(strFmt("@SYS118115", funcName()));
+        }
+
+        if (_reqCalcTasksBundle.ProcessDataAreaId   != curext()
+        ||  _reqCalcTasksBundle.ProcessId           != processId
+        ||  _reqCalcTasksBundle.ThreadId            != threadId)
+        {
+            throw error(strFmt("@SYS118115", funcName()));
+        }
+
+        _reqCalcTasksBundle.reread();
+        if (!_reqCalcTasksBundle.selectForUpdate())
+        {
+            _reqCalcTasksBundle.selectForUpdate(true);
+        }
+
+        _reqCalcTasksBundle.ProcessingState = ReqCalcTaskState::Ended;
+        _reqCalcTasksBundle.ThreadId = threadId;
+        _reqCalcTasksBundle.EndTime = DateTimeUtil::utcNow();
+        _reqCalcTasksBundle.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isUserConnectionUsed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if a user connection is being used.
+    /// </summary>
+    /// <returns>True if a user connection is being used; false, otherwise.</returns>
+    protected boolean isUserConnectionUsed()
+    {
+        return this.hasUserConnection() && connection.ttsLevel() > 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasUserConnection</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the controller has a user connection instanciated.
+    /// </summary>
+    /// <returns>True if a user connection is being used; false, otherwise.</returns>
+    protected boolean hasUserConnection()
+    {
+        return connection != null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateUserConnection</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the controller has a user connection, throws an error is a user connection has not been instanciated.
+    /// </summary>
+    protected void validateUserConnection()
+    {
+        if (!this.hasUserConnection())
+        {
+            throw error(strFmt("@SYS118114", funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>startTransactionInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts a transaction on a separate connection.
+    /// </summary>
+    internal void startTransactionInternal()
+    {
+        this.validateUserConnection();
+
+        try
+        {
+            connection.ttsbegin();
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (connection.ttsLevel() == 0 && ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                this.resetUserConnection();
+
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Ends a transaction on a separate connection that has been started with startTransaction().
+    /// </summary>
+    public void endTransaction()
+    {
+        if (this.isUserConnectionUsed())
+        {
+            connection.ttscommit();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>abortTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Aborts a transaction on a separate connection that has been started with startTransaction().
+    /// </summary>
+    public void abortTransaction()
+    {
+        if (this.isUserConnectionUsed())
+        {
+            connection.ttsabort();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a transaction scope and starts a new transaction in a separate connection.
+    /// 
+    /// The returned object can be used in an using statement to automatically commit/rollback the transaction.
+    /// Note that the transaction is rolled back by default and it must be marked for commit.
+    /// </summary>
+    /// <returns>A IDisposable object that represents a user transaction.</returns>
+    public ReqCalcTaskControllerTransactionScope createTransaction()
+    {
+        return new ReqCalcTaskControllerTransactionScope(this);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endAllTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Ends all transactions on a separate connection.
+    /// </summary>
+    public void endAllTransactions()
+    {
+        while (this.isUserConnectionUsed())
+        {
+            connection.ttscommit();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>flushTaskTrace</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Writes the task trace to the database.
+    /// </summary>
+    /// <remarks>
+    /// The method just flushes the <c>RecordInsertList</c> instance that is being used to save the task trace.
+    /// </remarks>
+    public void flushTaskTrace()
+    {
+        try
+        {
+            taskTraceRIL.insertDatabase();
+        }
+        catch(Exception::Break)
+        {
+            throw;
+        }
+        catch
+        {
+            if (this.retryTasksCleanupErrors())
+            {
+                retry;
+            }
+            else 
+            {
+                throw;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBundleSize</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the bundle size.
+    /// </summary>
+    /// <param name="_numberOfTasks">
+    /// The number of tasks.
+    /// </param>
+    /// <param name="_numberOfThreads">
+    /// The number of threads.
+    /// </param>
+    /// <returns>
+    /// The size of the bundle.
+    /// </returns>
+    public int getBundleSize(int _numberOfTasks, int _numberOfThreads)
+    {
+        try
+        {
+            return ReqCalcTasksBundle::calculateBundleSize(_numberOfTasks, _numberOfThreads);
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCurrentBundleTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the current bundle task.
+    /// </summary>
+    /// <returns>
+    /// The task record.
+    /// </returns>
+    public ReqCalcTask getCurrentBundleTask()
+    {
+        this.updateTaskFromBundle(currentBundleTask, currentBundle);
+
+        return currentBundleTask;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getStatusRuntime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Computes the runtime for a range of phases of the master planning process.
+    /// </summary>
+    /// <param name="_fromStatus">
+    /// Lowest inclusive status to use for runtime computation.
+    /// </param>
+    /// <param name="_toStatus">
+    /// Highest inclusive status to use for runtime computation.
+    /// </param>
+    /// <returns>
+    /// The amount of seconds spent in the phases between the from and to statuses.
+    /// </returns>
+    public Integer getStatusRuntime(ReqProcessStatus _fromStatus,
+                                    ReqProcessStatus _toStatus)
+    {
+        ReqCalcTasksBundle reqCalcTasksBundle;
+
+        try
+        {
+            select minof(StartTime), maxof(EndTime) from reqCalcTasksBundle
+                where   reqCalcTasksBundle.ProcessId           == processId
+                &&      reqCalcTasksBundle.ProcessDataAreaId   == curext()
+                &&      reqCalcTasksBundle.Status              >= _fromStatus
+                &&      reqCalcTasksBundle.Status              <= _toStatus
+                &&      reqCalcTasksBundle.StartTime           != DateTimeUtil::minValue()
+                &&      reqCalcTasksBundle.EndTime             != DateTimeUtil::minValue();
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+
+        return any2int(DateTimeUtil::getDifference(reqCalcTasksBundle.EndTime, reqCalcTasksBundle.StartTime));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getThreadCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the number of threads that were used in processing tasks for the current process.
+    /// </summary>
+    /// <returns>
+    /// The number of used threads.
+    /// </returns>
+    public int getThreadCount()
+    {
+        try
+        {
+            int                 threadCount;
+            ReqCalcTasksBundle  reqCalcTasksBundle;
+
+            while select ThreadId from
+                reqCalcTasksBundle
+                group by ThreadId
+            where   reqCalcTasksBundle.ProcessId           == processId
+                &&  reqCalcTasksBundle.ThreadId            != ''
+                &&  reqCalcTasksBundle.ProcessDataAreaId   == curext()
+            {
+                threadCount ++;
+            }
+
+            return threadCount;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts a task with a given status, level, level state and list number (bundle).
+    /// </summary>
+    /// <param name="_reqCalcTask">
+    /// A <c>ReqCalcTask</c> record to be initialized.
+    /// </param>
+    /// <param name="_bundle">
+    /// A bundle reference.
+    /// </param>
+    /// <param name="_itemId">
+    /// The item ID to be processed in the task; optional.
+    /// </param>
+    /// <param name="_taskGroupId">
+    /// The task group ID; optional.
+    /// </param>
+    protected void initTask(ReqCalcTask         _reqCalcTask,
+                            ReqCalcTasksBundle  _bundle,
+                            ItemId              _itemId     = '',
+                            PmfReqTaskGroupId   _taskGroupId = 0
+                           )
+    {
+        _reqCalcTask.Bundle             = _bundle.RecId;
+        _reqCalcTask.ProcessId          = processId;
+        _reqCalcTask.ProcessDataAreaId  = curext();
+        _reqCalcTask.ItemId             = _itemId;
+        _reqCalcTask.TaskGroupId        = _taskGroupId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts a task with a given status, level, level state and list number (bundle).
+    /// </summary>
+    /// <param name="_bundle">
+    /// The bundle reference.
+    /// </param>
+    /// <param name="_itemId">
+    /// The item ID to be processed by in the task; optional.
+    /// </param>
+    /// <param name="_taskGroupId">
+    /// The task group ID to be processed by in the task; optional.
+    /// </param>
+    /// <returns>
+    /// The task ID.
+    /// </returns>
+    /// <remarks>
+    /// Use <c>_bundle</c> parameter instead of obsoleted <c>_status</c>, <c>_level</c>, <c>_levelStage</c> and <c>_listNum</c> parameters.
+    /// </remarks>
+    public RecId insertTask(
+                            ReqCalcTasksBundle   _bundle,
+                            ItemId               _itemId        = '',
+                            PmfReqTaskGroupId   _taskGroupId    = 0
+                            )
+    {
+        ReqCalcTask reqCalcTask;
+
+        this.validateUserConnection();
+
+        this.initTask(reqCalcTask, _bundle, _itemId, _taskGroupId);
+        this.pmfAddTaskGroupId(_bundle.Level, _taskGroupId);
+
+        reqCalcTask.insert();
+
+        return reqCalcTask.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTaskAndBundle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the task and the associated bundle.
+    /// </summary>
+    /// <param name="_status">
+    /// The status.
+    /// </param>
+    /// <param name="_level">
+    /// The BOM level.
+    /// </param>
+    /// <param name="_levelState">
+    /// The level state.
+    /// </param>
+    /// <param name="_listNum">
+    /// The list number.
+    /// </param>
+    /// <param name="_itemId">
+    /// The item ID.
+    /// </param>
+    /// <param name="_taskGroupId">
+    /// Task group ID.
+    /// </param>
+    /// <returns>
+    /// The bundle record.
+    /// </returns>
+    public ReqCalcTasksBundle insertTaskAndBundle(
+        ReqProcessStatus     _status,
+        BOMLevel             _level      = 0,
+        ReqLevelState        _levelState = ReqLevelState::NotApplicable,
+        ReqProcessListNum    _listNum    = -1,
+        ItemId               _itemId     = '',
+        PmfReqTaskGroupId    _taskGroupId = 0)
+    {
+        try
+        {
+            this.removeExistingUnprocessedBundles(_status, _level, _levelState, _listNum);
+
+            ReqCalcTasksBundle bundle = this.createBundle(_status, _level, _levelState, _listNum);
+            this.insertTask(bundle, _itemId, _taskGroupId);
+
+            return bundle;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTaskAndAddToList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a task with a given status, level, level state and list number (bundle).
+    /// </summary>
+    /// <param name="_bundle">
+    /// A bundle reference.
+    /// </param>
+    /// <param name="_itemId">
+    /// The item ID to be processed in the task; optional.
+    /// </param>
+    /// <param name="_taskGroupId">
+    /// The task group ID; optional.
+    /// </param>
+    protected void initTaskAndAddToList(
+                            ReqCalcTasksBundle  _bundle,
+                            ItemId              _itemId     = '',
+                            PmfReqTaskGroupId   _taskGroupId = 0
+                           )
+    {
+        ReqCalcTask reqCalcTask;
+
+        this.initTask(reqCalcTask, _bundle, _itemId, _taskGroupId);
+        this.pmfAddTaskGroupId(_bundle.Level, _taskGroupId);
+
+        if (!reqCalcTask.Bundle)
+        {
+            reqCalcTask.Bundle(_bundle);
+            taskUoWInsertList.insertOnSaveChanges(_bundle);
+        }
+        taskUoWInsertList.insertOnSaveChanges(reqCalcTask);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTaskAndBundle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the task and the associated bundle to the <c>UnitOfWork</c> list. Task and bundle are NOT saved to DB.
+    /// </summary>
+    /// <param name="_status">
+    /// The status.
+    /// </param>
+    /// <param name="_level">
+    /// The BOM level.
+    /// </param>
+    /// <param name="_levelState">
+    /// The level state.
+    /// </param>
+    /// <param name="_listNum">
+    /// The list number.
+    /// </param>
+    /// <param name="_itemId">
+    /// The item ID.
+    /// </param>
+    /// <param name="_taskGroupId">
+    /// Task group ID.
+    /// </param>
+    /// <returns>
+    /// The bundle record.
+    /// </returns>
+    internal ReqCalcTasksBundle initTaskAndBundle(
+        ReqProcessStatus     _status,
+        BOMLevel             _level      = 0,
+        ReqLevelState        _levelState = ReqLevelState::NotApplicable,
+        ReqProcessListNum    _listNum    = -1,
+        ItemId               _itemId     = '',
+        PmfReqTaskGroupId    _taskGroupId = 0)
+    {
+        this.removeExistingUnprocessedBundles(_status, _level, _levelState, _listNum); 
+
+        ReqCalcTasksBundle bundle = this.initBundle(_status, _level, _levelState, _listNum);
+        this.initTaskAndAddToList(bundle, _itemId, _taskGroupId);
+
+        return bundle;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveTaskAndBundleList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Saves the list of bundles and tasks to the DB. 
+    /// </summary>
+    internal void saveTaskAndBundleList()
+    {
+        this.validateUserConnection();
+        taskUoWInsertList.saveChanges();
+
+        taskUoWInsertList.clear();
+        prevStatus     = 0;
+        prevLevel      = 0;
+        prevLevelState = ReqLevelState::NotApplicable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearTaskAndBundleList</Name>
+				<Source><![CDATA[
+    internal void clearTaskAndBundleList()
+    {
+        if (this.isReqCalcTaskControllerClearTaskAndBundleListEnabled)
+        {
+            taskUoWInsertList.clear();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTasksAndBundles</Name>
+				<Source><![CDATA[
+    protected void insertTasksAndBundles(
+        Set                  _ids,
+        ReqProcessNumThreads _numberOfThreads,
+        ReqProcessStatus     _status,
+        BOMLevel             _level,
+        ReqLevelState        _levelState,
+        boolean              _isPMF)
+    {
+        int size = this.getBundleSize(_ids.elements(), _numberOfThreads);
+  
+        int                 taskscount;
+        SetEnumerator       idEnumerator = _ids.getEnumerator();
+        ReqCalcTasksBundle  bundle;
+
+        using (var transaction = this.createTransaction())
+        {
+            this.removeExistingUnprocessedBundles(_status, _level, _levelState);
+
+            while (idEnumerator.moveNext())
+            {
+                if (!bundle)
+                {
+                    bundle = this.createBundle(_status, _level, _levelState);
+                }
+
+                if (_isPMF)
+                {
+                    this.initTaskAndAddToList(bundle, '', idEnumerator.current());
+                }
+                else
+                {
+                    this.initTaskAndAddToList(bundle, idEnumerator.current());
+                }
+
+                tasksCount++;
+
+                if (tasksCount == size)
+                {
+                    bundle = null;
+                    tasksCount = 0;
+                }
+            }
+
+            this.saveTaskAndBundleList();
+            transaction.markForCommit();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTaskBundlesTaskGroups</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts bundles tasks for task groups.
+    /// </summary>
+    /// <param name="_taskGroups">
+    /// The task groups to distribute into bundles of tasks.
+    /// </param>
+    /// <param name="_numberOfThreads">
+    /// The number of threads.
+    /// </param>
+    /// <param name="_status">
+    /// The status.
+    /// </param>
+    /// <param name="_level">
+    /// The BOM level.
+    /// </param>
+    /// <param name="_levelState">
+    /// The level state.
+    /// </param>
+    public void insertTaskBundlesTaskGroups(
+        Set                  _taskGroups,
+        ReqProcessNumThreads _numberOfThreads,
+        ReqProcessStatus     _status,
+        BOMLevel             _level      = 0,
+        ReqLevelState        _levelState = ReqLevelState::NotApplicable)
+    {
+        this.insertTasksAndBundles(_taskGroups, _numberOfThreads, _status, _level, _levelState, true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTaskBundlesForItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts bundles tasks for items.
+    /// </summary>
+    /// <param name="_items">
+    /// The items to distribute into bundles of tasks.
+    /// </param>
+    /// <param name="_numberOfThreads">
+    /// The number of threads.
+    /// </param>
+    /// <param name="_status">
+    /// The status.
+    /// </param>
+    /// <param name="_level">
+    /// The BOM level.
+    /// </param>
+    /// <param name="_levelState">
+    /// The level state.
+    /// </param>
+    public void insertTaskBundlesForItems(
+        Set                  _items,
+        ReqProcessNumThreads _numberOfThreads,
+        ReqProcessStatus     _status,
+        BOMLevel             _level      = 0,
+        ReqLevelState        _levelState = ReqLevelState::NotApplicable)
+    {
+        this.insertTasksAndBundles(_items, _numberOfThreads, _status, _level, _levelState, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeExistingUnprocessedBundles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes existing unprocessed tasks and bundles for the specific task, to ensure that duplicates will not be created in the case when a retry statement has occurred.  
+    /// </summary>
+    /// <param name = "_status">The status to remove for.</param>
+    /// <param name = "_level">The level to remove for.</param>
+    /// <param name = "_levelState">The sub state to remove for.</param>
+    /// <param name = "_listNum">The list number to remove for.</param>
+    protected void removeExistingUnprocessedBundles(
+        ReqProcessStatus     _status,
+        BOMLevel             _level,
+        ReqLevelState        _levelState,
+        ReqProcessListNum    _listNum    = -1)
+    {
+
+        if (prevStatus == _status && prevLevel == _level && prevLevelState == _levelState)
+        {
+            return;
+        }
+
+        prevStatus     = _status;
+        prevLevel      = _level;
+        prevLevelState = _levelState;
+
+        ReqCalcTasksBundle  bundle;
+        ReqCalcTask         task;
+
+        #localmacro.bundleCriteria
+               bundle.ProcessDataAreaId  == curext()
+            && bundle.ProcessId          == processId
+            && bundle.Status             == _status
+            && bundle.Level              == _level
+            && bundle.LevelState         == _levelState
+            && bundle.ProcessingState    == ReqCalcTaskState::Waiting
+        #endmacro
+
+        try
+        {
+            ttsbegin;
+
+            delete_from task
+                exists join bundle
+                where task.Bundle == bundle.RecId
+                   && #bundleCriteria;
+
+            bundle.skipDeleteActions(true);
+            bundle.skipDataMethods(true);
+
+            delete_from bundle            
+                where #bundleCriteria;
+
+            ttscommit;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        pollingInterval = defaultPollingInterval;
+        connection = new UserConnection();
+        taskTraceRIL = new RecordInsertList(tableNum(ReqCalcTaskTrace));
+        safeLevelsDefined = false;
+        taskUoWInsertList = new UnitOfWork();
+        prevStatus = 0;
+        prevLevel = 0;
+        prevLevelState = ReqLevelState::NotApplicable;
+
+        taskGroupIds = new Set(Types::String);
+
+        resetAssignedNotCompletedBundlesMaximumRetryCount = ReqCalcTaskController::resolveAssignedNotCompletedBundlesMaximumRetries();
+        isReqCalcTaskControllerClearTaskAndBundleListEnabled = ReqCalcTaskControllerClearTaskAndBundleListToggle::instance().isEnabled();
+        reqCalcTaskControllerTryFetchSamePreviousNotEndedBundleFirstToggleEnabled = ReqCalcTaskControllerTryFetchSamePreviousNotEndedBundleFirstToggle::instance().isEnabled();
+        reqCalcTaskControllerTryFetchSameNotEndedBundleFirstToggleEnabled = ReqCalcTaskControllerTryFetchSameNotEndedBundleFirstToggle::instance().isEnabled();
+        isReqCalcTaskControllerTryFetchFromSafeLevelsFirstToggleEnabled = ReqCalcTaskControllerTryFetchFromSafeLevelsFirstToggle::instance().isEnabled();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resolveAssignedNotCompletedBundlesMaximumRetries</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static int resolveAssignedNotCompletedBundlesMaximumRetries()
+    {
+        int retryCount = #RetryNum;
+
+        if (ReqCalcTaskControllerResetAssignedBundlesTwentyRetriesToggle::instance().isEnabled())
+        {
+            // setting maximum number of retries to 20 that allows to handle 17 minute of outage.
+            retryCount = 20;
+        }
+        else if (ReqCalcTaskControllerResetAssignedBundlesFifteenRetriesToggle::instance().isEnabled())
+        {
+            // setting maximum number of retries to 15 that allows to handle 12 minute of outage.
+            retryCount = 15;
+        }
+        else if (ReqCalcTaskControllerResetAssignedBundlesTenRetriesToggle::instance().isEnabled())
+        {
+            // setting maximum number of retries to 10 that allows to handle 7 minute of outage.
+            retryCount = 10;
+        }
+
+        return retryCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPollingInterval</Name>
+				<Source><![CDATA[
+    protected int parmPollingInterval(int _pollingInterval = pollingInterval)
+    {
+        pollingInterval = _pollingInterval;
+        return pollingInterval;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmProcessId</Name>
+				<Source><![CDATA[
+    protected ReqProcessId parmProcessId(ReqProcessId _processId = processId)
+    {
+        processId = _processId;
+        return processId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReqPlanId</Name>
+				<Source><![CDATA[
+    protected ReqPlanId parmReqPlanId(ReqPlanId _reqPlanId = reqPlanId)
+    {
+        reqPlanId = _reqPlanId;
+        return reqPlanId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmThreadId</Name>
+				<Source><![CDATA[
+    protected ReqProcessThreadId parmThreadId(ReqProcessThreadId _threadId = threadId)
+    {
+        threadId = _threadId;
+        return threadId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUserConnection</Name>
+				<Source><![CDATA[
+    public UserConnection parmUserConnection(UserConnection _userConnection = connection)
+    {
+        connection = _userConnection;
+        return connection;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfAddTaskGroupId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers the task group is as added.
+    /// </summary>
+    /// <param name="_level">
+    /// The task level.
+    /// </param>
+    /// <param name="_taskGroupId">
+    /// The task group identifier.
+    /// </param>
+    /// <remarks>
+    /// This method must be called after inserting a new task into the controller to have a fast way of determining
+    /// if a certain task group id exists in the task collection.
+    /// </remarks>
+    protected void pmfAddTaskGroupId(BOMLevel _level, PmfReqTaskGroupId _taskGroupId)
+    {
+        taskGroupIds.add(this.pmfTaskGroupLevelKey(_level, _taskGroupId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfExistTaskGroupId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if task with the given task group id already exists.
+    /// </summary>
+    /// <param name="_level">
+    /// The task level.
+    /// </param>
+    /// <param name="_taskGroupId">
+    /// The task group identifier.
+    /// </param>
+    /// <returns>
+    /// true if the task already exists; otherwise, false.
+    /// </returns>
+    public boolean pmfExistTaskGroupId(BOMLevel _level, PmfReqTaskGroupId _taskGroupId)
+    {
+        return taskGroupIds.in(this.pmfTaskGroupLevelKey(_level, _taskGroupId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pmfTaskGroupLevelKey</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates a combined key for a level and task group.
+    /// </summary>
+    /// <param name="_level">
+    /// The task level.
+    /// </param>
+    /// <param name="_taskGroupId">
+    /// The task group identifier.
+    /// </param>
+    /// <returns>
+    /// A combined key for a level and task group.
+    /// </returns>
+    protected str pmfTaskGroupLevelKey(BOMLevel _level, PmfReqTaskGroupId _taskGroupId)
+    {
+        return int2str(_level) + '#' + int642str(_taskGroupId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readBundleTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts iterating through the tasks of the bundle.
+    /// </summary>
+    /// <param name="_bundle">
+    /// The bundle record.
+    /// </param>
+    /// <returns>
+    /// true, if iteration can be done; otherwise, false.
+    /// </returns>
+    public boolean readBundleTasks(ReqCalcTasksBundle _bundle)
+    {
+        if (currentBundleTask)
+        {
+            next currentBundleTask;
+        }
+        else
+        {
+            currentBundle = _bundle;
+
+            select forupdate currentBundleTask
+                where currentBundleTask.Bundle == _bundle.RecId
+                && (!currentBundleTask.ProcessingState);
+        }
+
+        return currentBundleTask.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetAssignedNotCompletedBundlesProcessThread</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the bundles which are assigned to the specified thread for a process and not completed.
+    /// </summary>
+    /// <param name = "_processId">The process id to reset for.</param>
+    /// <param name = "_threadId">The thread id to reset for.</param>
+    public static void resetAssignedNotCompletedBundlesProcessThread(ReqProcessId _processId, ReqProcessThreadId _threadId)
+    {
+        ReqCalcTasksBundle  reqCalcTasksBundle;
+        ReqCalcTask         reqCalcTask;
+        
+        var instrumentationLogger = ReqInstrumentationLogger::createLogger(classStr(ReqCalcTaskController));
+
+        using (var activityContext = instrumentationLogger.calcTaskController().resetAssignedNotCompletedBundlesProcessThread())
+        {
+            try
+            {
+                ttsbegin;
+
+                update_recordset reqCalcTask
+                    setting ThreadId = '',
+                            ProcessingState = ReqCalcTaskState::Waiting
+                where   reqCalcTask.ProcessId           == _processId
+                    &&  reqCalcTask.ProcessDataAreaId   == curExt()
+                    &&  reqCalcTask.ThreadId            == _threadId
+                    &&  reqCalcTask.ProcessingState     == ReqCalcTaskState::Processing;
+
+                update_recordset reqCalcTasksBundle
+                    setting ThreadId = '',
+                            ProcessingState = ReqCalcTaskState::Waiting
+                where  reqCalcTasksBundle.ProcessId           == _processId
+                    && reqCalcTasksBundle.ProcessDataAreaId   == curExt()
+                    && reqCalcTasksBundle.ThreadId            == _threadId
+                    && reqCalcTasksBundle.ProcessingState     == ReqCalcTaskState::Processing;
+
+                ttscommit;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                var warningMessage = 'Update conflict occurred while resetting assigned not completed bundles and tasks for a thread. Retrying.';
+                instrumentationLogger.logWarningForProcessThread(warningMessage, _processId, _threadId);
+
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                var warningMessage = 'Deadlock occurred while resetting assigned not completed bundles and tasks for a thread. Retrying.';
+                instrumentationLogger.logWarningForProcessThread(warningMessage, _processId, _threadId);
+
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::TransientSqlConnectionError)
+            {
+                if (ReqCalcTaskController::retryTransientSqlConnectionError())
+                {
+                    retry;
+                }
+                else
+                {
+                    throw;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetAssignedNotCompletedBundles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the bundles which are assigned to the current thread and not completed.
+    /// </summary>
+    public void resetAssignedNotCompletedBundles()
+    {
+        // 5 seconds
+        int retryDelayInMilliseconds  = 5000;
+
+        var instrumentationLogger = ReqInstrumentationLogger::createLogger(classStr(ReqCalcTaskController));
+
+        using (var activityContext = instrumentationLogger.calcTaskController().resetAssignedNotCompletedBundles())
+        {
+            boolean tasksResetCompleted = false;
+            try
+            {
+                if (!tasksResetCompleted)
+                {
+                    this.resetAssignedNotCompletedTasks();
+                    tasksResetCompleted = true;
+                }
+
+                this.validateUserConnection();
+        
+                using (var transaction = this.createTransaction())
+                {
+                    ReqCalcTasksBundle reqCalcTasksBundle;
+                    reqCalcTasksBundle.setConnection(connection);
+
+                    update_recordset reqCalcTasksBundle
+                        setting ProcessingState = ReqCalcTaskState::Waiting
+                    where   reqCalcTasksBundle.ProcessDataAreaId   == curext()
+                        &&  reqCalcTasksBundle.ProcessId           == processId
+                        &&  reqCalcTasksBundle.ThreadId            == threadId
+                        &&  reqCalcTasksBundle.ProcessingState     == ReqCalcTaskState::Processing;
+
+                    transaction.markForCommit();
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                var warningMessage = 'Update conflict occurred while resetting assigned not completed batch tasks. Retrying.';
+                instrumentationLogger.logWarning(warningMessage);
+                retryDelayInMilliseconds = this.manageExceptionError(retryDelayInMilliseconds);
+                retry;
+            }
+            catch (Exception::Deadlock)
+            {
+                var warningMessage = 'Deadlock occurred while resetting assigned not completed batch tasks. Retrying.';
+                instrumentationLogger.logWarning(warningMessage);
+                retryDelayInMilliseconds = this.manageExceptionError(retryDelayInMilliseconds);
+                retry;
+            }
+            catch (Exception::TransientSqlConnectionError)
+            {
+                var warningMessage = 'TransientSqlConnectionError occurred while resetting assigned not completed batch tasks. Retrying.';
+                instrumentationLogger.logWarning(warningMessage);
+                retryDelayInMilliseconds = this.manageExceptionError(retryDelayInMilliseconds);
+                this.resetUserConnection();
+                retry;
+            }
+            catch
+            {
+                var warningMessage = 'Generic exception occurred while resetting assigned not completed batch tasks. Retrying.';
+                instrumentationLogger.logWarning(warningMessage);
+                retryDelayInMilliseconds = this.manageExceptionError(retryDelayInMilliseconds);
+                this.resetUserConnection();
+                retry;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>manageExceptionError</Name>
+				<Source><![CDATA[
+    private int manageExceptionError(int _retryDelayInMilliseconds)
+    {
+        if (xSession::currentRetryCount() >= resetAssignedNotCompletedBundlesMaximumRetryCount)
+        {
+            throw error("@SYS320450");
+        }
+        else
+        {
+            sleep(_retryDelayInMilliseconds);
+            // maximum delay used is 60 seconds
+            return min(60 * 1000, _retryDelayInMilliseconds * 2);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retryTasksCleanupErrors</Name>
+				<Source><![CDATA[
+    private boolean retryTasksCleanupErrors()
+    {
+        var currentRetryCount = xSession::currentRetryCount();
+        const int retryDelayInMilliseconds  = 5000;
+
+        if (currentRetryCount >= resetAssignedNotCompletedBundlesMaximumRetryCount)
+        {
+            return false;
+        }
+        else
+        {
+            var delay = retryDelayInMilliseconds * power(2, min(currentRetryCount, 5));
+            sleep(min(60 * 1000, delay));
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetAssignedNotCompletedTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reverts the assignment status of the tasks that are in progress for a given thread.
+    /// </summary>
+    public void resetAssignedNotCompletedTasks()
+    {
+        ReqCalcTask reqCalcTask;
+
+        ttsbegin;
+
+        update_recordset reqCalcTask
+            setting ThreadId = '',
+                    ProcessingState = ReqCalcTaskState::Waiting
+        where   reqCalcTask.ProcessDataAreaId   == curext()
+            &&  reqCalcTask.ProcessId           == processId
+            &&  reqCalcTask.ThreadId            == threadId
+            &&  reqCalcTask.ProcessingState     == ReqCalcTaskState::Processing;
+
+        currentBundleTask = null;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetTaskGroupIds</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the list of task groups.
+    /// </summary>
+    public void resetTaskGroupIds()
+    {
+        taskGroupIds = new Set(taskGroupIds.typeId());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveTaskToTrace</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Writes a task to the task trace.
+    /// </summary>
+    /// <param name="_reqCalcTask">
+    /// A <c>ReqCalcTask</c> record with the task data that is to be written to the task trace.
+    /// </param>
+    protected void saveTaskToTrace(ReqCalcTask _reqCalcTask)
+    {
+        ReqCalcTaskTrace reqCalcTaskTrace;
+
+        reqCalcTaskTrace.ReqPlanId  = reqPlanId;
+        reqCalcTaskTrace.ProcessId  = _reqCalcTask.ProcessId;
+        reqCalcTaskTrace.ThreadId   = _reqCalcTask.ThreadId;
+        reqCalcTaskTrace.Status     = _reqCalcTask.Status;
+        reqCalcTaskTrace.Level      = real2int(abs(_reqCalcTask.Level));
+        reqCalcTaskTrace.LevelState = _reqCalcTask.LevelState;
+        reqCalcTaskTrace.StartTime  = _reqCalcTask.StartTime;
+        reqCalcTaskTrace.EndTime    = _reqCalcTask.EndTime;
+        reqCalcTaskTrace.ItemId     = _reqCalcTask.ItemId;
+        reqCalcTaskTrace.Bundle     = _reqCalcTask.ListNum;
+
+        try
+        {
+            taskTraceRIL.add(reqCalcTaskTrace);
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            // add method can throw an exception as it might flush data to the database
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectBundleNotEnded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Selects the not ended bundle.
+    /// </summary>
+    /// <param name="_reqCalcTasksBundleOther">
+    /// The record which will contain the selected bundle.
+    /// </param>
+    protected void selectBundleNotEnded(ReqCalcTasksBundle _reqCalcTasksBundleOther)
+    {
+        if (reqCalcTaskControllerTryFetchSameNotEndedBundleFirstToggleEnabled)
+        {
+            _reqCalcTasksBundleOther.allowIndexHint(true);
+
+            if (lastFoundNotEndedBundleRecId)
+            {
+                // First checking if the last found not ended bundle is still not ended.
+                // This can utilize very efficient RecId index and will not suffer issues
+                // in case of uncleaned ghost records.
+                //
+                // This method can be called a lot if an mrp thread is waiting for a previous
+                // (status, level, levelState) to finish. In that case it is very likely that
+                // the not finished bundle is the same as last time this method was called.
+                select firstOnly RecId, ProcessingState from _reqCalcTasksBundleOther
+                    index hint RecId
+                    where _reqCalcTasksBundleOther.RecId == lastFoundNotEndedBundleRecId;
+
+                if (_reqCalcTasksBundleOther.RecId && _reqCalcTasksBundleOther.ProcessingState < ReqCalcTaskState::Ended)
+                {
+                    return;
+                }
+            }
+
+            // Bundles are selected in the reverse order to
+            // the order in which they are processed. This is done so that
+            // lastFoundNotEndedBundleRecId will be still not ended for as long as possible.
+            //
+            // For example, in case of the class <c>ReqCalcScheduleItemTable</c>
+            // this will find "Statistics" bundle at the beginning of the run and
+            // that bundle will be only ended once all the other bundles are ended. This means
+            // the above query, that takes advantage of the RecId index, will be used throughout the run.
+            // 
+            // DO NOT REMOVE ProcessingState from order by. Seems like it is needed 
+            // for SQL to find a good plan - where it takes the first record going backwards 
+            // on the TaskBundleIdx index.
+            select firstOnly RecId from _reqCalcTasksBundleOther
+                index hint TaskBundleIdx
+                order by ProcessingState desc, Status desc, Level desc, LevelState desc
+                where _reqCalcTasksBundleOther.ProcessDataAreaId == curext()
+                   && _reqCalcTasksBundleOther.ProcessId == processId
+                   && _reqCalcTasksBundleOther.ProcessingState < ReqCalcTaskState::Ended;
+
+            lastFoundNotEndedBundleRecId = _reqCalcTasksBundleOther.RecId;
+
+            return;
+        }
+
+        select firstonly RecId from _reqCalcTasksBundleOther
+            where _reqCalcTasksBundleOther.ProcessDataAreaId == curext()
+               && _reqCalcTasksBundleOther.ProcessId == processId
+               && _reqCalcTasksBundleOther.ProcessingState < ReqCalcTaskState::Ended;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>selectPreviousTaskBundleNotEnded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the non ended bundle on the previous bundle level.
+    /// </summary>
+    /// <param name="_reqCalcTasksBundle">
+    /// The bundle record from the current level of bundles.
+    /// </param>
+    /// <param name="_reqCalcTasksBundleOther">
+    /// The record which will contain the bundle from the previous level.
+    /// </param>
+    protected void selectPreviousTaskBundleNotEnded(ReqCalcTasksBundle _reqCalcTasksBundle, ReqCalcTasksBundle _reqCalcTasksBundleOther)
+    {
+        if (reqCalcTaskControllerTryFetchSamePreviousNotEndedBundleFirstToggleEnabled)
+        {
+            if (lastFoundPreviousNotEndedBundleRecId)
+            {
+                // First checking if the last found not ended bundle is still not ended and qualifies as previous.
+                // This can utilize very efficient RecId index and will not suffer issues
+                // in case of uncleaned ghost records.
+                //
+                // This method can be called a lot if an mrp thread is waiting for a previous
+                // (status, level, levelState) to finish. In that case it is very likely that
+                // the not finished bundle found last time is still not finished.
+                _reqCalcTasksBundleOther.allowIndexHint(true);
+
+                select firstOnly RecId, ProcessingState, Status, Level, LevelState from _reqCalcTasksBundleOther
+                    index hint RecId
+                    where _reqCalcTasksBundleOther.RecId == lastFoundPreviousNotEndedBundleRecId;
+
+                if (_reqCalcTasksBundleOther.RecId
+                    && _reqCalcTasksBundleOther.ProcessingState < ReqCalcTaskState::Ended
+                    && this.mustBeProcessedAfter(_reqCalcTasksBundle, 
+                                                _reqCalcTasksBundleOther.Status, 
+                                                ReqCalcTaskControllerLastFoundComparisonFlight::instance().isEnabled() ? _reqCalcTasksBundleOther.Level : _reqCalcTasksBundle.Level,
+                                                _reqCalcTasksBundleOther.LevelState))
+                {
+                    return;
+                }
+            }
+
+            _reqCalcTasksBundleOther.clear();
+
+            ReqCalcTasksBundleFirstLevelNotEnded notEndedBundle;
+
+            select firstOnly notEndedBundle
+                order by notEndedBundle.WaitingStatus, notEndedBundle.WaitingLevel, notEndedBundle.WaitingLevelState
+                where notEndedBundle.ProcessDataAreaId == curext()
+                   && notEndedBundle.ProcessId == _reqCalcTasksBundle.ProcessId;
+
+            if (this.mustBeProcessedAfter(_reqCalcTasksBundle, notEndedBundle.WaitingStatus, notEndedBundle.WaitingLevel, notEndedBundle.WaitingLevelState))
+            {
+                _reqCalcTasksBundleOther.RecId = notEndedBundle.RecId;
+                lastFoundPreviousNotEndedBundleRecId = notEndedBundle.RecId;
+            }
+            else if (notEndedBundle.ProcessingStatus 
+                && this.mustBeProcessedAfter(_reqCalcTasksBundle, notEndedBundle.ProcessingStatus, notEndedBundle.ProcessingLevel, notEndedBundle.ProcessingLevelState))
+            {
+                // Additional query needs to be run as ReqCalcTasksBundleFirstLevelNotEnded view only contains the RecId
+                // of the waiting bundle.
+                _reqCalcTasksBundleOther.allowIndexHint(true);
+
+                select firstOnly RecId from _reqCalcTasksBundleOther
+                    index hint TaskBundleIdx
+                    where _reqCalcTasksBundleOther.ProcessDataAreaId == curext()
+                       && _reqCalcTasksBundleOther.ProcessId == _reqCalcTasksBundle.ProcessId
+                       && _reqCalcTasksBundleOther.ProcessingState == ReqCalcTaskState::Processing
+                       && _reqCalcTasksBundleOther.Status == notEndedBundle.ProcessingStatus
+                       && _reqCalcTasksBundleOther.Level == notEndedBundle.ProcessingLevel
+                       && _reqCalcTasksBundleOther.LevelState == notEndedBundle.ProcessingLevelState;
+
+                if (_reqCalcTasksBundleOther.RecId)
+                {
+                    lastFoundPreviousNotEndedBundleRecId = _reqCalcTasksBundleOther.RecId;
+                }
+                else
+                {
+                    // In the case that we do not find the bundle, the RecId is set to the 
+                    // RecId of the waiting bundle to indicate to the caller that there are
+                    // bundles that should be processed before the given bundle.
+                    _reqCalcTasksBundleOther.RecId = notEndedBundle.RecId;
+                    lastFoundPreviousNotEndedBundleRecId = 0;
+                }
+            }
+
+            return;
+        }
+
+        _reqCalcTasksBundleOther.clear();
+
+        ReqCalcTasksBundleFirstLevelNotEnded notEndedBundle;
+
+        select firstonly notEndedBundle
+            order by notEndedBundle.WaitingStatus, notEndedBundle.WaitingLevel, notEndedBundle.WaitingLevelState
+            where notEndedBundle.ProcessDataAreaId == curext()
+               && notEndedBundle.ProcessId == _reqCalcTasksBundle.ProcessId;
+
+        if (notEndedBundle.WaitingStatus < _reqCalcTasksBundle.Status ||
+            (notEndedBundle.WaitingStatus == _reqCalcTasksBundle.Status && notEndedBundle.WaitingLevel < _reqCalcTasksBundle.Level) ||
+            (notEndedBundle.WaitingStatus == _reqCalcTasksBundle.Status && notEndedBundle.WaitingLevel == _reqCalcTasksBundle.Level && notEndedBundle.WaitingLevelState < _reqCalcTasksBundle.LevelState) ||
+            (notEndedBundle.ProcessingStatus && (
+                notEndedBundle.ProcessingStatus < _reqCalcTasksBundle.Status ||
+                (notEndedBundle.ProcessingStatus == _reqCalcTasksBundle.Status && notEndedBundle.ProcessingLevel < _reqCalcTasksBundle.Level) ||
+                (notEndedBundle.ProcessingStatus == _reqCalcTasksBundle.Status && notEndedBundle.ProcessingLevel == _reqCalcTasksBundle.Level && notEndedBundle.ProcessingLevelState < _reqCalcTasksBundle.LevelState))))
+        {
+            _reqCalcTasksBundleOther.RecId = notEndedBundle.RecId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTaskBundleAsRunning</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the task bundle to the running state.
+    /// </summary>
+    /// <param name="_reqCalcTaskBundle">
+    /// The bundle record to update.
+    /// </param>
+    public void setTaskBundleAsRunning(ReqCalcTasksBundle _reqCalcTaskBundle)
+    {
+        var instrumentationLogger = ReqInstrumentationLogger::createLogger(classStr(ReqCalcTaskController));
+
+        using (var activityContext = instrumentationLogger.calcTaskController().setBundleAsRunning(
+            _reqCalcTaskBundle.ProcessId,
+            _reqCalcTaskBundle.ThreadId,
+            _reqCalcTaskBundle.Status,
+            _reqCalcTaskBundle.Level,
+            _reqCalcTaskBundle.LevelState))
+        {
+            if (!_reqCalcTaskBundle)
+            {
+                throw error(strFmt("@SYS118115", funcName()));
+            }
+
+            if (_reqCalcTaskBundle.ProcessDataAreaId   != curext()
+            ||  _reqCalcTaskBundle.ProcessId           != processId)
+            {
+                throw error(strFmt("@SYS118115", funcName()));
+            }
+
+            _reqCalcTaskBundle.ThreadId = threadId;
+            _reqCalcTaskBundle.ProcessingState = ReqCalcTaskState::Processing;
+
+            _reqCalcTaskBundle.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>detectAndResetOrphanTasksBundles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Detect any orphan task bundles stopped heartbeating and reset their statuses.
+    /// </summary>
+    internal void detectAndResetOrphanTasksBundles()
+    {
+        var instrumentationLogger = ReqInstrumentationLogger::createLogger(classStr(ReqCalcTaskController));
+
+        using (var activityContext = instrumentationLogger.calcTaskController().detectAndResetOrphanTasksBundles())
+        {
+            ReqProcessThreadList reqProcessThreadList;
+            Batch helperBatch;
+
+            while select reqProcessThreadList
+                where reqProcessThreadList.ProcessId == processId
+                outer join helperBatch
+                    where helperBatch.RecId == reqProcessThreadList.BatchTaskRecId
+            {
+                if (helperBatch && helperBatch.Status == BatchStatus::Executing)
+                {
+                    continue;
+                }
+
+                var logLineTry = infologLine();
+
+                try
+                {
+                    ReqCalcTaskController::resetAssignedNotCompletedBundlesProcessThread(reqProcessThreadList.ProcessId, reqProcessThreadList.ThreadId);
+                    instrumentationLogger.logReqProcessThreadListInformation('Orphan task bundles were reset to waiting status.', reqProcessThreadList);
+                }
+                catch
+                {
+                    instrumentationLogger.logReqProcessThreadListInformation('Exception occurred while resetting assigned not completed bundle processes. We will not retry until next check.', reqProcessThreadList);
+                    infolog.clear(logLineTry);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTaskFromBundle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the task record from the bundle record.
+    /// </summary>
+    /// <param name="_task">
+    /// The task to update.
+    /// </param>
+    /// <param name="_bundle">
+    /// The bundle from which to update the task.
+    /// </param>
+    protected void updateTaskFromBundle(ReqCalcTask _task, ReqCalcTasksBundle _bundle)
+    {
+        _task.Status = _bundle.Status;
+        _task.Level = _bundle.Level;
+        _task.LevelState = _bundle.LevelState;
+        _task.ThreadId = _bundle.ThreadId;
+        _task.ListNum = _bundle.ListNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    protected static ReqCalcTaskController construct()
+    {
+        return new ReqCalcTaskController();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newController</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a new instance of the <c>ReqCalcTaskController</c> class.
+    /// </summary>
+    /// <param name="_reqPlanId">
+    /// The plan ID.
+    /// </param>
+    /// <param name="_processId">
+    /// The master planning process ID.
+    /// </param>
+    /// <param name="_threadId">
+    /// The master planning thread ID that is using the task controller instance.
+    /// </param>
+    /// <returns>
+    /// A new instance of the <c>ReqCalcTaskController</c> class.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Thrown if the process ID or the thread ID are invalid.
+    /// </exception>
+    public static ReqCalcTaskController newController(ReqPlanId             _reqPlanId,
+                                                      ReqProcessId          _processId,
+                                                      ReqProcessThreadId    _threadId)
+    {
+        ReqCalcTaskController taskController = ReqCalcTaskController::construct();
+
+        if (!_reqPlanId || !_processId || !_threadId)
+        {
+            throw error(strFmt("@SYS118115", funcName()));
+        }
+
+        taskController.parmReqPlanId(_reqPlanId);
+        taskController.parmProcessId(_processId);
+        taskController.parmThreadId(_threadId);
+
+        return taskController;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>Dispose</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Releases the resources used by the <c>ReqCalcTaskController</c> class.
+    /// </summary>
+    public void Dispose()
+    {
+        connection.finalize();
+        connection = null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetUserConnection</Name>
+				<Source><![CDATA[
+    internal void resetUserConnection()
+    {
+        if (!this.hasUserConnection() || !ReqTransientSqlConnectionErrorHandlingHelper::isReqTransientSqlConnectionErrorHandlingMRPTaskManagementToggleEnabled())
+        {
+            return;
+        }
+
+        try
+        {
+            connection.finalize();
+        }
+        catch
+        {
+            // nothing to do
+        }
+
+        connection = new UserConnection();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retryTransientSqlConnectionError</Name>
+				<Source><![CDATA[
+    private static boolean retryTransientSqlConnectionError()
+    {
+        return ReqTransientSqlConnectionErrorHandlingHelper::isReqTransientSqlConnectionErrorHandlingMRPTaskManagementToggleEnabled()
+            && ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustBeProcessedAfter</Name>
+				<Source><![CDATA[
+    private boolean mustBeProcessedAfter(ReqCalcTasksBundle _reqCalcTasksBundle, ReqProcessStatus _status, BOMLevel _level, ReqLevelState _levelState)
+    {
+        return _status < _reqCalcTasksBundle.Status
+            || (_status == _reqCalcTasksBundle.Status && _level < _reqCalcTasksBundle.Level)
+            || (_status == _reqCalcTasksBundle.Status && _level == _reqCalcTasksBundle.Level && _levelState < _reqCalcTasksBundle.LevelState);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>tryAssignBundleFromSafeLevels</Name>
+				<Source><![CDATA[
+    private void tryAssignBundleFromSafeLevels(ReqCalcTasksBundle _reqCalcTasksBundle)
+    {
+        if (isReqCalcTaskControllerTryFetchFromSafeLevelsFirstToggleEnabled
+            && safeLevelsDefined
+            && tryFetchingNextBundleFromSafeLevelsFirst)
+        {
+            // The check for tryFetchingNextBundleFromSafeLevelsFirst is added to avoid doing two queries
+            // each time when calling assignBundle in case when all the tasks in current "stage" (status, level, levelState)
+            // are being processed and the thread needs to wait for them to complete to proceed to the next "stage".
+
+            // Attempt is made to fetch from a "safe" (Status, Level, LevelState)
+            // as most of the time the next bundle will be found that way.
+            // This helps battle issues with uncleaned ghost records as more specific index
+            // is used so only the not cleaned ghost records within particular (Status, bLevel, LevelState)
+            // can affect the performance.
+            if (#PmfEnabled && safeStatus == ReqProcessStatus::Coverage)
+            {
+                // In case Pmf is enabled it is possible (when the material substitution feature is used) 
+                // that levels will be run again (within coverage phase), that is, it is possible 
+                // tasks on lower bom level will be created.
+                // Because of that we can only filter on the safeStatus.
+                select firstOnly pessimisticLock _reqCalcTasksBundle
+                    order by Status, Level, LevelState, ListNum
+                    where _reqCalcTasksBundle.ProcessDataAreaId == curext() 
+                        && _reqCalcTasksBundle.ProcessId == processId
+                        && _reqCalcTasksBundle.ProcessingState == ReqCalcTaskState::Waiting
+                        && _reqCalcTasksBundle.Status == safeStatus;
+            }
+            else
+            {
+                select firstOnly pessimisticLock _reqCalcTasksBundle
+                    order by Status, Level, LevelState, ListNum
+                    where _reqCalcTasksBundle.ProcessDataAreaId == curext()
+                        && _reqCalcTasksBundle.ProcessId == processId
+                        && _reqCalcTasksBundle.ProcessingState == ReqCalcTaskState::Waiting
+                        && _reqCalcTasksBundle.Status == safeStatus
+                        && _reqCalcTasksBundle.Level == safeLevel
+                        && _reqCalcTasksBundle.LevelState == safeLevelState;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reqProcessListClearBatchTask</Name>
+				<Source><![CDATA[
+    internal static void reqProcessListClearBatchTask(RefRecId _batchTaskRecId)
+    {
+        try
+        {
+            ReqProcessList reqProcessList;
+            var reqProcessListRecIds = new Set(Types::Int64);
+
+            while select reqProcessList
+                where reqProcessList.MainThreadBatchTaskRecId == _batchTaskRecId
+            {
+                reqProcessListRecIds.add(reqprocesslist.RecId);
+            }
+            
+            var setEnumerator = reqProcessListRecIds.getEnumerator();
+
+            while (setEnumerator.moveNext())
+            {
+                var reqProcessListRecId = setEnumerator.current();
+                
+                ttsbegin;
+
+                update_recordset reqProcessList
+                    setting MainThreadBatchTaskRecId = 0
+                    where reqProcessList.RecId == reqProcessListRecId;
+
+                ttscommit;
+            }
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqCalcTaskController::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            retry;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enablePeriodicTelemetryForAssigningBundles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether telemetry for assigning a bundle is needed.
+    /// Telemetry is issued periodicly in order to avoid rapid telemetry volume increase but to provide more information in case a thread is not picking up bundles.
+    /// </summary>
+    /// <returns>true in case telemetry should be issues; otherwise, false.</returns>
+    private boolean enablePeriodicTelemetryForAssigningBundles()
+    {
+        utcdatetime utcNow = DateTimeUtil::utcNow();
+
+        if (utcNow >= nextEarliestAssignBundleTelemetryEnabledDateTime)
+        {
+            nextEarliestAssignBundleTelemetryEnabledDateTime = DateTimeUtil::addSeconds(utcNow, DefaultAssignBundleTelemetryIntervalSeconds);
+
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

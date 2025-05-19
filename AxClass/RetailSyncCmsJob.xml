@@ -1,0 +1,1018 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailSyncCmsJob</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+using CmsProxy=Microsoft.Dynamics.Commerce.Proxies.CMS;
+using System.Reflection;
+using System.Collections;
+using System.IO;
+using System.Text;
+using System.Web;
+using System.Web.Script.Serialization;
+using Microsoft.Dynamics.ApplicationPlatform.Environment;
+
+internal class RetailSyncCmsJob extends RunBaseBatch implements BatchRetryable
+{
+    // Connector property names.
+    private const str azureCmsConnectorName = 'AzureCms';
+    private const str lastSyncStartTimePropertyName = 'LastSyncStartTime';
+    private const str entityTypePropertyName = 'EntityType';
+    private const str pageSizePropertyName = 'PageSize';
+    private const str skipPropertyName = 'Skip';
+    private const str shouldDownloadOfflineImagesPropertyName = 'ShouldDownloadOfflineImages';
+    private const str mediaServerBaseUrlPropertyName = 'MediaServerBaseUrl';
+    private const str offlineImageWidthPropertyName = "OfflineImageWidth";
+    private const str offlineImageHeightPropertyName = "OfflineImageHeight";
+
+    private const int maxRetryCount = 2;
+    private const int defaultBatchSize = 100;
+    private const str omniChannelIdentifier = 'system_omni';
+    private const str neutralLanguageIdentifier = 'system_neutral';
+    private const str defaultCatalogIdentifier = "0";
+
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        if (!FeatureStateProvider::isFeatureEnabled(OmniChannelMediaManagementAuthoringFeature::instance()))
+        {
+            eventSource.EventWriteSyncCmsJobSkippedDueToAuthoringFeatureNotEnabled();
+            return;
+        }
+
+        // Synchronize product media.
+        this.synchronizeMediaData(RetailCmsEntityType::Product);
+
+        // Synchronize category media.
+        this.synchronizeMediaData(RetailCmsEntityType::Category);
+
+        // Clean up media, media relationships and alt texts that are not used anymore.
+        this.cleanupOrphanRecords();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the description of the class.
+    /// </summary>
+    /// <returns>
+    /// The description of the class.
+    /// </returns>
+    public static ClassDescription description()
+    {
+        return "@Retail:SyncCmsJob";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instantiate an instance of the <b>RetailSyncCmsJob</b> and run the operation.
+    /// </summary>
+    /// <param name = "_args">The arguments to run teh batch job.</param>
+    public static void main(Args _args)
+    {
+        RetailSyncCmsJob scheduler = new RetailSyncCmsJob();
+
+        if (scheduler.prompt())
+        {
+            scheduler.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>RetailSyncCmsJob</c> class can be run in a new session.
+    /// </summary>
+    /// <returns>true if the the class <c>RetailSyncCmsJob</c> cannot be run in a new session; otherwise, false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>synchronizeMediaData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Synchronizes the media resources for specified entity type from CMS to HQ.
+    /// </summary>
+    /// <param name = "_entityType">The entity to be synchronized.</param>
+    private void synchronizeMediaData(RetailCmsEntityType _entityType)
+    {
+        // Retrieve CMS connector configuration.
+        RetailCmsConnectorMetadata cmsConnectorMetadata = RetailCmsConnectorMetadata::findByConnectorName(azureCmsConnectorName, true);
+
+        if (!cmsConnectorMetadata || cmsConnectorMetadata.TenantCode == '' || cmsConnectorMetadata.CmsEndpoint == '')
+        {
+            throw error("@Retail:CmsConnectorConfigurationMissing");
+        }
+
+        // Initialize CMS connector.
+        RetailCmsTenantCode tenantCode = cmsConnectorMetadata.TenantCode;
+        RetailCmsEndpoint cmsEndpoint = cmsConnectorMetadata.CmsEndpoint;
+        int batchSize = cmsConnectorMetadata.BatchSize == 0 ? defaultBatchSize : cmsConnectorMetadata.BatchSize;
+
+        CmsProxy.ICmsConnector connector = new CmsProxy.AzureCms.AzureCmsConnector(cmsEndpoint, tenantCode);
+
+        // Update media server base URL.
+        RetailCmsMediaServerBaseUrl mediaServerBaseUrl = this.getMediaServerBaseUrlByConnector(connector);
+
+        if (mediaServerBaseUrl != '')
+        {
+            ttsbegin;
+
+            cmsConnectorMetadata.MediaServerBaseUrl = mediaServerBaseUrl;
+            cmsConnectorMetadata.update();
+
+            ttscommit;
+        }
+
+        // Retrive connector state for the specified entity type.
+        RetailCmsConnectorState cmsConnectorState = RetailCmsConnectorState::findByConnectorAndEntityType(cmsConnectorMetadata.RecId, _entityType, true);
+        RetailSyncCmsStartTime lastSyncStartDateTime = cmsConnectorState.LastSyncStartDateTime != DateTimeUtil::minValue() ?
+            cmsConnectorState.LastSyncStartDateTime :
+            DateTimeUtil::addSeconds(DateTimeUtil::minValue(), 1); // 1 second is added to default utcdatetime value because the default value could not be serialized to string (it's treated the same as null)
+        RetailSyncCmsStartTime currentSyncStartDateTime = DateTimeUtil::utcNow();
+
+        // Start downloading data from CMS for the specified entity type.
+        eventSource.EventWriteSyncCmsJobStarted(enum2Symbol(enumNum(RetailCmsEntityType), _entityType), tenantCode, cmsEndpoint, lastSyncStartDateTime);
+        System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
+        stopwatch.Start();
+
+        boolean isSyncSuccessfullyFinished = this.downloadMediaDataFromCms(
+            _entityType,
+            connector,
+            batchSize,
+            lastSyncStartDateTime,
+            mediaServerBaseUrl);
+
+        if (isSyncSuccessfullyFinished)
+        {
+            this.updateConnectorState(cmsConnectorMetadata.RecId, cmsConnectorState, _entityType, currentSyncStartDateTime);
+        }
+
+        stopwatch.Stop();
+        eventSource.EventWriteSyncCmsJobFinished(enum2Symbol(enumNum(RetailCmsEntityType), _entityType), stopwatch.ElapsedMilliseconds);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>downloadMediaDataFromCms</Name>
+				<Source><![CDATA[
+    private boolean downloadMediaDataFromCms(
+        RetailCmsEntityType _entityType,
+        CmsProxy.ICmsConnector _connector,
+        int _batchSize,
+        RetailSyncCmsStartTime _lastSyncStartDateTime,
+        RetailCmsMediaServerBaseUrl _mediaServerBaseUrl)
+    {
+        int fromLine = Global::infologLine();
+        CmsProxy.MediaSynchronizationResult result;
+        boolean isSyncSuccessfullyFinished = true;
+
+        // Setup connector properties.
+        int skip = 0;
+        IDictionary connectorProperties = new Generic.Dictionary<str, str>();
+        connectorProperties.Add(lastSyncStartTimePropertyName, DateTimeUtil::toStr(_lastSyncStartDateTime));
+        connectorProperties.Add(pageSizePropertyName, int2Str(_batchSize));
+        connectorProperties.Add(entityTypePropertyName, int2Str(_entityType));
+        connectorProperties.Add(mediaServerBaseUrlPropertyName, _mediaServerBaseUrl);
+        connectorProperties.Add(offlineImageWidthPropertyName, int2Str(RetailMediaHelper::OfflineImageWidth));
+        connectorProperties.Add(offlineImageHeightPropertyName, int2Str(RetailMediaHelper::OfflineImageHeight));
+        connectorProperties.Remove(skipPropertyName);
+        connectorProperties.Add(skipPropertyName, int2Str(skip));
+
+        if (RetailMerchandisingDownloadOfflineImagesWhenSyncCmsMediaFlight::instance().isEnabled())
+        {
+            connectorProperties.Add(shouldDownloadOfflineImagesPropertyName, 'true');
+        }
+        else
+        {
+            connectorProperties.Add(shouldDownloadOfflineImagesPropertyName, 'false');
+        }
+
+        try
+        {
+            do
+            {
+                eventSource.EventWriteDownloadMediaDataFromCmsStarted(enum2Symbol(enumNum(RetailCmsEntityType), _entityType), _batchSize, skip);
+                result = this.downloadMediaDataByConnector(_connector, connectorProperties);
+                eventSource.EventWriteDownloadMediaDataFromCmsFinished(enum2Symbol(enumNum(RetailCmsEntityType), _entityType), _batchSize, skip);
+
+                if (result == null)
+                {
+                    break;
+                }
+
+                this.insertMediaResources(result);
+                this.insertMediaAltTexts(result);
+                switch (_entityType)
+                {
+                    case RetailCmsEntityType::Product:
+                        this.insertMediaProductRelations(result);
+                        this.insertProductSwatches(result);
+                        break;
+                    case RetailCmsEntityType::Category:
+                        this.insertMediaCategoryRelations(result);
+                        break;
+                    default:
+                        return false;
+                }
+
+                // Set skip property to fetch next page.
+                skip += _batchSize;
+                connectorProperties.Remove(skipPropertyName);
+                connectorProperties.Add(skipPropertyName, int2Str(skip));
+            }
+            while (result != null && result.HasNextPage);
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception clrException = CLRInterop::getLastException();
+            eventSource.EventWriteSyncCmsJobClrExceptionEncountered(funcName(), clrException.InnerException.Message, clrException.InnerException.StackTrace);
+            isSyncSuccessfullyFinished = false;
+
+            throw clrException.InnerException;
+        }
+        catch (Exception::DuplicateKeyExceptionNotRecovered)
+        {
+            str infoLogMsg = strLRTrim(RetailTransactionServiceUtilities::getInfologMessages(fromLine));
+
+            if (xSession::currentRetryCount() >= maxRetryCount)
+            {
+                eventSource.EventWriteSyncCmsJobSqlExceptionNotRecovered(funcName(), 'DuplicateKeyExceptionNotRecovered', infoLogMsg);
+
+                isSyncSuccessfullyFinished = false;
+                throw Exception::DuplicateKeyExceptionNotRecovered;
+            }
+
+            eventSource.EventWriteSyncCmsJobSqlExceptionRetry(funcName(), 'DuplicateKeyExceptionNotRecovered', xSession::currentRetryCount(), infoLogMsg);
+            retry;
+        }
+        catch (Exception::UpdateConflictNotRecovered)
+        {
+            str infoLogMsg = strLRTrim(RetailTransactionServiceUtilities::getInfologMessages(fromLine));
+
+            if (xSession::currentRetryCount() >= maxRetryCount)
+            {
+                eventSource.EventWriteSyncCmsJobSqlExceptionNotRecovered(funcName(), 'UpdateConflictNotRecovered', infoLogMsg);
+
+                isSyncSuccessfullyFinished = false;
+                throw Exception::UpdateConflictNotRecovered;
+            }
+
+            eventSource.EventWriteSyncCmsJobSqlExceptionRetry(funcName(), 'UpdateConflictNotRecovered', xSession::currentRetryCount(), infoLogMsg);
+            retry;
+        }
+        catch
+        {
+            isSyncSuccessfullyFinished = false;
+            this.processGenericException(fromLine);
+        }
+
+        return isSyncSuccessfullyFinished;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>downloadMediaDataByConnector</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This simple method is created to allow unit testing mock.
+    /// </summary>
+    /// <param name = "_connector">The CMS connector.</param>
+    /// <param name = "_connectorProperties">The collection of connector properties.</param>
+    /// <returns>Media data.</returns>
+    private CmsProxy.MediaSynchronizationResult downloadMediaDataByConnector(CmsProxy.ICmsConnector _connector, IDictionary _connectorProperties)
+    {
+        return _connector.GetMediaSynchronizationResult(_connectorProperties);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMediaServerBaseUrlByConnector</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This simple method is created to allow unit testing mock.
+    /// </summary>
+    /// <param name = "_connector">The CMS connector.</param>
+    /// <returns>Media server base URL.</returns>
+    private RetailCmsMediaServerBaseUrl getMediaServerBaseUrlByConnector(CmsProxy.ICmsConnector _connector)
+    {
+        return _connector.GetMediaServerBaseUrl();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateConnectorState</Name>
+				<Source><![CDATA[
+    private void updateConnectorState(RefRecId _connectorRecId, RetailCmsConnectorState _connectorState, RetailCmsEntityType _entityType, utcdatetime _currentSyncStartDateTime)
+    {
+        int fromLine = Global::infologLine();
+
+        try
+        {
+            ttsbegin;
+
+            if (_connectorState)
+            {
+                _connectorState.LastSyncStartDateTime = _currentSyncStartDateTime;
+                _connectorState.LastSyncEndDateTime = DateTimeUtil::utcNow();
+                _connectorState.update();
+            }
+            else
+            {
+                _connectorState.Connector = _connectorRecId;
+                _connectorState.EntityType = _entityType;
+                _connectorState.LastSyncStartDateTime = _currentSyncStartDateTime;
+                _connectorState.LastSyncEndDateTime = DateTimeUtil::utcNow();
+                _connectorState.insert();
+            }
+
+            ttscommit;
+        }
+        catch
+        {
+            this.processGenericException(fromLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertMediaResources</Name>
+				<Source><![CDATA[
+    private void insertMediaResources(CmsProxy.MediaSynchronizationResult _result)
+    {
+        RetailTmpMediaResource tmpMediaResourceTable;
+        RecordInsertList tmpMediaResourceInsertList = new RecordInsertList(
+            tableNum(RetailTmpMediaResource),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpMediaResourceTable); // buffer where records will be inserted
+
+        var mediaResources = _result.GetMediaResources();
+        int nextRetailMediaResourceId = RetailMediaResource::getNextResourceId();
+
+        eventSource.EventWriteSyncCmsJobInsertMediaResourcesStarted(mediaResources.get_Count());
+        System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
+        stopwatch.Start();
+
+        // Put all media resources to RecordInsertList so that we can insert all records in batch later.
+        for(int i = 0; i < mediaResources.get_Count(); i++)
+        {
+            CmsProxy.MediaResource mediaResource = mediaResources.get_Item(i);
+
+            tmpMediaResourceTable.clear();
+            tmpMediaResourceTable.ResourceUrl = mediaResource.Url;
+            tmpMediaResourceTable.ExternalResourceId = mediaResource.Id;
+            tmpMediaResourceTable.RetailResourceId = nextRetailMediaResourceId;
+            tmpMediaResourceTable.MediaType = any2Enum(mediaResource.Type);
+
+            if (mediaResource.ImageBytes != null && mediaResource.ImageBytes.Length > 0)
+            {
+                using (var imageStream = new MemoryStream(mediaResource.ImageBytes))
+                {
+                    tmpMediaResourceTable.ResourceBlob = Binary::constructFromMemoryStream(imageStream).getContainer();
+                }
+            }
+
+            tmpMediaResourceInsertList.add(tmpMediaResourceTable);
+            nextRetailMediaResourceId++;
+        }
+
+        ttsbegin;
+
+        tmpMediaResourceInsertList.insertDatabase();
+        RetailMediaResource mediaResourceTable, existingMediaResourceTable;
+
+        // Update ResourceUrl for existing records
+        update_recordset mediaResourceTable
+        setting
+            ResourceUrl = tmpMediaResourceTable.ResourceUrl,
+            MediaType = tmpMediaResourceTable.MediaType,
+            ResourceBlob = tmpMediaResourceTable.ResourceBlob
+            join tmpMediaResourceTable
+                where mediaResourceTable.ExternalResourceId == tmpMediaResourceTable.ExternalResourceId
+                    && mediaResourceTable.ResourceUrl != tmpMediaResourceTable.ResourceUrl;
+
+        // Insert all media resources in batch.
+        insert_recordset mediaResourceTable (ResourceId, ResourceUrl, ExternalResourceId, MediaType, ResourceBlob)
+            select RetailResourceId, ResourceUrl, ExternalResourceId, MediaType, ResourceBlob from tmpMediaResourceTable
+            notexists join existingMediaResourceTable
+                where existingMediaResourceTable.ExternalResourceId == tmpMediaResourceTable.ExternalResourceId;
+
+        ttscommit;
+
+        stopwatch.Stop();
+        eventSource.EventWriteSyncCmsJobInsertMediaResourcesFinished(stopwatch.ElapsedMilliseconds);
+
+        tmpMediaResourceTable = null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertProductSwatches</Name>
+				<Source><![CDATA[
+    private void insertProductSwatches(CmsProxy.MediaSynchronizationResult _result)
+    {
+        // Get the list of product swatches that have been changed since last synchronization.
+        var changedSwatches = _result.GetChangedEntities(CmsProxy.EntityChangeType::EntitySwatch);
+
+        RetailTmpProductSwatchOverride tmpChangedSwatchTable;
+        RecordInsertList tmpChangedSwatchInsertList = new RecordInsertList(
+            tableNum(RetailTmpProductSwatchOverride),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpChangedSwatchTable); // buffer where records will be inserted
+
+        for (int i = 0; i < changedSwatches.get_Count(); i++)
+        {
+            CmsProxy.ChangedEntity swatch = changedSwatches.get_Item(i);
+
+            RefRecId catalogRefRecId = this.ResolveCatalogRecId(swatch.Criteria);
+            RefRecId retailInternalOrgRefRecId = this.ResolveInternalOrgRecId(swatch.Criteria);
+
+            tmpChangedSwatchTable.clear();
+            tmpChangedSwatchTable.ProductMaster = EcoResProduct::findByDisplayProductNumber(swatch.EntityId).RecId;
+            tmpChangedSwatchTable.RetailInternalOrgRefRecId = retailInternalOrgRefRecId;
+            tmpChangedSwatchTable.CatalogRefRecId = catalogRefRecId;
+            tmpChangedSwatchTable.LanguageId = swatch.Criteria.Locale == neutralLanguageIdentifier ? '' : swatch.Criteria.Locale;
+
+            tmpChangedSwatchInsertList.Add(tmpChangedSwatchTable);
+        }
+
+        // Get the list of updated product swatches.
+        var swatches = _result.GetEntitySwatches();
+
+        eventSource.EventWriteSyncCmsJobInsertProductSwatchesStarted(swatches.get_Count());
+        System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
+        stopwatch.Start();
+
+        RetailTmpProductSwatchOverride tmpSwatchTable;
+        RecordInsertList tmpSwatchInsertList = new RecordInsertList(
+            tableNum(RetailTmpProductSwatchOverride),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpSwatchTable); // buffer where records will be inserted
+
+        for (int i = 0; i < swatches.get_Count(); i++)
+        {
+            CmsProxy.EntitySwatch swatch = swatches.get_Item(i);
+
+            RefRecId catalogRefRecId = this.ResolveCatalogRecId(swatch.Criteria);
+            RefRecId retailInternalOrgRefRecId = this.ResolveInternalOrgRecId(swatch.Criteria);
+
+            tmpSwatchTable.clear();
+            if (swatch.MediaResourceId != '')
+            {
+                tmpSwatchTable.Image = RetailMediaResource::findByExternalResourceId(swatch.MediaResourceId).RecId;
+            }
+            tmpSwatchTable.HexCode = swatch.HexCode;
+            tmpSwatchTable.Text = swatch.Text;
+            tmpSwatchTable.ProductMaster = EcoResProduct::findByDisplayProductNumber(swatch.EntityId).RecId;
+            tmpSwatchTable.DimensionType = swatch.DimensionType;
+            tmpSwatchTable.RetailInternalOrgRefRecId = retailInternalOrgRefRecId;
+            tmpSwatchTable.CatalogRefRecId = catalogRefRecId;
+            tmpSwatchTable.LanguageId = swatch.Criteria.Locale == neutralLanguageIdentifier ? '' : swatch.Criteria.Locale;
+            switch (tmpSwatchTable.DimensionType)
+            {
+                case RetailProductDimensionType::Color:
+                    tmpSwatchTable.DimensionValue = EcoResColor::findByName(swatch.DimensionValue).RecId;
+                    break;
+                case RetailProductDimensionType::Size:
+                    tmpSwatchTable.DimensionValue = EcoResSize::findByName(swatch.DimensionValue).RecId;
+                    break;
+                case RetailProductDimensionType::Style:
+                    tmpSwatchTable.DimensionValue = EcoResStyle::findByName(swatch.DimensionValue).RecId;
+                    break;
+                case RetailProductDimensionType::Configuration:
+                    tmpSwatchTable.DimensionValue = EcoResConfiguration::findByName(swatch.DimensionValue).RecId;
+                    break;
+                default:
+                    continue;
+            }
+
+            tmpSwatchInsertList.Add(tmpSwatchTable);
+        }
+
+        ttsbegin;
+
+        tmpChangedSwatchInsertList.InsertDatabase();
+        tmpSwatchInsertList.InsertDatabase();
+
+        RetailProductSwatchOverride swatchTable;
+
+        // Delete the product swatches that have been changed (updated/deleted) since last synchronization.
+        delete_from swatchTable
+            exists join tmpChangedSwatchTable
+                where swatchTable.ProductMaster == tmpChangedSwatchTable.ProductMaster
+                    && swatchTable.CatalogId == tmpChangedSwatchTable.CatalogRefRecId
+                    && swatchTable.LanguageId == tmpChangedSwatchTable.LanguageId
+                    && swatchTable.InternalOrganization == tmpChangedSwatchTable.RetailInternalOrgRefRecId;
+
+        // Insert the updated product swatches to database.
+        insert_recordset swatchTable (Image, HexCode, Text, ProductMaster, DimensionType, DimensionValue, CatalogId, LanguageId, InternalOrganization)
+            select Image, HexCode, Text, ProductMaster, DimensionType, DimensionValue, CatalogRefRecId, LanguageId, RetailInternalOrgRefRecId from tmpSwatchTable;
+
+        ttscommit;
+
+        stopwatch.Stop();
+        eventSource.EventWriteSyncCmsJobInsertProductSwatchesFinished(stopwatch.ElapsedMilliseconds);
+
+        tmpSwatchTable = null;
+        tmpChangedSwatchTable = null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertMediaProductRelations</Name>
+				<Source><![CDATA[
+    private void insertMediaProductRelations(CmsProxy.MediaSynchronizationResult _result)
+    {
+        // Get the list of media product relations that have been changed since last synchronization.
+        var changedMediaProductRelations = _result.GetChangedEntities(CmsProxy.EntityChangeType::MediaEntityRelation);
+
+        RetailTmpMediaEntityRelation tmpChangedMediaProductRelationTable;
+        RecordInsertList tmpChangedMediaProductRelationInsertList = new RecordInsertList(
+            tableNum(RetailTmpMediaEntityRelation),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpChangedMediaProductRelationTable); // buffer where records will be inserted
+
+        for (int i = 0; i < changedMediaProductRelations.get_Count(); i++)
+        {
+            CmsProxy.ChangedEntity mediaProductRelation = changedMediaProductRelations.get_Item(i);
+
+            RefRecId catalogRefRecId = this.ResolveCatalogRecId(mediaProductRelation.Criteria);
+            RefRecId retailInternalOrgRefRecId = this.ResolveInternalOrgRecId(mediaProductRelation.Criteria);
+
+            tmpChangedMediaProductRelationTable.clear();
+            tmpChangedMediaProductRelationTable.EntityRefRecId = EcoResProduct::findByDisplayProductNumber(mediaProductRelation.EntityId).RecId;
+            tmpChangedMediaProductRelationTable.RetailInternalOrgRefRecId = retailInternalOrgRefRecId;
+            tmpChangedMediaProductRelationTable.CatalogRefRecId = catalogRefRecId;
+            tmpChangedMediaProductRelationTable.LanguageId = mediaProductRelation.Criteria.Locale == neutralLanguageIdentifier ? '' : mediaProductRelation.Criteria.Locale;
+
+            tmpChangedMediaProductRelationInsertList.Add(tmpChangedMediaProductRelationTable);
+        }
+
+        // Get the list of updated product media relations.
+        var mediaEntityRelations = _result.GetMediaEntityRelations();
+
+        eventSource.EventWriteSyncCmsJobInsertMediaEntityRelationsStarted(mediaEntityRelations.get_Count());
+        System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
+        stopwatch.Start();
+
+        RetailTmpMediaEntityRelation tmpMediaEntityRelationTable;
+        RecordInsertList tmpMediaEntityRelationInsertList = new RecordInsertList(
+            tableNum(RetailTmpMediaEntityRelation),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpMediaEntityRelationTable); // buffer where records will be inserted
+
+        // Put all media product relations to RecordInsertList so that we can insert all records in batch later.
+        for (int i = 0; i < mediaEntityRelations.get_Count(); i++)
+        {
+            CmsProxy.MediaEntityRelation mediaEntityRelation = mediaEntityRelations.get_Item(i);
+
+            RefRecId catalogRefRecId = this.ResolveCatalogRecId(mediaEntityRelation.Criteria);
+            RefRecId retailInternalOrgRefRecId = this.ResolveInternalOrgRecId(mediaEntityRelation.Criteria);
+
+            tmpMediaEntityRelationTable.clear();
+            tmpMediaEntityRelationTable.ExternalResourceId = mediaEntityRelation.MediaResourceId;
+            tmpMediaEntityRelationTable.EntityRefRecId = EcoResProduct::findByDisplayProductNumber(mediaEntityRelation.EntityId).RecId;
+            tmpMediaEntityRelationTable.LanguageId = mediaEntityRelation.Criteria.Locale == neutralLanguageIdentifier ? '' : mediaEntityRelation.Criteria.Locale;
+            tmpMediaEntityRelationTable.RetailInternalOrgRefRecId = retailInternalOrgRefRecId;
+            tmpMediaEntityRelationTable.CatalogRefRecId = catalogRefRecId;
+            tmpMediaEntityRelationTable.IsAdditionalMedia = mediaEntityRelation.IsAdditionalMedia;
+            tmpMediaEntityRelationTable.DisplayOrder = mediaEntityRelation.DisplayOrder;
+            tmpMediaEntityRelationTable.IsDefault = mediaEntityRelation.IsDefault;
+            tmpMediaEntityRelationTable.MediaPurpose = mediaEntityRelation.MediaPurpose;
+
+            tmpMediaEntityRelationInsertList.add(tmpMediaEntityRelationTable);
+        }
+
+        ttsbegin;
+
+        tmpChangedMediaProductRelationInsertList.insertDatabase();
+        tmpMediaEntityRelationInsertList.insertDatabase();
+
+        RetailMediaResource mediaResourceTable;
+        RetailMediaProductRelation mediaProductRelationTable;
+
+        // Delete the media product relations that have been changed (updated/deleted) since last synchronization.
+        delete_from mediaProductRelationTable
+            exists join tmpChangedMediaProductRelationTable
+                where mediaProductRelationTable.Product == tmpChangedMediaProductRelationTable.EntityRefRecId
+                    && mediaProductRelationTable.Catalog == tmpChangedMediaProductRelationTable.CatalogRefRecId
+                    && mediaProductRelationTable.InternalOrganization == tmpChangedMediaProductRelationTable.RetailInternalOrgRefRecId
+                    && mediaProductRelationTable.LanguageId == tmpChangedMediaProductRelationTable.LanguageId
+            exists join mediaResourceTable
+                where mediaResourceTable.RecId == mediaProductRelationTable.MediaResource
+                    && mediaResourceTable.ExternalResourceId != '';
+
+        // Insert updated media product relations to database.
+        insert_recordset mediaProductRelationTable (Product, InternalOrganization, Catalog, LanguageId, IsAdditionalMedia, DisplayOrder, IsDefault, MediaPurpose, MediaResource)
+            select EntityRefRecId, RetailInternalOrgRefRecId, CatalogRefRecId, LanguageId, IsAdditionalMedia, DisplayOrder, IsDefault, MediaPurpose from tmpMediaEntityRelationTable
+            join RecId from mediaResourceTable
+                where mediaResourceTable.ExternalResourceId == tmpMediaEntityRelationTable.ExternalResourceId;
+
+        ttscommit;
+
+        stopwatch.Stop();
+        eventSource.EventWriteSyncCmsJobInsertMediaEntityRelationsFinished(stopwatch.ElapsedMilliseconds);
+
+        tmpChangedMediaProductRelationTable = null;
+        tmpMediaEntityRelationTable = null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertMediaCategoryRelations</Name>
+				<Source><![CDATA[
+    private void insertMediaCategoryRelations(CmsProxy.MediaSynchronizationResult _result)
+    {
+        var changeEntityRelations = _result.GetChangedEntities(CmsProxy.EntityChangeType::MediaEntityRelation);
+
+        RetailTmpMediaEntityRelation tmpChangedMediaRelationTable;
+        RecordInsertList tmpChangedMediaRelationInsertList = new RecordInsertList(
+            tableNum(RetailTmpMediaEntityRelation),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpChangedMediaRelationTable); // buffer where records will be inserted
+
+        for (int i = 0; i < changeEntityRelations.get_Count(); i++)
+        {
+            CmsProxy.ChangedEntity mediaEntityRelation = changeEntityRelations.get_Item(i);
+            RefRecId categoryId = this.ResolveCategoryRecId(mediaEntityRelation.Criteria, mediaEntityRelation.EntityId);
+
+            if (categoryId != 0)
+            {
+                tmpChangedMediaRelationTable.clear();
+                tmpChangedMediaRelationTable.EntityRefRecId = categoryId;
+                tmpChangedMediaRelationTable.LanguageId = mediaEntityRelation.Criteria.Locale == neutralLanguageIdentifier ? '' : mediaEntityRelation.Criteria.Locale;
+
+                tmpChangedMediaRelationInsertList.Add(tmpChangedMediaRelationTable);
+            }
+        }
+
+        var mediaEntityRelations = _result.GetMediaEntityRelations();
+
+        eventSource.EventWriteSyncCmsJobInsertMediaEntityRelationsStarted(mediaEntityRelations.get_Count());
+        System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
+        stopwatch.Start();
+
+        RetailTmpMediaEntityRelation tmpMediaEntityRelationTable;
+        RecordInsertList tmpMediaEntityRelationInsertList = new RecordInsertList(
+            tableNum(RetailTmpMediaEntityRelation),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpMediaEntityRelationTable); // buffer where records will be inserted
+
+        // Put all media relations to RecordInsertList so that we can insert all records in batch later.
+        for (int i = 0; i < mediaEntityRelations.get_Count(); i++)
+        {
+            CmsProxy.MediaEntityRelation mediaEntityRelation = mediaEntityRelations.get_Item(i);
+            RefRecId categoryId = this.ResolveCategoryRecId(mediaEntityRelation.Criteria, mediaEntityRelation.EntityId);
+
+            if (categoryId != 0)
+            {
+                tmpMediaEntityRelationTable.clear();
+                tmpMediaEntityRelationTable.EntityRefRecId = categoryId;
+                tmpMediaEntityRelationTable.ExternalResourceId = mediaEntityRelation.MediaResourceId;
+                tmpMediaEntityRelationTable.LanguageId = mediaEntityRelation.Criteria.Locale == neutralLanguageIdentifier ? '' : mediaEntityRelation.Criteria.Locale;
+                tmpMediaEntityRelationTable.DisplayOrder = mediaEntityRelation.DisplayOrder;
+                tmpMediaEntityRelationTable.IsDefault = mediaEntityRelation.IsDefault;
+                tmpMediaEntityRelationTable.IsAdditionalMedia = mediaEntityRelation.IsAdditionalMedia;
+
+                tmpMediaEntityRelationInsertList.add(tmpMediaEntityRelationTable);
+            }
+        }
+
+        ttsbegin;
+
+        tmpChangedMediaRelationInsertList.insertDatabase();
+        tmpMediaEntityRelationInsertList.insertDatabase();
+
+        RetailMediaResource mediaResourceTable;
+        RetailMediaAndMasterEntityRelation mediaRelationTable;
+
+        // Delete the media relations that have been changed (updated/deleted) since last synchronization.
+        delete_from mediaRelationTable
+            exists join tmpChangedMediaRelationTable
+                where mediaRelationTable.MasterEntityRecId == tmpChangedMediaRelationTable.EntityRefRecId
+                    && mediaRelationTable.LanguageId == tmpChangedMediaRelationTable.LanguageId
+            exists join mediaResourceTable
+                where mediaRelationTable.MediaResourceId == mediaResourceTable.ResourceId
+                    && mediaResourceTable.ExternalResourceId != '';
+
+        // Insert updated media relations to database.
+        var categoryType = enum2int(RetailMediaMasterEntity::Category);
+        insert_recordset mediaRelationTable (MasterEntityRecId, MasterEntityType, LanguageId, IsDefault, IsAdditionalMedia, DisplayOrder, MediaResourceId)
+            select EntityRefRecId, categoryType, LanguageId, IsDefault, IsAdditionalMedia, DisplayOrder from tmpMediaEntityRelationTable
+            join ResourceId from mediaResourceTable
+                where mediaResourceTable.ExternalResourceId == tmpMediaEntityRelationTable.ExternalResourceId;
+
+        ttscommit;
+
+        stopwatch.Stop();
+        eventSource.EventWriteSyncCmsJobInsertMediaEntityRelationsFinished(stopwatch.ElapsedMilliseconds);
+
+        tmpChangedMediaRelationTable = null;
+        tmpMediaEntityRelationTable = null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertMediaAltTexts</Name>
+				<Source><![CDATA[
+    private void insertMediaAltTexts(CmsProxy.MediaSynchronizationResult _result)
+    {
+        RetailTmpMediaResourceTranslation tmpMediaResourceTranslationTable;
+
+        RecordInsertList tmpMediaResourceTranslationInsertList = new RecordInsertList(
+            tableNum(RetailTmpMediaResourceTranslation),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpMediaResourceTranslationTable); // buffer where records will be inserted
+
+        var mediaAltTexts = _result.GetMediaAltTexts();
+
+        eventSource.EventWriteSyncCmsJobInsertMediaAltTextsStarted(mediaAltTexts.get_Count());
+        System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
+        stopwatch.Start();
+
+        ttsbegin;
+
+        // Put all media alt texts to RecordInsertList so that we can insert all records in batch later.
+        for (int i = 0; i < mediaAltTexts.get_Count(); i++)
+        {
+            CmsProxy.MediaAltText mediaAltText = mediaAltTexts.get_Item(i);
+
+            tmpMediaResourceTranslationTable.clear();
+            tmpMediaResourceTranslationTable.ExternalResourceId = mediaAltText.MediaResourceId;
+            tmpMediaResourceTranslationTable.LanguageId = mediaAltText.Locale == neutralLanguageIdentifier ? '' : mediaAltText.Locale;
+            tmpMediaResourceTranslationTable.AltText = mediaAltText.Text;
+
+            tmpMediaResourceTranslationInsertList.add(tmpMediaResourceTranslationTable);
+        }
+
+        tmpMediaResourceTranslationInsertList.insertDatabase();
+
+        // Insert all alt texts in batch.
+        RetailMediaResource mediaResourceTable;
+        RetailMediaResourceTranslation mediaResourceTranslationTable, existingMediaResourceTranslationTable;
+        insert_recordset mediaResourceTranslationTable (LanguageId, AltText, MediaResource)
+            select LanguageId, AltText from tmpMediaResourceTranslationTable
+            join RecId from mediaResourceTable
+                where mediaResourceTable.ExternalResourceId == tmpMediaResourceTranslationTable.ExternalResourceId
+            notexists join existingMediaResourceTranslationTable
+                where existingMediaResourceTranslationTable.MediaResource == mediaResourceTable.RecId
+                      && existingMediaResourceTranslationTable.LanguageId == tmpMediaResourceTranslationTable.LanguageId;
+
+        ttscommit;
+
+        stopwatch.Stop();
+        eventSource.EventWriteSyncCmsJobInsertMediaAltTextsFinished(stopwatch.ElapsedMilliseconds);
+
+        tmpMediaResourceTranslationTable = null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ResolveCatalogRecId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resolves Catalog RecId from synchronization criteria.
+    /// </summary>
+    /// <param name = "retailCatalogId">Synchronization criteria.</param>
+    /// <returns>Catalog's RecId.</returns>
+    /// <remarks>
+    /// CatalogId in criteria is CatalogId column in Catalog table.
+    /// </remarks>
+    private RefRecId ResolveCatalogRecId(CmsProxy.MediaSynchronizationCriteria _criteria)
+    {
+        RefRecId catalogRefRecId = _criteria.CatalogId == null || _criteria.CatalogId == '' || _criteria.CatalogId == defaultCatalogIdentifier
+            ? 0 : Catalog::FindByCatalogId(_criteria.CatalogId).RecId;
+
+        return catalogRefRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ResolveInternalOrgRecId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resolves RetailInternalOrganization RecId from synchronization criteria.
+    /// </summary>
+    /// <param name = "retailCatalogId">Synchronization criteria.</param>
+    /// <returns>RetailInternalOrganization's RecId.</returns>
+    /// <remarks>
+    /// OrgUnitNumber in criteria is OMOperatingUnitNumber column in OMOperatingUnit table.
+    /// </remarks>
+    private RefRecId ResolveInternalOrgRecId(CmsProxy.MediaSynchronizationCriteria _criteria)
+    {
+        RefRecId retailInternalOrgRefRecId;
+        OMOperatingUnit omOperatingUnit;
+
+        if (_criteria.OrgUnitNumber == null || _criteria.OrgUnitNumber == '' || _criteria.OrgUnitNumber == omniChannelIdentifier)
+        {
+            retailInternalOrgRefRecId = 0;
+        }
+        else
+        {
+            select RecId from omOperatingUnit where omOperatingUnit.OMOperatingUnitNumber == _criteria.OrgUnitNumber;
+            retailInternalOrgRefRecId = RetailInternalOrganization::findByOMInternalOrganization(omOperatingUnit.RecId).RecId;
+        }
+
+        return retailInternalOrgRefRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ResolveCategoryRecId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resolves Category RecId from synchronization criteria (channel) and category name.
+    /// </summary>
+    /// <param name = "_criteria">Synchronization criteria.</param>
+    /// <param name = "_categoryName">Category name.</param>
+    /// <returns>EcoResCategory's RecId.</returns>
+    /// <remarks>
+    /// OrgUnitNumber in criteria is OMOperatingUnitNumber column in OMOperatingUnit table.
+    /// </remarks>
+    private RefRecId ResolveCategoryRecId(CmsProxy.MediaSynchronizationCriteria _criteria, str _categoryName)
+    {
+        OMOperatingUnit omOperatingUnit;
+        EcoResCategory category;
+
+        select RecId from omOperatingUnit where omOperatingUnit.OMOperatingUnitNumber == _criteria.OrgUnitNumber;
+        RetailInternalOrganization retailInternalOrg = RetailInternalOrganization::findByOMInternalOrganization(omOperatingUnit.RecId);
+
+        select firstonly RecId from category
+                where category.CategoryHierarchy == retailInternalOrg.CategoryHierarchy && category.Name == _categoryName;
+
+        return category.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanupOrphanRecords</Name>
+				<Source><![CDATA[
+    private void cleanupOrphanRecords()
+    {
+        int fromLine = Global::infologLine();
+
+        try
+        {
+            eventSource.EventWriteSyncCmsJobCleanupOrphanRecordsStarted();
+            System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
+            stopwatch.Start();
+
+            ttsbegin;
+
+            // Remove media product relations if the products do not exist anymore.
+            RetailMediaProductRelation mediaProductRelationTable;
+            EcoResProduct ecoResProductTable;
+
+            delete_from mediaProductRelationTable
+            notexists join ecoResProductTable
+                where ecoResProductTable.RecId == mediaProductRelationTable.Product;
+
+            // Remove product swatches if the products do not exist anymore.
+            RetailProductSwatchOverride productSwatchTable;
+            delete_from productSwatchTable
+            notexists join ecoResProductTable
+                where ecoResProductTable.RecId == productSwatchTable.ProductMaster;
+
+            // Remove media resources that are downloaded from CMS if they are not used anymore.
+            RetailMediaResource mediaResourceTable;
+            RetailInUseMediaResourceView inUseMediaResource;
+
+            delete_from mediaResourceTable
+                where mediaResourceTable.ExternalResourceId != '' // if the media resource is downloaded from CMS.
+            notexists join inUseMediaResource
+                where inUseMediaResource.MediaResource == mediaResourceTable.RecId;
+
+            // Remove media alt texts if the media resources do not exist anymore.
+            RetailMediaResourceTranslation mediaResourceTranslationTable;
+
+            delete_from mediaResourceTranslationTable
+            notexists join mediaResourceTable
+                where mediaResourceTable.RecId == mediaResourceTranslationTable.MediaResource;
+
+            ttscommit;
+
+            stopwatch.Stop();
+            eventSource.EventWriteSyncCmsJobCleanupOrphanRecordsFinished(stopwatch.ElapsedMilliseconds);
+        }
+        catch
+        {
+            this.processGenericException(fromLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processGenericException</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Catches the generic exception.
+    /// </summary>
+    /// <param name = "_fromLine">The from line value.</param>
+    private void processGenericException(int _fromLine)
+    {
+        str infoLogMsg = strLRTrim(RetailTransactionServiceUtilities::getInfologMessages(_fromLine));
+
+        if (infoLogMsg == '')
+        {
+            // No infolog was found, log a generic message to the UI.
+            infoLogMsg = "@Retail:SyncCmsJobRuntimeGenericErrorPleaseTryAgainContactSysAdmin";
+        }
+
+        str errMessage = strFmt('Generic exception encountered while running sync CMS job: %1', infoLogMsg);
+        str localizedErrMessage = strFmt("@Retail:SyncCmsJobRuntimeGenericException", infoLogMsg);
+
+        eventSource.EventWriteSyncCmsJobGenericExceptionEncountered(errMessage);
+
+        throw error(localizedErrMessage);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

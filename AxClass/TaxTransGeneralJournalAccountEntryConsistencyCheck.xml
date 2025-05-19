@@ -1,0 +1,397 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TaxTransGeneralJournalAccountEntryConsistencyCheck</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.TaxEngine.Instrumentation;
+
+/// <summary>
+/// The <c>TaxTransGeneralJournalAccountEntryConsistencyCheck</c> class checks and corrects <c>TaxTransGeneralJournalAccountEntry</c> if ledger trans for tax is inserted.
+/// </summary>
+/// <remarks>
+/// This consistency check doesn't support the scenario which TaxBaseAmount is zero and TaxTransGeneralJournalAccountEntry.TaxTransRelationship is TaxTransRelationshipType::TransactionLineAccount for now.
+/// </remarks>
+public class TaxTransGeneralJournalAccountEntryConsistencyCheck extends SysConsistencyCheck
+{
+    Set transferIdAndLedger;
+    boolean ignoreCheckTransactionLineAccountRelationWhenBaseAmountIsZero = true;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the process of checking and fixing the missing links in <c>TaxTransGeneralJournalAccountEntry</c>.
+    /// </summary>
+    public void run()
+    {
+        TaxTrans                           taxTrans;
+        Counter                            totalNumOfMissedRecords;
+        TaxTransGeneralJournalAccountEntry taxTransGeneralJournalAccountEntry;
+
+        transferIdAndLedger = new Set(Types::Container);
+
+        List transactionRuleRecordList = new List(Types::Record);
+        FromDate fromDate = this.consistencyCheckJob.parmFromDate();
+
+        // Check taxTrans.TaxOrigin = Tax
+        while select taxTrans
+            where taxTrans.TaxOrigin == TaxOrigin::Tax
+                && taxTrans.TransDate >= fromDate
+                // skip the TaxTrans that has 0 tax amount
+                && (taxTrans.TaxAmount != 0
+                    || taxTrans.TaxAmountCur != 0
+                    || taxTrans.TaxAmountRep != 0
+                    || taxTrans.SourceTaxAmountCur != 0
+                    || taxTrans.SourceRegulateAmountCur != 0
+                    || taxTrans.TaxInCostPrice != 0
+                    || taxTrans.TaxInCostPriceCur != 0
+                    || taxTrans.TaxInCostPriceMST != 0
+                    || taxTrans.TaxInCostPriceRegulated != 0
+                    || taxTrans.TaxInCostPriceRep != 0)
+        {
+            select count(RecId) from taxTransGeneralJournalAccountEntry
+                where taxTransGeneralJournalAccountEntry.TaxTrans == taxTrans.RecId
+                    && (!ignoreCheckTransactionLineAccountRelationWhenBaseAmountIsZero
+                        || !(taxTrans.TaxBaseAmount == 0
+                            && taxTransGeneralJournalAccountEntry.TaxTransRelationship == TaxTransRelationshipType::TransactionLineAccount));
+
+            Counter existRecordNum = taxTransGeneralJournalAccountEntry.RecId;
+
+            Counter needRecordNum = this.checkNeedNumberOfTaxTransLink(taxTrans);
+
+            if (needRecordNum > existRecordNum)
+            {
+                str message = strFmt("@TaxTransGeneralJournalAccountEntry:MissingLog", taxTrans.RecId, existRecordNum, needRecordNum);
+                warning(message);
+
+                transactionRuleRecordList.addEnd(taxTrans);
+
+                var log = TaxEngineEventSource::Get_Log();
+                str value = strFmt(@"%1", taxTrans.RecId);
+                log.TrackMetric(message, value);
+
+                totalNumOfMissedRecords++;
+            }
+        }
+
+        if (totalNumOfMissedRecords > 0 && this.checkFix() == CheckFix::Fix && FeatureStateProvider::isFeatureEnabled(TaxTransLinkMissingFixEnableFlighting::instance()))
+        {
+            ListEnumerator enumerator = transactionRuleRecordList.getEnumerator();
+
+            Counter totalNumOfRepairedRecords;
+            while(enumerator.moveNext())
+            {
+                TaxTrans currentRecord = enumerator.current();
+
+                boolean canRepair = this.canGenerateTaxTransLink(currentRecord);
+                if (canRepair)
+                {
+                    totalNumOfRepairedRecords++;
+                }
+            }
+
+            this.updateCorrected(totalNumOfRepairedRecords);
+        }
+        this.updateNotCorrected();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>treeParentClassId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Provides the id of the parent class.
+    /// </summary>
+    /// <returns>The class id of the parent class.</returns>
+    public ClassId treeParentClassId()
+    {
+        return classNum(TaxConsistencyCheck);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@TaxTransGeneralJournalAccountEntry:CheckConsistencyName";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>helpText</Name>
+				<Source><![CDATA[
+    public static HelpTxt helpText()
+    {
+        return strFmt("@TaxTransGeneralJournalAccountEntry:CheckConsistencyDescription");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>executionOrder</Name>
+				<Source><![CDATA[
+    public Integer executionOrder()
+    {
+        return 1;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkNeedNumberOfTaxTransLink</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the necessary number of <c>TaxTrans</c> links.
+    /// </summary>
+    /// <param name = "_taxTrans">The record in table <c>TaxTrans</c>.</param>
+    /// <returns>The number of <c>TaxTrans</c> links needed.</returns>
+    private Counter checkNeedNumberOfTaxTransLink(TaxTrans _taxTrans)
+    {
+        Counter needRecordNum = 0;
+   
+        // check TaxTransRelationShip = TransactionLineAccount.
+        needRecordNum += this.numberOfTaxTransLinkForTransactionLineAccount(_taxTrans.TaxBaseAmount);
+
+        // check TaxTransRelationShip = Tax.
+        needRecordNum += this.numberOfTaxTransLinkForTax(_taxTrans.TaxAmount, _taxTrans.TaxInCostPrice);
+
+        // check TaxTransRelationShip = TaxInCostPrice
+        needRecordNum += this.numberOfTaxTransLinkForTaxInCostPrice(_taxTrans.TaxInCostPrice);
+
+        // check TaxTransRelationShip = UseTaxPayable
+        needRecordNum += this.numberOfTaxTransLinkForUseTaxPayable(_taxTrans.TaxDirection, _taxTrans.TaxAmount, _taxTrans.TaxInCostPrice);
+
+        // check TaxTransRelationShip = LineDiscount
+        needRecordNum += this.numberOfTaxTransLinkForLineDiscount(_taxTrans.SourceTableId, _taxTrans.SourceRecId);
+
+        // Future to be added
+        // check TaxTransRelationShip = TotalDiscount
+        // check TaxTransRelationShip = CashDiscount
+        // check TaxTransRelationShip = Offset_RU
+
+        return needRecordNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfTaxTransLinkForTransactionLineAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the number of <c>TaxTrans</c> links with TaxTransRelationShipType::TransactionLineAccount it needs to create.
+    /// </summary>
+    /// <param name = "_taxBaseAmount">TaxBaseAmount from table <c>TaxTrans</c>.</param>
+    /// <returns>The number of <c>TaxTrans</c> links with TaxTransRelationShipType::TransactionLineAccount it needs to create.</returns>
+    private Counter numberOfTaxTransLinkForTransactionLineAccount(Amount _taxBaseAmount)
+    {
+        if (!ignoreCheckTransactionLineAccountRelationWhenBaseAmountIsZero || _taxBaseAmount != 0 )
+        {
+            return 1;
+        }
+
+        return 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfTaxTransLinkForTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the number of <c>TaxTrans</c> links with TaxTransRelationShipType::Tax it needs to create.
+    /// </summary>
+    /// <param name = "_taxAmount">TaxAmount from table <c>TaxTrans</c>.</param>
+    /// <param name = "_taxInCostPrice">TaxIncostPrice from table <c>TaxTrans</c>.</param>
+    /// <returns>The number of <c>TaxTrans</c> links with TaxTransRelationShipType::Tax it needs to create.</returns>
+    private Counter numberOfTaxTransLinkForTax(Amount _taxAmount, Amount _taxInCostPrice)
+    {
+        if (_taxInCostPrice != 0 && _taxInCostPrice != _taxAmount)
+        {
+            return 1;
+        }
+
+        if (_taxInCostPrice == 0 && _taxAmount != 0)
+        {
+            return 1;
+        }
+
+        return 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfTaxTransLinkForTaxInCostPrice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the number of <c>TaxTrans</c> links with TaxTransRelationShipType::TaxInCostPrice it needs to create.
+    /// </summary>
+    /// <param name = "_taxInCostPrice">TaxIncostPrice from table <c>TaxTrans</c>.</param>
+    /// <returns>The number of <c>TaxTrans</c> links with TaxTransRelationShipType::TaxInCostPrice it needs to create.</returns>
+    private Counter numberOfTaxTransLinkForTaxInCostPrice(Amount _taxInCostPrice)
+    {
+        if (_taxInCostPrice != 0)
+        {
+            return 1;
+        }
+
+        return 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfTaxTransLinkForUseTaxPayable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the number of <c>TaxTrans</c> links with TaxTransRelationShipType::UseTaxPayable it needs to create.
+    /// </summary>
+    /// <param name = "_taxDirection">It can identity if it uses use tax.</param>
+    /// <param name = "_taxAmount">TaxAmount from table <c>TaxTrans</c>.</param>
+    /// <param name = "_taxInCostPrice">TaxIncostPrice from table <c>TaxTrans</c>.</param>
+    /// <returns>The number of <c>TaxTrans</c> links with TaxTransRelationShipType::UseTaxPayable it needs to create.</returns>
+    private Counter numberOfTaxTransLinkForUseTaxPayable(TaxDirection _taxDirection, Amount _taxAmount, Amount _taxInCostPrice)
+    {
+        Counter needRecordNum;
+
+        if (_taxDirection == TaxDirection::UseTax)
+        {
+            if (_taxInCostPrice != 0)
+            {
+                needRecordNum++;
+            }
+
+            if (_taxAmount != _taxInCostPrice)
+            {
+                needRecordNum++;
+            }
+        }
+
+        return needRecordNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfTaxTransLinkForLineDiscount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the number of <c>TaxTrans</c> links with TaxTransRelationShipType::LineDiscount it needs to create.
+    /// </summary>
+    /// <param name = "_sourceTableId">SourceTableId from table <c>TaxTrans</c>.</param>
+    /// <param name = "_sourceRecId">SourceRecId from table <c>TaxTrans</c>.</param>
+    /// <returns>The number of <c>TaxTrans</c> links with TaxTransRelationShipType::LineDiscount it needs to create.</returns>
+    private Counter numberOfTaxTransLinkForLineDiscount(RefTableId _sourceTableId, RecId _sourceRecId)
+    {
+        Counter needRecordNum;
+
+        if (_sourceTableId == tableNum(VendInvoiceTrans))
+        {
+            VendInvoiceTrans vendInvoiceTrans;
+            select firstonly vendInvoiceTrans
+                where vendInvoiceTrans.RecId == _sourceRecId;
+
+            if (vendInvoiceTrans.DiscAmount != 0)
+            {
+                needRecordNum++;
+            }
+
+            if (vendInvoiceTrans.DiscPercent != 0)
+            {
+                needRecordNum++;
+            }
+        }
+
+        return needRecordNum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canGenerateTaxTransLink</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Judges if it can generate <c>TaxTrans</c> link when it misses links for <c>TaxTrans</c> record.
+    /// </summary>
+    /// <param name = "_taxTrans">The record in table <c>TaxTrans</c> with missing links.</param>
+    /// <returns>true, if it can generate link; otherwise, false.</returns>
+    private boolean canGenerateTaxTransLink(TaxTrans _taxTrans)
+    {
+        if (_taxTrans.SourceDocumentLine != 0)
+        {
+            SubledgerJournalEntry subledgerJournalEntry;
+            AccountingEvent       accountingEvent;
+            SourceDocumentLine    sourceDocumentLine;
+
+            select firstonly TransferId, Ledger from subledgerJournalEntry
+                where subledgerJournalEntry.Status == SubledgerJournalEntryStatus::Transferred
+                    && subledgerJournalEntry.TransferId != 0
+                join RecId from accountingEvent
+                    where subledgerJournalEntry.AccountingEvent == accountingEvent.RecId
+                join sourceDocumentLine
+                    where sourceDocumentLine.SourceDocumentHeader == accountingEvent.SourceDocumentHeader
+                        && sourceDocumentLine.RecId ==  _taxTrans.SourceDocumentLine;
+
+            container currentTransferIdAndLedger = [subledgerJournalEntry.TransferId, subledgerJournalEntry.Ledger];
+
+            if (subledgerJournalEntry.TransferId && subledgerJournalEntry.Ledger)
+            {
+                if (!transferIdAndLedger.in(currentTransferIdAndLedger))
+                {
+                    SubledgerJournalEntry              subledgerJournalEntryForDeletingLink;
+                    AccountingEvent                    accountingEventForDeletingLink;
+                    SourceDocumentLine                 sourceDocumentLineForDeletingLink;
+                    TaxTrans                           taxTransForDeletingLink;
+
+                    ttsbegin;
+
+                    while select taxTransForDeletingLink
+                        join TransferId from subledgerJournalEntryForDeletingLink
+                            where subledgerJournalEntryForDeletingLink.TransferId == subledgerJournalEntry.TransferId
+                                && subledgerJournalEntryForDeletingLink.Ledger == subledgerJournalEntry.Ledger
+                        join RecId from accountingEventForDeletingLink
+                            where accountingEventForDeletingLink.RecId == subledgerJournalEntryForDeletingLink.AccountingEvent
+                        join RecId from sourceDocumentLineForDeletingLink
+                            where sourceDocumentLineForDeletingLink.SourceDocumentHeader == accountingEventForDeletingLink.SourceDocumentHeader
+                                && sourceDocumentLineForDeletingLink.RecId == taxTransForDeletingLink.SourceDocumentLine
+                    {
+                        if (taxTransForDeletingLink.TaxOrigin != TaxOrigin::Tax)
+                        {
+                            warning(strFmt("@TaxTransGeneralJournalAccountEntry:RepairErrorMessage", _taxTrans.RecId));
+                            ttsabort;
+                            return false;
+                        }
+                        else
+                        {
+                            TaxTransGeneralJournalAccountEntry taxTransLinkTobeDeleted;
+                            delete_from taxTransLinkTobeDeleted
+                                where taxTransLinkTobeDeleted.TaxTrans == taxTransForDeletingLink.RecId;
+                        }
+                    }
+
+                    TaxTransGeneralJournalAccountEntry::create(subledgerJournalEntry.TransferId, subledgerJournalEntry.Ledger);
+
+                    transferIdAndLedger.add(currentTransferIdAndLedger);
+
+                    ttscommit;
+                }
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

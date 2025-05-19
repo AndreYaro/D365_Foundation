@@ -1,0 +1,1753 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>MCRSalesStatsCust</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///     The <c>MCRSalesStatsCust</c> class generates some basic statistics on items a customers has purchased.
+/// </summary>
+final class MCRSalesStatsCust extends RunBaseBatch implements BatchRetryable
+{
+    Counter         progressTotal;
+    Counter         progressCounter;
+
+    QueryRun        queryRun;
+    CustAccount     custAccount;
+
+    StartDate       startDate;
+    EndDate         endDate;
+    NoYesId         calcRFM;
+    DialogField     dialogCustAccount;
+    DialogField     dialogStartDate;
+    DialogField     dialogEndDate;
+
+    #define.currentVersion(1)
+    #LOCALMACRO.ParmList
+        startDate,
+        endDate
+    #ENDMACRO
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>buildQuery</Name>
+				<Source><![CDATA[
+    private void buildQuery()
+    {
+        QueryBuildDataSource    queryBuildDataSource;
+        QueryBuildRange         queryBuildRange;
+
+        queryBuildDataSource = queryRun.query().dataSourceTable(tableNum(CustInvoiceJour));
+        queryBuildRange = queryBuildDataSource.addRange(fieldNum(CustInvoiceJour, InvoiceDate));
+        queryBuildRange.value( SysQuery::value(startDate) + '..' );
+        queryBuildRange.value('..' + SysQuery::value(endDate)  );
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcStatsForCust</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Calculates item sales statistics for each unique combination of customer account,
+    ///     item ID, cofiguration ID, size, version and color.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which to calculate statistics.
+    /// </param>
+    public void calcStatsForCust(CustAccount _custAccount)
+    {
+        MCRSalesStatsCustTable  mcrSalesStatsCustTable;
+        utcDateTime             fromDate;
+        utcDateTime             toDate;
+        mcrSalesStatsCustTable = MCRSalesStatsCustTable::find(_custAccount, true);
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        ttsBegin;
+
+        // Create the Stat header if it does not exist.
+        if (!mcrSalesStatsCustTable)
+        {
+            mcrSalesStatsCustTable.CustAccount = _custAccount;
+            mcrSalesStatsCustTable.Dirty = NoYes::Yes;
+            mcrSalesStatsCustTable.StartDate = startDate;
+            mcrSalesStatsCustTable.EndDate = endDate;
+            mcrSalesStatsCustTable.FirstOrderDate = MCRSalesStatsCust::getFirstCustOrderDate(_custAccount);
+            mcrSalesStatsCustTable.LastOrderDate = MCRSalesStatsCust::getLastCustOrderDate(_custAccount);
+            //  get last order date based on the statistical date range
+            if (endDate == dateNull())
+            {
+                mcrSalesStatsCustTable.StatLastOrderDate = MCRSalesStatsCust::getLastCustOrderDate(_custAccount, fromDate);
+            }
+            else
+            {
+                mcrSalesStatsCustTable.StatLastOrderDate = MCRSalesStatsCust::getLastCustOrderDate(_custAccount, fromDate, toDate);
+            }
+
+            // track customer creation date time
+            mcrSalesStatsCustTable.CustomerCreationDateTime = CustTable::find(_custAccount).CreatedDateTime;
+
+            if (mcrSalesStatsCustTable.validateWrite())
+            {
+                mcrSalesStatsCustTable.insert();
+            }
+            else
+            {
+                throw error("@SYS104318");
+            }
+        }
+
+        // Only calculate new stats if the data has been flagged as dirty or the date range
+        // has changed, otherwise, it shouldn't need to be done again.
+        if (mcrSalesStatsCustTable.Dirty ||
+           mcrSalesStatsCustTable.StartDate != startDate ||
+           mcrSalesStatsCustTable.EndDate != endDate)
+        {
+            // clear & delete any current cust item stats previously calculated for the customer.
+            MCRSalesStatsCust::clearStats(_custAccount);
+            mcrSalesStatsCustTable.reread();
+
+            this.calcStatsForCustSalesOrders(_custAccount, mcrSalesStatsCustTable, fromDate, toDate);
+            this.calcStatsForMergedCustSalesOrders(_custAccount, mcrSalesStatsCustTable, fromDate, toDate);
+
+            // Loop over all sales order for the passed customer as well as any
+            // account #'s that have been merged to this customer.
+            mcrSalesStatsCustTable.StartDate = startDate;
+            mcrSalesStatsCustTable.EndDate = endDate;
+            mcrSalesStatsCustTable.Dirty = NoYes::No;
+            //  gets historical data and updates stats if it exists.
+            this.getCustHistory(mcrSalesStatsCustTable);
+
+            if (endDate == dateNull())
+            {
+                mcrSalesStatsCustTable.StatLastOrderDate = MCRSalesStatsCust::getLastCustOrderDate(_custAccount, fromDate);
+            }
+            else
+            {
+                mcrSalesStatsCustTable.StatLastOrderDate = MCRSalesStatsCust::getLastCustOrderDate(_custAccount, fromDate, toDate);
+            }
+
+            if (mcrSalesStatsCustTable.validateWrite())
+            {
+                mcrSalesStatsCustTable.update();
+            }
+            else
+            {
+                throw error("@SYS104318");
+            }
+        }
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcStatsForCustSalesOrders</Name>
+				<Source><![CDATA[
+    private void calcStatsForCustSalesOrders(CustAccount _custAccount, MCRSalesStatsCustTable mcrSalesStatsCustTable, utcdatetime utcfdate, utcdatetime utctdate)
+    {
+        CustTable               custTable;
+        SalesLine               salesLine;
+        InventDim               inventDim;
+        MCRSalesStatsCustItem   salesStatsCustItem;
+        Qty                     orderQtyMode;
+        int                     orderQtyModeFreq;
+        Qty                     totalInvoicedQty;
+        AmountMST               totalInvoicedAmount;
+
+        ttsBegin;
+        this.setInvoicedStatsForCust(_custAccount, mcrSalesStatsCustTable);
+        while select custTable
+            where   custTable.AccountNum == _custAccount
+                ||  custTable.MCRMergedRoot == _custAccount
+                join ItemId, sum(QtyOrdered), count(RecId)
+                    from salesLine
+                    group by ItemId
+                    where   salesLine.CustAccount      == custTable.AccountNum
+                        &&      salesLine.LineDeliveryType != LineDeliveryType::DeliveryLine
+                        &&      salesLine.SalesStatus      == SalesStatus::Invoiced
+                        &&      salesLine.SalesQty         >  0
+                        &&    ((salesLine.CreatedDateTime  >= utcfdate
+                        &&      salesLine.CreatedDateTime  <= utctDate)
+                        ||     (startDate                   == dateNull()
+                        &&      salesLine.CreatedDateTime  <= utctDate)
+                        ||     (salesLine.CreatedDateTime  >= utcfDate
+                        &&      endDate                     == dateNull())
+                        ||     (startDate                   == dateNull()
+                        &&      endDate                     == dateNull()))
+                        join ConfigId, InventColorId, InventSizeId, InventVersionId from  inventDim
+                            group by ConfigId, InventColorId, InventSizeId, InventVersionId
+                            where   inventDim.InventDimId      == salesLine.InventDimId
+        {
+            // If a stat record already exists for this item (should only be
+            // the case when dealing w/ merged customers) retrive it for update.
+            select forupdate salesStatsCustItem
+                where salesStatsCustItem.CustAccount == _custAccount
+                    && salesStatsCustItem.ItemId == salesLine.ItemId
+                    && salesStatsCustItem.ConfigId == inventDim.ConfigId
+                    && salesStatsCustItem.InventColorId == inventDim.InventColorId
+                    && salesStatsCustItem.InventSizeId == inventDim.InventSizeId
+                    && salesStatsCustItem.InventVersionId == inventDim.InventVersionId;
+
+            // Add the total # of sales lines for this item.
+            salesStatsCustItem.OrderFrequency += any2int(salesLine.RecId);
+            // Add the total invent qty ordered for this item.
+            salesStatsCustItem.TotalOrderedQty += salesLine.QtyOrdered;
+            // Compute the average ordered.
+            if (salesStatsCustItem.OrderFrequency)
+            {
+                salesStatsCustItem.AvgOrderedQty =
+                    salesStatsCustItem.TotalOrderedQty/salesStatsCustItem.OrderFrequency;
+            }
+
+            // Only do this when processing the account # passed - don't do for the merged
+            // customer.
+            if (_custAccount == custTable.AccountNum)
+            {
+                // Determine Mode (most frequent ordered quantity).
+                [orderQtyMode, orderQtyModeFreq] = this.getSalesModeAndModeFrequency(custTable.AccountNum,
+                                                                                     salesLine.ItemId,
+                                                                                     inventDim.InventSizeId,
+                                                                                     inventDim.InventColorId,
+                                                                                     inventDim.ConfigId,
+                                                                                     inventDim.InventVersionId);
+
+                // Set mode & frequency
+                salesStatsCustItem.OrderQtyMode = orderQtyMode;
+                salesStatsCustItem.OrderModeFrequency = orderQtyModeFreq;
+
+                // set the max ordered for a given sales line.
+                salesStatsCustItem.MaxOrderedQty = this.getMaxOrderQty(custTable.AccountNum,
+                                                                       salesLine.ItemId,
+                                                                       inventDim.ConfigId,
+                                                                       inventDim.InventSizeId,
+                                                                       inventDim.InventColorId,
+                                                                       inventDim.InventVersionId);
+
+                // set the min ordered for a given sales line.
+                salesStatsCustItem.MinOrderedQty = this.getMinOrderQty(custTable.AccountNum,
+                                                                       salesLine.ItemId,
+                                                                       inventDim.ConfigId,
+                                                                       inventDim.InventSizeId,
+                                                                       inventDim.InventColorId,
+                                                                       inventDim.InventVersionId);
+            }
+
+            // get total qty invoiced for this item, config, size, version & color combo.
+            [totalInvoicedQty, totalInvoicedAmount] = this.getTotalInvoicedForItem(_custAccount,
+                                                                                   salesLine.ItemId,
+                                                                                   inventDim.ConfigId,
+                                                                                   inventDim.InventSizeId,
+                                                                                   inventDim.InventColorId,
+                                                                                   inventDim.InventVersionId);
+
+            salesStatsCustItem.TotalInvoicedQty += totalInvoicedQty;
+            salesStatsCustItem.ProductTotalInvoiceAmountMST += totalInvoicedAmount;
+
+            // calc avg invoiced per order.
+            if (salesStatsCustItem.OrderFrequency)
+            {
+                salesStatsCustItem.AvgInvoicedQty =
+                    salesStatsCustItem.TotalInvoicedQty/salesStatsCustItem.OrderFrequency;
+            }
+
+            // if record previously existed update it else insert it.
+            if (salesStatsCustItem.RecId)
+            {
+                // update
+                if (salesStatsCustItem.validateWrite())
+                {
+                    salesStatsCustItem.update();
+                }
+                else
+                {
+                    throw error("@SYS104318");
+                }
+            }
+            else
+            {
+                // insert
+                salesStatsCustItem.CustAccount = _custAccount;
+                salesStatsCustItem.ItemId = salesLine.ItemId;
+                salesStatsCustItem.ConfigId = inventDim.ConfigId;
+                salesStatsCustItem.InventSizeId = inventDim.InventSizeId;
+                salesStatsCustItem.InventColorId = inventDim.InventColorId;
+                salesStatsCustItem.InventVersionId = inventDim.InventVersionId;
+
+                if ( salesStatsCustItem.validateWrite())
+                {
+                        salesStatsCustItem.insert();
+                }
+                else
+                {
+                    throw error("@SYS104318");
+                }
+            }
+
+            // reset
+            orderQtyMode = 0;
+            orderQtyModeFreq = 0;
+            salesStatsCustItem = null;
+        } // end salesLine while loop
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcStatsForMergedCustSalesOrders</Name>
+				<Source><![CDATA[
+    private void calcStatsForMergedCustSalesOrders(CustAccount _custAccount, MCRSalesStatsCustTable mcrSalesStatsCustTable, utcdatetime utcfdate, utcdatetime utctdate)
+    {
+        CustTable               custTable;
+        InventDim               inventDim;
+        MCRSalesStatsCustItem   mcrSalesStatsCustItem;
+        Qty                     orderQtyMode;
+        int                     orderQtyModeFreq;
+        Qty                     totalInvoicedQty;
+        AmountMST               totalInvoicedAmount;
+        MCRHistSalesLine        mcrHistSalesLine;
+
+        while select custTable
+            where custTable.AccountNum == _custAccount
+                || custTable.MCRMergedRoot == _custAccount
+                join ItemId, sum(QtyOrdered), count(RecId) from mcrHistSalesLine
+                    group by ItemId
+                    where mcrHistSalesLine.CustAccount == custTable.AccountNum
+                        && mcrHistSalesLine.LineDeliveryType != LineDeliveryType::DeliveryLine
+                        && mcrHistSalesLine.SalesStatus == SalesStatus::Invoiced
+                        && mcrHistSalesLine.SalesQty > 0
+                        && ((mcrHistSalesLine.MCRSalesLineCreatedDateTime >= utcfdate
+                        && mcrHistSalesLine.MCRSalesLineCreatedDateTime <= utctDate)
+                        || (startDate == dateNull()
+                        && mcrHistSalesLine.MCRSalesLineCreatedDateTime <= utctDate)
+                        || (mcrHistSalesLine.MCRSalesLineCreatedDateTime >= utcfDate
+                        && endDate == dateNull())
+                        || (startDate == dateNull()
+                        && endDate == dateNull()))
+                join ConfigId, InventColorId, InventSizeId, InventVersionId from inventDim
+                    group by ConfigId, InventColorId, InventSizeId, InventVersionId
+                    where inventDim.InventDimId == mcrHistSalesLine.InventDimId
+        {
+             // If a stat record already exists for this item (should only be
+            // the case when dealing w/ merged customers) retrive it for update.
+            select forupdate mcrSalesStatsCustItem
+                where mcrSalesStatsCustItem.CustAccount == _custAccount
+                    && mcrSalesStatsCustItem.ItemId == mcrHistSalesLine.ItemId
+                    && mcrSalesStatsCustItem.ConfigId == inventDim.ConfigId
+                    && mcrSalesStatsCustItem.InventColorId == inventDim.InventColorId
+                    && mcrSalesStatsCustItem.InventSizeId == inventDim.InventSizeId
+                    && mcrSalesStatsCustItem.InventVersionId == inventDim.InventVersionId;
+
+            mcrSalesStatsCustItem.OrderFrequency  += any2int(mcrHistSalesLine.RecId);
+            mcrSalesStatsCustItem.TotalOrderedQty += mcrHistSalesLine.QtyOrdered;
+            if (mcrSalesStatsCustItem.OrderFrequency)
+            {
+                mcrSalesStatsCustItem.AvgOrderedQty =
+                    mcrSalesStatsCustItem.TotalOrderedQty/mcrSalesStatsCustItem.OrderFrequency;
+            }
+            if (_custAccount == custTable.AccountNum)
+            {
+                [orderQtyMode, orderQtyModeFreq] = this.getSalesModeAndModeFreqHist(custTable.AccountNum,
+                                                                                    mcrHistSalesLine.ItemId,
+                                                                                    inventDim.InventSizeId,
+                                                                                    inventDim.InventColorId,
+                                                                                    inventDim.ConfigId,
+                                                                                    inventDim.InventVersionId);
+                mcrSalesStatsCustItem.OrderQtyMode        = orderQtyMode;
+                mcrSalesStatsCustItem.OrderModeFrequency  = orderQtyModeFreq;
+                mcrSalesStatsCustItem.MaxOrderedQty       = this.getMaxOrderQtyHist(custTable.AccountNum,
+                                                                                    mcrHistSalesLine.ItemId,
+                                                                                    inventDim.ConfigId,
+                                                                                    inventDim.InventSizeId,
+                                                                                    inventDim.InventColorId,
+                                                                                    inventDim.InventVersionId);
+                mcrSalesStatsCustItem.MinOrderedQty       = this.getMinOrderQtyHist(custTable.AccountNum,
+                                                                                    mcrHistSalesLine.ItemId,
+                                                                                    inventDim.ConfigId,
+                                                                                    inventDim.InventSizeId,
+                                                                                    inventDim.InventColorId,
+                                                                                    inventDim.InventVersionId);
+            }
+            [totalInvoicedQty, totalInvoicedAmount]    = this.getTotalInvoicedForItemHist(custTable.AccountNum,
+                                                                                            mcrHistSalesLine.ItemId,
+                                                                                            inventDim.ConfigId,
+                                                                                            inventDim.InventSizeId,
+                                                                                            inventDim.InventColorId,
+                                                                                            inventDim.InventVersionId);
+            mcrSalesStatsCustItem.TotalInvoicedQty                += totalInvoicedQty;
+            mcrSalesStatsCustItem.ProductTotalInvoiceAmountMST    += totalInvoicedAmount;
+            if (mcrSalesStatsCustItem.OrderFrequency)
+            {
+                mcrSalesStatsCustItem.AvgInvoicedQty =
+                    mcrSalesStatsCustItem.TotalInvoicedQty/mcrSalesStatsCustItem.OrderFrequency;
+            }
+            if (mcrSalesStatsCustItem.RecId)
+            {
+                if (mcrSalesStatsCustItem.validateWrite())
+                {
+                    mcrSalesStatsCustItem.update();
+                }
+                else
+                {
+                    throw error("@SYS104318");
+                }
+            }
+            else
+            {
+                mcrSalesStatsCustItem.CustAccount     = _custAccount;
+                mcrSalesStatsCustItem.ItemId          = mcrHistSalesLine.ItemId;
+                mcrSalesStatsCustItem.ConfigId        = inventDim.ConfigId;
+                mcrSalesStatsCustItem.InventSizeId    = inventDim.InventSizeId;
+                mcrSalesStatsCustItem.InventColorId   = inventDim.InventColorId;
+                mcrSalesStatsCustItem.InventVersionId = inventDim.InventVersionId;
+                if (mcrSalesStatsCustItem.validateWrite())
+                {
+                    mcrSalesStatsCustItem.insert();
+                }
+                else
+                {
+                    throw error("@SYS104318");
+                }
+            }
+
+            // reset
+            orderQtyMode = 0;
+            orderQtyModeFreq = 0;
+            mcrSalesStatsCustItem = null;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The dialog of customer sales statistics.
+    /// </summary>
+    /// <returns>The dialog object.</returns>
+    public Object dialog()
+    {
+        DialogRunbase dialog;
+        if (custAccount)
+        {
+            this.updateQueryBuild();
+        }
+
+        dialog = super();
+        dialog.caption("@MCR24903");
+
+        // Called to process only a single customer, therefore, display the cust #
+        // and hide the option to allow the user to set the query on the custtable.
+        if (custAccount)
+        {
+            dialogCustAccount = dialog.addField(extendedTypeStr(CustAccount));
+            dialogCustAccount.enabled(false);
+            dialogCustAccount.value(custAccount);
+        }
+
+        dialogStartDate = dialog.addField(extendedTypeStr(StartDate), "@SYS2168", "@MCR24995");
+        dialogEndDate = dialog.addField(extendedTypeStr(EndDate), "@SYS22882", "@MCR24994");
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustHistory</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Retrieves the customer's order history.
+    /// </summary>
+    /// <param name="_mcrSalesStatsCustTable">
+    ///     The customer's order history.
+    /// </param>
+    private void getCustHistory(MCRSalesStatsCustTable _mcrSalesStatsCustTable)
+    {
+        MCRRFMHistory trfmHistory;
+
+        select count(RecId), maxof(TransDate), sum(SaleAmount), sum(CostAmount)
+            from trfmHistory
+            where trfmHistory.CustAccount == _mcrSalesStatsCustTable.CustAccount &&
+                trfmHistory.SaleAmount > 0 &&
+                (_mcrSalesStatsCustTable.StartDate == dateNull() ||
+                 trfmHistory.TransDate >= _mcrSalesStatsCustTable.StartDate) &&
+                (_mcrSalesStatsCustTable.EndDate == dateNull() ||
+                 trfmHistory.TransDate <= _mcrSalesStatsCustTable.EndDate);
+
+        if (trfmHistory.RecId)
+        {
+            _mcrSalesStatsCustTable.OrderFrequency += int642int(trfmHistory.RecId);
+
+            if (_mcrSalesStatsCustTable.LastOrderDate < trfmHistory.TransDate)
+            {
+                _mcrSalesStatsCustTable.LastOrderDate = trfmHistory.TransDate;
+            }
+
+            _mcrSalesStatsCustTable.TotalInvoiceAmountMST += trfmHistory.SaleAmount;
+            _mcrSalesStatsCustTable.TotalInvoiceCostAmountMST += trfmHistory.CostAmount;
+
+            _mcrSalesStatsCustTable.AvgInvoiceAmountMST =
+                _mcrSalesStatsCustTable.TotalInvoiceAmountMST/_mcrSalesStatsCustTable.OrderFrequency;
+        }
+
+        select sum(SaleAmount), sum(CostAmount)
+            from trfmHistory
+            where trfmHistory.CustAccount == _mcrSalesStatsCustTable.CustAccount &&
+                trfmHistory.SaleAmount < 0 &&
+                (_mcrSalesStatsCustTable.StartDate == dateNull() ||
+                 trfmHistory.TransDate >= _mcrSalesStatsCustTable.StartDate) &&
+                (_mcrSalesStatsCustTable.EndDate == dateNull() ||
+                 trfmHistory.TransDate <= _mcrSalesStatsCustTable.EndDate);
+
+        _mcrSalesStatsCustTable.TotalReturnInvoicedAmountMST += trfmHistory.SaleAmount;
+        _mcrSalesStatsCustTable.TotalInvoiceCostAmountMST += trfmHistory.CostAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Retrieves user entered values from dialog form.
+    /// </summary>
+    /// <returns>
+    ///     true if the dialog was closed with okay button; otherwise, false.
+    /// </returns>
+    public boolean getFromDialog()
+    {
+        boolean ret;
+
+        ret = super();
+
+        startDate   = dialogStartDate.value();
+        endDate     = dialogEndDate.value();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMaxOrderQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines the max quantity ordered by a customer for a specific
+    ///     item on a single sales line.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the max quantity was ordered.
+    /// </param>
+    /// <param name="_itemId">
+    ///     The item ID of which the max quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResConfigurationName">
+    ///     The configuration of the item of which the max quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResSizeName">
+    ///     The size of the item of which the max quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResColorName">
+    ///     The color of the item of which the max quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResVersionName">
+    ///     The version of the item of which the max quantity was ordered.
+    /// </param>
+    /// <returns>
+    ///     The max quantity ordered by a customer for a specific
+    ///     item on a single sales line.
+    /// </returns>
+    private Qty getMaxOrderQty(CustAccount _custAccount, 
+        ItemId _itemId, 
+        EcoResConfigurationName _ecoResConfigurationName, 
+        EcoResSizeName _ecoResSizeName,
+        EcoResColorName _ecoResColorName,
+        EcoResVersionName _ecoResVersionName)
+    {
+        SalesLine           salesLine;
+        InventDim           inventDim;
+        CustTable           custTable;
+        utcDateTime         fromDate;
+        utcDateTime         toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        select custTable
+            where   custTable.AccountNum       == _custAccount
+                ||      custTable.MCRMergedRoot     == _custAccount
+                join  ItemId, maxof(QtyOrdered) from salesLine
+                    group by ItemId
+                    where   salesLine.CustAccount      == custTable.AccountNum
+                        &&      salesLine.ItemId           == _itemId
+                        &&      salesLine.SalesStatus      == SalesStatus::Invoiced
+                        &&      salesLine.QtyOrdered       >  0
+                        &&    ((salesLine.CreatedDateTime  >= fromDate
+                        &&      salesLine.CreatedDateTime  <= toDate)
+                        ||    ( startDate                   == dateNull()
+                        &&      salesLine.CreatedDateTime  <= toDate)
+                        ||     (salesLine.CreatedDateTime  >= fromDate
+                        &&      endDate                     == dateNull())
+                        ||    ( startDate                   == dateNull()
+                        &&  endDate                         == dateNull()))
+                        join inventDim
+                        group by ConfigId, InventColorId, InventSizeId, InventVersionId
+                    where       inventDim.InventDimId                  == salesLine.InventDimId
+                        &&      inventDim.ConfigId                     == _ecoResConfigurationName
+                        &&      inventDim.InventSizeId                 == _ecoResSizeName
+                        &&      inventDim.InventColorId                == _ecoResColorName
+                        &&      inventDim.InventVersionId              == _ecoResVersionName;
+
+        return salesLine.QtyOrdered;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMaxOrderQtyHist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines the max quantity ordered by a customer for a specific
+    ///     item on a single sales line.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the max quantity was ordered.
+    /// </param>
+    /// <param name="_itemId">
+    ///     The item ID of which the max quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResConfigurationName">
+    ///     The configuration of the itme of which the max quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResSizeName">
+    ///     The size of the item of which the max quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResColorName">
+    ///     The color of the item of which the max quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResVersioname">
+    ///     The version of the item of which the max quantity was ordered.
+    /// </param>
+    /// <returns>
+    ///     The max quantity ordered by a customer for a specific
+    ///     item on a single sales line.
+    /// </returns>
+    private Qty getMaxOrderQtyHist(CustAccount      _custAccount,
+                           ItemId           _itemId,
+                           EcoResConfigurationName _ecoResConfigurationName,
+                           EcoResSizeName _ecoResSizeName,
+                           EcoResColorName _ecoResColorName,
+                           EcoResVersionName _ecoResVersionName)
+    {
+        MCRHistSalesLine     salesLine;
+        InventDim           inventDim;
+        CustTable           custTable;
+        utcDateTime         fromDate;
+        utcDateTime         toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        select custTable
+            where   custTable.AccountNum                   == _custAccount
+                ||      custTable.MCRMergedRoot                 == _custAccount
+                join  ItemId, maxof(QtyOrdered) from salesLine
+                    group by ItemId
+                    where   salesLine.CustAccount                  == custTable.AccountNum
+                        &&      salesLine.ItemId                       == _itemId
+                        &&      salesLine.SalesStatus                  == SalesStatus::Invoiced
+                        &&      salesLine.QtyOrdered                   >  0
+                        &&    ((salesLine.MCRSalesLineCreatedDateTime   >= fromDate
+                        &&      salesLine.MCRSalesLineCreatedDateTime   <= toDate)
+                        ||    ( startDate                               == dateNull()
+                        &&      salesLine.MCRSalesLineCreatedDateTime   <= toDate)
+                        ||     (salesLine.MCRSalesLineCreatedDateTime   >= fromDate
+                        &&      endDate                                 == dateNull())
+                        ||    ( startDate                               == dateNull()
+                        &&  endDate                                     == dateNull()))
+                        join inventDim
+                            group by ConfigId, InventColorId, InventSizeId
+                            where   inventDim.InventDimId                  == salesLine.InventDimId
+                            &&      inventDim.ConfigId                     == _ecoResConfigurationName
+                            &&      inventDim.InventSizeId                 == _ecoResSizeName
+                            &&      inventDim.InventColorId                == _ecoResColorName
+                            &&      inventDim.InventVersionId              == _ecoResVersionName;
+
+        return salesLine.QtyOrdered;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMinOrderQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines the minimum quantity ordered by a customer for a specific
+    ///     item on a single sales line.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_itemId">
+    ///     The item ID of which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResConfigurationName">
+    ///     The configuration of the item of which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResSizeName">
+    ///     The size of the item of which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResColorName">
+    ///     The color of the item of which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResVersionName">
+    ///     The version of the item of which the minimum quantity was ordered.
+    /// </param>
+    /// <returns>
+    ///     The minimum quantity ordered by a customer for a specific
+    ///     item on a single sales line.
+    /// </returns>
+    private Qty getMinOrderQty(CustAccount _custAccount, 
+        ItemId _itemId, 
+        EcoResConfigurationName _ecoResConfigurationName, 
+        EcoResSizeName _ecoResSizeName,
+        EcoResColorName _ecoResColorName,
+        EcoResVersionName _ecoResVersionName)
+    {
+        SalesLine           salesLine;
+        InventDim           inventDim;
+        CustTable           custTable;
+        utcDateTime         fromDate;
+        utcDateTime         toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        select custTable
+            where   custTable.AccountNum       == _custAccount
+            ||      custTable.MCRMergedRoot     == _custAccount
+            join    ItemId, minof(QtyOrdered) from salesLine
+            group by ItemId
+            where   salesLine.CustAccount      == custTable.AccountNum
+            &&      salesLine.ItemId           == _itemId
+            &&      salesLine.SalesStatus      == SalesStatus::Invoiced
+            &&      salesLine.QtyOrdered       >  0
+            &&    ((salesLine.CreatedDateTime  >= fromDate
+            &&      salesLine.CreatedDateTime  <= toDate)
+            ||     (startDate                   == dateNull()
+            &&      salesLine.CreatedDateTime  <= toDate)
+            ||     (salesLine.CreatedDateTime  >= fromDate
+            &&      endDate                     == dateNull())
+            ||     (startDate                   == dateNull()
+            &&      endDate                     == dateNull()))
+            join    inventDim
+            group by ConfigId, InventColorId, InventSizeId, InventVersionId
+            where   inventDim.InventDimId      == salesLine.InventDimId
+            &&      inventDim.ConfigId         == _ecoResConfigurationName
+            &&      inventDim.InventSizeId     == _ecoResSizeName
+            &&      inventDim.InventColorId    == _ecoResColorName
+            &&      inventDim.InventVersionId  == _ecoResVersionName;
+        return salesLine.QtyOrdered;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMinOrderQtyHist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines the minimum quantity ordered by a customer for a specific
+    ///     item on a single sales line.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_itemId">
+    ///     The item ID of which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResConfigurationName">
+    ///     The configuration of the item of which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResSizeName">
+    ///     The size of the item of which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResColorName">
+    ///     The color of the item of which the minimum quantity was ordered.
+    /// </param>
+    /// <param name="_ecoResVersionName">
+    ///     The version of the item of which the minimum quantity was ordered.
+    /// </param>
+    /// <returns>
+    ///     The minimum quantity ordered by a customer for a specific
+    ///     item on a single sales line.
+    /// </returns>
+    private Qty getMinOrderQtyHist(CustAccount      _custAccount,
+                           ItemId           _itemId,
+                           EcoResConfigurationName _ecoResConfigurationName,
+                           EcoResSizeName _ecoResSizeName,
+                           EcoResColorName _ecoResColorName,
+                           EcoResVersionName _ecoResVersionName)
+    {
+        MCRHistSalesLine     salesLine;
+        InventDim           inventDim;
+        CustTable           custTable;
+        utcDateTime         fromDate;
+        utcDateTime         toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        select custTable
+            where   custTable.AccountNum                   == _custAccount
+            ||      custTable.MCRMergedRoot                 == _custAccount
+            join    ItemId, minof(QtyOrdered) from salesLine
+            group by ItemId
+            where   salesLine.CustAccount                  == custTable.AccountNum
+            &&      salesLine.ItemId                       == _itemId
+            &&      salesLine.SalesStatus                  == SalesStatus::Invoiced
+            &&      salesLine.QtyOrdered                   >  0
+            &&    ((salesLine.MCRSalesLineCreatedDateTime   >= fromDate
+            &&      salesLine.MCRSalesLineCreatedDateTime   <= toDate)
+            ||     (startDate                               == dateNull()
+            &&      salesLine.MCRSalesLineCreatedDateTime   <= toDate)
+            ||     (salesLine.MCRSalesLineCreatedDateTime   >= fromDate
+            &&      endDate                                 == dateNull())
+            ||     (startDate                               == dateNull()
+            &&      endDate                                 == dateNull()))
+            join    inventDim
+            group by ConfigId, InventColorId, InventSizeId, InventVersionId
+            where   inventDim.InventDimId                  == salesLine.InventDimId
+            &&      inventDim.ConfigId                     == _ecoResConfigurationName
+            &&      inventDim.InventSizeId                 == _ecoResSizeName
+            &&      inventDim.InventColorId                == _ecoResColorName
+            &&      inventDim.InventVersionId              == _ecoResVersionName;
+        return salesLine.QtyOrdered;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesModeAndModeFreqHist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Detemines the most commonly ordered quantity by a customer for a specific item.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_itemId">
+    ///     The item ID for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResSizeName">
+    ///     The size for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResColorName">
+    ///     The color for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResConfigurationName">
+    ///     The configuration for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResVersionName">
+    ///     The version for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <returns>
+    ///     The most commonly ordered quantity by a customer for a specific item.
+    /// </returns>
+    private container getSalesModeAndModeFreqHist(CustAccount   _custAccount,
+                                          ItemId        _itemId,
+                                          EcoResSizeName _ecoResSizeName,
+                                          EcoResColorName _ecoResColorName,
+                                          EcoResConfigurationName _ecoResConfigurationName,
+                                          EcoResVersionName _ecoResVersionName)
+    {
+        MCRHistSalesLine        mcrHistSalesLineMode;
+        InventDim               inventDimMode;
+        CustTable               custTable;
+
+        Qty                     qtyMode;
+        int                     qtyModeFreq;
+        utcDateTime             fromDate;
+        utcDateTime             toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+
+        while select custTable
+            where   custTable.AccountNum                       == _custAccount
+                ||      custTable.MCRMergedRoot                     == _custAccount
+                join  ItemId, QtyOrdered, count(RecId) from mcrHistSalesLineMode
+                    group by ItemId, QtyOrdered
+                    where   mcrHistSalesLineMode.CustAccount                  == custTable.AccountNum
+                        &&      mcrHistSalesLineMode.ItemId                       == _itemId
+                        &&      mcrHistSalesLineMode.SalesStatus                  == SalesStatus::Invoiced
+                        &&      mcrHistSalesLineMode.QtyOrdered                   >  0
+                        &&    ((mcrHistSalesLineMode.MCRSalesLineCreatedDateTime   >= fromDate
+                        &&      mcrHistSalesLineMode.MCRSalesLineCreatedDateTime   <= toDate)
+                        ||     (startDate                                   == dateNull()
+                        &&      mcrHistSalesLineMode.MCRSalesLineCreatedDateTime   <= toDate)
+                        ||     (mcrHistSalesLineMode.MCRSalesLineCreatedDateTime   >= fromDate
+                        &&      endDate                                     == dateNull())
+                        ||     (startDate                                   == dateNull()
+                        &&      endDate                                     == dateNull()))
+                        join    RecId from inventDimMode
+                            where   inventDimMode.InventDimId                  == mcrHistSalesLineMode.InventDimId
+                                &&      inventDimMode.InventSizeId                 == _ecoResSizeName
+                                &&      inventDimMode.InventColorId                == _ecoResColorName
+                                &&      inventDimMode.ConfigId                     == _ecoResConfigurationName
+                                &&      inventDimMode.InventVersionId              == _ecoResVersionName
+        {
+            if (mcrHistSalesLineMode.RecId > qtyModeFreq)
+            {
+                qtyMode     = mcrHistSalesLineMode.QtyOrdered;
+                qtyModeFreq = any2int(mcrHistSalesLineMode.RecId);
+            }
+        }
+        return [qtyMode, qtyModeFreq];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesModeAndModeFrequency</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Detemines the most commonly ordered quantity by a customer for a specific item.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_itemId">
+    ///     The item ID for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResSizeName">
+    ///     The size for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResColorName">
+    ///     The color for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResConfigurationName">
+    ///     The configuration for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResVersionName">
+    ///     The version for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <returns>
+    ///     The most commonly ordered quantity by a customer for a specific item.
+    /// </returns>
+    private container getSalesModeAndModeFrequency(CustAccount _custAccount,
+                                                   ItemId _itemId,
+                                                   EcoResSizeName _ecoResSizeName,
+                                                   EcoResColorName _ecoResColorName,
+                                                   EcoResConfigurationName _ecoResConfigurationName,
+                                                   EcoResVersionName _ecoResVersionName)
+    {
+        SalesLine               salesLineMode;
+        InventDim               inventDimMode;
+        CustTable               custTable;
+        Qty                     qtyMode;
+        int                     qtyModeFreq;
+        utcDateTime             fromDate;
+        utcDateTime             toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+
+        while select custTable
+            where   custTable.AccountNum == _custAccount
+                ||      custTable.MCRMergedRoot == _custAccount
+                join  ItemId, QtyOrdered, count(RecId) from salesLineMode
+                    group by ItemId, QtyOrdered
+                    where   salesLineMode.CustAccount      == custTable.AccountNum
+                        &&      salesLineMode.ItemId           == _itemId
+                        &&      salesLineMode.SalesStatus      == SalesStatus::Invoiced
+                        &&      salesLineMode.QtyOrdered       >  0
+                        &&    ((salesLineMode.CreatedDateTime  >= fromDate
+                        &&      salesLineMode.CreatedDateTime  <= toDate)
+                        ||     (startDate                       == dateNull()
+                        &&      salesLineMode.CreatedDateTime  <= toDate)
+                        ||     (salesLineMode.CreatedDateTime  >= fromDate
+                        &&      endDate                         == dateNull())
+                        ||     (startDate                       == dateNull()
+                        &&      endDate                         == dateNull()))
+                        join    RecId from inventDimMode
+                            where   inventDimMode.InventDimId      == salesLineMode.InventDimId
+                                &&      inventDimMode.InventSizeId     == _ecoResSizeName
+                                &&      inventDimMode.InventColorId    == _ecoResColorName
+                                &&      inventDimMode.ConfigId         == _ecoResConfigurationName
+                                &&      inventDimMode.InventVersionId  == _ecoResVersionName
+        {
+            if (salesLineMode.RecId > qtyModeFreq)
+            {
+                qtyMode = salesLineMode.QtyOrdered;
+                qtyModeFreq = any2int(salesLineMode.RecId);
+            }
+        }
+        return [qtyMode, qtyModeFreq];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTotalInvoicedForItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines total invocied for a customer for a specific item.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the invoiced total is to be found.
+    /// </param>
+    /// <param name="_itemId">
+    ///     The item ID for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResConfigurationName">
+    ///     The configuration of the item whose invoices are to be totalled.
+    /// </param>
+    /// <param name="_ecoResSizeName">
+    ///     The size of the item whose invoices are to be totalled.
+    /// </param>
+    /// <param name="_ecoResColorName">
+    ///     The color of the item whose invoices are to be totalled.
+    /// </param>
+    /// <param name="_ecoResVersionName">
+    ///     The version of the item whose invoices are to be totalled.
+    /// </param>
+    /// <returns>
+    ///     The total invocied for a customer for a specific item.
+    /// </returns>
+    private container getTotalInvoicedForItem(CustAccount _custAccount,
+                                              ItemId _itemId,
+                                              EcoResConfigurationName _ecoResConfigurationName,
+                                              EcoResSizeName _ecoResSizeName,
+                                              EcoResColorName _ecoResColorName,
+                                              EcoResVersionName _ecoResVersionName)
+    {
+        SalesLine               salesLineInvoice;
+        InventDim               inventDimInvoice;
+        CustInvoiceTrans        custInvoiceTrans;
+        utcDateTime             fromDate;
+        utcDateTime             toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        // get total qty invoiced for this item, config, size, version & color combo.
+        select sum(InventQty), sum(LineAmountMST) from custInvoiceTrans
+            join RecId from salesLineInvoice
+                where salesLineInvoice.InventTransId       == custInvoiceTrans.InventTransId
+                    &&    salesLineInvoice.ItemId              == _itemId
+                    &&    salesLineInvoice.CustAccount         == _custAccount
+                    &&    salesLineInvoice.SalesStatus         == SalesStatus::Invoiced
+                    &&    salesLineInvoice.QtyOrdered          >  0
+                    &&  ((salesLineInvoice.CreatedDateTime     >= fromDate
+                    &&    salesLineInvoice.CreatedDateTime     <= toDate)
+                    ||   (startDate                             == dateNull()
+                    &&    salesLineInvoice.CreatedDateTime     <= toDate)
+                    ||   (salesLineInvoice.CreatedDateTime     >= fromDate
+                    &&    endDate                               == dateNull())
+                    ||   (startDate                             == dateNull()
+                    &&    endDate                               == dateNull()))
+                    join RecId from inventDimInvoice
+                        where inventDimInvoice.InventDimId         == salesLineInvoice.InventDimId
+                            &&    inventDimInvoice.ConfigId            == _ecoResConfigurationName
+                            &&    inventDimInvoice.InventSizeId        == _ecoResSizeName
+                            &&    inventDimInvoice.InventColorId       == _ecoResColorName
+                            &&    inventDimInvoice.InventVersionId     == _ecoResVersionName;
+
+        return [custInvoiceTrans.InventQty, custInvoiceTrans.LineAmountMST];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTotalInvoicedForItemHist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines total invocied for a customer for a specific item.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the invoiced total is to be found.
+    /// </param>
+    /// <param name="_itemId">
+    ///     The item ID for which the most commonly ordered quantity is to be found.
+    /// </param>
+    /// <param name="_ecoResConfigurationName">
+    ///     The configuration of the item whose invoices are to be totalled.
+    /// </param>
+    /// <param name="_ecoResSizeName">
+    ///     The size of the item whose invoices are to be totalled.
+    /// </param>
+    /// <param name="_ecoResColorName">
+    ///     The color of the item whose invoices are to be totalled.
+    /// </param>
+    /// <param name="_ecoResVersionName">
+    ///     The version of the item whose invoices are to be totalled.
+    /// </param>
+    /// <returns>
+    ///     The total invocied for a customer for a specific item.
+    /// </returns>
+    private container getTotalInvoicedForItemHist(CustAccount   _custAccount,
+                                                  ItemId        _itemId,
+                                                  EcoResConfigurationName _ecoResConfigurationName,
+                                                  EcoResSizeName _ecoResSizeName,
+                                                  EcoResColorName _ecoResColorName,
+                                                  EcoResVersionName _ecoResVersionName)
+    {
+        MCRHistSalesLine        mcrHistSalesLineInvoice;
+        InventDim               inventDimInvoice;
+        CustInvoiceTrans        custInvoiceTrans;
+        utcDateTime             fromDate;
+        utcDateTime             toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        select sum(InventQty), sum(LineAmountMST) from custInvoiceTrans
+            join RecId from mcrHistSalesLineInvoice
+                where mcrHistSalesLineInvoice.InventTransId                   == custInvoiceTrans.InventTransId
+                    &&    mcrHistSalesLineInvoice.ItemId                          == _itemId
+                    &&    mcrHistSalesLineInvoice.CustAccount                     == _custAccount
+                    &&    mcrHistSalesLineInvoice.SalesStatus                     == SalesStatus::Invoiced
+                    &&    mcrHistSalesLineInvoice.QtyOrdered                      >  0
+                    &&  ((mcrHistSalesLineInvoice.MCRSalesLineCreatedDateTime      >= fromDate
+                    &&    mcrHistSalesLineInvoice.MCRSalesLineCreatedDateTime      <= toDate)
+                    ||   (startDate                                         == dateNull()
+                    &&    mcrHistSalesLineInvoice.MCRSalesLineCreatedDateTime      <= toDate)
+                    ||   (mcrHistSalesLineInvoice.MCRSalesLineCreatedDateTime      >= fromDate
+                    &&    endDate                                           == dateNull())
+                    ||   (startDate                                         == dateNull()
+                    &&    endDate                                           == dateNull()))
+                    join RecId from inventDimInvoice
+                        where inventDimInvoice.InventDimId                     == mcrHistSalesLineInvoice.InventDimId
+                            &&    inventDimInvoice.ConfigId                        == _ecoResConfigurationName
+                            &&    inventDimInvoice.InventSizeId                    == _ecoResSizeName
+                            &&    inventDimInvoice.InventColorId                   == _ecoResColorName
+                            &&    inventDimInvoice.InventVersionId                 == _ecoResVersionName;
+
+        return [custInvoiceTrans.InventQty, custInvoiceTrans.LineAmountMST];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTotalReturnInvoicedForCust</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines total returns invoiced for a customer.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account whose return inoivces are to be totalled.
+    /// </param>
+    /// <returns>
+    ///     The total of returns invoiced for a customer.
+    /// </returns>
+    private AmountMST getTotalReturnInvoicedForCust(CustAccount _custAccount)
+    {
+        SalesTable              salesTableInvoiced;
+        CustInvoiceJour         custInvoiceJour;
+        AmountMST               invoicedTotal;
+        utcDateTime             fromDate;
+        utcDateTime             toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        // get total order invoiced for this customer.
+        select sum(InvoiceAmountMST) from custInvoiceJour
+            where custInvoiceJour.InvoiceAmountMST < 0
+                &&  custInvoiceJour.OrderAccount == _custAccount
+                join RecId from salesTableInvoiced
+                    where salesTableInvoiced.SalesId           == custInvoiceJour.SalesId
+                        &&  ((salesTableInvoiced.CreatedDateTime   >= fromDate
+                        &&    salesTableInvoiced.CreatedDateTime   <= toDate)
+                        ||   (startDate                             == dateNull()
+                        &&    salesTableInvoiced.CreatedDateTime   <= toDate)
+                        ||   (salesTableInvoiced.CreatedDateTime   >= fromDate
+                        &&    endDate                               == dateNull())
+                        ||   (startDate                             == dateNull()
+                        &&    endDate                               == dateNull()));
+
+        invoicedTotal = custInvoiceJour.InvoiceAmountMST;
+
+        return invoicedTotal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmCustAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Sets the customer account number in the class instance.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account value to which the class variable is set.
+    /// </param>
+    private void initParmCustAccount(CustAccount _custAccount)
+    {
+        custAccount = _custAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Sets the object to user the MCRCustSalesStats query.
+    /// </summary>
+    public void initParmDefault()
+    {
+        Query q = new Query();
+        super();
+        queryRun = new QueryRun(queryStr(MCRCustSalesStats));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmEndDate</Name>
+				<Source><![CDATA[
+    private void initParmEndDate(EndDate _endDate)
+    {
+        endDate = _endDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmStartDate</Name>
+				<Source><![CDATA[
+    private void initParmStartDate(StartDate _startDate)
+    {
+        startDate = _startDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #ParmList, queryRun.pack()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The query for customer sales item statistics.
+    /// </summary>
+    /// <returns>The queryRun object.</returns>
+    public QueryRun queryRun()
+    {
+        queryRun.title("@MCR24903");
+
+        return queryRun;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Loops over the customer table query and calculates sales item
+    ///     statistics for each customer in the query.
+    /// </summary>
+    public void run()
+    {
+        CustTable       custTable;
+        if (!this.validate())
+        {
+            throw error('');
+        }
+
+        progressTotal = SysQuery::countTotal(queryRun);
+        this.progressInit("@SYS93174", progressTotal, #AviFormLetter);
+
+        progress.setText("@SYS93174");
+
+        while (queryRun.next())
+        {
+            progressCounter++;
+            progress.setCount(progressCounter);
+
+            custTable = queryRun.get(tableNum(CustTable));
+            if (custTable.RecId)
+            {
+                this.calcStatsForCust(custTable.AccountNum);
+            }
+        }
+
+         progress = null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setInvoicedStatsForCust</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Determines total invocied to a customer for orders placed
+    ///     along with the average invoiced per order and the total
+    ///     returned for the customer.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which the the invoice statistics will be calculated.
+    /// </param>
+    /// <param name="_mcrSalesStatsCustTable">
+    ///     The sales statistics customer table where the statistics is to be stored.
+    /// </param>
+    private void setInvoicedStatsForCust(CustAccount _custAccount, MCRSalesStatsCustTable _mcrSalesStatsCustTable)
+    {
+        SalesTable              salesTableInvoiced;
+        MCRHistSalesTable       mcrHistSalesTableInvoiced;
+        CustInvoiceJour         custInvoiceJour;
+        CustInvoiceTrans        custInvoiceTrans;
+        InventTrans             inventTrans;
+        utcDateTime             fromDate;
+        utcDateTime             toDate;
+        fromDate = datetobeginUtcDateTime(startDate, DateTimeUtil::getUserPreferredTimeZone());
+        toDate = datetoendUtcDateTime(endDate, DateTimeUtil::getUserPreferredTimeZone());
+        // get total order invoiced for this customer.
+        while select sum(InvoiceAmountMST) from custInvoiceJour
+            group by SalesId
+            where custInvoiceJour.InvoiceAmountMST > 0
+                &&  custInvoiceJour.OrderAccount == _custAccount
+                    exists join salesTableInvoiced
+                        where salesTableInvoiced.SalesId           == custInvoiceJour.SalesId
+                            &&  ((salesTableInvoiced.CreatedDateTime   >= fromDate
+                            &&    salesTableInvoiced.CreatedDateTime   <= toDate)
+                            ||   (startDate                             == dateNull()
+                            &&    salesTableInvoiced.CreatedDateTime   <= toDate)
+                            ||   (salesTableInvoiced.CreatedDateTime   >= fromDate
+                            &&    endDate                               == dateNull())
+                            ||   (startDate                             == dateNull()
+                            &&    endDate                               == dateNull()))
+
+        {
+            _mcrSalesStatsCustTable.TotalInvoiceAmountMST += custInvoiceJour.InvoiceAmountMST;
+            _mcrSalesStatsCustTable.OrderFrequency ++;
+        }
+
+        // Get total order invoiced for this customer (History)
+        while select sum(InvoiceAmountMST) from custInvoiceJour
+            group by SalesId
+            where custInvoiceJour.InvoiceAmountMST >   0
+                && custInvoiceJour.OrderAccount == _custAccount
+                    exists join mcrHistSalesTableInvoiced
+                        where mcrHistSalesTableInvoiced.SalesId == custInvoiceJour.SalesId
+                            &&  ((mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   >= fromDate
+                            &&    mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   <= toDate)
+                            ||   (startDate                                             == dateNull()
+                            &&    mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   <= toDate)
+                            ||   (mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   >= fromDate
+                            &&    endDate                                               == dateNull())
+                            ||   (startDate                                             == dateNull()
+                            &&    endDate                                               == dateNull()))
+
+        {
+            _mcrSalesStatsCustTable.TotalInvoiceAmountMST += custInvoiceJour.InvoiceAmountMST;
+            _mcrSalesStatsCustTable.OrderFrequency        ++;
+        }
+
+        if (_mcrSalesStatsCustTable.OrderFrequency)
+        {
+            _mcrSalesStatsCustTable.AvgInvoiceAmountMST = _mcrSalesStatsCustTable.TotalInvoiceAmountMST/_mcrSalesStatsCustTable.OrderFrequency;
+        }
+
+        // Get total return invoiced for this customer.
+        select sum(InvoiceAmountMST) from custInvoiceJour
+            where custInvoiceJour.InvoiceAmountMST < 0
+                &&  custInvoiceJour.OrderAccount == _custAccount
+                exists join salesTableInvoiced
+                    where salesTableInvoiced.SalesId           == custInvoiceJour.SalesId
+                        && ( (salesTableInvoiced.CreatedDateTime   >= fromDate
+                        &&    salesTableInvoiced.CreatedDateTime   <= toDate)
+                        ||   (startDate                             == dateNull()
+                        &&    salesTableInvoiced.CreatedDateTime   <= toDate)
+                        ||   (salesTableInvoiced.CreatedDateTime   >= fromDate
+                        &&    endDate                               == dateNull())
+                        ||   (startDate                             == dateNull()
+                        &&    endDate                               == dateNull()));
+
+        _mcrSalesStatsCustTable.TotalReturnInvoicedAmountMST = custInvoiceJour.InvoiceAmountMST;
+
+        // Get total return invoiced for this customer (History).
+        select sum(InvoiceAmountMST) from custInvoiceJour
+            where custInvoiceJour.InvoiceAmountMST                     <  0
+                &&    custInvoiceJour.OrderAccount                         == _custAccount
+                exists join  mcrHistSalesTableInvoiced
+                    where mcrHistSalesTableInvoiced.SalesId                       == custInvoiceJour.SalesId
+                        && ( (mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   >= fromDate
+                        &&    mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   <= toDate)
+                        ||   (startDate                                             == dateNull()
+                        &&    mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   <= toDate)
+                        ||   (mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   >= fromDate
+                        &&    endDate                                               == dateNull())
+                        ||   (startDate                                             == dateNull()
+                        &&    endDate                                               == dateNull()));
+
+        _mcrSalesStatsCustTable.TotalReturnInvoicedAmountMST += custInvoiceJour.InvoiceAmountMST;
+
+        // Get total Cost
+        select sum(CostAmountPosted), sum(CostAmountAdjustment)
+            from inventTrans
+            exists join custInvoiceJour
+                where custInvoiceJour.InvoiceId == inventTrans.InvoiceId
+                    &&  custInvoiceJour.InvoiceDate == custInvoiceTrans.InvoiceDate
+                    &&  custInvoiceJour.SalesId == custInvoiceTrans.SalesId
+                    &&  custInvoiceJour.OrderAccount == _custAccount
+                    &&  custInvoiceJour.InvoiceAmountMST > 0
+                    exists join salesTableInvoiced
+                        where salesTableInvoiced.SalesId           == custInvoiceJour.SalesId
+                            && ( (salesTableInvoiced.CreatedDateTime   >= fromDate
+                            &&    salesTableInvoiced.CreatedDateTime   <= toDate)
+                            ||   (startDate                             == dateNull()
+                            &&    salesTableInvoiced.CreatedDateTime   <= toDate)
+                            ||   (salesTableInvoiced.CreatedDateTime   >= fromDate
+                            &&    endDate                               == dateNull())
+                            ||   (startDate                             == dateNull()
+                            &&    endDate                               == dateNull()));
+
+            _mcrSalesStatsCustTable.TotalInvoiceCostAmountMST = -(inventTrans.CostAmountPosted + inventTrans.CostAmountAdjustment);
+
+        // Get total Cost (History)
+        select sum(CostAmountPosted), sum(CostAmountAdjustment)
+            from inventTrans
+            exists join custInvoiceJour
+                where custInvoiceJour.InvoiceId                           == inventTrans.InvoiceId
+                    &&  custInvoiceJour.InvoiceDate == custInvoiceTrans.InvoiceDate
+                    &&  custInvoiceJour.SalesId == custInvoiceTrans.SalesId
+                    &&  custInvoiceJour.OrderAccount == _custAccount
+                    &&  custInvoiceJour.InvoiceAmountMST > 0
+                    exists join mcrHistSalesTableInvoiced
+                        where mcrHistSalesTableInvoiced.SalesId                       == custInvoiceJour.SalesId
+                            && ( (mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   >= fromDate
+                            &&    mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   <= toDate)
+                            ||   (startDate                                             == dateNull()
+                            &&    mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   <= toDate)
+                            ||   (mcrHistSalesTableInvoiced.MCRSalesTableCreatedDateTime   >= fromDate
+                            &&    endDate                                               == dateNull())
+                            ||   (startDate                                             == dateNull()
+                            &&    endDate                                               == dateNull()));
+
+            _mcrSalesStatsCustTable.TotalInvoiceCostAmountMST += -(inventTrans.CostAmountPosted + inventTrans.CostAmountAdjustment);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQueryValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Boolean to indicate if the query value is visible.
+    /// </summary>
+    /// <returns>True if the query value should be visible; otherwise, false.</returns>
+    public boolean showQueryValues()
+    {
+        if (custAccount)
+        {
+            return false;
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container  packedClass)
+    {
+        Version     version = conPeek(packedClass, 1);
+        boolean     ret;
+        container   packedQuery;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #ParmList, packedQuery] = packedClass;
+
+                if (packedQuery)
+                {
+                    queryRun = new QueryRun(packedQuery);
+                }
+
+                ret = true;
+                break;
+
+            default:
+                ret = false;
+                break;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateQueryBuild</Name>
+				<Source><![CDATA[
+    private QueryRun updateQueryBuild()
+    {
+        QueryBuildDataSource    queryBuildDataSource;
+        QueryBuildRange queryBuildRange;
+        #query
+
+        queryRun = new QueryRun(queryStr(MCRCustSalesStats));
+
+        queryRun.title("@MCR24903");
+
+        if (custAccount)
+        {
+            queryBuildDataSource = queryRun.query().dataSourceTable(tableNum(CustTable));
+
+            queryBuildRange = queryRun.query().dataSourceTable(tableNum(CustTable)).rangeField(fieldNum(CustTable, AccountNum));
+            queryBuildRange.value(custAccount);
+        }
+
+        return queryRun;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Validates the user's input.
+    /// </summary>
+    /// <param name="_calledFrom">
+    ///     The object the validate is being called from.
+    /// </param>
+    /// <returns>
+    ///     true if validatation is successful; otherwise, false.
+    /// </returns>
+    public boolean validate(Object _calledFrom = null)
+    {
+        boolean ret;
+
+        ret = super();
+
+        // If the user has populated the entire date range (start date
+        // and end date) then force them to enter a start date less than
+        // or equal to the end date.  If the start date is blank it's assume
+        // everything should be picked up until the populated end date.
+        // If the end date is populated it's assumed everything should
+        // be picked greater then or equal to the start date.  Finally, if
+        // both are blank pick up all SO history.
+        if (ret &&
+           startDate &&
+           endDate &&
+           startDate > endDate)
+        {
+            ret = checkFailed("@MCR24954");
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearStats</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Deletes stats for past customer.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which to delete stats.
+    /// </param>
+    public static void clearStats(CustAccount _custAccount = '')
+    {
+        MCRSalesStatsCustItem    mcrSalesStatsCustItem;
+        MCRSalesStatsCustTable   mcrSalesStatsCustTable;
+
+        if (_custAccount)
+        {
+            // clear out cust stats
+
+            update_recordset mcrSalesStatsCustTable
+                setting OrderFrequency = 0,
+                        TotalInvoiceAmountMST = 0,
+                        AvgInvoiceAmountMST = 0,
+                        TotalReturnInvoicedAmountMST = 0,
+                        TotalInvoiceCostAmountMST =  0
+                    where mcrSalesStatsCustTable.CustAccount == _custAccount;
+
+            // clear out cust item stats
+            delete_from mcrSalesStatsCustItem
+                where mcrSalesStatsCustItem.CustAccount == _custAccount;
+        }
+        else
+        {
+            // clear out cust stats
+            delete_from mcrSalesStatsCustTable;
+
+            // clear out cust item stats
+            delete_from mcrSalesStatsCustItem;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFirstCustOrderDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Gets the oldest order date for a customer.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which to retrieve the oldest order date.
+    /// </param>
+    /// <returns>
+    ///     The oldest order date.
+    /// </returns>
+    public static TransDate getFirstCustOrderDate(CustAccount _custAccount)
+    {
+        SalesTable salesTable;
+        CustTable  custTable;
+
+        if (_custAccount)
+        {
+            select firstonly RecId, CreatedDateTime from salesTable
+                order by CreatedDateTime asc
+                join RecId from custTable
+                    where (custTable.MCRMergedRoot == _custAccount
+                        || custTable.AccountNum == _custAccount)
+                        && salesTable.CustAccount == custTable.AccountNum;
+            if (salesTable)
+            {
+                return DateTimeUtil::date(salesTable.CreatedDateTime);
+            }
+        }
+
+        return dateNull();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLastCustOrderDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Finds the newest order date for a customer.
+    /// </summary>
+    /// <param name="_custAccount">
+    ///     The customer account for which to retrieve the newest order date.
+    /// </param>
+    /// <param name="_startDate">
+    ///     The earliest date that should be returned.
+    /// </param>
+    /// <param name="_endDate">
+    ///     The latest date that should be returned.
+    /// </param>
+    /// <returns>
+    ///     The newest order date for a customer.
+    /// </returns>
+    public static TransDate getLastCustOrderDate(CustAccount _custAccount, TransDateTime _startDate = DateTimeUtil::minValue(), TransDateTime _endDate = DateTimeUtil::maxValue())
+    {
+        SalesTable salesTable;
+        CustTable  custTable;
+
+        if (_custAccount)
+        {
+            select firstonly RecId, CreatedDateTime from salesTable
+                order by CreatedDateTime desc
+                exists join custTable
+                    where (custTable.MCRMergedRoot == _custAccount
+                        || custTable.AccountNum == _custAccount)
+                        && salesTable.CustAccount == custTable.AccountNum
+                        && salesTable.CreatedDateTime >= _startDate
+                        && salesTable.CreatedDateTime <= _endDate;
+            if (salesTable)
+            {
+                return DateTimeUtil::date(salesTable.CreatedDateTime);
+            }
+        }
+
+        return dateNull();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void  main(Args  _args)
+    {
+        MCRSalesStatsCust       mcrSalesStatsCust;
+        Common                  record;
+        CustTable               custTable;
+        MCRSalesStatsCustTable  mcrSalesStatsCustTable;
+        MCRRFMDefinition        mcrRFMDefinition;
+
+        if (_args)
+        {
+            record      = _args.record();
+        }
+
+        mcrSalesStatsCust = new MCRSalesStatsCust();
+        mcrSalesStatsCust.reset();
+        mcrSalesStatsCust.parmInBatch(false);
+
+        if (record)
+        {
+            switch (record.TableId)
+            {
+                case tableNum(CustTable):
+                    custTable = record;
+                    mcrSalesStatsCust.initParmCustAccount(custTable.AccountNum);
+                    break;
+                case tableNum(MCRSalesStatsCustTable):
+                    mcrSalesStatsCustTable = record;
+                    mcrSalesStatsCust.initParmCustAccount(mcrSalesStatsCustTable.CustAccount);
+                    break;
+
+                case tableNum(MCRRFMDefinition):
+                    mcrRFMDefinition = record;
+                    mcrSalesStatsCust.initParmStartDate(mcrRFMDefinition.StartDate);
+                    mcrSalesStatsCust.initParmEndDate(mcrRFMDefinition.EndDate);
+                    break;
+            }
+        }
+
+        if (mcrRFMDefinition)
+        {
+            mcrSalesStatsCust.initParmDefault();
+            mcrSalesStatsCust.runOperation();
+        }
+        else if (mcrSalesStatsCust.prompt())
+        {
+            mcrSalesStatsCust.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>MCRSalesStatsCust</c>
+    /// class can be run in a new session.
+    /// </summary>
+    /// <returns>true if the the class <c>MCRSalesStatsCust</c> can
+    /// be run in a new session; otherwise, false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		<Method><Name>isRetryable</Name><Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+]]></Source></Method></Methods>
+	</SourceCode>
+</AxClass>

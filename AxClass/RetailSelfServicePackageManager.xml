@@ -1,0 +1,1701 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailSelfServicePackageManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.IO.Compression;
+using Microsoft.DynamicsOnline.Infrastructure.Components.SharedServiceUnitStorage;
+using EventLogger = Microsoft.Dynamics.Application.Instrumentation.ApplicationEventSource;
+using Microsoft.Dynamics.ApplicationPlatform.Environment;
+
+/// <summary>
+/// This class is built on top of the <c>SelfServicePackageManager</c> class and provides Retail specific functionalities
+/// for Azure Cloud Storage based package management.
+/// </summary>
+class RetailSelfServicePackageManager
+{
+    public const str MassDownloadMapFileName = 'RetailAssociationMap.xml';
+
+    private static Map pkgNameToPkgTypeMapping = new Map(Types::String, Types::Integer);
+    private static Map pkgTypeToDefaultDescMapping = new Map(Types::Integer, Types::String);
+    private static Map appSettingsKeyValuePairs = new Map(Types::String, Types::String);
+
+    private const str selfServiceManifestFileName = 'InstallationInfo.xml';
+    private const str selfServiceRegistryKey = @'SOFTWARE\Microsoft\Dynamics\7.0\RetailSelfService';
+    private const str selfServicePackagesKeyName = 'SelfServicePackagesLocation';
+    private const str selfServiceScriptsKeyName = 'SelfServiceScriptsLocation';
+
+    private const str customModernPOSFileNameXPath = '/ServiceModelInstallationInfo/ModernPosExeName';
+    private const str customModernPOSOfflineFileNameXPath = '/ServiceModelInstallationInfo/ModernPosOfflineExeName';
+    private const str customHardwareStationFileNameXPath = '/ServiceModelInstallationInfo/HardwareStationExeName';
+    private const str customRetailScaleUnitFileNameXPath = '/ServiceModelInstallationInfo/StoreSystemExeName';
+
+    private const str customRetailMPOSWindowsPhoneFileNameXPath = '/ServiceModelInstallationInfo/MPOSWindowsPhoneFileName';
+    private const str customRetailMPOSAndroidFileNameXPath = '/ServiceModelInstallationInfo/MPOSAndroidFileName';
+    private const str customRetailMPOSiOSFileNameXPath = '/ServiceModelInstallationInfo/MPOSiOSFileName';
+    private const str customRetailHardwarePeripheralSimulatorFileNameXPath = '/ServiceModelInstallationInfo/HardwarePeripheralSimulatorFileName';
+
+    private const str customDescriptionXPath = '/ServiceModelInstallationInfo/CustomDescription';
+    private const str customPackageVersionXPath = '/ServiceModelInstallationInfo/CustomVersion';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>RunPostDeploymentSelfServicePackageUpload</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Logic to upload all retail self service packages to tenant
+    /// storage during post deployment configuration step.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void RunPostDeploymentSelfServicePackageUpload()
+    {
+        IApplicationEnvironment environment = Microsoft.Dynamics.ApplicationPlatform.Environment.EnvironmentFactory::GetApplicationEnvironment();
+        boolean isServiceFabricEnv = environment.Common.HostingEnvironment ==
+            Microsoft.Dynamics.ApplicationPlatform.Environment.HostingEnvironment::ServiceFabric;
+
+        if (isServiceFabricEnv)
+        {
+            EventLogger::EventWriteSelfServiceInformation('Skip RunPostDeploymentSelfServicePackageUpload on Service Fabric because this method needs a VM-based host to upload packages from local path to Azure Blob Storage.');
+            return;
+        }
+
+        EventLogger::EventWriteRetailSelfServicePostDeploymentPackageUploadStart();
+        RetailSelfServicePackageManager::GenerateMapOfTargetPackages();
+
+        str retailSelfServicePkgLocation = RetailSelfServicePackageManager::GetSelfServicePackagesLocation();
+
+        MapEnumerator pkgNameToPkgTypeMappingEnumerator = pkgNameToPkgTypeMapping.getEnumerator();
+
+        while (pkgNameToPkgTypeMappingEnumerator.moveNext())
+        {
+            if (!RetailSelfServicePackageManager::CheckIfPackageExists(pkgNameToPkgTypeMappingEnumerator.currentKey(), SelfServicePackageManager::GetApplicationVersion()))
+            {
+                str packagePath = System.IO.Path::Combine(retailSelfServicePkgLocation, pkgNameToPkgTypeMappingEnumerator.currentKey());
+                PackageType typeOfPackageBeingUploaded = pkgNameToPkgTypeMappingEnumerator.currentValue();
+
+                str descriptionOfPackage = pkgTypeToDefaultDescMapping.lookup(typeOfPackageBeingUploaded);
+                boolean uploadSuccessful = SelfServicePackageManager::UploadPackage(packagePath, "", descriptionOfPackage, typeOfPackageBeingUploaded);
+
+                if (!uploadSuccessful)
+                {
+                    str errorMsg = strFmt("@RETAIL:PackageUploadFailed", packagePath);
+                    EventLogger::EventWriteSelfServiceError(errorMsg, errorMsg, System.Environment::StackTrace);
+                    throw Global::error(errorMsg);
+                }
+            }
+        }
+
+        RetailServicingOrchestrator::uploadCustomizedSelfServicePackages();
+        EventLogger::EventWriteRetailSelfServicePostDeploymentPackageUploadStop();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GeneratePackageDownloadLink</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the download link for the selected record.
+    /// </summary>
+    /// <param name = "selectedRecId">Rec Id of the selected device, hardware station or real-time service profile.</param>
+    /// <param name = "typeOfPackage">Specify the type of package which is being retrieved.</param>
+    /// <param name = "retryWithUploadOnFailure">If link generation fails, specifies if we should try uploading packages n try again.</param>
+    /// <returns>Returns the download link for the specified package type.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GeneratePackageDownloadLink(int64 selectedRecId, PackageType typeOfPackage, boolean retryWithUploadOnFailure = false)
+    {
+        EventLogger::EventWriteSelfServiceInformation(strFmt('Download link generation request received for %1 with recId = %2.', enum2Str(typeOfPackage), selectedRecId));
+
+        if (selectedRecId == 0)
+        {
+            str errorMsg = strFmt("@SYS127989", selectedRecId);
+            EventLogger::EventWriteSelfServiceError(errorMsg, "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error(errorMsg);
+        }
+
+        RetailSelfServicePackageInfo packageInfo = RetailSelfServicePackageManager::getPackageInfoFromSelectedComponent(
+                selectedRecId, typeOfPackage);
+
+        return RetailSelfServicePackageManager::generatePackageDownloadLinkByPackageReference(packageInfo.RecId,
+           retryWithUploadOnFailure);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>OpenLinkInNewBrowserTab</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Opens a download link in a new browser tab.
+    /// </summary>
+    /// <param name = "linkToOpen">Download link to open in a browser tab.</param>
+    /// <param name = "errorMessage">Error message to show if the link is null.</param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void OpenLinkInNewBrowserTab(str linkToOpen, str errorMessage)
+    {
+        // To open a new browser tab we need a non-empty string as url.
+        if (!System.String::IsNullOrWhiteSpace(linkToOpen))
+        {
+            // Opens new tab and navigate to specified url
+            Browser currentBrowser = new Browser();
+            currentBrowser.navigate(linkToOpen, true, true);
+        }
+        else
+        {
+            throw Global::error(errorMessage);
+        }
+
+        Global::warning("@RETAIL:DisablePopupBlockerWarningMessage");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ProcessExternalRequests</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retail Self service end-point for servicing package
+    /// management requests generated via powershell scripts.
+    /// </summary>
+    /// <param name = "inputXmlString">Xml string containing the service request.
+    /// Sample input xml will look similar to:
+    /// <![CDATA[
+    /// <?xml version="1.0" encoding="UTF-8"?>
+    /// <RetailSelfServicePackageManager>
+    ///     <UploadDetails>
+    ///        <PackagePath>C:\cd\SelfServiceDeployment\Packages\AX7ModernPOSSetup.exe</PackagePath>
+    ///        <PackageDescription>Sample description<PackageDescription>
+    ///        <PackageVersion>7.0.968.0</PackageVersion>
+    ///        <PackageType>HardwareStation</PackageType>
+    ///        <PackageReplaceMode>ReplaceExistingByType</PackageReplaceMode>
+    ///        <AssignToStores>HOUSTON,SEATTLE</AssignToStores>
+    ///     </UploadDetails>
+    ///     <DeletionDetails>
+    ///         <PackageFriendlyName>CustomPackage</PackageFriendlyName>
+    ///         <PackageVersion>7.0.968.0</PackageVersion>
+    ///         <PackageType>HardwareStation</PackageType>
+    ///     </DeletionDetails>
+    /// </RetailSelfServicePackageManager>
+    /// ]]]]><![CDATA[>
+    /// </param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void ProcessExternalRequests(str actionDetailsAsXmlString)
+    {
+        XmlDocument actionDetailsAsXmlDocument;
+        System.Exception exception;
+
+        try
+        {
+            // Add start event
+            actionDetailsAsXmlDocument = new XmlDocument();
+            actionDetailsAsXmlDocument.loadXml(actionDetailsAsXmlString);
+
+            XmlNode uploadNode = actionDetailsAsXmlDocument.selectSingleNode(@"/RetailSelfServicePackageManager/UploadDetails");
+            XmlNode deleteNode = actionDetailsAsXmlDocument.selectSingleNode(@"/RetailSelfServicePackageManager/DeletionDetails");
+
+            boolean isRequestForPackageUpload = uploadNode != null;
+            boolean isRequestForPackageDeletion = deleteNode != null;
+
+            // Process an upload request.
+            if (isRequestForPackageUpload)
+            {
+                PackageType typeofPackage;
+                PackageReplaceMode pkgReplaceMode;
+
+                // Extract information from incoming xml
+                str packagePath = uploadNode.getNamedElement('PackagePath').text();
+                str packageFriendlyName = uploadNode.getNamedElement('PackageFriendlyName').text();
+                str packageDescription = uploadNode.getNamedElement('PackageDescription').text();
+
+                str packageVersion = uploadNode.getNamedElement('PackageVersion').text();
+                str typeOfPackageToUpload = uploadNode.getNamedElement('PackageType').text();
+
+                str packageReplaceMode = uploadNode.getNamedElement('PackageReplaceMode').text();
+                str commaSeparatedStringOfStores = uploadNode.getNamedElement('AssignToStores').text();
+
+                typeofPackage = str2Enum(typeofPackage, typeOfPackageToUpload);
+                pkgReplaceMode = str2Enum(pkgReplaceMode, packageReplaceMode);
+
+                EventLogger::EventWriteSelfServiceInformation('Processing external request to upload a file.');
+
+                // Perform package upload.
+                boolean wasUploadRequestSuccessful = SelfServicePackageManager::UploadPackage(packagePath, packageFriendlyName, packageDescription, typeofPackage, packageVersion, pkgReplaceMode);
+                if (!wasUploadRequestSuccessful)
+                {
+                    throw Global::error('External request to upload file failed. Please check the event logs for more details.');
+                }
+
+                str packageBlobName = SelfServicePackageManager::GenerateBlobName(packagePath, packageVersion);
+
+                // Set the default package for stores
+                RetailSelfServicePackageManager::SetDefaultPackageForStores(commaSeparatedStringOfStores, packageBlobName);
+                EventLogger::EventWriteSelfServiceInformation('External request to upload file processed.');
+            }
+
+            if (isRequestForPackageDeletion)
+            {
+                // Extract information from incoming xml
+                str packageFriendlyName = deleteNode.getNamedElement('PackageFriendlyName').text();
+                str packageVersion = deleteNode.getNamedElement('PackageVersion').text();
+
+                PackageType typeofPackage;
+                str typeOfPackageToUpload = deleteNode.getNamedElement('PackageType').text();
+
+                typeofPackage = str2Enum(typeofPackage, typeOfPackageToUpload);
+                EventLogger::EventWriteSelfServiceInformation('Processing external request to delete a package.');
+
+                SelfServicePackageManager::DeletePackageWithFriendlyName(packageFriendlyName, packageVersion, typeofPackage);
+                EventLogger::EventWriteSelfServiceInformation('External request to delete package processed.');
+            }
+        }
+        catch (exception)
+        {
+            EventLogger::EventWriteSelfServiceError('Error while processing external file upload request', exception.Message, exception.StackTrace);
+            throw Global::error(exception.ToString());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateUrl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Open a new active connection to the download URL retrieved
+    /// and check the headers returned to see if the url is valid.
+    /// </summary>
+    /// <param name = "downloadLink"></param>
+    /// <returns>True if valid link else false.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static boolean ValidateUrl(str downloadLink)
+    {
+        boolean result;
+        System.Exception exception;
+
+        try
+        {
+            System.Net.HttpWebRequest request = System.Net.WebRequest::Create(downloadLink) as System.Net.HttpWebRequest;
+
+            request.Method = "HEAD";
+            using (System.Net.HttpWebResponse response = request.GetResponse())
+            {
+                result = response.StatusCode == System.Net.HttpStatusCode::OK;
+            }
+        }
+        catch (exception)
+        {
+            result = false;
+            EventLogger::EventWriteSelfServiceError(strFmt('Download url generated: %1 is not valid.', downloadLink), exception.Message, exception.StackTrace);
+        }
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DownloadConfigurationXml</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate a configuration xml of the selected device or hardware station profile record and allow user to download the file.
+    /// </summary>
+    /// <param name = "selectedRecordId">Rec Id of the selected device or hardware station profile.</param>
+    [SysObsolete('Use method DownloadConfigXml instead.', false, 31\01\2016)]
+    public static void DownloadConfigurationXml(int64 selectedRecordId, boolean isModernPos)
+    {
+        if (isModernPos)
+        {
+            RetailSelfServicePackageManager::DownloadConfigXml(selectedRecordId, PackageType::ModernPosWithoutOffline);
+        }
+        else
+        {
+            RetailSelfServicePackageManager::DownloadConfigXml(selectedRecordId, PackageType::RetailStoreScaleUnit);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DownloadConfigXml</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate a configuration xml of the selected device, hardware station or real-time service profile record and allow user to download the file.
+    /// </summary>
+    /// <param name = "selectedRecordId">Rec Id of the selected device, hardware station or real-time service profile.</param>
+    /// <param name = "packageType">Specify the target PackageType for the configuration xml.</param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void DownloadConfigXml(int64 selectedRecordId, PackageType packageType)
+    {
+        if (selectedRecordId == 0)
+        {
+            str errorMsg = strFmt("@SYS127989", selectedRecordId);
+            EventLogger::EventWriteSelfServiceError(errorMsg, "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error(errorMsg);
+        }
+
+        // Generate the downloadable configuration xml content.
+        str configurationXmlContent = RetailSelfServicePackageManager::GenerateConfigurationXmlContent(packageType, selectedRecordId);
+
+        // Get the filename of the configuration xml to be generated.
+        str configurationXmlFileName = RetailSelfServicePackageManager::GetConfigurationXmlFilename(packageType, selectedRecordId );
+
+        // Upload self-service configuration xml as filestream and start xml download.
+        System.Text.Encoding encodingFormat = System.Text.Encoding::UTF8;
+        File::SendStringAsFileToUser(configurationXmlContent, configurationXmlFileName, encodingFormat);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetSelfServiceManifestFileContent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the self-service manifest file contents.
+    /// </summary>
+    /// <returns>The self-service manifest file contents.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GetSelfServiceManifestFileContent()
+    {
+        str scriptsLocationFromRegistry = RetailUtilities::ReadRegistryKey(selfServiceRegistryKey, selfServiceScriptsKeyName);
+        str manifestFileFullPath = System.IO.Path::Combine(scriptsLocationFromRegistry, selfServiceManifestFileName);
+        str manifestFileContent = RetailUtilities::GetXmlFileContent(manifestFileFullPath, false);
+
+        return manifestFileContent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetCustomizedPackageVersion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the self-service customized package version.
+    /// </summary>
+    /// <param name = "manifestFileContent">Contents of the self-service manifest.</param>
+    /// <returns>The self-service customized package version.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GetCustomizedPackageVersion(str manifestFileContent)
+    {
+        str result = RetailUtilities::GetXmlInnerText(manifestFileContent, customPackageVersionXPath);
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetCustomizedSelfServicePkgPathMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Read the self-service manifest to retrieve the customized packages file paths.
+    /// </summary>
+    /// <param name = "manifestFileContent">Contents of the self-service manifest.</param>
+    /// <returns>The map of customized self-service file paths.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static Map GetCustomizedSelfServicePkgPathMap(str manifestFileContent)
+    {
+        Map result = new Map(Types::Integer, Types::String);
+        str packagesLocationFromRegistry = RetailUtilities::ReadRegistryKey(selfServiceRegistryKey, selfServicePackagesKeyName);
+
+        if (System.String::IsNullOrWhiteSpace(packagesLocationFromRegistry))
+        {
+            str errorMsg = strFmt('Unable to read registry key %1 at location %2', selfServicePackagesKeyName, selfServiceRegistryKey);
+            EventLogger::EventWriteSelfServiceError(errorMsg, errorMsg, System.Environment::StackTrace);
+            throw Global::error(errorMsg);
+        }
+
+        str customizedModernPOSFileName = RetailUtilities::GetXmlInnerText(manifestFileContent, customModernPOSFileNameXPath);
+        str customizedModernPOSOfflineFileName = RetailUtilities::GetXmlInnerText(manifestFileContent, customModernPOSOfflineFileNameXPath);
+        str customizedHardwareStationFileName = RetailUtilities::GetXmlInnerText(manifestFileContent, customHardwareStationFileNameXPath);
+        str customizedRetailScaleUnitFileName = RetailUtilities::GetXmlInnerText(manifestFileContent, customRetailScaleUnitFileNameXPath);
+        str customizedRetailMPOSWindowsPhoneFileName = RetailUtilities::GetXmlInnerText(manifestFileContent, customRetailMPOSWindowsPhoneFileNameXPath);
+        str customizedRetailMPOSAndroidFileName = RetailUtilities::GetXmlInnerText(manifestFileContent, customRetailMPOSAndroidFileNameXPath);
+        str customizedRetailMPOSiOSFileName = RetailUtilities::GetXmlInnerText(manifestFileContent, customRetailMPOSiOSFileNameXPath);
+        str customizedRetailHardwarePeripheralSimulatorFileName = RetailUtilities::GetXmlInnerText(manifestFileContent, customRetailHardwarePeripheralSimulatorFileNameXPath);
+
+        str customizedModernPOSPackagePath = System.String::IsNullOrWhiteSpace(customizedModernPOSFileName)? '' : System.IO.Path::Combine(packagesLocationFromRegistry, customizedModernPOSFileName);
+        str customizedModernPOSOfflinePackagePath = System.String::IsNullOrWhiteSpace(customizedModernPOSOfflineFileName)? '' : System.IO.Path::Combine(packagesLocationFromRegistry, customizedModernPOSOfflineFileName);
+        str customizedHardwareStationPackagePath = System.String::IsNullOrWhiteSpace(customizedHardwareStationFileName)? '' : System.IO.Path::Combine(packagesLocationFromRegistry, customizedHardwareStationFileName);
+        str customizedRetailStoreScaleUnitPackagePath = System.String::IsNullOrWhiteSpace(customizedRetailScaleUnitFileName)? '' : System.IO.Path::Combine(packagesLocationFromRegistry, customizedRetailScaleUnitFileName);
+        str customizedMPOSWindowsPhonePackagePath = System.String::IsNullOrWhiteSpace(customizedRetailMPOSWindowsPhoneFileName)? '' : System.IO.Path::Combine(packagesLocationFromRegistry, customizedRetailMPOSWindowsPhoneFileName);
+        str customizedMPOSAndroidPackagePath = System.String::IsNullOrWhiteSpace(customizedRetailMPOSAndroidFileName)? '' : System.IO.Path::Combine(packagesLocationFromRegistry, customizedRetailMPOSAndroidFileName);
+        str customizedMPOSiOSPackagePath = System.String::IsNullOrWhiteSpace(customizedRetailMPOSiOSFileName)? '' : System.IO.Path::Combine(packagesLocationFromRegistry, customizedRetailMPOSiOSFileName);
+        str customizedHardwarePeripheralSimulatorPackagePath = System.String::IsNullOrWhiteSpace(customizedRetailHardwarePeripheralSimulatorFileName)? '' : System.IO.Path::Combine(packagesLocationFromRegistry, customizedRetailHardwarePeripheralSimulatorFileName);
+
+        result.insert(PackageType::ModernPosWithoutOffline, customizedModernPOSPackagePath);
+        result.insert(PackageType::ModernPosWithOffline, customizedModernPOSOfflinePackagePath);
+        result.insert(PackageType::HardwareStation, customizedHardwareStationPackagePath);
+        result.insert(PackageType::RetailStoreScaleUnit, customizedRetailStoreScaleUnitPackagePath);
+        result.insert(PackageType::ModernPosWindowsPhone, customizedMPOSWindowsPhonePackagePath);
+        result.insert(PackageType::ModernPosAndroid, customizedMPOSAndroidPackagePath);
+        result.insert(PackageType::ModernPosiOS, customizedMPOSiOSPackagePath);
+        result.insert(PackageType::HardwarePeripheralSimulator, customizedHardwarePeripheralSimulatorPackagePath);
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetCustomizedSelfServicePkgDescriptionMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Read the self-service manifest to retrieve the customized packages descriptions.
+    /// </summary>
+    /// <param name = "manifestFileContent">Contents of the self-service manifest.</param>
+    /// <returns>The map of customized self-service descriptions.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static Map GetCustomizedSelfServicePkgDescriptionMap(str manifestFileContent)
+    {
+        Map result = new Map(Types::Integer, Types::String);
+        str customizedDescription = RetailUtilities::GetXmlInnerText(manifestFileContent, customDescriptionXPath);
+        customizedDescription = System.String::IsNullOrWhiteSpace(customizedDescription) ? 'Customized Retail self-service package.' : customizedDescription;
+
+        result.insert(PackageType::ModernPosWithoutOffline, strFmt('[Retail Modern POS] - %1', customizedDescription));
+        result.insert(PackageType::ModernPosWithOffline, strFmt('[Retail Modern POS Offline] - %1', customizedDescription));
+        result.insert(PackageType::HardwareStation, strFmt('[Retail Hardware Station] - %1', customizedDescription));
+        result.insert(PackageType::RetailStoreScaleUnit, strFmt('[Retail Store Scale Unit] - %1', customizedDescription));
+        result.insert(PackageType::ModernPosWindowsPhone, strFmt('[Retail Modern POS for Windows Phone] - %1', customizedDescription));
+        result.insert(PackageType::ModernPosAndroid, strFmt('[Retail Modern POS for Android] - %1', customizedDescription));
+        result.insert(PackageType::ModernPosiOS, strFmt('[Retail Modern POS for iOS] - %1', customizedDescription));
+        result.insert(PackageType::HardwarePeripheralSimulator, strFmt('[Retail Hardware Peripheral Simulator] - %1', customizedDescription));
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DownloadMassDownloadZip</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Given the set of selected stores, create a zip memory stream containing the configuration files, installer files, and map XML file for all Windows MPOS devices.
+    /// </summary>
+    /// <param name = "selectedStoreRecIds">A set of store records.</param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void DownloadMassDownloadZip(Set selectedStoreRecIds)
+    {
+        const str extensionZIP = '.zip';
+        const str zipFileName = 'RetailMassDownload';
+
+        System.DateTime timeStamp = System.DateTime::UtcNow;
+
+        using (System.IO.MemoryStream zipArchiveStream = RetailSelfServicePackageManager::CreateMassDownloadZipStream(selectedStoreRecIds))
+        {
+            // Downlaod the file to the user using standard package format:  For example:  RetailMassDownload_22-20-02.zip
+            File::SendFileToUser(zipArchiveStream, strFmt('%1_%2%3', zipFileName, timeStamp.ToString('HH-mm-ss'), extensionZIP));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateMassDownloadZipStream</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Given the set of selected stores, create a zip memory stream containing the configuration files, installer files, and map XML file for all Windows MPOS devices.
+    /// </summary>
+    /// <param name = "selectedStoreRecIds">A set of store records.</param>
+    /// <returns>A memory stream for a zip file.  NOTE: Caller is responsible for disposing the stream.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static System.IO.MemoryStream CreateMassDownloadZipStream(Set selectedStoreRecIds)
+    {
+        const str zipFileName = 'RetailMassDownload';
+        const str extensionZIP = '.zip';
+
+        RetailStoreTable        storeTable;
+        RetailTerminalTable     terminalTable;
+        RetailDevice            device;
+        PackageType             devicePackageType;
+        int64                   selectedRecordId;
+        SetEnumerator           selectedStoreEnumerator;
+        str                     installerPackageFileName = '';
+        System.Text.Encoding    encodingUtf8Format = System.Text.Encoding::UTF8;
+        System.Byte[]           byteArray;
+
+        Map configFileToPackageId = new Map(Types::String, Types::String);
+        Map configFileToTerminalId = new Map(Types::String, Types::String);
+        Map configFileToDeviceId = new Map(Types::String, Types::String);
+        Map packageIdToInstallerFile = new Map(Types::String, Types::String);
+        System.Exception exception;
+
+        System.DateTime timeStamp = System.DateTime::UtcNow;
+        System.IO.MemoryStream zipArchiveStream;
+  
+        try
+        {
+            EventLogger::EventWriteRetailServicingInformation('Retail Create Mass Device zip stream started.');
+
+            zipArchiveStream = new System.IO.MemoryStream();
+
+            using (ZipArchive zipArchive = new ZipArchive(zipArchiveStream, ZipArchiveMode::Create, true))
+            {
+                // start processing for selected Stores.
+                selectedStoreEnumerator = selectedStoreRecIds.getEnumerator();
+                while (selectedStoreEnumerator.moveNext())
+                {
+                    storeTable = RetailStoreTable::findRecId(selectedStoreEnumerator.current());
+
+                    while select * from terminalTable where terminalTable.StoreRecId == storeTable.RecId
+                    {
+                        try
+                        {
+                            while select * from device where device.Terminal == terminalTable.terminalId
+                            {
+                                devicePackageType = device.computePackageTypeFilter();
+                                selectedRecordId = device.RecId;
+
+                                if ((devicePackageType == PackageType::ModernPosWithOffline) || (devicePackageType == PackageType::ModernPosWithoutOffline))
+                                {
+                                    // Only process for Modern POS (with or without offline)
+                                    str configurationXmlContent = RetailSelfServicePackageManager::GenerateConfigurationXmlContent(devicePackageType, selectedRecordId);
+
+                                    // Get the filename of the configuration xml to be generated.
+                                    str configurationXmlFileName = RetailSelfServicePackageManager::GetConfigurationXmlFilename(devicePackageType, selectedRecordId );
+
+                                    // Upload self-service configuration xml as filestream and start xml download.
+                                    // Create the configuration stream
+                                    byteArray = encodingUtf8Format.GetBytes(configurationXmlContent);
+                                    using (System.IO.MemoryStream configMemoryStream = new System.IO.MemoryStream(byteArray))
+                                    {
+                                        // Add the configuration to the zip file
+                                        RetailSelfServicePackageManager::packStream(zipArchive, configMemoryStream, configurationXmlFileName);
+                                    }
+
+                                    // Get the associated pacakge Storage UID for the installer
+                                    str packageStorageUID = RetailSelfServicePackageManager::GetReferenceIdForPackage(selectedRecordId, devicePackageType);
+
+                                    // Map: configuration XML file to the packageStoreUID
+                                    configFileToPackageId.insert(configurationXmlFileName, packageStorageUID);
+                                    configFileToTerminalId.insert(configurationXmlFileName, terminalTable.terminalId);
+                                    configFileToDeviceId.insert(configurationXmlFileName, device.deviceId);
+
+                                    if (!System.String::IsNullOrWhiteSpace(packageStorageUID))
+                                    {
+                                        // We have an associated packageStorageUID for the installer
+
+                                        if (!packageIdToInstallerFile.exists(packageStorageUID))
+                                        {
+                                            // the packageStorageUID needs to be added to the map and the installer file added the the ZIP archive...
+
+                                            // Get the installer filename - do not suppress errors
+                                            installerPackageFileName = SelfServicePackageManager::GetPackageFilename(packageStorageUID);
+
+                                            packageIdToInstallerFile.insert(packageStorageUID, installerPackageFileName);
+
+                                            using (System.IO.MemoryStream installerMemoryStream = SelfServicePackageManager::getPackageFromStorageAsMemoryStream(packageStorageUID))
+                                            {
+                                                RetailSelfServicePackageManager::packStream(zipArchive, installerMemoryStream, installerPackageFileName);
+                                            }
+                                        }
+                                    }
+
+                                }
+                            }
+                        }
+                        catch (exception)
+                        {
+                            continue; //Although this one failed, we can still continue with others.  Detail logging is done at point of failure.
+                        }
+                    }
+                }
+
+                // Populate the zip with map file...
+                System.Text.Encoding encodingFormat = System.Text.Encoding::UTF8;
+                str mapXml = RetailSelfServicePackageManager::GenerateMapMassDownloadXmlContent(configFileToPackageId, packageIdToInstallerFile, configFileToTerminalId, configFileToDeviceId);
+            
+                byteArray = encodingUtf8Format.GetBytes(mapXml);
+                using (System.IO.MemoryStream mapMemoryStream = new System.IO.MemoryStream(byteArray))
+                {
+                    // Add the configuration to the zip file
+                    RetailSelfServicePackageManager::packStream(zipArchive, mapMemoryStream, MassDownloadMapFileName);
+                }
+            }
+
+            EventLogger::EventWriteRetailServicingInformation('Retail Create Mass Device zip stream completed.');
+        }
+        catch (Exception::Error)
+        {
+            if (zipArchiveStream != null)
+            {
+                zipArchiveStream.Dispose();
+                zipArchiveStream = null;
+            }
+
+            EventLogger::EventWriteSelfServiceError("@RETAIL:MassDownloadFailed", 'Exception::Error', System.Environment::StackTrace);
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception interopException = CLRInterop::getLastException();
+            str exceptionMessage = RetailSelfServicePackageManager::getFriendlyExceptionMessage(interopException);
+
+            if (zipArchiveStream != null)
+            {
+                zipArchiveStream.Dispose();
+                zipArchiveStream = null;
+            }
+
+            EventLogger::EventWriteSelfServiceError("@RETAIL:MassDownloadFailed", exceptionMessage, System.Environment::StackTrace);
+
+        }
+
+        return zipArchiveStream;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateMapMassDownloadXmlContent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate the map XML file for mass download.
+    /// </summary>
+    /// <param name = "configFileToPackageId">Map ConfigurationFile string to PackageId string.</param>
+    /// <param name = "packageIdToInstallerFile">Map PackageId string to InstallerFile.</param>
+    /// <param name = "configFileToTerminalId">Map ConfigurationFile string to TerminalId.</param>
+    /// <param name = "configFileToDeviceId">Map ConfigurationFile string to DeviceId.</param>
+    /// <returns>Generated mapping xml content.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GenerateMapMassDownloadXmlContent(Map configFileToPackageId, Map packageIdToInstallerFile, Map configFileToTerminalId, Map configFileToDeviceId)
+    {
+        System.Xml.XmlDocument configXML = new System.Xml.XmlDocument();
+
+        // Create the xml declaration
+        System.Xml.XmlDeclaration xmlDeclarationNode = configXML.createXmlDeclaration("1.0", "UTF-8", null);
+        System.Xml.XmlElement root = configXML.DocumentElement;
+        configXML.insertBefore(xmlDeclarationNode, root);
+
+        // Create root node called configuration
+        System.Xml.XmlElement rootConfiguration = configXML.CreateElement("Configurations");
+        configXML.AppendChild(rootConfiguration);
+
+        MapEnumerator configFileMapEnumerator = configFileToPackageId.getEnumerator();
+
+        while (configFileMapEnumerator.moveNext())
+        {
+            str configFile = configFileMapEnumerator.currentKey();
+            str packageId = configFileMapEnumerator.currentValue();
+            str installerFile = '';
+            str terminalId = '';
+            str deviceId = '';
+
+            if (packageIdToInstallerFile.exists(packageId))
+            {
+                installerFile = packageIdToInstallerFile.lookup(packageId);
+            }
+
+            if (configFileToTerminalId.exists(configFile))
+            {
+                terminalId = configFileToTerminalId.lookup(configFile);
+            }
+
+            if (configFileToDeviceId.exists(configFile))
+            {
+                deviceId = configFileToDeviceId.lookup(configFile);
+            }
+
+            System.Xml.XmlElement appSettingsChildElement = configXML.CreateElement('Configuration');
+
+            appSettingsChildElement.setAttribute('File',   configFile);
+            appSettingsChildElement.setAttribute('Installer', installerFile);
+            appSettingsChildElement.setAttribute('Terminal', terminalId);
+            appSettingsChildElement.setAttribute('Device', deviceId);
+
+            rootConfiguration.appendChild(appSettingsChildElement);
+        }
+
+        return configXML.outerXml;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>packStream</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Pack a stream into a Zip archive with the filename specified.
+    /// </summary>
+    /// <param name = "_archive">The target zip archive.</param>
+    /// <param name = "_stream">The source data stream.</param>
+    /// <param name = "_name">The filename.</param>
+    private static void packStream(System.IO.Compression.ZipArchive _archive, System.IO.Stream _stream, str _name)
+    {
+        if ((_stream != null) && (_archive != null))
+        {
+            _stream.Seek(0, System.IO.SeekOrigin::Begin);
+            var entry = _archive.CreateEntry(_name);
+            using (var entryStream = entry.Open())
+            {
+                _stream.CopyTo(entryStream);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generatePackageDownloadLinkByPackageReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the package download link by package reference identifier.
+    /// </summary>
+    /// <param name = "packageReferenceId">Record identifier for table <c>RetailSelfServicePackageInfo</c>.</param>
+    /// <param name = "retryWithUploadOnFailure">If link generation fails, specifies if we should try uploading packages and try again.</param>
+    /// <returns>Returns the download link for the specified package type.</returns>
+    internal static str generatePackageDownloadLinkByPackageReference(RefRecId packageReferenceId,
+        boolean retryWithUploadOnFailure = false)
+    {
+        str result = '';
+        System.Exception exception;
+        int linesInInfoLog = Global::infologLine();
+        
+        RetailSelfServicePackageInfo packageInfo = RetailSelfServicePackageInfo::findByRecId(packageReferenceId);
+
+        if (!packageInfo)
+        {
+            throw Global::error(strFmt("@RetailSelfServiceInstaller:RecordNotFoundOnMergedPackagesTable",
+                packageReferenceId, tableStr(RetailSelfServicePackageInfo)));
+        }
+
+        try
+        {
+            result = SelfServicePackageManager::GeneratePackageDownloadLink(packageInfo.PackageStorageUID);
+        }
+        catch (exception)
+        {
+            if (retryWithUploadOnFailure)
+            {
+                // Clear off all the infolog messages added by us while keeping the old ones.
+                infolog.clear(linesInInfoLog);
+                EventLogger::EventWriteSelfServiceWarning(strFmt('Primary attempt at download link generation failed. Probable cause: %1. Retrying..', exception.Message));
+
+                // The exception caught above is because of a missing package being referenced.
+                // Hence we upload the packages and retry the download link generation.
+                RetailSelfServicePackageManager::RunPostDeploymentSelfServicePackageUpload();
+                packageInfo = RetailSelfServicePackageInfo::findByRecId(packageReferenceId);
+                result = SelfServicePackageManager::GeneratePackageDownloadLink(packageInfo.PackageStorageUID);
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SetDefaultPackageForStores</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// For a comma seperated list of stores, set a given package as the default package.
+    /// </summary>
+    /// <param name = "commaSeperatedStringOfStores">Comma seperated list of stores.</param>
+    /// <param name = "packageBlobName">The package name which needs to be set as the default package.</param>
+    private static void SetDefaultPackageForStores(str commaSeperatedStringOfStores, str packageBlobName)
+    {
+        RetailStoreTable storeTable;
+        RetailDefaultChannelPackages channelPkgTable;
+
+        RetailSelfServicePackageInfo pkgInfoTable;
+        select firstonly1 * from pkgInfoTable where pkgInfoTable.PackageName == packageBlobName;
+
+        List listOfStores = new List(Types::String);
+        listOfStores = Global::strSplit(commaSeperatedStringOfStores, ",");
+
+        boolean performUpdate;
+        ListIterator storeIterator = new ListIterator(listOfStores);
+
+        ttsbegin;
+        while (storeIterator.more())
+        {
+            str storeNumberToUpdate = Global::strLRTrim(storeIterator.value());
+            select * from storeTable where storeTable.StoreNumber == storeNumberToUpdate;
+
+            if (storeTable.RecId != 0)
+            {
+                select forupdate * from channelPkgTable where channelPkgTable.ChannelRecId == storeTable.RecId;
+
+                performUpdate = (channelPkgTable.RecId != 0);
+                channelPkgTable.ChannelRecId = storeTable.RecId;
+
+                channelPkgTable.DefaultModernPOSPackage = (pkgInfoTable.PackageType == PackageType::ModernPosWithoutOffline)? pkgInfoTable.RecId: channelPkgTable.DefaultModernPOSPackage;
+                channelPkgTable.DefaultModernPOSOfflinePackage = (pkgInfoTable.PackageType == PackageType::ModernPosWithOffline)? pkgInfoTable.RecId: channelPkgTable.DefaultModernPOSOfflinePackage;
+
+                if (performUpdate)
+                {
+                    channelPkgTable.update();
+                }
+                else
+                {
+                    channelPkgTable.insert();
+                }
+
+                Global::info(strFmt('Set default package for store number: %1', storeNumberToUpdate));
+            }
+            else if (!System.String::IsNullOrWhiteSpace(storeNumberToUpdate))
+            {
+                Global::info(strFmt('No store found with store number: %1', storeNumberToUpdate));
+            }
+
+            storeIterator.next();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateMapOfTargetPackages</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate a Package :: Package Type mapping for
+    /// packages targeted for upload to tenant storage.
+    /// </summary>
+    private static void GenerateMapOfTargetPackages()
+    {
+        // Initialize list of packages and corressponding package types.
+        pkgNameToPkgTypeMapping.insert('AsyncServerConnectorServiceSetup.exe',  PackageType::AsyncServerConnectorService);
+        pkgNameToPkgTypeMapping.insert('RealtimeServiceAX63Setup.exe',          PackageType::RealtimeServiceAX63);
+        pkgNameToPkgTypeMapping.insert('HardwareStationSetup.exe',              PackageType::HardwareStation);
+        pkgNameToPkgTypeMapping.insert('ModernPOSSetup.exe',                    PackageType::ModernPosWithoutOffline);
+        pkgNameToPkgTypeMapping.insert('ModernPOSSetupOffline.exe',             PackageType::ModernPosWithOffline);
+        pkgNameToPkgTypeMapping.insert('StoreSystemSetup.exe',                  PackageType::RetailStoreScaleUnit);
+        pkgNameToPkgTypeMapping.insert('VirtualPeripherals.msi',                PackageType::HardwarePeripheralSimulator);
+        pkgNameToPkgTypeMapping.insert('RetailModernPOS_ARM.appx',              PackageType::ModernPosWindowsPhone);
+
+        pkgTypeToDefaultDescMapping.insert(PackageType::AsyncServerConnectorService, "@Retail:DefaultAsyncServerConnectorServicePackageDescription");
+        pkgTypeToDefaultDescMapping.insert(PackageType::RealtimeServiceAX63, "@Retail:DefaultRealtimeServiceAX63PackageDescription");
+        pkgTypeToDefaultDescMapping.insert(PackageType::ModernPosWithoutOffline, "@Retail:DefaultModernPOSPackageDescription");
+        pkgTypeToDefaultDescMapping.insert(PackageType::ModernPosWithOffline, "@Retail:DefaultModernPOSOfflinePackageDescription");
+        pkgTypeToDefaultDescMapping.insert(PackageType::HardwareStation, "@Retail:DefaultHardwareStationPackageDescription");
+        pkgTypeToDefaultDescMapping.insert(PackageType::RetailStoreScaleUnit, "@Retail:DefaultRetailStoreScaleUnitPackageDescription");
+        pkgTypeToDefaultDescMapping.insert(PackageType::HardwarePeripheralSimulator, "@Retail:DefaultHardwarePeripheralSimulatorPackageDescription");
+        pkgTypeToDefaultDescMapping.insert(PackageType::ModernPosWindowsPhone, "@Retail:DefaultModernPOSWindowsPhonePackageDescription");
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetSelfServicePackagesLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Iterate through a list of potential places to look for
+    /// the self service packages and see which is accessible by the user.
+    /// </summary>
+    /// <returns>Valid path when successful else empty string.</returns>
+    private static str GetSelfServicePackagesLocation()
+    {
+        str result = "";
+        str error = "";
+        str locationFromRegistry = RetailSelfServicePackageManager::GetPackageLocationFromRegistry();
+
+        if (System.String::IsNullOrWhiteSpace(locationFromRegistry))
+        {
+            error = 'Could not find Retail selfservice package location from registry';
+            EventLogger::EventWriteSelfServiceError(error, error, System.Environment::StackTrace);
+            throw Global::error(error);
+        }
+                
+        result = locationFromRegistry;
+        EventLogger::EventWriteSelfServiceInformation(strFmt('Got Retail selfservice package location from registry: %1', result));
+        if (!RetailSelfServicePackageManager::ValidateSelfServicePackageLocation(locationFromRegistry))
+        {
+            error = strFmt('Packages are not found on local disk at %1',locationFromRegistry);
+            EventLogger::EventWriteSelfServiceError(error, error, System.Environment::StackTrace);
+            throw Global::error(error);
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetPackageLocationFromRegistry</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Read the registry to check if self service packages location is specified.
+    /// </summary>
+    /// <returns>Valid path if successful else empty string.</returns>
+    private static str GetPackageLocationFromRegistry()
+    {
+        str result = RetailUtilities::ReadRegistryKey(selfServiceRegistryKey, selfServicePackagesKeyName);
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ValidateSelfServicePackageLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if a given source location has all packages expected.
+    /// </summary>
+    private static boolean ValidateSelfServicePackageLocation(str location)
+    {
+        EventLogger::EventWriteSelfServiceInformation(strFmt('Validating selfservice package location at %1',location));
+        boolean result = true;
+        MapEnumerator pkgNameToPkgTypeMappingEnumerator = pkgNameToPkgTypeMapping.getEnumerator();
+
+        while (pkgNameToPkgTypeMappingEnumerator.moveNext())
+        {
+            str fullFilePath = System.IO.Path::Combine(location, pkgNameToPkgTypeMappingEnumerator.currentKey());
+
+            // Check if the path provided is valid.
+            if (!System.IO.File::Exists(fullFilePath))
+            {
+                EventLogger::EventWriteSelfServiceWarning(strFmt('Packages do not exist at: %1', fullFilePath));
+                result = false;
+                break;
+            }
+
+            // Check if user has read access to the location
+            if (!RetailSelfServicePackageManager::CheckIfUserHasPermissionsToLocation(fullFilePath))
+            {
+                EventLogger::EventWriteSelfServiceWarning(strFmt('User permissions check failed at: %1', fullFilePath));
+                result = false;
+                break;
+            }
+        }
+
+        EventLogger::EventWriteSelfServiceInformation(strFmt('Validating selfservice package location is completed, result: %1',result));
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CheckIfUserHasPermissionsToLocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the user has read access to a file location.
+    /// </summary>
+    /// <param name = "fullFilePath">File location to test.</param>
+    /// <returns>True if accessible by user else false.</returns>
+    private static boolean CheckIfUserHasPermissionsToLocation(str fullFilePath)
+    {
+        boolean result = true;
+
+        try
+        {
+            System.IO.File::Open(fullFilePath, System.IO.FileMode::Open, System.IO.FileAccess::Read).Dispose();
+        }
+        catch
+        {
+            result = false;
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CheckIfPackageExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if a package with given name was previously uploaded to cloud storage.
+    /// </summary>
+    /// <param name = "packageName">Name of the package to lookup.</param>
+    /// <param name = "packageVersion">Version of the package to find.</param>
+    /// <returns>True if it exists else false.</returns>
+    private static boolean CheckIfPackageExists(str packageName, str packageVersion)
+    {
+        boolean result = true;
+        str blobName = SelfServicePackageManager::GenerateBlobName(packageName, packageVersion);
+
+        // check if record exists in the metadata holding table.
+        str packageStorageUID = SelfServicePackageManager::GetPackageIdentifierByName(blobName);
+        if (System.String::IsNullOrWhiteSpace(packageStorageUID))
+        {
+            return false;
+        }
+
+        // If unique identifier exists for package, check if valid download url can be generated for package.
+        str downloadLink = SelfServicePackageManager::GeneratePackageDownloadLink(packageStorageUID, true);
+
+        if (System.String::IsNullOrWhiteSpace(downloadLink))
+        {
+            result = false;
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetReferenceIdForPackage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the referenceId for a selected record in the devices page.
+    /// </summary>
+    /// <param name = "selectedDeviceRecId">Rec Id of the selected record in the devices page.</param>
+    /// <param name = "typeOfPackage">Specify the type of package which is being retrieved. Hardware Station or Modern Pos.</param>
+    /// <returns>Reference Id for the type of package selected.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GetReferenceIdForPackage(int64 selectedDeviceRecId, PackageType typeOfPackage)
+    {
+        RetailSelfServicePackageInfo packageInfo = RetailSelfServicePackageManager::getPackageInfoFromSelectedComponent(
+            selectedDeviceRecId, typeOfPackage);
+
+        if (System.String::IsNullOrWhiteSpace(packageInfo.PackageStorageUID))
+        {
+            throw Global::error("@Retail:NoPackageAssigned");
+        }
+
+        return packageInfo.PackageStorageUID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateConfigurationXmlContent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates the configuration xml content for the self-service package installers.
+    /// </summary>
+    /// <param name = "typeOfPackage">Type of package for which the xml is being generated.</param>
+    /// <param name = "selectedRecordId">RecId for the package in consideration.</param>
+    /// <returns>Generated configuration xml content.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GenerateConfigurationXmlContent(PackageType typeOfPackage, int64 selectedRecordId)
+    {
+        System.Xml.XmlDocument configXML = new System.Xml.XmlDocument();
+
+        // Create the xml declaration
+        System.Xml.XmlDeclaration xmlDeclarationNode = configXML.createXmlDeclaration("1.0", "UTF-8", null);
+        System.Xml.XmlElement root = configXML.DocumentElement;
+        configXML.insertBefore(xmlDeclarationNode, root);
+
+        // Create root node called configuration
+        System.Xml.XmlElement rootConfiguration = configXML.CreateElement("configuration");
+        configXML.AppendChild(rootConfiguration);
+
+        // Create a child node for 'configuration' called 'appSettings'
+        System.Xml.XmlElement appSettings = configXML.CreateElement("appSettings");
+        rootConfiguration.AppendChild(appSettings);
+
+        // Generate a list of all key-value attributes to be added under appSettings
+        switch (typeOfPackage)
+        {
+            case PackageType::AsyncServerConnectorService:
+                RetailSelfServicePackageManager::GenerateAsyncServerConnectorServiceSettingsMap();
+                break;
+
+            case PackageType::HardwareStation:
+                RetailSelfServicePackageManager::GenerateHardwareStationSettingsMap(selectedRecordId);
+                break;
+
+            case PackageType::ModernPosWithOffline:
+            case PackageType::ModernPosWithoutOffline:
+                RetailSelfServicePackageManager::GenerateMordernPOSAppSettingsMap(selectedRecordId);
+                break;
+
+            case PackageType::RealtimeServiceAX63:
+                RetailSelfServicePackageManager::GenerateRealtimeServiceAX63SettingsMap(selectedRecordId);
+                break;
+
+            case PackageType::RetailStoreScaleUnit:
+                RetailSelfServicePackageManager::GenerateRetailStoreScaleUnitSettingsMap(selectedRecordId);
+                break;
+        }
+
+        MapEnumerator appSettingsMapEnumerator = appSettingsKeyValuePairs.getEnumerator();
+
+        while (appSettingsMapEnumerator.moveNext())
+        {
+            System.Xml.XmlElement appSettingsChildElement = configXML.CreateElement("add");
+
+            appSettingsChildElement.setAttribute("value", appSettingsMapEnumerator.currentValue());
+            appSettingsChildElement.setAttribute("key",   appSettingsMapEnumerator.currentKey());
+
+            appSettings.appendChild(appSettingsChildElement);
+        }
+
+        return configXML.outerXml;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateMordernPOSAppSettingsMap</Name>
+				<Source><![CDATA[
+    private static void GenerateMordernPOSAppSettingsMap(int64 selectedRecordId)
+    {
+        // Get devices table record for which the config needs to be generated
+        RetailDevice devicesTable;
+        str deviceId = '';
+        str retailServerUrl = '';
+        str terminalId = '';
+        str allowMassActivation = 'false';
+
+        select firstonly1 * from devicesTable where devicesTable.RecId == selectedRecordId;
+
+        if (devicesTable)
+        {
+            deviceId = devicesTable.DeviceId;
+            if (devicesTable.AllowMassActivation)
+            {
+                allowMassActivation = 'true';
+            }
+
+            // Retrieve Terminal Id and Retail Server Url for the associated terminal, if possible
+            if (!System.String::IsNullOrWhiteSpace(devicesTable.Terminal))
+            {
+                terminalId = devicesTable.Terminal;
+
+                int64 associatedStoreRecId = RetailTerminalTable::find(devicesTable.Terminal).StoreRecId;
+                retailServerUrl = RetailChannelProfile::getRetailServerUrl(associatedStoreRecId);
+            }
+        }
+
+        // Get sideloading key value
+        RetailSharedParameters retailSharedParameters = RetailSharedParameters::find(false);
+        str sideloadingKey = retailSharedParameters.SideloadingKey;
+
+        // Populate appSettingsKeyValuePairs Map with appSettings data
+        appSettingsKeyValuePairs = new Map(Types::String, Types::String);
+        appSettingsKeyValuePairs.insert('ModernPosAADLoginUrl',      RetailSelfServicePackageManager::GetAadAuthorityUrlPrefix() + '/common');
+        appSettingsKeyValuePairs.insert('ModernPosRetailServerUrl',  retailServerUrl);
+        appSettingsKeyValuePairs.insert('ModernPosTerminalId',       terminalId);
+        appSettingsKeyValuePairs.insert('ModernPosDeviceId',         deviceId);
+        appSettingsKeyValuePairs.insert('ModernPosSideLoadingKey',   sideloadingKey);
+        if (devicesTable.AllowMassActivation)
+        {
+            // It has been decided to only include the Key in the configuration when the value is True (e.g., feature is enabled).
+            appSettingsKeyValuePairs.insert('ModernPosAllowMassActivation', allowMassActivation);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateHardwareStationSettingsMap</Name>
+				<Source><![CDATA[
+    private static void GenerateHardwareStationSettingsMap(int64 selectedRecordId)
+    {
+        RetailStoreHardwareStationTable hardwareTable;
+        str retailServerUrl = '';
+        str hostName = '';
+        int port = 0;
+        str certificateThumbprint = '';
+
+        select firstonly1 * from hardwareTable where hardwareTable.RecId == selectedRecordId;
+
+        if (hardwareTable)
+        {
+            retailServerUrl = hardwareTable.getRetailServerUrl();
+            hostName = hardwareTable.HostName;  // e.g., "retailhardwarestation.cloud.onebox.dynamics.com"
+            port = hardwareTable.Port;  // e.g., 0
+            certificateThumbprint = hardwareTable.CertificateThumbprint;  // e.g., "466CD26A6E2F346A3A813D12E2BAAD0E886E7BBF"
+        }
+
+        // Populate appSettingsKeyValuePairs Map with appSettings data
+        appSettingsKeyValuePairs = new Map(Types::String, Types::String);
+
+        // HardwareStation.HostName: "HardwareStationHostName" - Name of a host where hardware station is hosted.  E.g., "frvm019051slabl.northamerica.corp.microsoft.com" or "RDXP0123E8V-SRS.FAREAST.CORP.MICROSOFT.COM"
+        appSettingsKeyValuePairs.insert('HardwareStationHostName',  hostName);
+
+        // HardwareStation.AllowOpenFirewallPort: "HardwareStationAllowOpenFirewallPort" - Whether automatic opening firewall port on the client system is allowed. E.g., "True"
+        appSettingsKeyValuePairs.insert('HardwareStationAllowOpenFirewallPort',  'False');  // Left unchecked by default.
+
+        // HardwareStation.ServiceBaseUrl: "HardwareStationRefRetailServerUrl" - Hardware Station Reference Retail Server Url., E.g., "https://localhost:443/commerce"
+        appSettingsKeyValuePairs.insert('HardwareStationRefRetailServerUrl',  retailServerUrl);
+
+        // HardwareStation.HttpsPort: "HardwareStationHttpsPort" - Hardware Station https listening port. E.g., "443"
+        appSettingsKeyValuePairs.insert('HardwareStationHttpsPort',  int2str(port));
+
+        // HardwareStation.ServerCertificateThumbprint:  "HardwareStationCertificateThumbprint" - Hardware Station certificate thumbprint., E.g., "466CD26A6E2F346A3A813D12E2BAAD0E886E7BBF"
+        appSettingsKeyValuePairs.insert('HardwareStationCertificateThumbprint',  certificateThumbprint);
+
+        // Not required and thus excluded:
+        // HardwareStation.ServiceAccount: "HardwareStationAccount" - Hardware Station service account.
+        // HardwareStation.WebApplicationName: "HardwareStationWebApplicationName" - Hardware Station web application name., E.g., "HardwareStation"
+        // HardwareStation.ServiceAccountPassword: "HardwareStationAccountPassword" - Hardware Station service account password.
+
+        // HardwareStation.AllowUseDefaultAccount: "HardwareStationAllowUseDefaultAccount" - Hardware Station allow use default account.
+        appSettingsKeyValuePairs.insert('HardwareStationAllowUseDefaultAccount',  'True');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateRetailStoreScaleUnitSettingsMap</Name>
+				<Source><![CDATA[
+    private static void GenerateRetailStoreScaleUnitSettingsMap(int64 selectedRecordId)
+    {
+        System.Exception exception;
+
+        RetailConnDatabaseProfile databaseProfile;
+        RetailTransactionServiceProfile rtsProfile;
+        RetailSharedParameters sharedParameters;
+
+        select databaseProfile where databaseProfile.RecId == selectedRecordId;
+        select firstonly1 rtsProfile where rtsProfile.IsCustomerRecord == NoYes::No;
+        select firstonly1 sharedParameters;
+
+        var environment = EnvironmentFactory::GetApplicationEnvironment();
+
+        appSettingsKeyValuePairs = new Map(Types::String, Types::String);
+        System.String aadAuthorityUrlPrefix = RetailSelfServicePackageManager::GetAadAuthorityUrlPrefix();
+        appSettingsKeyValuePairs.insert('AadTokenIssuerPrefix', RetailSelfServicePackageManager::GetIdentityProviderPrefix());
+        appSettingsKeyValuePairs.insert('AadAuthorityUrlPrefix', aadAuthorityUrlPrefix);
+        appSettingsKeyValuePairs.insert('AadGraphUrlPrefix', RetailSelfServicePackageManager::GetAadGraphUrlPrefix());
+        appSettingsKeyValuePairs.insert('StoreSystemChannelDatabaseId', databaseProfile.Name);
+
+        try
+        {
+            System.String azureResource = (environment != null && !System.String::IsNullOrEmpty(environment.Infrastructure.HostUrl))? environment.Infrastructure.HostUrl : rtsProfile.AzureResource;
+
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureResource', azureResource.TrimEnd('/'));
+
+            System.String transactionServiceAzureAuthority = (environment != null && !System.String::IsNullOrEmpty(environment.Aad.AADTenantId))?
+                                                             (aadAuthorityUrlPrefix.TrimEnd('/') + '/' + environment.Aad.AADTenantId) : rtsProfile.AzureAuthority;
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureAuthority', transactionServiceAzureAuthority);
+
+            appSettingsKeyValuePairs.insert('StoreSystemAosUrl', (System.String::IsNullOrWhitespace(rtsProfile.AosUrl))? azureResource : rtsProfile.AosUrl);
+
+            System.String environmentId = RetailUtils::getEnvironmentId();
+            appSettingsKeyValuePairs.insert('EnvironmentId', environmentId);
+
+            System.String tenantId = RetailUtils::getTenantId();
+            appSettingsKeyValuePairs.insert('TenantId', tenantId);
+
+            System.String instrumentationKey = (environment != null && !System.String::IsNullOrEmpty(environment.Commerce.RetailSelfServiceInstallersClientAppinsightsInstrumentation))? environment.Commerce.RetailSelfServiceInstallersClientAppinsightsInstrumentation : sharedParameters.ClientAppInsightsInstrumentationKey;
+            appSettingsKeyValuePairs.insert('ClientAppInsightsInstrumentationKey', instrumentationKey);
+
+            instrumentationKey = (environment != null && !System.String::IsNullOrEmpty(environment.Commerce.RetailSelfServiceInstallersHardwareStationAppinsightsInstrumentation))? environment.Commerce.RetailSelfServiceInstallersHardwareStationAppinsightsInstrumentation : sharedParameters.HardwareStationAppInsightsInstrumentationKey;
+            appSettingsKeyValuePairs.insert('HardwareStationAppInsightsInstrumentationKey', instrumentationKey);
+
+            instrumentationKey = (environment != null && !System.String::IsNullOrEmpty(environment.Commerce.RetailSelfServiceInstallersCloudPosAppinsightsInstrumentation))? environment.Commerce.RetailSelfServiceInstallersCloudPosAppinsightsInstrumentation : sharedParameters.CloudPosAppInsightsInstrumentationKey;
+            appSettingsKeyValuePairs.insert('CloudPosAppInsightsInstrumentationKey', instrumentationKey);
+
+            instrumentationKey = (environment != null && !System.String::IsNullOrEmpty(environment.Commerce.RetailSelfServiceInstallersRetailServerAppinsightsInstrumentation))? environment.Commerce.RetailSelfServiceInstallersRetailServerAppinsightsInstrumentation : sharedParameters.RetailServerAppInsightsInstrumentationKey;
+            appSettingsKeyValuePairs.insert('RetailServerAppInsightsInstrumentationKey', instrumentationKey);
+
+            instrumentationKey = (environment != null && !System.String::IsNullOrEmpty(environment.Commerce.RetailSelfServiceInstallersAsyncClientAppinsightsInstrumentation))? environment.Commerce.RetailSelfServiceInstallersAsyncClientAppinsightsInstrumentation : sharedParameters.AsyncClientAppInsightsInstrumentationKey;
+            appSettingsKeyValuePairs.insert('AsyncClientAppInsightsInstrumentationKey', instrumentationKey);
+
+            instrumentationKey = (environment != null && !System.String::IsNullOrEmpty(environment.Commerce.RetailSelfServiceInstallersWindowsPhoneAppinsightsInstrumentation))? environment.Commerce.RetailSelfServiceInstallersWindowsPhoneAppinsightsInstrumentation : sharedParameters.WindowsPhoneAppInsightsInstrumentationKey;
+            appSettingsKeyValuePairs.insert('WindowsPhoneAppInsightsInstrumentationKey', instrumentationKey);
+        }
+        catch (exception)
+        {
+            EventLogger::EventWriteSelfServiceError('Error occured while getting commerce configuration.', exception.Message, exception.StackTrace);
+            EventLogger::EventWriteSelfServiceInformation('Using values from database for configuration.');
+
+            System.String azureResource = (System.String::IsNullOrWhiteSpace(rtsProfile.AzureResource))? "" : rtsProfile.AzureResource;
+
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureAuthority', rtsProfile.AzureAuthority);
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureResource', azureResource.TrimEnd('/'));
+            appSettingsKeyValuePairs.insert('StoreSystemAosUrl', (System.String::IsNullOrWhitespace(rtsProfile.AosUrl))? azureResource : rtsProfile.AosUrl);
+
+            appSettingsKeyValuePairs.insert('EnvironmentId', RetailUtils::getEnvironmentId());
+            appSettingsKeyValuePairs.insert('TenantId', RetailUtils::getTenantId());
+
+            appSettingsKeyValuePairs.insert('ClientAppInsightsInstrumentationKey', sharedParameters.ClientAppInsightsInstrumentationKey);
+            appSettingsKeyValuePairs.insert('HardwareStationAppInsightsInstrumentationKey', sharedParameters.HardwareStationAppInsightsInstrumentationKey);
+            appSettingsKeyValuePairs.insert('CloudPosAppInsightsInstrumentationKey', sharedParameters.CloudPosAppInsightsInstrumentationKey);
+            appSettingsKeyValuePairs.insert('RetailServerAppInsightsInstrumentationKey', sharedParameters.RetailServerAppInsightsInstrumentationKey);
+
+            appSettingsKeyValuePairs.insert('AsyncClientAppInsightsInstrumentationKey', sharedParameters.AsyncClientAppInsightsInstrumentationKey);
+            appSettingsKeyValuePairs.insert('WindowsPhoneAppInsightsInstrumentationKey', sharedParameters.WindowsPhoneAppInsightsInstrumentationKey);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateAsyncServerConnectorServiceSettingsMap</Name>
+				<Source><![CDATA[
+    private static void GenerateAsyncServerConnectorServiceSettingsMap()
+    {
+        System.Exception exception;
+
+        RetailTransactionServiceProfile defaultRtsProfile;
+        RetailSharedParameters sharedParameters;
+
+        select firstonly1 defaultRtsProfile where defaultRtsProfile.IsCustomerRecord == NoYes::No;
+        select firstonly1 sharedParameters;
+        RetailConnParameters retailConnParameters = RetailConnParameters::find();
+
+        var environment = EnvironmentFactory::GetApplicationEnvironment();
+
+        appSettingsKeyValuePairs = new Map(Types::String, Types::String);
+        System.String aadAuthorityUrlPrefix = RetailSelfServicePackageManager::GetAadAuthorityUrlPrefix();
+        appSettingsKeyValuePairs.insert('AadAuthorityUrlPrefix', aadAuthorityUrlPrefix);
+        appSettingsKeyValuePairs.insert('AadGraphUrlPrefix', RetailSelfServicePackageManager::GetAadGraphUrlPrefix());
+        appSettingsKeyValuePairs.insert('AadTokenIssuerPrefix', RetailSelfServicePackageManager::GetIdentityProviderPrefix());
+        appSettingsKeyValuePairs.insert('HQMessageDatabaseName', retailConnParameters.HQMsgDBName);
+        appSettingsKeyValuePairs.insert('HQMessageDatabaseServerName', retailConnParameters.HQMsgDBServerName);
+        appSettingsKeyValuePairs.insert('HQMessageDatabaseServerNamedInstanceName', retailConnParameters.HQMsgDBInstanceName);
+
+        try
+        {
+            System.String azureResource = (environment != null && !System.String::IsNullOrEmpty(environment.Infrastructure.HostUrl))? environment.Infrastructure.HostUrl : defaultRtsProfile.AzureResource;
+
+            appSettingsKeyValuePairs.insert('AsyncServerConnectorServiceAosUrl', azureResource);
+
+            System.String instrumentationKey = (environment != null && !System.String::IsNullOrEmpty(environment.Commerce.RetailSelfServiceInstallersAsyncServerConnectorServiceAppinsightsInstrumentation))?
+                                                    environment.Commerce.RetailSelfServiceInstallersAsyncServerConnectorServiceAppinsightsInstrumentation : sharedParameters.AsyncServerConnectorServiceAppInsightsInstrumentationKey;
+            appSettingsKeyValuePairs.insert('AsyncServerConnectorServiceAppInsightsInstrumentationKey', instrumentationKey);
+
+            System.String environmentId = RetailUtils::getEnvironmentId();
+            appSettingsKeyValuePairs.insert('EnvironmentId', environmentId);
+
+            System.String tenantId = RetailUtils::getTenantId();
+            appSettingsKeyValuePairs.insert('TenantId', tenantId);
+
+            System.String transactionServiceAzureAuthority = (environment != null && !System.String::IsNullOrEmpty(environment.Aad.AADTenantId))?
+                                                             (aadAuthorityUrlPrefix.TrimEnd('/') + '/' + environment.Aad.AADTenantId) : defaultRtsProfile.AzureAuthority;
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureAuthority', transactionServiceAzureAuthority);
+
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureResource', azureResource.TrimEnd('/'));
+        }
+        catch (exception)
+        {
+            EventLogger::EventWriteSelfServiceError('Error occured while getting commerce configuration.', exception.Message, exception.StackTrace);
+            EventLogger::EventWriteSelfServiceInformation(strFmt('Using values from database for configuration.'));
+
+            System.String azureResource = (System.String::IsNullOrWhiteSpace(defaultRtsProfile.AzureResource)) ? '' : defaultRtsProfile.AzureResource;
+        
+            appSettingsKeyValuePairs.insert('AsyncServerConnectorServiceAosUrl', azureResource);
+            appSettingsKeyValuePairs.insert('AsyncServerConnectorServiceAppInsightsInstrumentationKey', sharedParameters.AsyncServerConnectorServiceAppInsightsInstrumentationKey);
+            appSettingsKeyValuePairs.insert('EnvironmentId', RetailUtils::getEnvironmentId());
+            appSettingsKeyValuePairs.insert('TenantId', RetailUtils::getTenantId());
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureAuthority', defaultRtsProfile.AzureAuthority);
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureResource', azureResource.TrimEnd('/'));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateRealtimeServiceAX63SettingsMap</Name>
+				<Source><![CDATA[
+    private static void GenerateRealtimeServiceAX63SettingsMap(int64 rtsProfileRecId)
+    {
+        System.Exception exception;
+
+        RetailTransactionServiceProfile defaultRtsProfile;
+        RetailTransactionServiceProfile rtsProfile;
+        RetailSharedParameters sharedParameters;
+
+        select firstonly1 defaultRtsProfile where defaultRtsProfile.IsCustomerRecord == NoYes::No;
+        select firstonly1 rtsProfile where rtsProfile.RecId == rtsProfileRecId;
+        select firstonly1 sharedParameters;
+
+        var environment = EnvironmentFactory::GetApplicationEnvironment();
+
+        appSettingsKeyValuePairs = new Map(Types::String, Types::String);
+
+        System.String aadAuthorityUrlPrefix = RetailSelfServicePackageManager::GetAadAuthorityUrlPrefix();
+        appSettingsKeyValuePairs.insert('AadAuthorityUrlPrefix', aadAuthorityUrlPrefix);
+        appSettingsKeyValuePairs.insert('AadGraphUrlPrefix', RetailSelfServicePackageManager::GetAadGraphUrlPrefix());
+        appSettingsKeyValuePairs.insert('AadTokenIssuerPrefix', RetailSelfServicePackageManager::GetIdentityProviderPrefix());
+
+        appSettingsKeyValuePairs.insert('RealtimeServiceAX63WebApplicationName', rtsProfile.ServerServiceName);
+        appSettingsKeyValuePairs.insert('RealtimeServiceAX63HostName', rtsProfile.centralTableServer);
+
+        if (rtsProfile.protocol == RetailTransactionServiceProtocolType::NetTcp)
+        {
+            appSettingsKeyValuePairs.insert('RealtimeServiceAX63TcpPort', rtsProfile.centralTableServerPort);
+        }
+        else
+        {
+            appSettingsKeyValuePairs.insert('RealtimeServiceAX63HttpsPort', rtsProfile.centralTableServerPort);
+        }
+
+        try
+        {
+            System.String azureResource = (environment != null && !System.String::IsNullOrEmpty(environment.Infrastructure.HostUrl))? environment.Infrastructure.HostUrl : defaultRtsProfile.AzureResource;
+
+            System.String environmentId = RetailUtils::getEnvironmentId();
+            appSettingsKeyValuePairs.insert('EnvironmentId', environmentId);
+
+            System.String tenantId = RetailUtils::getTenantId();
+            appSettingsKeyValuePairs.insert('TenantId', tenantId);
+
+            // AosURL is no longer populated for the default RetailTransactionService profile.
+            appSettingsKeyValuePairs.insert('RealtimeServiceAX63AosUrl', azureResource.TrimEnd('/'));
+
+            System.String instrumentationKey = (environment != null && !System.String::IsNullOrEmpty(environment.Commerce.RetailSelfServiceInstallersRealtimeServiceAx63AppinsightsInstrumentation))?
+                                                    environment.Commerce.RetailSelfServiceInstallersRealtimeServiceAx63AppinsightsInstrumentation : sharedParameters.RealtimeServiceAX63AppInsightsInstrumentationKey;
+            appSettingsKeyValuePairs.insert('RealtimeServiceAX63AppInsightsInstrumentationKey', instrumentationKey);
+
+            System.String transactionServiceAzureAuthority = (environment != null && !System.String::IsNullOrEmpty(environment.Aad.AADTenantId))?
+                                                             (aadAuthorityUrlPrefix.TrimEnd('/') + '/' + environment.Aad.AADTenantId) : defaultRtsProfile.AzureAuthority;
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureAuthority', transactionServiceAzureAuthority);
+
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureResource', azureResource.TrimEnd('/'));
+        }
+        catch (exception)
+        {
+            EventLogger::EventWriteSelfServiceError('Error occured while getting commerce configuration.', exception.Message, exception.StackTrace);
+            EventLogger::EventWriteSelfServiceInformation(strFmt('Using values from database for configuration.'));
+
+            System.String azureResource = (System.String::IsNullOrWhiteSpace(defaultRtsProfile.AzureResource)) ? '' : defaultRtsProfile.AzureResource;
+            appSettingsKeyValuePairs.insert('EnvironmentId', RetailUtils::getEnvironmentId());
+
+            // AosURL is no longer populated for the default RetailTransactionService profile.
+            appSettingsKeyValuePairs.insert('RealtimeServiceAX63AosUrl', defaultRtsProfile.AzureResource);
+
+            appSettingsKeyValuePairs.insert('RealtimeServiceAX63AppInsightsInstrumentationKey', sharedParameters.RealtimeServiceAX63AppInsightsInstrumentationKey);
+
+            appSettingsKeyValuePairs.insert('TenantId', RetailUtils::getTenantId());
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureAuthority', defaultRtsProfile.AzureAuthority);
+            appSettingsKeyValuePairs.insert('TransactionServiceAzureResource', azureResource.TrimEnd('/'));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetConfigurationXmlFilename</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GetConfigurationXmlFilename(PackageType typeOfPackage, int64 selectedRecordId)
+    {
+        str configurationXmlFilename = '';
+        RetailSelfServiceMergedPackages mergedPackages;
+        System.String fileName;
+
+        switch (typeOfPackage)
+        {
+            case PackageType::AsyncServerConnectorService:
+                // for this component, we always return the latest package.
+                select firstonly1 * from mergedPackages order by mergedPackages.RecId desc where mergedPackages.PackageType == PackageType::AsyncServerConnectorService;
+                break;
+
+            case PackageType::HardwareStation:
+                select firstonly1 * from mergedPackages order by mergedPackages.RecId desc where mergedPackages.PackageType == PackageType::HardwareStation;;
+                break;
+
+            case PackageType::AllModernPOS:
+            case PackageType::ModernPosWithOffline:
+            case PackageType::ModernPosWithoutOffline:
+                // Get devices table record for which the config is being generated.
+                RetailDevice devicesTable;
+
+                select firstonly1 * from devicesTable where devicesTable.RecId == selectedRecordId;
+                select firstonly1 * from mergedPackages where mergedPackages.RecId == devicesTable.MergedSelfServicePackageReference;
+
+                // Get device ID and replace all non-safe filename characters with a "-"
+                fileName = RetailSelfServicePackageManager::ReplaceUnsafeCharsInFilename(devicesTable.DeviceId, System.Char::Parse('-'));
+                break;
+
+            case PackageType::RealtimeServiceAX63:
+                RetailTransactionServiceProfile rtsProfile;
+                select firstonly1 * from rtsProfile where rtsProfile.RecId == selectedRecordId;
+                select firstonly1 * from mergedPackages order by mergedPackages.RecId desc where mergedPackages.PackageType == PackageType::RealtimeServiceAX63;
+
+                fileName = RetailSelfServicePackageManager::ReplaceUnsafeCharsInFilename(rtsProfile.profileId, System.Char::Parse('-'));
+                break;
+
+            case PackageType::RetailStoreScaleUnit:
+                RetailConnDatabaseProfile databaseProfile;
+                select firstonly1 * from databaseProfile where databaseProfile.RecId == selectedRecordId;
+                select firstonly1 * from mergedPackages where mergedPackages.RecId == databaseProfile.MergedSelfServicePackageReference;
+                fileName = RetailSelfServicePackageManager::ReplaceUnsafeCharsInFilename(databaseProfile.Name, System.Char::Parse('-'));
+                break;
+        }
+
+        if (mergedPackages.RecId != 0)
+        {
+            RetailLcsAssetName fileNameWithoutExtension = mergedPackages.PackageFriendlyName ? mergedPackages.PackageFriendlyName : enum2Str(mergedPackages.PackageType);
+            str versionNumber = mergedPackages.VersionNumber ? strFmt('V%1', Global::strReplace(mergedPackages.VersionNumber , '.' ,'')) : '';
+            System.DateTime timeStamp = System.DateTime::UtcNow;
+
+            configurationXmlFilename = strFmt('%1_%2_%3_%4.xml', fileNameWithoutExtension, versionNumber, fileName, timeStamp.ToString("HH-mm-ss"));
+        }
+
+        return configurationXmlFilename;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ReplaceUnsafeCharsInFilename</Name>
+				<Source><![CDATA[
+    private static System.String ReplaceUnsafeCharsInFilename(System.String filename, System.Char replacementCharacter)
+    {
+        System.Char[] invalidFilenameChars = System.IO.Path::GetInvalidFileNameChars();
+
+        for (int counter = 0; counter < invalidFilenameChars.Length; counter++)
+        {
+            filename = filename.Replace(invalidFilenameChars.Get(counter), replacementCharacter);
+        }
+
+        return filename;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetAadAuthorityUrlPrefix</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets an AAD Authority URL. E.g.: "https://login.partner.microsoftonline.cn"
+    /// </summary>
+    /// <returns>The AAD authority URL.</returns>
+    private static str GetAadAuthorityUrlPrefix()
+    {
+        // get environment components
+        IApplicationEnvironment environment = EnvironmentFactory::GetApplicationEnvironment();
+        var addEnvironment = environment.Aad;
+
+        var aadInstance = addEnvironment.AADLoginWsfedEndpointFormat;
+        aadInstance = aadInstance.Substring(0, aadInstance.IndexOf("/{0}"));
+        return aadInstance;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetAadGraphUrlPrefix</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the environment's graph endpoint AAD resource, e.g. "https://graph.windows.net"
+    /// </summary>
+    /// <returns></returns>
+    private static str GetAadGraphUrlPrefix()
+    {
+        str exceptionMessage = '';
+        try
+        {
+            IApplicationEnvironment environment = EnvironmentFactory::GetApplicationEnvironment();
+            return environment.GraphApi.GraphAPIAADResource;
+        }
+        catch(Exception::CLRError)
+        {
+            System.Exception interopException = CLRInterop::getLastException();
+            exceptionMessage = RetailSelfServicePackageManager::getFriendlyExceptionMessage(interopException);
+        }
+        catch
+        {
+            exceptionMessage = 'Failed to obtain app setting for: GraphAPIAADResource';
+        }
+
+        EventLogger::EventWriteSelfServiceError("@Retail::RetailCloudConfig", exceptionMessage, System.Environment::StackTrace);
+        str result = 'https://graph.windows.net';
+        if (!RetailDeploymentUtility::isEnvironmentConfiguredForProduction())
+        {
+            result = 'https://graph.ppe.windows.net';
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetIdentityProviderPrefix</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the environment provisioning admin identity provider, e.g. "https://sts.windows.net"
+    /// </summary>
+    /// <returns>The url for STS identity provider.</returns>
+    private static str GetIdentityProviderPrefix()
+    {
+        IApplicationEnvironment environment = EnvironmentFactory::GetApplicationEnvironment();
+        return environment.Provisioning.AdminIdentityProvider.TrimEnd('/');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFriendlyExceptionMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a simple error message from a CLR error while unwrapping <see cref="System.Reflection.TargetInvocationException"/>s to its root exception.
+    /// </summary>
+    /// <param name="ex">The CLR exception to get the message of.</param>
+    /// <returns>The message from the CLR exception with any TargetInvocationExceptions removed.</returns>
+    private static str getFriendlyExceptionMessage(System.Exception ex)
+    {
+        str exceptionMessage;
+
+        if (ex != null)
+        {
+            if (ex is System.Reflection.TargetInvocationException)
+            {
+                System.Exception innerException = ex.InnerException;
+                if (innerException != null)
+                {
+                    exceptionMessage = innerException.Message;
+                }
+            }
+            else
+            {
+                exceptionMessage = ex.Message;
+            }
+        }
+
+        return exceptionMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPackageInfoFromSelectedComponent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the package information from selected devices.
+    /// </summary>
+    /// <param name = "selectedDeviceRecId">Rec Id of the selected record in the devices page.</param>
+    /// <param name = "typeOfPackage">Specify the type of package which is being retrieved. Hardware Station or Modern Pos.</param>
+    /// <returns>The package information</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    private static RetailSelfServicePackageInfo getPackageInfoFromSelectedComponent(int64 selectedDeviceRecId, PackageType typeOfPackage)
+    {
+        if (selectedDeviceRecId == 0)
+        {
+            str errorMsg = strFmt("@SYS127989", selectedDeviceRecId);
+            EventLogger::EventWriteSelfServiceError(errorMsg, "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error(errorMsg);
+        }
+
+        RetailDevice devicesTable;
+        RetailStoreHardwareStationTable hardwareStationTable;
+        RetailConnDatabaseProfile channelDatabaseProfileTable;
+        RetailHardwareProfile hardwareProfileTable;
+
+        RetailSelfServicePackageInfo pkgInfoTable;
+        str refIdToReturn = null;
+
+        switch (typeOfPackage)
+        {
+            case PackageType::AsyncServerConnectorService:
+                select firstonly1 * from pkgInfoTable order by pkgInfoTable.RecId desc where pkgInfoTable.PackageType == PackageType::AsyncServerConnectorService;
+                break;
+
+            case PackageType::ModernPosWithOffline:
+            case PackageType::ModernPosWithoutOffline:
+                select * from pkgInfoTable join devicesTable where devicesTable.RecId == selectedDeviceRecId && pkgInfoTable.RecId == devicesTable.SelfServicePackage;
+                break;
+
+            case PackageType::HardwareStation:
+                select * from pkgInfoTable join hardwareStationTable where hardwareStationTable.RecId == selectedDeviceRecId && pkgInfoTable.RecId == hardwareStationTable.SelfServicePackage;
+                break;
+
+            case PackageType::RealtimeServiceAX63:
+                select firstonly1 * from pkgInfoTable order by pkgInfoTable.RecId desc where pkgInfoTable.PackageType == PackageType::RealtimeServiceAX63;
+                break;
+
+            case PackageType::RetailStoreScaleUnit:
+                select * from pkgInfoTable join channelDatabaseProfileTable where channelDatabaseProfileTable.RecId == selectedDeviceRecId && pkgInfoTable.RecId == channelDatabaseProfileTable.SelfServicePackage;
+                break;
+
+            case PackageType::HardwarePeripheralSimulator:
+                select * from pkgInfoTable join hardwareProfileTable where hardwareProfileTable.RecId == selectedDeviceRecId && pkgInfoTable.RecId == hardwareProfileTable.SelfServicePackage;
+                break;
+        }
+
+        return pkgInfoTable;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

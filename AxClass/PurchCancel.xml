@@ -1,0 +1,936 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PurchCancel</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class PurchCancel extends RunBaseBatch implements BatchRetryable
+{
+    PurchTable  purchTable;
+    boolean     clearFiscalDocumentRef_BR;
+    boolean     hasLines;
+    boolean     shouldUpdatePurchTableToApprovedState;
+
+    private PurchInstrumentationLogger instrumentationLogger;
+
+    #define.CurrentVersion(1)
+    #LOCALMACRO.CurrentList
+        purchTable
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>cancelMarkup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancels the transactions changes records.
+    /// </summary>
+    /// <param name="_transTableId">
+    /// The ID of the table to which the <c>markupTrans</c> records are related.
+    /// </param>
+    /// <param name="_transRecId">
+    /// The ID of the record to which the <c>markupTrans</c> records are related.
+    /// </param>
+    protected void cancelMarkup(
+        TableId     _transTableId,
+        RecId       _transRecId
+        )
+    {
+        MarkupTrans         markupTrans;
+
+        while select forupdate * from markupTrans
+            where markupTrans.TransRecId == _transRecId
+               && markupTrans.TransTableId == _transTableId
+               && markupTrans.MarkupCategory == MarkupCategory::Fixed
+               && !markupTrans.IsDeleted
+        {
+            markupTrans.Value = 0;
+            markupTrans.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+
+        //Don't get last, just cancel current purchase order.
+        getLastCalled = true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPurchTable</Name>
+				<Source><![CDATA[
+    protected PurchTable parmPurchTable(PurchTable _purchTable = purchTable)
+    {
+        purchTable = _purchTable;
+
+        return purchTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetQtyStockedOverDeliveredLines</Name>
+				<Source><![CDATA[
+    private void resetQtyStockedOverDeliveredLines(PurchLine _purchLine)
+    {
+        _purchLine.RemainPurchPhysical       = 0;
+        _purchLine.RemainInventPhysical      = 0;
+        _purchLine.PdsCWRemainInventPhysical = 0;
+        
+        if (_purchLine.validateWrite() && _purchLine.purchTable().checkUpdate())
+        {
+            InterCompanyUpdateRemPhys::synchronize(_purchLine,
+                                                    _purchLine.RemainInventPhysical,
+                                                    _purchLine.RemainPurchPhysical,
+                                                    InterCompanySkipUpdate::No,
+                                                    _purchLine.PdsCWRemainInventPhysical);
+            
+            if(_purchLine.ItemRefType  == InventRefType::Sales
+                &&  _purchLine.InventRefTransId
+                &&  _purchLine.isDropShipment())
+            {
+                _purchLine.reread();
+                _purchLine.RemainPurchPhysical       = 0;
+                _purchLine.RemainInventPhysical      = 0;
+                _purchLine.PdsCWRemainInventPhysical = 0;
+            }
+            
+            _purchLine.write();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeReferenceForDirectDelivery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Remove reference for the direct delivery sales order and purchase order, when the item is non-stocked item
+    /// </summary>
+    /// <param name="_purchLine">
+    /// The purchase line record
+    /// </param>
+    private void removeReferenceForDirectDelivery(PurchLine _purchLine)
+    {
+        PurchLine purchLine = _purchLine;
+        boolean   isStocked = purchLine.isStocked();
+        SalesLine salesLine = purchLine.salesLine();
+
+        if (this.canRemovePOLAndSOLReference(isStocked, salesLine))
+        {
+            salesLine.selectForUpdate(true);
+            salesLine.clearInventReference();
+            salesLine.DeliveryType = TradeLineDlvType::None;
+            salesLine.doUpdate();
+
+            purchLine.clearInventReference();
+            purchLine.DeliveryType = TradeLineDlvType::None;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRemovePOLAndSOLReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Whether to remove purchase order line and sales order line referenced.
+    /// </summary>
+    /// <returns>
+    /// true to remove purchase order line and sales order line reference; otherwise, false.
+    /// </returns>
+    internal protected boolean canRemovePOLAndSOLReference(
+        boolean _isStocked,
+        SalesLine _salesLine)
+    {
+        return (_salesLine.salesTable().SalesType == SalesType::ReturnItem)
+            || (!_isStocked && _salesLine.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustCancelLine</Name>
+				<Source><![CDATA[
+    protected boolean mustCancelLine(PurchLine _purchLine)
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs the purchase order cancelation.
+    /// </summary>
+    public void run()
+    {
+        using (var activityContext = this.instrumentationLogger().purchCancelActivities().run(this.parmPurchTable()))
+        {
+            PurchLine purchLine;
+
+            ttsbegin;
+
+            if (purchTable.InterCompanyDirectDelivery)
+            {
+                throw error (strFmt("@SCM:CannotCancelDirectDeliveryIntercompanyPurchaseOrder", purchTable.PurchId));
+            }
+
+            if (!PurchPrepayRemove::reversePrepaymentInvoice(purchTable.PurchId))
+            {
+                //throws error and returns with message that a paid prepayment invoice exists therefore purchase order cannot be cancelled
+                throw error(strFmt("@SYS341265", purchTable.PurchId));
+            }
+
+            if (BudgetPurchaseOrderCancelBlockFlight::instance().isEnabled()
+                && purchTable.isDocumentConfirmed()
+                && BudgetControlPurchaseOrderSettingsValidator::canUpdatedAccountingDateAffectBudget(purchTable))
+            {
+                throw error("@Budget:BudgetPurchaseOrderCancelError");
+            }
+
+            this.updatePurchTable();
+
+            while select forupdate purchLine
+            where purchLine.PurchId             == purchTable.PurchId
+               && purchLine.IsDeleted           == NoYes::No
+            {
+                if (this.mustCancelLine(purchLine))
+                {
+                    hasLines = true;
+                    if(purchTable.DocumentState == VersioningDocumentState::InExternalReview)
+                    {
+                        purchLine.reread();
+                    }
+
+                    InventRefTransId inventRefTransId = purchLine.InventRefTransId;
+                    MCRSalesOrderCancellation mcrSalesOrderCancellation;
+                    PurchSalesOrderCancellation purchSalesOrderCancellation = new PurchSalesOrderCancellation();
+                    mcrSalesOrderCancellation = purchSalesOrderCancellation.mcrSalesOrderCancelInit(mcrSalesOrderCancellation, inventRefTransId);
+
+                    this.cancelPurchLine(purchLine, purchTable);
+
+                    purchSalesOrderCancellation.mcrSalesOrderCancel(mcrSalesOrderCancellation, inventRefTransId);
+                }
+            }
+        
+            if (shouldUpdatePurchTableToApprovedState)
+            {
+                ttsbegin;
+                purchTable.reread();
+                purchTable.DocumentState = VersioningDocumentState::Approved;
+                //this was intentionally changed to doUpdate() to unblock workflow
+                purchTable.doUpdate();
+                ttscommit;
+            }
+
+            this.cancelHeaderReferences();
+
+            if (!hasLines)
+            {
+                this.cancelOrder();
+            }
+
+            this.updateHeaderReferencesAfterCancellation(purchTable);
+            ttscommit;
+
+            PurchPrepayTable::checkApplicationRemaining(purchTable.PurchId, purchTable.InvoiceAccount);
+
+            if (CatCXMLPurchRequestHistory::findByCurrent(this.purchTable.PurchId))
+            {
+                CatCXMLPurchRequestMaintain::markForDelete(this.purchTable.PurchId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateHeaderReferencesAfterCancellation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the purchase order reference data after cancellation.
+    /// </summary>
+    /// <param name = "_purchTable">The <c>PurchTable</c> that was cancelled.</param>
+    protected void updateHeaderReferencesAfterCancellation(PurchTable _purchTable)
+    {
+        if (BrazilParameters::isEnabled() && (clearFiscalDocumentRef_BR || !hasLines))
+        {
+            _purchTable.removeInvoiceRefRecId_BR();
+        }
+
+        if (_purchTable.MCRDropShipment)
+        {
+            McrOrderEventTable mcrOrderEventTable;
+            mcrOrderEventTable.insertFromDropShipment(_purchTable.referenceSalesTable().SalesId, _purchTable.PurchId, MCROrderEventType::CancelDropShipPO);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePurchTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new change request for the purchase order or archives the purchase order if necessary.
+    /// </summary>
+    protected void updatePurchTable()
+    {
+        using (var activityContext = this.instrumentationLogger().purchCancelActivities().updatePurchTable())
+        {
+            if (!purchTable.selectForUpdate())
+            {
+                purchTable = PurchTable::findRecId(purchTable.RecId, true);
+            }
+
+            if (purchTable.ChangeRequestRequired && purchTable.DocumentState >= VersioningDocumentState::Approved)
+            {
+                VersioningPurchaseOrder::newPurchaseOrder(purchTable).createChangeRequest();
+            }
+            else if (!VersioningPurchaseOrder::newPurchaseOrder(purchTable).isLastVersionArchived() && purchTable.DocumentState == VersioningDocumentState::Confirmed)
+            {
+                // Force archiving to avoid it during line cancellation as that would lead to update conflicts.
+                purchTable.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelHeaderReferences</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the purchase order references to cancelled, before cancellation of the purchase order.
+    /// </summary>
+    protected void cancelHeaderReferences()
+    {
+        // cancel header markup
+        this.cancelMarkup(purchTable.TableId, purchTable.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the purchase order to status cancelled.
+    /// </summary>
+    protected void cancelOrder()
+    {
+        purchTable.PurchStatus = PurchStatus::Canceled;
+        purchTable.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelPurchLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handles the cancellation of the given purchase line.
+    /// </summary>
+    /// <param name = "_purchLine">A <c>PurchLine</c> record that is to be cancelled</param>
+    /// <param name = "_purchTable"></param>
+    protected void cancelPurchLine(PurchLine _purchLine, PurchTable _purchTable)
+    {
+        boolean     messageShown = false;
+
+        using (var activityContext = this.instrumentationLogger().purchCancelActivities().cancelPurchLine(_purchLine))
+        {
+            if (this.canCancelPurchaseLine(_purchLine))
+            {
+                // do not cancel invoice matched lines.
+                if (_purchLine.IsInvoiceMatched == NoYes::Yes)
+                {
+                    boolean allowCancelInvoice = PurchLineAllowInvoiceCancelFlight::instance().isEnabled() ?
+                    VendParameters::find().IsAllowCancelInvoiceEnable :
+                    FeatureStateProvider::isFeatureEnabled(PurchOrderInvoiceCancelFeature::instance());
+                    if (allowCancelInvoice)
+                    {
+                        this.cancelInvoicedPurchLine(_purchLine, _purchTable);
+
+                        ttsbegin;
+                        VersioningPurchaseOrder VersioningPurchaseOrder = VersioningPurchaseOrder::newPurchaseOrder(_purchTable, false);
+                        VersioningPurchaseOrder.archiveOnDemand();
+                        ttscommit;
+
+                        if (PurchCancelUpdPurchTableAfterLinesCancellationFlight::instance().isEnabled()
+                        && _purchTable.isChangeRequestRequired())
+                        {
+                            shouldUpdatePurchTableToApprovedState = true;
+                        }
+                        else
+                        {
+                            _purchTable.reread();
+                            ttsbegin;
+                            _purchTable.DocumentState = VersioningDocumentState::Approved;
+                            _purchTable.update();
+                            ttscommit;
+                        }
+                    }
+                    else if (!_purchLine.isInvoiced())
+                    {
+                        if (!messageShown)
+                        {
+                            info("@SYS342633");
+                            messageShown = true;
+                        }
+                        info(strFmt("@SYS342634", _purchLine.LineNumber, _purchLine.ItemId));
+                    }
+                }
+                else
+                {
+                    boolean isCWItem = PdsGlobal::pdsIsCWItem(_purchLine.ItemId);
+                            
+                    PdsCWInventQty  pdsCWQty = isCWItem? _purchLine.pdsCWReceivedInTotal() + _purchLine.pdsCWArrived() + _purchLine.pdsCWRegistered(): 0;
+                    PurchQty        purchQty = this.sumPurchLineReceivedArrivedRegisteredQty(_purchLine);
+                
+                    if (purchQty)
+                    {
+                        // if anything was received, arrived or registered then write down to what was received, arrived and registered.
+                        if (_purchLine.isStocked())
+                        {
+                            if ((!isCWItem && purchQty > _purchLine.PurchQty)
+                            || (isCWItem && pdsCWQty > _purchLine.pdsCWQty))
+                            {
+                                this.resetQtyStockedOverDeliveredLines(_purchLine);
+                            }
+                            else
+                            {
+                                this.resetQtyForStockedLines(_purchLine, _purchTable, purchQty, pdsCWQty);
+                            }
+
+                        }
+                        else
+                        {
+                            this.resetQtyForNonStockedLines(_purchLine, _purchTable, purchQty, pdsCWQty);
+                        }
+                    }
+                    else
+                    {
+                        this.resetQtyForOrderedLines(_purchLine, _purchTable);
+                    }
+
+                    this.cancelLineReferences(_purchLine, _purchTable);
+                    this.doCancelLine(_purchLine);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCancelPurchaseLine</Name>
+				<Source><![CDATA[
+    private boolean canCancelPurchaseLine(PurchLine _purchLine)
+    {
+        return (!_purchLine.isStocked() || _purchLine.RemainInventPhysical || (!_purchLine.PurchQty && !InventTransOriginPurchLine::findInventTransOriginId(_purchLine.DataAreaId, _purchLine.InventTransId) &&_purchLine.PurchStatus != PurchStatus::Canceled));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelInvoicedPurchLine</Name>
+				<Source><![CDATA[
+    private void cancelInvoicedPurchLine(PurchLine _purchLine, PurchTable _purchTable)
+    {
+        ttsbegin;
+        if ((_purchLine.RemainInventPhysical 
+            || (_purchLine.RemainPurchPhysical 
+                && !_purchLine.isStocked() 
+                && PurchCancelInvoicedNotStockedLineFlight::instance().isEnabled()))
+            && _purchLine.validateWrite() 
+            && _purchLine.purchTable().checkUpdate())
+        {
+            PurchQty remainingPhysicalPurchaseQuantity = _purchLine.RemainPurchPhysical;
+
+            this.updateRemainPhysical(_purchLine);
+
+            _purchLine.write();
+
+            this.updateSourceDocument(_purchLine, remainingPhysicalPurchaseQuantity);
+            
+            this.cancelInterCompanyReturnOrder(_purchLine);
+
+            if (_purchLine.purchTable().PurchStatus == PurchStatus::Canceled)
+            {
+                PurchPrepayRemove::reversePrepaymentInvoice(_purchLine.PurchId);
+            }
+        }
+        ttscommit;
+
+        this.cancelLineReferences(_purchLine, _purchTable);
+        this.doCancelLine(_purchLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSourceDocument</Name>
+				<Source><![CDATA[
+    private void updateSourceDocument(PurchLine _purchLine, PurchQty _remainingPhysicalPurchaseQuantity)
+    {
+        if (_purchLine.RemainPurchPhysical && _remainingPhysicalPurchaseQuantity != _purchLine.RemainPurchPhysical)
+        {
+            SourceDocumentLine sourceDocumentLine = SourceDocumentLine::find(_purchLine.SourceDocumentLine);
+            sourceDocumentLineItem sourceDocumentLineItem = sourceDocumentLineItem::newFromSourceDocumentLine(sourceDocumentLine);
+            ProjectCommitmentFacade::updateProjectCommitments(sourceDocumentLineItem);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelInterCompanyReturnOrder</Name>
+				<Source><![CDATA[
+    private void cancelInterCompanyReturnOrder(PurchLine _purchLine)
+    {
+        if (_purchLine.PurchStatus  == PurchStatus::Canceled &&
+                    _purchLine.PurchaseType == PurchaseType::ReturnItem &&
+                    _purchLine.isInterCompanyOrder())
+        {
+            if (_purchLine.InterCompanyInventTransId)
+            {
+                changecompany(_purchLine.purchTable().InterCompanyCompanyId)
+                {
+                    ttsbegin;
+                    var interCompanySalesLine = SalesLine::findInventTransId(_purchLine.InterCompanyInventTransId);
+                    var interCompanySalesTable = interCompanySalesLine.SalesTable();
+    
+                    if (interCompanySalesTable.ReturnStatus == ReturnStatusHeader::Created &&
+                                !interCompanySalesTable.existRegisteredReceivedInvoicedLines())
+                    {
+                        interCompanySalesLine.SalesStatus = SalesStatus::Canceled;
+                        interCompanySalesLine.ReturnStatus = ReturnStatusLine::Canceled;
+                        interCompanySalesLine.doUpdate();
+                    }
+                            
+                    interCompanySalesTable.SalesStatus = SalesTableType::construct(interCompanySalesTable).lowestSalesStatus();
+                    if (interCompanySalesTable.SalesStatus == SalesStatus::Canceled)
+                    {
+                        interCompanySalesTable.ReturnStatus = ReturnStatusHeader::Canceled;
+                        interCompanySalesTable.doUpdate();
+                    }
+                    ttscommit;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetQtyForStockedLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets a stocked line which is not over delivered and non stocked lines during the cancellation.
+    /// </summary>
+    /// <param name = "_purchLine">The <c>PurchLine</c> record to be cancelled.</param>
+    /// <param name = "_purchTable">The <c>PurchTable</c> of the line being cancelled.</param>
+    /// <param name = "_purchQty">The <c>PurchQty</c> to set.</param>
+    /// <param name = "_pdsCWQty">The <c>PdsCWQty</c> to set.</param>
+    protected void resetQtyForStockedLines(PurchLine _purchLine, PurchTable _purchTable, PurchQty _purchQty, PdsCWQty _pdsCWQty)
+    {
+        _purchLine.PurchQty      = _purchQty;
+        _purchLine.PdsCWQty      = _pdsCWQty;
+        _purchLine.LineAmount    = _purchLine.calcLineAmountForced();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetQtyForNonStockedLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets a stocked line which is not over delivered and non stocked lines during the cancellation.
+    /// </summary>
+    /// <param name = "_purchLine">The <c>PurchLine</c> record to be cancelled.</param>
+    /// <param name = "_purchTable">The <c>PurchTable</c> of the line being cancelled.</param>
+    /// <param name = "_purchQty">The <c>PurchQty</c> to set.</param>
+    /// <param name = "_pdsCWQty">The <c>PdsCWQty</c> to set.</param>
+    protected void resetQtyForNonStockedLines(PurchLine _purchLine, PurchTable _purchTable, PurchQty _purchQty, PdsCWQty _pdsCWQty)
+    {
+        _purchLine.PurchQty      = _purchQty;
+        _purchLine.PdsCWQty      = _pdsCWQty;
+        _purchLine.LineAmount    = _purchLine.calcLineAmountForced();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetQtyForOrderedLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets a purchase line that is neither received, arrived nor registered.
+    /// </summary>
+    /// <param name = "_purchLine">The <c>PurchLine</c> record to be cancelled.</param>
+    /// <param name = "_purchTable">The <c>PurchTable</c> of the line being cancelled.</param>
+    protected void resetQtyForOrderedLines(PurchLine _purchLine, PurchTable _purchTable)
+    {
+        this.updateRemainPhysical(_purchLine);
+
+        _purchLine.PurchQty      = 0;
+        _purchLine.LineAmount    = 0;
+        _purchLine.PdsCWQty      = 0;
+        _purchLine.PurchStatus = PurchStatus::Canceled;
+
+        if (BrazilParameters::isEnabled())
+        {
+            clearFiscalDocumentRef_BR = true;
+        }
+
+        if (_purchLine.isDropShipment() &&
+            _purchTable.InterCompanyDirectDelivery == NoYes::Yes)
+        {
+            _purchTable.InterCompanyDirectDelivery = NoYes::No;
+            _purchTable.doUpdate();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRemainPhysical</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the remaining physical quantities in the <c>PurchLine</c> record.
+    /// </summary>
+    /// <param name = "_callerPurchLine">The caller <c>_purchLine</c> record to update the remaining physical quantities for.</param>
+    private void updateRemainPhysical(PurchLine _purchLine)
+    {
+        InventQty       diffRemainPurchPhysical       = _purchLine.RemainPurchPhysical;
+        InventQty       diffRemainInventPhysical      = _purchLine.RemainInventPhysical;
+        PdsCWInventQty  diffPdsCWRemainInventPhysical = _purchLine.PdsCWRemainInventPhysical;
+
+        _purchLine.RemainPurchPhysical         = 0;
+        _purchLine.RemainInventPhysical        = 0;
+        _purchLine.PdsCWRemainInventPhysical   = 0;
+
+        InterCompanyUpdateRemPhys::synchronize(_purchLine,
+            diffRemainInventPhysical,
+            diffRemainPurchPhysical,
+            this.retrieveInterCompanySkipUpdateFlag(_purchLine),
+            diffPdsCWRemainInventPhysical);
+
+        if (_purchLine.ItemRefType  == InventRefType::Sales
+            && _purchLine.InventRefTransId
+            && _purchLine.isDropShipment())
+        {
+            _purchLine.reread();
+            _purchLine.RemainPurchPhysical       = 0;
+            _purchLine.RemainInventPhysical      = 0;
+            _purchLine.PdsCWRemainInventPhysical = 0;
+        }
+
+        if (_purchLine.type().isPurchTableInterCompanyOrder()
+            && (_purchLine.SkipUpdate != InterCompanySkipUpdate::InterCompany
+                || _purchLine.SkipUpdate != InterCompanySkipUpdate::Both))
+        {
+            _purchLine.SkipUpdate = InterCompanySkipUpdate::InterCompany;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelLineReferences</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets a purchase line that is neither received, arrived nor registered to cancelled.
+    /// </summary>
+    /// <param name = "_purchLine">The <c>PurchLine</c> record to be cancelled.</param>
+    /// <param name = "_purchTable">The <c>PurchTable</c> of the line being cancelled.</param>
+    protected void cancelLineReferences(PurchLine _purchLine, PurchTable _purchTable)
+    {
+        InventMovement::bufferSetTransQtyUnit(_purchLine);
+        
+        if (this.sumPurchLineReceivedArrivedRegisteredQty(_purchLine))
+        {
+            InventMovement::bufferSetRemainQty(_purchLine);
+        }
+
+        // now cancel the markup
+        this.cancelMarkup(_purchLine.TableId, _purchLine.RecId);
+
+        // remove reference for non-stock purch lines
+        this.removeReferenceForDirectDelivery(_purchLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doCancelLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the line as cancelled.
+    /// </summary>
+    /// <param name = "_purchLine">The <c>PurchLine</c> being cancelled.</param>
+    protected void doCancelLine(PurchLine _purchLine)
+    {
+        _purchLine.updateWithoutUpdatingDropShipStatus();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        boolean ret;
+        Integer version = conPeek(packedClass,1);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+                ret = true;
+                break;
+            default:
+                ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    protected static PurchCancel construct()
+    {
+        return new PurchCancel();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@SYS305256";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    static void main(Args _args)
+    { 
+        if (!_args || !_args.record() || _args.dataset() != tableNum(PurchTable))
+        {
+            throw error("@SYS25407");
+        }
+
+        Common common = _args.record();
+        if (tableHasMethod(new DictTable(common.tableId), identifierStr(existInvoice)) && common.existInvoice())
+        {
+            throw error("@SCM:CannotCancelPurchaseOrderWithPendingInvoicesMessage");
+        }
+
+        // Option to skip the dialog
+        NoYes skipPrompt;
+        if (_args.parmEnumType() == enumNum(NoYes))
+        {
+            skipPrompt = _args.parmEnum();
+        }
+
+        // Main method are bound to client due to calls on formDataSource. The update itself are called from MainOnServer which is bound to server.
+        if (PurchCancel::canCancelPurchaseOrder(common as PurchTable, skipPrompt))
+        {
+            using (SysErrorMessageHelpScope scope = SysErrorMessageHelpScope::newErrorContext(_args))
+            {
+                PurchTable purchTable = _args.record();
+                PurchCancel::mainOnServer(purchTable);
+
+                if (PurchCancelWithChangeManagementInfoFlight::instance().isEnabled() && purchTable.isChangeRequestRequired())
+                {
+                    info("@SCM:CancelPurchOrderWithChangeManagementConfirmationReminder");
+                }
+                else
+                {
+                    info("@SCM:CancelPurchOrderConfirmationReminder");
+                }
+            }
+
+            FormDataSource formDataSource = FormDataUtil::getFormDataSource(_args.record());
+            if (formDataSource)
+            {
+                // The Document state and Status are changed on PurchTable
+                formDataSource.reread();
+                formDataSource.refresh();
+
+                // This is necessary to update the enable status of the fields on the header
+                formDataSource.active();
+
+                // The quantities on the lines are changed
+                Object formDataSourceObject = formDataSource;
+                if (formDataSourceHasMethod(formDataSourceObject, identifierStr(reReadLines)))
+                {
+                    formDataSourceObject.rereadLines();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mainOnServer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancels a purchase order.
+    /// </summary>
+    /// <param name="_purchTable">
+    /// A <c>PurchTable</c> record that stores the header of the order to be canceled.
+    /// </param>
+    protected static void mainOnServer(PurchTable _purchTable)
+    {
+        PurchCancel purchCancel = PurchCancel::construct();
+        purchCancel.parmPurchTable(_purchTable);
+
+        if (purchCancel.prompt())
+        {
+            purchCancel.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///   Get the caption of the batch job.
+    /// </summary>
+    /// <returns>The caption of the batch job.
+    /// </returns>
+    public ClassDescription caption()
+    {
+        return strFmt("%1 %2", super(), purchTable.PurchId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>retrieveInterCompanySkipUpdateFlag</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the flag controlling which parts of the intercompany update process are skipped.
+    /// </summary>
+    /// <param name = "_callerPurchLine">
+    /// The caller purchase order line record.
+    /// </param>
+    /// <returns>
+    /// The intercompany skip update flag.
+    /// </returns>
+    [SuppressBpWarning("BPParameterNotUsed", "Parameter _callerPurchLine is used by extensions that wrap this method.")]
+    protected InterCompanySkipUpdate retrieveInterCompanySkipUpdateFlag(PurchLine _callerPurchLine)
+    {
+        return InterCompanySkipUpdate::No;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    internal PurchInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = PurchInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sumPurchLineReceivedArrivedRegisteredQty</Name>
+				<Source><![CDATA[
+    private PurchQty sumPurchLineReceivedArrivedRegisteredQty(PurchLine _purchLine)
+    {
+        return _purchLine.receivedInTotal() + _purchLine.arrivedInPurchUnit() + _purchLine.registeredInPurchUnit();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCancelPurchaseOrder</Name>
+				<Source><![CDATA[
+    private static boolean canCancelPurchaseOrder(PurchTable _purchTable, boolean _skipPrompt)
+    {
+        if (_purchTable.isInterCompanyPurchaseOrderInvoiced())
+        {
+            return false;
+        }
+
+        if (_skipPrompt 
+            || Box::yesNo("@SYS307326",DialogButton::No, PurchCancel::description()) == DialogButton::Yes)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

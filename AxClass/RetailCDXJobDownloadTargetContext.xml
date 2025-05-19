@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailCDXJobDownloadTargetContext</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using System.Net;
+using Microsoft.Dynamics.Retail.CommerceDataExchange;
+using Microsoft.Dynamics.Retail.SynchLibrary.Metadata;
+
+/// <summary>
+/// Represents the class that is used to apply download sessions to a target database.
+/// </summary>
+internal class RetailCDXJobDownloadTargetContext
+{
+    RetailAsyncClientDownloadSession downloadSession;
+    RetailCDXDataStoreRefRecId dataStoreRecID;
+    str                        workDir;
+    RetailCdxSqlCommandTimeout sqlTimeout;
+    RetailCDXScheduleRefRecId  scheduleRecID;
+    str                        dataStoreName;
+    int                        totalRowsAffected;
+    guid                       correlationId;
+    boolean                    isProcessingSkipped;
+    RetailCDXJobDownloadTargetLogger logger;
+    RetailCDXSessionNumber     sessionId; // The download session Id (session number)
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instantiates a new instance of <c>RetailCDXJobDownloadTargetContext</c> object.
+    /// </summary>
+    /// <param name = "_downloadSession">The download session.</param>
+    /// <param name = "_dataStoreRecID">Data store RecId.</param>
+    /// <param name = "_correlationId">The event correlationId.</param>
+    internal void new (RetailAsyncClientDownloadSession _downloadSession, RetailCDXDataStoreRefRecId _dataStoreRecID, guid _correlationId = newGuid())
+    {
+        logger = new RetailCDXJobDownloadTargetLogger(this);
+        this.paramDownloadSession(_downloadSession);
+        this.paramDataStoreRecID(_dataStoreRecID);
+        this.paramCorrelationId(_correlationId);
+
+        RetailCDXDownloadSession cdxDownloadSession;
+
+        // set session Id (session number) for logging
+        select firstonly cdxDownloadSession
+            where cdxDownloadSession.RecId == _downloadSession.Id();
+
+        if (cdxDownloadSession)
+        {
+            this.paramSessionId(cdxDownloadSession.Session);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeContext</Name>
+				<Source><![CDATA[
+    private void initializeContext()
+    {
+        this.sqlTimeout = RetailConnParameters::find().getSqlCommandTimeout();
+
+        str workDirBase = System.IO.Path::GetTempPath();
+        str workDirName = System.IO.Path::GetRandomFileName();
+        this.workDir = System.IO.Path::Combine(workDirBase, workDirName);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Applies the package of all available download sessions.
+    /// </summary>
+    /// <remarks>This directly uses the synchLibary API instead of the x++ implementation.</remarks>
+    internal void execute()
+    {
+        RetailConnDatabaseProfile         dataStore;
+        boolean                           errorFound;
+        str                               errorMessage;
+
+        select firstonly Name, ConnectionString, DataGroup
+                        from dataStore
+                        where dataStore.RecId == this.dataStoreRecID;
+
+        this.paramDataStoreName(dataStore.Name);
+
+        Microsoft.Dynamics.Ax.Xpp.ErrorException xppEx;
+        System.Exception ex;
+
+        try
+        {
+            logger.logCDXJobDownloadTargetProcessingStart();
+
+            using (ReqReaderWriterLock downloadJobDataStoreLock = ReqReaderWriterLock::construct())
+            {
+                RetailCDXDownloadSessionDataStore retailCDXDownloadSessionDataStore;
+                select Status from retailCDXDownloadSessionDataStore
+                    where retailCDXDownloadSessionDataStore.Session == this.paramDownloadSession().Id() &&
+                    retailCDXDownloadSessionDataStore.DataStore == this.paramDataStoreRecID();
+
+                str downloadLockName = strFmt(RetailCDXConstants::DownloadSessionDataStoreLockName, retailCDXDownloadSessionDataStore.RecId);
+
+                boolean acquireLock = downloadJobDataStoreLock.tryEnterWriterLock(downloadLockName);
+                retailCDXDownloadSessionDataStore.reread();
+
+                if (!acquireLock ||
+                    retailCDXDownloadSessionDataStore.Status == RetailCDXDownloadSessionStatus::Applied ||
+                    retailCDXDownloadSessionDataStore.Status == RetailCDXDownloadSessionStatus::Canceled )
+                {
+                    // log and return from here as another process is applying or has already applied the sessionDataStore.
+                    this.paramIsProcessingSkipped(true);
+
+                    logger.logCDXJobDownloadTargetProcessingSkipped();
+
+                    return;
+                }
+
+                this.initializeContext();
+
+                // instantiate the SqlTargetRequestContext object.
+                SqlTargetRequestContext targetRequestContext = this.createTargetRequestContext(downloadSession, dataStore, this.paramCorrelationId());
+
+                // invoke the SynchLibrary API to apply the download session to the channel database.
+                Microsoft.Dynamics.Retail.SynchLibrary.Metadata.DownloadSession downloadSessionResult = this.applyToTargetDatabase(targetRequestContext);
+
+                // get download session status properties
+                Map downloadSessionPropertyMap = ReflectionHelper::getPropertyValuesOnObject(downloadSessionResult,
+                    con2List(['ID','JobID','JobDescription','FileSize', 'CheckSum', 'DataStoreName', 'RowsAffected', 'Message', 'Status']));
+
+                // update the AX download Session record with the result returned from the ApplyToTargetDatabase API.
+                RetailAsyncClientDownloadSessionUpdateStatus downloadSessionUpdateStatus = new RetailAsyncClientDownloadSessionUpdateStatus();
+                downloadSessionUpdateStatus.paramId(downloadSessionPropertyMap.lookup('ID'));
+                downloadSessionUpdateStatus.paramRowsAffected(downloadSessionPropertyMap.lookup('RowsAffected'));
+                downloadSessionUpdateStatus.paramMessage(downloadSessionPropertyMap.lookup('Message'));
+                downloadSessionUpdateStatus.paramStatus(downloadSessionPropertyMap.lookup('Status'));
+                downloadSessionUpdateStatus.paramDataStoreName(downloadSessionPropertyMap.lookup('DataStoreName'));
+
+                RetailCDXDownloadService::UpdateDownloadSessionStatus(downloadSessionUpdateStatus);
+
+                this.paramRowsAffected(downloadSessionPropertyMap.lookup('RowsAffected'));
+
+                if(downloadSessionUpdateStatus.paramStatus() != RetailCDXDownloadSessionStatus::Applied)
+                {
+                    throw error(downloadSessionUpdateStatus.paramMessage());
+                }
+            }
+        }
+        catch (xppEx)
+        {
+            ex = xppEx;
+            logger.logCDXJobDownloadTargetProcessingFailure(ex);
+            throw error(strFmt("@Retail:ApplyDownloadSessionErrMsg", downloadSession.JobId(), downloadSession.Id(), dataStore.Name));
+        }
+        catch (ex)
+        {
+            logger.logCDXJobDownloadTargetProcessingFailure(ex);
+            throw error(strFmt("@Retail:ApplyDownloadSessionErrMsg", downloadSession.JobId(), downloadSession.Id(), dataStore.Name));
+        }
+        finally
+        {
+            this.cleanUp();
+            logger.logCDXJobDownloadTargetProcessingStop(ex);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyToTargetDatabase</Name>
+				<Source><![CDATA[
+    private Microsoft.Dynamics.Retail.SynchLibrary.Metadata.DownloadSession applyToTargetDatabase(SqlTargetRequestContext _targetRequestContext)
+    {
+        return SqlTargetRequestHandler::ApplyToTargetDatabase(_targetRequestContext);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTargetRequestContext</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the .Net <c>TargetRequestContextObject</c> instance used in the data sync operation
+    /// </summary>
+    /// <param name = "_downloadsession">The download session object.</param>
+    /// <param name = "dataStore">The data store record.</param>
+    /// <param name = "_correlationId">The correlation Id.</param>
+    /// <returns>The <c>TargetRequestContextObject</c> object</returns>
+    private Microsoft.Dynamics.Retail.CommerceDataExchange.SqlTargetRequestContext createTargetRequestContext(RetailAsyncClientDownloadSession _downloadsession, RetailConnDatabaseProfile dataStore, guid _correlationId = newGuid())
+    {
+        Microsoft.Dynamics.Retail.SynchLibrary.Metadata.DownloadSession downloadSessionObject =
+            new Microsoft.Dynamics.Retail.SynchLibrary.Metadata.DownloadSession(
+            _downloadsession.Id(),
+            _downloadsession.JobId(),
+            _downloadsession.JobDescription(),
+            downloadsession.FileSize(),
+            _downloadsession.Checksum(),
+            0, // DataGroupRecId
+            dataStore.Name,
+            _downloadsession.DownloadLink());
+
+        str channelDBConnectionString = dataStore.connectionStringEdit(false, "");
+
+        return new Microsoft.Dynamics.Retail.CommerceDataExchange.SqlTargetRequestContext(
+                        Microsoft.Dynamics.Retail.SynchLibrary.Metadata.RequestOriginType::AX,
+                        downloadSessionObject,
+                        this.workDir,
+                        channelDBConnectionString,
+                        this.sqlTimeout,
+                        _correlationId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Clean up the working folders.
+    /// </summary>
+    private void cleanUp()
+    {
+        try
+        {
+            if (this.workDir && System.IO.Directory::Exists(workDir))
+            {
+                System.IO.Directory::Delete(this.workDir, true);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception ex = CLRInterop::getLastException();
+            logger.logCDXResourceCleanUpFailureWarning(ex);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramDownloadSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the value of download session object.
+    /// </summary>
+    /// <param name="_downloadSession">The download session object.</param>
+    /// <returns>The <c>RetailAsyncClientDownloadSession</c> download session object.</returns>
+    internal RetailAsyncClientDownloadSession paramDownloadSession(RetailAsyncClientDownloadSession _downloadSession = downloadSession)
+    {
+        downloadSession = _downloadSession;
+        return downloadSession;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramIsProcessingSkipped</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the flag which indicates the cdx job download target processing is skipped for the current download session or not.
+    /// </summary>
+    /// <param name = "_isProcessingSkipped">The flag which indicates if the cdx job download target processing is skipped or not.</param>
+    /// <returns>True if processing of the download job is skipped for the specified download session; false otherwise.</returns>
+    /// <remarks>The CDX download processing is skipped if another process is already applying the download session on the specified datastore.</remarks>
+    internal boolean paramIsProcessingSkipped(boolean _isProcessingSkipped = isProcessingSkipped)
+    {
+        isProcessingSkipped = _isProcessingSkipped;
+
+        return isProcessingSkipped;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramDataStoreRecID</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the value of data store rec id.
+    /// </summary>
+    /// <param name="_dataStoreRecID">The value of data store record identifier.</param>
+    /// <returns>Data store rec id.</returns>
+    internal RefRecId paramDataStoreRecID(RefRecId _dataStoreRecID = dataStoreRecID)
+    {
+        dataStoreRecID = _dataStoreRecID;
+
+        return dataStoreRecID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramDataStoreName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the dataStore name.
+    /// </summary>
+    /// <param name="_dataStoreName">The dataStore name.</param>
+    /// <returns>The dataStore name.</returns>
+    internal str paramDataStoreName(str _dataStoreName = dataStoreName)
+    {
+        dataStoreName = _dataStoreName;
+
+        return dataStoreName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramRowsAffected</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the number of rows affected.
+    /// </summary>
+    /// <param name = "_rowsAffected">The number of rows affected.</param>
+    /// <returns>The number of rows affected.</returns>
+    internal int paramRowsAffected(int _rowsAffected = totalRowsAffected)
+    {
+        totalRowsAffected = _rowsAffected;
+
+        return totalRowsAffected;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramCorrelationId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the event correlation Id.
+    /// </summary>
+    /// <param name="_correlationId">The event correlation Id.</param>
+    /// <returns>The eventcorrelation Id.</returns>
+    internal guid paramCorrelationId(guid _correlationId = correlationId)
+    {
+        correlationId = _correlationId;
+
+        return correlationId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>paramSessionId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the session Id (session number).
+    /// </summary>
+    /// <param name="_sessionId">The session Id (session number).</param>
+    /// <returns>The session Id (session number).</returns>
+    internal RetailCDXSessionNumber paramSessionId(RetailCDXSessionNumber _sessionId = sessionId)
+    {
+        sessionId = _sessionId;
+
+        return sessionId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

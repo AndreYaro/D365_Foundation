@@ -1,0 +1,1015 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>LedgerSettleProcessor_ApplicationSuite_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(classStr(LedgerSettleProcessor))]
+public final class LedgerSettleProcessor_ApplicationSuite_Extension
+{
+    private const str PostingLayerParameterName = identifierStr(PostingLayer);
+    private const str IsBalanceSheetParameterName = identifierStr(IsBalanceSheet);
+    private const str MainAccountParameterName = identifierStr(MainAccount);
+    private const str LegalEntityParameterName = identifierStr(LegalEntity);
+    private const str PartitionParameterName = identifierStr(Partition);
+    private const str SettleIdParameterName = identifierStr(SettleId);
+    private const str AutomationRuleParameterName = identifierStr(AutomationRule);
+    private const str UserIdParameterName = identifierStr(UserId);
+    private const str IsCreditParameterName = identifierStr(IsCredit);
+
+    private readonly boolean isSplitFlightEnabled = FeatureStateProvider::isFeatureEnabled(LedgerSettlementSplitVarianceTransactionFlight::instance());
+   
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>ledgerSettlePostVariances</Name>
+				<Source><![CDATA[
+    public void ledgerSettlePostVariances(
+        LedgerSettledMarkedTransactionsBalancesResult _markedTransactionsBalancesResult,
+        MainAccountRecId _currMainAccountId,
+        TransDate _settleDate,
+        Num _settleNum,
+        TransactionTextLarge _settlementDescription,
+        ProcessScheduleSeriesName _automationRule)
+    {
+        if (_markedTransactionsBalancesResult.accountingCurrencyBalance != 0)
+        {
+            this.createVarianceTransaction(_markedTransactionsBalancesResult, _currMainAccountId, _settleDate, _settleNum, _settlementDescription, _automationRule, true);
+        }
+
+        if (_markedTransactionsBalancesResult.reportingCurrencyBalance != 0)
+        {
+            this.createVarianceTransaction(_markedTransactionsBalancesResult, _currMainAccountId, _settleDate, _settleNum, _settlementDescription, _automationRule, false);
+        }
+
+        next ledgerSettlePostVariances(_markedTransactionsBalancesResult, _currMainAccountId, _settleDate, _settleNum, _settlementDescription, _automationRule);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVarianceTransaction</Name>
+				<Source><![CDATA[
+    private void createVarianceTransaction(
+        LedgerSettledMarkedTransactionsBalancesResult _markedTransactionsBalancesResult,
+        MainAccountRecId _currMainAccountId,
+        TransDate _settleDate,
+        Num _settleNum,
+        TransactionTextLarge _settlementDescription,
+        ProcessScheduleSeriesName _automationRule,
+        boolean _isAccountingCurrencyVarianceTransaction)
+    {
+        LedgerTransSettlementAccount ledgerTransSettlementAccount;
+
+        select firstonly TypicalBalance, CalculateRealizedGainsLosses from ledgerTransSettlementAccount
+                where ledgerTransSettlementAccount.MainAccount == _currMainAccountId;
+
+        if (ledgerTransSettlementAccount.CalculateRealizedGainsLosses)
+        {
+            // 1) Create the list of transactions in the ledgerTransSettlementAdjustmentTmp table, grouping by LedgerDimension
+            // 2) Calculate the split of the variance, if any.
+            CompanyInfo companyInfo = CompanyInfo::find();
+            LedgerRecId ledgerRecId = Ledger::current();
+
+            // Create the ledgerTransSettlementAdjustmentTmp records, to be used in postAdjustment() method later
+            LedgerTransSettlementAdjustmentTmp ledgerTransSettlementAdjustmentTmp = 
+                    this.createSettlementTempTableRecords(
+                        _isAccountingCurrencyVarianceTransaction,
+                        _markedTransactionsBalancesResult, 
+                        _currMainAccountId,
+                        companyInfo,
+                        ledgerTransSettlementAccount.TypicalBalance, 
+                        _settleNum, 
+                        _automationRule);
+
+            NumberSeq numberSeq = NumberSeq::newGetVoucher(LedgerParameters::numRefLedgerSettlementsAdjustmentVoucher(), false);
+            Voucher voucher = numberSeq.voucher();
+
+            LedgerVoucher ledgerVoucher = LedgerVoucher::newLedgerPost(
+                    DetailSummary::Summary,
+                    SysModule::Ledger,
+                    numberSeq.parmVoucherSequenceCode());
+
+            if (ledgerVoucher)
+            {
+                ledgerVoucher.parmCheckBlockedDimensions(false);
+
+                // Create and post the realized gain/loss for Accounting currency / Reporting currency variances.
+                this.postAdjustment(
+                        ledgerVoucher,
+                        voucher,
+                        ledgerTransSettlementAdjustmentTmp,
+                        ledgerTransSettlementAdjustmentTmp.TransactionCurrencyCode,
+                        _isAccountingCurrencyVarianceTransaction,
+                        _settleDate,
+                        _settlementDescription,
+                        ledgerRecId,
+                        companyInfo.RecId);
+
+                ledgerVoucher.end();
+
+                TransactionLog::create(TransactionLogType::LedgerSettlement, voucher);
+
+                // After posting, we need to create new LedgerTransSettlement records for what we just posted and give it the same Settlenum as the others
+                // Need to attach the voucher number to the same settlement transactions
+                this.createLedgerTransSettleRecordsForPostedTrx(companyInfo, _currMainAccountId, _settleNum, _settleDate, voucher, _automationRule);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSettlementTempTableRecords</Name>
+				<Source><![CDATA[
+    private LedgerTransSettlementAdjustmentTmp createSettlementTempTableRecords(
+        boolean _isAccountingCurrencyVarianceTransaction,
+        LedgerSettledMarkedTransactionsBalancesResult _markedTransactionsBalancesResult,
+        MainAccountRecId _currMainAccountId,
+        CompanyInfo _companyInfo,
+        LedgerSettlementsAccountTypicalBalance _typicalBalance,
+        Num _settleNum,
+        ProcessScheduleSeriesName _automationRule = '')
+    {
+        LedgerTransSettlementAdjustmentTmp ledgerTransSettlementAdjustmentTmp;
+
+        boolean isBalanceSheet = this.isBalanceSheetAccount(_currMainAccountId);
+        boolean isCredit = (_typicalBalance == LedgerSettlementsAccountTypicalBalance::Credit);
+
+        // These values will be constant/common for all records for the main account being processed
+        ledgerTransSettlementAdjustmentTmp.PostingLayer = CurrentOperationsTax::Current;
+        ledgerTransSettlementAdjustmentTmp.MainAccount = _currMainAccountId;
+        ledgerTransSettlementAdjustmentTmp.IsBalanceSheet = isBalanceSheet;
+        ledgerTransSettlementAdjustmentTmp.LegalEntity = _companyInfo.RecId;
+
+        TableName settlementAdjustmentTempTable = ledgerTransSettlementAdjustmentTmp.getPhysicalTableName();
+        this.createAndExecuteAdjustmentTmpInsertStatement(
+            settlementAdjustmentTempTable, isBalanceSheet, isCredit, CurrentOperationsTax::Current, _currMainAccountId,  Ledger::current(), _settleNum, _automationRule);
+
+        if (isSplitFlightEnabled)
+        {
+            this.updateTransactionCurrencyCodeForVarianceTransactions(ledgerTransSettlementAdjustmentTmp, _settleNum);
+        }
+
+        // Calculate the split of the variance amount, if any variance exists
+        this.splitVarianceAmount(_isAccountingCurrencyVarianceTransaction, _markedTransactionsBalancesResult, ledgerTransSettlementAdjustmentTmp);
+
+        return ledgerTransSettlementAdjustmentTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isBalanceSheetAccount</Name>
+				<Source><![CDATA[
+    private boolean isBalanceSheetAccount(MainAccountRecId _currMainAccountId)
+    {
+        MainAccount mainAccount;
+
+        select firstonly mainAccount where mainAccount.RecId == _currMainAccountId;
+        boolean isBalanceSheet = mainAccount.isBalanceSheetAccount();
+
+        return isBalanceSheet;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAndExecuteAdjustmentTmpInsertStatement</Name>
+				<Source><![CDATA[
+    private void createAndExecuteAdjustmentTmpInsertStatement(
+        str _ledgerTransSettlementAdjustmentTmpTableName,
+        boolean _isBalanceSheet,
+        boolean _isCredit,
+        CurrentOperationsTax _postingLayer,
+        MainAccountRecId _mainAccount,
+        LegalEntityRecId _legalEntity,
+        Num _settleId,
+        ProcessScheduleSeriesName _automationRule)
+    {
+        // The idea behind this method is to both insert the relevant records, but also group them by LedgerDimension, so we don't have to do a second pass
+        // to combine records that have the same LedgerDimension value.
+        // Using direct SQL as I needed to use the SUM() sql function, and I could not find an equivalent function in X++
+        //
+        // Example SQL:
+        //
+        // declare @AutomationRule [nvarchar](max) = ''
+        // declare @IsBalanceSheet [int] = 0
+        // declare @LegalEntity [bigint] = 22565420922
+        // declare @MainAccount [bigint] = 22565421336
+        // declare @Partition [bigint] = 5637144576
+        // declare @PostingLayer [int] = 0
+        // declare @SettleId [nvarchar](max) = '001011'
+        // declare @UserId [nvarchar](max) = 'Admin'
+        // declare @IsCredit [int] = 0
+        //
+        // -- When LedgerSettlementSplitVarianceTransactionFlight flight is enabled
+        // INSERT INTO tempdb."DBO".t28879IISAuroraV72848_17817672_0A36D6D9CE73414493C35E219A67EBE0
+        // (PostingLayer, LedgerDimension, IsBalanceSheet, 
+        //      AccountingCurrencyAmount, ReportingCurrencyAmount, TransactionCurrencyAmount, 
+        //      MainAccount, LegalEntity, Partition, ACCOUNTINGCURRENCYADJUSTMENTAMOUNT, ReportingCurrencyAdjustmentAmount, RecVersion)
+        // select @PostingLayer, GJAE.LedgerDimension, @IsBalanceSheet, 
+        //      sum(GJAE.AccountingCurrencyAmount), sum(GJAE.ReportingCurrencyAmount), sum(GJAE.TransactionCurrencyAmount), 
+        //      @MainAccount, @LegalEntity, @Partition, 0, 0, 1
+        // from DBO.LedgerTransSettlementWork LTSW
+        //      join DBO.GeneralJournalAccountEntry GJAE on LTSW.GeneralJournalAccountEntry = GJAE.RecId
+        //      join DBO.GeneralJournalEntry GJE on GJE.RecId = GJAE.GeneralJournalEntry  
+        // where LTSW.Marked = 1 and LTSW.SettleId = @SettleId and LTSW.UserId = @UserId and LTSW.Partition = @Partition
+        //         and GJAE.MainAccount = @MainAccount and GJE.Ledger = @LegalEntity and GJE.Partition = @Partition
+        //         and GJAE.IsCredit = @IsCredit and GJE.Partition = @Partition
+        // group by GJAE.LedgerDimension
+        //
+        // -- When LedgerSettlementSplitVarianceTransactionFlight flight is disabled
+        // INSERT INTO tempdb."DBO".t28879IISAuroraV72848_17817672_0A36D6D9CE73414493C35E219A67EBE0
+        // (PostingLayer, LedgerDimension, TransactionCurrencyCode, IsBalanceSheet,
+        //      AccountingCurrencyAmount, ReportingCurrencyAmount, TransactionCurrencyAmount,
+        //      MainAccount, LegalEntity, Partition, ACCOUNTINGCURRENCYADJUSTMENTAMOUNT, ReportingCurrencyAdjustmentAmount, RecVersion)
+        // select @PostingLayer, GJAE.LedgerDimension, GJAE.TransactionCurrencyCode, @IsBalanceSheet,
+        //      sum(GJAE.AccountingCurrencyAmount), sum(GJAE.ReportingCurrencyAmount), sum(GJAE.TransactionCurrencyAmount),
+        //      @MainAccount, @LegalEntity, @Partition, 0, 0, 1
+        // from DBO.LedgerTransSettlementWork LTSW
+        //      join DBO.GeneralJournalAccountEntry GJAE on LTSW.GeneralJournalAccountEntry = GJAE.RecId
+        //      join DBO.GeneralJournalEntry GJE on GJE.RecId = GJAE.GeneralJournalEntry
+        // where LTSW.Marked = 1 and LTSW.SettleId = @SettleId and LTSW.UserId = @UserId and LTSW.Partition = @Partition
+        //         and GJAE.MainAccount = @MainAccount and GJE.Ledger = @LegalEntity and GJE.Partition = @Partition
+        //         and GJAE.IsCredit = @IsCredit and GJE.Partition = @Partition
+        // group by GJAE.LedgerDimension, GJAE.TransactionCurrencyCode
+
+        Connection connection = new Connection();
+        Statement statement;
+        str whereAndGroupByClause = "";
+
+        try
+        {
+            statement = connection.createStatement();
+
+            if (_automationRule != '')
+            {
+                if (isSplitFlightEnabled)
+                {
+                    //    where LTSW.Marked = 1 and LTSW.SettleId = @SettleId and LTSW.AutomationRule = @AutomationRule and LTSW.Partition = @Partition
+                    //        and GJAE.MainAccount = @MainAccount and GJE.Ledger = @LegalEntity and GJE.Partition = @Partition
+                    //        and GJAE.IsCredit = @IsCredit
+                    //    group by GJAE.LedgerDimension
+                    whereAndGroupByClause = strFmt(@" where LTSW.%19 = 1 and LTSW.%20 = @%30 and LTSW.%21 = @%31 and LTSW.%14 = @%29
+                                and GJAE.%12 = @%27 and GJE.%25 = @%28 and GJE.%14 = @%29
+                                and GJAE.%34 = @%35 and GJAE.%14 = @%29
+                                group by GJAE.%6");
+                }
+                else
+                {
+                    //    where LTSW.Marked = 1 and LTSW.SettleId = @SettleId and LTSW.AutomationRule = @AutomationRule and LTSW.Partition = @Partition
+                    //        and GJAE.MainAccount = @MainAccount and GJE.Ledger = @LegalEntity and GJE.Partition = @Partition
+                    //        and GJAE.IsCredit = @IsCredit
+                    //    group by GJAE.LedgerDimension, GJAE.TransactionCurrencyCode
+                    whereAndGroupByClause = strFmt(@" where LTSW.%19 = 1 and LTSW.%20 = @%30 and LTSW.%21 = @%31 and LTSW.%14 = @%29
+                                and GJAE.%12 = @%27 and GJE.%25 = @%28 and GJE.%14 = @%29
+                                and GJAE.%34 = @%35 and GJAE.%14 = @%29
+                                group by GJAE.%6, GJAE.%7");
+                }
+            }
+            else
+            {
+                if (isSplitFlightEnabled)
+                {
+                    //    where LTSW.Marked = 1 and LTSW.SettleId = @SettleId and LTSW.UserId == curUserId()  and LTSW.Partition = @Partition
+                    //        and GJAE.MainAccount = @MainAccount and GJE.Ledger = @LegalEntity and GJE.Partition = @Partition
+                    //        and GJAE.IsCredit = @IsCredit
+                    //    group by GJAE.LedgerDimension
+                    whereAndGroupByClause =  strFmt(@" where LTSW.%19 = 1 and LTSW.%20 = @%30 and LTSW.%22 = @%33 and LTSW.%14 = @%29
+                                and GJAE.%12 = @%27 and GJE.%25 = @%28 and GJE.%14 = @%29
+                                and GJAE.%34 = @%35 and GJAE.%14 = @%29
+                                group by GJAE.%6");
+                }
+                else
+                {
+                    //    where LTSW.Marked = 1 and LTSW.SettleId = @SettleId and LTSW.UserId == curUserId()  and LTSW.Partition = @Partition
+                    //        and GJAE.MainAccount = @MainAccount and GJE.Ledger = @LegalEntity and GJE.Partition = @Partition
+                    //        and GJAE.IsCredit = @IsCredit
+                    //    group by GJAE.LedgerDimension, GJAE.TransactionCurrencyCode
+                    whereAndGroupByClause =  strFmt(@" where LTSW.%19 = 1 and LTSW.%20 = @%30 and LTSW.%22 = @%33 and LTSW.%14 = @%29
+                                and GJAE.%12 = @%27 and GJE.%25 = @%28 and GJE.%14 = @%29
+                                and GJAE.%34 = @%35 and GJAE.%14 = @%29
+                                group by GJAE.%6, GJAE.%7");
+                }
+            }
+
+            str sqlStatement;
+
+            if (isSplitFlightEnabled)
+            {
+                sqlStatement = strFmt(@"
+                    INSERT INTO %1
+                    (%5, %6, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17)
+                    select @%32, GJAE.%6, @%26, sum(GJAE.%9), sum(GJAE.%10), sum(GJAE.%11), @%27, @%28, @%29, 0, 0, 1
+                        from DBO.%2 LTSW
+                        join DBO.%4 GJAE on LTSW.%18 = GJAE.%24
+                        join DBO.%3 GJE on GJE.%24 = GJAE.%23 " + whereAndGroupByClause,
+
+                        _ledgerTransSettlementAdjustmentTmpTableName, // %1
+                        tableStr(LedgerTransSettlementWork), //%2
+                        tableStr(GeneralJournalEntry), //%3
+                        tableStr(GeneralJournalAccountEntry), //%4
+
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, PostingLayer), // %5
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, LedgerDimension), // %6
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, TransactionCurrencyCode), // %7
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, IsBalanceSheet), // %8
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, AccountingCurrencyAmount), // %9
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, ReportingCurrencyAmount), // %10
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, TransactionCurrencyAmount), // %11
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, MainAccount), // %12
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, LegalEntity), // %13
+                        identifierStr(Partition), // %14
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, ACCOUNTINGCURRENCYADJUSTMENTAMOUNT), // %15
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, ReportingCurrencyAdjustmentAmount), // %16
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, RecVersion), // %17
+
+                        fieldStr(LedgerTransSettlementWork, GeneralJournalAccountEntry), // %18
+                        fieldStr(LedgerTransSettlementWork, Marked), // %19
+                        fieldStr(LedgerTransSettlementWork, SettleId), // %20
+                        fieldStr(LedgerTransSettlementWork, AutomationRule), // %21
+                        fieldStr(LedgerTransSettlementWork, UserId), // %22
+                        fieldStr(GeneralJournalAccountEntry, GeneralJournalEntry), // %23
+                        fieldStr(GeneralJournalAccountEntry, RecId), // %24
+                        fieldStr(GeneralJournalEntry, Ledger), // %25
+
+                        IsBalanceSheetParameterName, // %26
+                        MainAccountParameterName, // %27
+                        LegalEntityParameterName, // %28
+                        PartitionParameterName, // %29
+                        SettleIdParameterName, // %30
+                        AutomationRuleParameterName, // %31
+                        PostingLayerParameterName, // %32
+                        UserIdParameterName, // %33
+
+                        fieldStr(GeneralJournalAccountEntry, IsCredit), // %34
+                        IsCreditParameterName); // %35
+            }
+            else
+            {
+                sqlStatement = strFmt(@"
+                    INSERT INTO %1
+                    (%5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17)
+                    select @%32, GJAE.%6, GJAE.%7, @%26, sum(GJAE.%9), sum(GJAE.%10), sum(GJAE.%11), @%27, @%28, @%29, 0, 0, 1
+                        from DBO.%2 LTSW
+                        join DBO.%4 GJAE on LTSW.%18 = GJAE.%24
+                        join DBO.%3 GJE on GJE.%24 = GJAE.%23 " + whereAndGroupByClause,
+
+                        _ledgerTransSettlementAdjustmentTmpTableName, // %1
+                        tableStr(LedgerTransSettlementWork), //%2
+                        tableStr(GeneralJournalEntry), //%3
+                        tableStr(GeneralJournalAccountEntry), //%4
+
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, PostingLayer), // %5
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, LedgerDimension), // %6
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, TransactionCurrencyCode), // %7
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, IsBalanceSheet), // %8
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, AccountingCurrencyAmount), // %9
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, ReportingCurrencyAmount), // %10
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, TransactionCurrencyAmount), // %11
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, MainAccount), // %12
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, LegalEntity), // %13
+                        identifierStr(Partition), // %14
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, ACCOUNTINGCURRENCYADJUSTMENTAMOUNT), // %15
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, ReportingCurrencyAdjustmentAmount), // %16
+                        fieldStr(LedgerTransSettlementAdjustmentTmp, RecVersion), // %17
+
+                        fieldStr(LedgerTransSettlementWork, GeneralJournalAccountEntry), // %18
+                        fieldStr(LedgerTransSettlementWork, Marked), // %19
+                        fieldStr(LedgerTransSettlementWork, SettleId), // %20
+                        fieldStr(LedgerTransSettlementWork, AutomationRule), // %21
+                        fieldStr(LedgerTransSettlementWork, UserId), // %22
+                        fieldStr(GeneralJournalAccountEntry, GeneralJournalEntry), // %23
+                        fieldStr(GeneralJournalAccountEntry, RecId), // %24
+                        fieldStr(GeneralJournalEntry, Ledger), // %25
+
+                        IsBalanceSheetParameterName, // %26
+                        MainAccountParameterName, // %27
+                        LegalEntityParameterName, // %28
+                        PartitionParameterName, // %29
+                        SettleIdParameterName, // %30
+                        AutomationRuleParameterName, // %31
+                        PostingLayerParameterName, // %32
+                        UserIdParameterName, // %33
+
+                        fieldStr(GeneralJournalAccountEntry, IsCredit), // %34
+                        IsCreditParameterName); // %35
+            }
+
+            Map sqlParams = SqlParams::create();
+            sqlParams.add(PostingLayerParameterName, enum2int(_postingLayer));
+            if (_isBalanceSheet)
+            {
+                sqlParams.add(IsBalanceSheetParameterName, 1);
+            }
+            else
+            {
+                sqlParams.add(IsBalanceSheetParameterName, 0);
+            }
+
+            if (_isCredit)
+            {
+                sqlParams.add(IsCreditParameterName, 1);
+            }
+            else
+            {
+                sqlParams.add(IsCreditParameterName, 0);
+            }
+            sqlParams.add(MainAccountParameterName, _mainAccount);
+            sqlParams.add(LegalEntityParameterName, _legalEntity);
+            sqlParams.add(PartitionParameterName, getCurrentPartitionRecId());
+            sqlParams.add(SettleIdParameterName, _settleId);
+            sqlParams.add(AutomationRuleParameterName, _automationRule);
+            sqlParams.add(UserIdParameterName, curUserId());
+        
+            statement.executeUpdateWithParameters(sqlStatement, sqlParams);
+        }
+        finally
+        {
+            if (statement != null)
+            {
+                statement.close();
+            }
+
+            connection.finalize();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransactionCurrencyCodeForVarianceTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  The Currency of the gain/loss voucher will be set to be the same as the first voucher record the system finds.
+    /// </summary>
+    /// <param name = "_ledgerTransSettlementAdjustmentTmp">A <c>LedgerTransSettlementAdjustmentTmp</c> table instance</param>
+    /// <param name = "_settleNum">The target SettleId</param>
+    private void updateTransactionCurrencyCodeForVarianceTransactions(LedgerTransSettlementAdjustmentTmp _ledgerTransSettlementAdjustmentTmp, Num _settleNum)
+    {
+        LedgerTransSettlementWork ledgerTransSettlementWork;
+        GeneralJournalEntry generalJournalEntry;
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+
+        while select forupdate _ledgerTransSettlementAdjustmentTmp
+        {
+            select firstonly TransactionCurrencyCode from generalJournalAccountEntry
+                order by generalJournalAccountEntry.RecId asc
+                where generalJournalAccountEntry.LedgerDimension == _ledgerTransSettlementAdjustmentTmp.LedgerDimension
+                join ledgerTransSettlementWork
+                    where ledgerTransSettlementWork.GeneralJournalAccountEntry == generalJournalAccountEntry.RecId
+                        && ledgerTransSettlementWork.Marked == NoYes::Yes
+                        && ledgerTransSettlementWork.UserId == curUserId()
+                        && ledgerTransSettlementWork.SettleId == _settleNum
+                join generalJournalEntry
+                        where generalJournalEntry.RecId == generalJournalAccountEntry.GeneralJournalEntry
+                        && generalJournalEntry.Ledger == _ledgerTransSettlementAdjustmentTmp.LegalEntity;
+
+            _ledgerTransSettlementAdjustmentTmp.TransactionCurrencyCode = generalJournalAccountEntry.TransactionCurrencyCode;
+            _ledgerTransSettlementAdjustmentTmp.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitVarianceAmount</Name>
+				<Source><![CDATA[
+    private void splitVarianceAmount(
+        boolean _isAccountingCurrencyVarianceTransaction,
+        LedgerSettledMarkedTransactionsBalancesResult _markedTransactionsBalancesResult,
+        LedgerTransSettlementAdjustmentTmp _ledgerTransSettlementAdjustmentTmp)
+    {
+        // Get the total amount, will be used to determine percentages
+        AmountMST totalAmount;
+
+        if (isSplitFlightEnabled)
+        {
+            if (_markedTransactionsBalancesResult.hasSameTransactionCurrency)
+            {
+                select sum(TransactionCurrencyAmount), count(RecId) from _ledgerTransSettlementAdjustmentTmp;
+                totalAmount = _ledgerTransSettlementAdjustmentTmp.TransactionCurrencyAmount;
+            }
+            else
+            {
+                select sum(AccountingCurrencyAmount), count(RecId) from _ledgerTransSettlementAdjustmentTmp;
+                totalAmount = _ledgerTransSettlementAdjustmentTmp.AccountingCurrencyAmount;
+            }
+        }
+        else
+        {
+            select sum(TransactionCurrencyAmount), count(RecId) from _ledgerTransSettlementAdjustmentTmp;
+            totalAmount = _ledgerTransSettlementAdjustmentTmp.TransactionCurrencyAmount;
+        }
+
+        // If only one record, no need to "split" the reporting currency balance, just update the temp table with the full amount.
+        if (_ledgerTransSettlementAdjustmentTmp.RecId == 1)
+        {
+            if (_isAccountingCurrencyVarianceTransaction)
+            {
+                update_recordset _ledgerTransSettlementAdjustmentTmp
+                    setting AccountingCurrencyAdjustmentAmount = _markedTransactionsBalancesResult.accountingCurrencyBalance * -1;
+            }
+            else
+            {
+                update_recordset _ledgerTransSettlementAdjustmentTmp
+                    setting ReportingCurrencyAdjustmentAmount = _markedTransactionsBalancesResult.reportingCurrencyBalance * -1;
+            }
+        }
+        else
+        {
+            Statement statement;
+            Connection connection = new Connection();
+
+            try
+            {
+                TableName settlementAdjustmentTempTable = _ledgerTransSettlementAdjustmentTmp.getPhysicalTableName();
+
+                // This calculates the number of decimal places we need to round to, based off the currency code's RoundingPrecision value
+                RoundOff precision = _isAccountingCurrencyVarianceTransaction ? 
+                    Currency::find(Ledger::accountingCurrency()).RoundingPrecision :
+                    Currency::find(Ledger::reportingCurrency()).RoundingPrecision;
+                int precisionLength = strLen(any2Str(precision)) - strScan(any2Str(precision),'.', 0, strLen(any2Str(precision)));
+
+                // Product default is 2, so if no value entered for the "General rounding rule", use the default value
+                if (precision == 0)
+                {
+                    precisionLength = 2;
+                }
+
+                AmountMST varianceAmount = _isAccountingCurrencyVarianceTransaction ? 
+                    _markedTransactionsBalancesResult.accountingCurrencyBalance :
+                    _markedTransactionsBalancesResult.reportingCurrencyBalance;
+
+                str targetCol = _isAccountingCurrencyVarianceTransaction ?
+                    new DictField(tableNum(LedgerTransSettlementAdjustmentTmp), fieldNum(LedgerTransSettlementAdjustmentTmp, AccountingCurrencyAdjustmentAmount)).name(DbBackend::Sql) :
+                    new DictField(tableNum(LedgerTransSettlementAdjustmentTmp), fieldNum(LedgerTransSettlementAdjustmentTmp, ReportingCurrencyAdjustmentAmount)).name(DbBackend::Sql);
+
+                str totalCol = '';
+
+                if (isSplitFlightEnabled)
+                {
+                    if (_markedTransactionsBalancesResult.hasSameTransactionCurrency)
+                    {
+                        totalCol = new DictField(tableNum(LedgerTransSettlementAdjustmentTmp), fieldNum(LedgerTransSettlementAdjustmentTmp, TransactionCurrencyAmount)).name(DbBackend::Sql);
+                    }
+                    else
+                    {
+                        totalCol = new DictField(tableNum(LedgerTransSettlementAdjustmentTmp), fieldNum(LedgerTransSettlementAdjustmentTmp, AccountingCurrencyAmount)).name(DbBackend::Sql);
+                    }
+                }
+                else
+                {
+                    totalCol = new DictField(tableNum(LedgerTransSettlementAdjustmentTmp), fieldNum(LedgerTransSettlementAdjustmentTmp, TransactionCurrencyAmount)).name(DbBackend::Sql);
+                }
+
+                str sqlStatement = this.createAdjustmentAmountUpdateStatement(settlementAdjustmentTempTable, targetCol, varianceAmount, totalCol, totalAmount, precisionlength);
+                statement = connection.createStatement();
+                statement.executeUpdateWithParameters(sqlStatement, SqlParams::create());
+            }
+            finally
+            {
+                if (statement != null)
+                {
+                    statement.close();
+                }
+
+                connection.finalize();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAdjustmentAmountUpdateStatement</Name>
+				<Source><![CDATA[
+    private str createAdjustmentAmountUpdateStatement(
+        str _ledgerTransSettlementAdjustmentTmpTableName, str _targetCol, AmountMST _totalVarianceAmount, str _totalCol, AmountMST _totalAmount, int _precisionlength)
+    {
+        // Sample SQL:
+        // -- if LedgerSettlementSplitVarianceTransactionFlight flight is enabled
+        // update ledgerTransSettlementAdjustmentTmp
+        // set ReportingCurrencyAdjustmentAmount = Round((_totalVarianceAmount * (AccountingCurrencyAmount / _totalAmount) * -1), _precision)
+        // -- if LedgerSettlementSplitVarianceTransactionFlight flight is disabled
+        // update ledgerTransSettlementAdjustmentTmp
+        // set ReportingCurrencyAdjustmentAmount = Round((_totalVarianceAmount * (TransactionCurrencyAmount / _totalAmount) * -1), _precision)
+        // Using direct SQL as rounding in this scenario is tempermental and needed to round in SQL vs in X++
+
+        str sqlStatement = '';
+
+        sqlStatement = strFmt('UPDATE %1 ' +
+            'SET %2 = ROUND((%3 * (%1.%4 / %5) * -1), %6)',
+            _ledgerTransSettlementAdjustmentTmpTableName, // %1
+            _targetCol, //%2
+            num2Str(_totalVarianceAmount, 0, numOfDec(_totalVarianceAmount), 0, 0), // %3
+            _totalCol, //%4
+            num2Str(_totalAmount, 0, numOfDec(_totalAmount), 0, 0), // %5
+            num2Str(_precisionlength, 0, numOfDec(_precisionlength), 0, 0)); // %6
+
+        return sqlStatement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransactionTypeInformation</Name>
+				<Source><![CDATA[
+    private container getTransactionTypeInformation(boolean _isRealizedGain)
+    {
+        #ISOCountryRegionCodes
+        boolean countryRegion_EE = this.isCurrentLegalEntityInCountryRegion([#isoEE]);
+
+        container trxTypeInfo;
+
+        if (_isRealizedGain)
+        {
+            trxTypeInfo += LedgerPostingType::ExchRateGain;
+
+            // <GEEEE>
+            if (countryRegion_EE)
+            {
+                trxTypeInfo += CurrencyGainLossAccountType::FinancialGain;
+            }
+            // </GEEEE>
+            else
+            {
+                trxTypeInfo += this.getSettlementAdjustmentCurrencyAccountTypeGain();
+            }
+        }
+        else // Realized loss
+        {
+            trxTypeInfo += LedgerPostingType::ExchRateLoss;
+
+            // <GEEEE>
+            if (countryRegion_EE)
+            {
+                trxTypeInfo += CurrencyGainLossAccountType::FinancialLoss;
+            }
+            // </GEEEE>
+            else
+            {
+                trxTypeInfo += this.getSettlementAdjustmentCurrencyAccountTypeLoss();
+            }
+        }
+
+        return trxTypeInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postAdjustment</Name>
+				<Source><![CDATA[
+    protected void postAdjustment(
+        LedgerVoucher _ledgerVoucher,
+        Voucher _voucher,
+        LedgerTransSettlementAdjustmentTmp _ledgerTransSettlementAdjustmentTmp,
+        CurrencyCode _adjustmentGainLossCurrencyCode,
+        boolean _isAccountingCurrencyAdjustment,
+        TransDate _settleDate,
+        TransactionTextLarge _settlementDescription,
+        LedgerRecId _ledgerRecId,
+        CompanyInfoRecId _companyInfoRecId)
+    {
+        LedgerPostingType               posting;
+        CurrencyGainLossAccountType     currencyAccountType;
+        container trxTypeInfo;
+        AmountMST _adjustmentAmount;
+        boolean isBalanceSheet;
+
+        #ISOCountryRegionCodes
+
+        while select * from _ledgerTransSettlementAdjustmentTmp
+            order by PostingLayer, TransactionCurrencyCode, LedgerDimension
+                where _ledgerTransSettlementAdjustmentTmp.LegalEntity == _ledgerRecId
+        {
+            isBalanceSheet = _ledgerTransSettlementAdjustmentTmp.IsBalanceSheet;
+
+            // Negate these values to match how the adjustment amount is perceived in posting logic
+            if (_isAccountingCurrencyAdjustment)
+            {
+                _adjustmentAmount = _ledgerTransSettlementAdjustmentTmp.AccountingCurrencyAdjustmentAmount;
+            }
+            else
+            {
+                _adjustmentAmount = _ledgerTransSettlementAdjustmentTmp.ReportingCurrencyAdjustmentAmount;
+            }
+
+            // When MainAccount type = BalanceSheet and AdjustmentAmount > 0, then gain (need to increase Debit)
+            // When MainAccount type = BalanceSheet and AdjustmentAmount < 0, then loss (need to increase Credit)
+            // When MainAccount type = Profit or Loss and AdjustmentAmount > 0, then loss
+            // When MainAccount type = Profit or Loss and AdjustmentAmount > 0, then gain
+            if ((isBalanceSheet && _adjustmentAmount > 0) || (!isBalanceSheet && _adjustmentAmount <= 0))
+            {
+                // Gain
+                trxTypeInfo = this.getTransactionTypeInformation(true);
+            }
+            else
+            {
+                // Loss
+                trxTypeInfo = this.getTransactionTypeInformation(false);
+            }
+
+            posting = conPeek(trxTypeInfo, 1);
+            currencyAccountType = conPeek(trxTypeInfo, 2);
+
+            // <GEERU>
+            boolean countryRegion_RU = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]);
+            LedgerDimensionAccount adjustedAccountDimension = _ledgerTransSettlementAdjustmentTmp.LedgerDimension;
+
+            CurrencyCode transactionCurrencyCode = _ledgerTransSettlementAdjustmentTmp.TransactionCurrencyCode;
+
+            if (countryRegion_RU)
+            {
+                RTax25ExchAdjDimension exchAdjDimension = new RTax25ExchAdjDimension();
+                LedgerCurrencyParameters_RU ledgerCurrencyParameters = LedgerCurrencyParameters_RU::findParameters(Ledger::current(), transactionCurrencyCode);
+                exchAdjDimension.setProfitIds(ledgerCurrencyParameters.rTax25ProfitTableProfit, ledgerCurrencyParameters.rTax25ProfitTableLoss);
+                exchAdjDimension.parmExchAdjType(RTax25ExchAdjDimension::postingType2AdjType(posting));
+                adjustedAccountDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(adjustedAccountDimension, exchAdjDimension.getDefaultDimension(LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(adjustedAccountDimension)));
+            }
+            // </GEERU>
+
+            AmountMST accountingCurrencyAdjustment;
+            AmountMSTSecondary reportingCurrencyAdjustment;
+
+            // Accounting currency and reporting currency adjustments will always be posted separately since they can vary independently.
+            if (_isAccountingCurrencyAdjustment)
+            {
+                accountingCurrencyAdjustment = _adjustmentAmount;
+                reportingCurrencyAdjustment = 0;
+            }
+            else
+            {
+                accountingCurrencyAdjustment = 0;
+                reportingCurrencyAdjustment = _adjustmentAmount;
+            }
+
+            CurrentOperationsTax postingLayer = _ledgerTransSettlementAdjustmentTmp.PostingLayer;
+
+            LedgerVoucherObject ledgerVoucherObject = _ledgerVoucher.findLedgerVoucherObject(
+                _voucher,
+                _settleDate,
+                postingLayer);
+
+            if (ledgerVoucherObject == null)
+            {
+                ledgerVoucherObject = LedgerVoucherObject::newVoucher(
+                    _voucher,
+                    _settleDate,
+                    SysModule::Ledger,
+                    LedgerTransType::LedgerSettlement);
+
+                ledgerVoucherObject.parmPostingLayer(postingLayer);
+
+                TransactionTextLarge transactionTxt = _settlementDescription;
+
+                ledgerVoucherObject.lastTransTxt(transactionTxt);
+
+                _ledgerVoucher.addVoucher(ledgerVoucherObject);
+            }
+
+            // Post to the account being adjusted
+            LedgerVoucherTransObject ledgerVoucherTransObject = LedgerVoucherTransObject::newAdjustmentDefault(
+                ledgerVoucherObject,
+                posting,
+                // <GEERU>
+                adjustedAccountDimension,
+                // </GEERU>
+                transactionCurrencyCode,
+                accountingCurrencyAdjustment,
+                reportingCurrencyAdjustment);
+
+            // The dimensions associated with this account being adjusted may no longer be valid
+            // according to current account rules, so skip dimension validation. For this process,
+            // posting is more important than validating dimensions.
+            ledgerVoucherTransObject.parmSkipDimensionValidation(true);
+
+            _ledgerVoucher.addTrans(ledgerVoucherTransObject);
+
+            // Post to the gain/loss account
+            LedgerDimensionDefaultAccount regLedgerDimension;
+
+            CurrencyCode adjCurrencyCode;
+
+            if (LedgerSettleProcessorExchAdjPostingProfileFlight::instance().isEnabled())
+            {
+                adjCurrencyCode = _ledgerTransSettlementAdjustmentTmp.TransactionCurrencyCode;
+            }
+            else
+            {
+                adjCurrencyCode = _adjustmentGainLossCurrencyCode;
+            }
+        
+            regLedgerDimension = this.getGainLossAccountFromPostingProfile(
+                adjCurrencyCode,
+                currencyAccountType,
+                LedgerDimensionFacade::getMainAccountIdFromLedgerDimension(adjustedAccountDimension));
+
+            if (regLedgerDimension == 0)
+            {
+                regLedgerDimension = this.getGainLossAccount(_companyInfoRecId, _adjustmentGainLossCurrencyCode, currencyAccountType);
+            }
+
+            LedgerDimensionAccount ledgerDimensionMerged = this.getMergedLedgerDim(regLedgerDimension, adjustedAccountDimension);
+
+            ledgerVoucherTransObject = LedgerVoucherTransObject::newAdjustmentDefault(
+                ledgerVoucherObject,
+                posting,
+                ledgerDimensionMerged,
+                transactionCurrencyCode,
+                -accountingCurrencyAdjustment,
+                -reportingCurrencyAdjustment);
+
+            // The default dimensions used with this account were taken from the account being
+            // adjusted. Since it could have dimensions that are no longer valid according to
+            // the current rules, skip dimension validation. For this process, posting is more
+            // important than validating dimensions.
+            ledgerVoucherTransObject.parmSkipDimensionValidation(true);
+
+            _ledgerVoucher.addTrans(ledgerVoucherTransObject);
+
+            // <GEERU>
+            _ledgerVoucher.bondLast2_RU();
+            // </GEERU>
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerTransSettleRecordsForPostedTrx</Name>
+				<Source><![CDATA[
+    private void createLedgerTransSettleRecordsForPostedTrx(
+        CompanyInfo _companyInfo,
+        MainAccountRecId _currMainAccountId,
+        Num _settleNum,
+        TransDate _settleDate,
+        Voucher _voucher,
+        ProcessScheduleSeriesName _automationRule)
+    {
+        GeneralJournalEntry generalJournalEntry;
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+
+        LedgerTransSettlement ledgerTransSettlement;
+        insert_recordset ledgerTransSettlement
+            (
+                SettleId,
+                TransRecId,
+                SettleDate,
+                DateProcessed,
+                AutomationRule,
+                Voucher
+            )
+        select _settleNum, RecId, _settleDate, _settleDate, _automationRule, _voucher from generalJournalAccountEntry
+            where generalJournalAccountEntry.MainAccount == _currMainAccountId
+            exists join generalJournalEntry
+                where  generalJournalEntry.RecId == generalJournalAccountEntry.GeneralJournalEntry
+                    && generalJournalEntry.SubledgerVoucher == _voucher
+                    && generalJournalEntry.SubledgerVoucherDataAreaId == _companyInfo.DataArea;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMergedLedgerDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the Merged ledger dimension account.
+    /// </summary>
+    /// <param name = "_regLedgerDimension">
+    /// The Register ledger dimension.
+    /// </param>
+    /// <param name = "_adjustedAccountDimension">
+    /// The Adjusted account dimension.
+    /// </param>
+    /// <returns>
+    /// The Merged ledger dimension account.
+    /// </returns>
+    protected LedgerDimensionAccount getMergedLedgerDim(LedgerDimensionDefaultAccount _regLedgerDimension, LedgerDimensionAccount _adjustedAccountDimension)
+    {
+        LedgerDimensionAccount ledgerDimMerged = LedgerDimensionFacade::serviceLedgerDimensionFromLedgerDims(
+            _regLedgerDimension,
+            _adjustedAccountDimension);
+
+        return ledgerDimMerged;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getGainLossAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the Adjustment gain and loss account.
+    /// </summary>
+    /// <param name = "_companyInfoRecId">
+    /// The Company info record id.
+    /// </param>
+    /// <param name = "_adjustmentGainLossCurrencyCode">
+    /// The Adjustment gain loss currency code.
+    /// </param>
+    /// <param name = "_currencyAccountType">
+    /// The Currency account type.
+    /// </param>
+    /// <returns>
+    /// The Ledger dimension account.
+    /// </returns>
+    protected LedgerDimensionDefaultAccount getGainLossAccount(CompanyInfoRecId _companyInfoRecId, CurrencyCode _adjustmentGainLossCurrencyCode, CurrencyGainLossAccountType _currencyAccountType)
+    {
+        LedgerDimensionDefaultAccount registerLedgerDimension = CurrencyLedgerGainLossAccount::ledgerDimension(
+            Ledger::primaryLedger(_companyInfoRecId),
+            _adjustmentGainLossCurrencyCode,
+            _currencyAccountType);
+
+        return registerLedgerDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getGainLossAccountFromPostingProfile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the Adjustment gain and loss account from posting profile.
+    /// </summary>
+    /// <param name = "_currencyCode">
+    /// The Adjustment gain loss currency code.
+    /// </param>
+    /// <param name = "_accountType">
+    /// The Currency account type.
+    /// </param>
+    /// <param name = "_accountNum">
+    /// The account number.
+    /// </param>
+    /// <returns>
+    /// The Ledger dimension account.
+    /// </returns>
+    protected LedgerDimensionDefaultAccount getGainLossAccountFromPostingProfile(
+        CurrencyCode _currencyCode,
+        CurrencyGainLossAccountType _accountType,
+        MainAccountNum _accountNum)
+    {
+        LedgerDimensionDefaultAccount registerLedgerDimension = LedgerExchAdjPosting::getLedgerDimensionFromParameters(
+                LedgerExchAdjPostingSearchParameters::newFromParameters(
+                    LedgerExchAdjPostingModule::GeneralLedger,
+                    _accountType,
+                    _currencyCode,
+                    _accountNum));
+
+        return registerLedgerDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSettlementAdjustmentCurrencyAccountTypeGain</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the <c>CurrencyGainLossAccountType</c> enumeration value for settlement gain adjustment.
+    /// </summary>
+    /// <returns>The <c>CurrencyGainLossAccountType</c> enumeration value for gain.</returns>
+    protected CurrencyGainLossAccountType getSettlementAdjustmentCurrencyAccountTypeGain()
+    {
+        return CurrencyGainLossAccountType::RealizedGain;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSettlementAdjustmentCurrencyAccountTypeLoss</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the <c>CurrencyGainLossAccountType</c> enumeration value for settlement loss adjustment.
+    /// </summary>
+    /// <returns>The <c>CurrencyGainLossAccountType</c> enumeration value for loss.</returns>
+    protected CurrencyGainLossAccountType getSettlementAdjustmentCurrencyAccountTypeLoss()
+    {
+        return CurrencyGainLossAccountType::RealizedLoss;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCurrentLegalEntityInCountryRegion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the current legal entity has any of the specified country codes.
+    /// </summary>
+    /// <param name="_isoCountryCodes">
+    /// A container that contains a list of ISO country codes.
+    /// </param>
+    /// <returns>
+    /// True if match is found; otherwise, false.
+    /// </returns>
+    protected boolean isCurrentLegalEntityInCountryRegion(container _isoCountryCodes)
+    {
+        return SysCountryRegionCode::isLegalEntityInCountryRegion(_isoCountryCodes);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

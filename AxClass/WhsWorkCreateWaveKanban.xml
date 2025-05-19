@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSWorkCreateWaveKanban</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+///    The <c>WHSWorkCreateWaveKanban</c> creates work for a kanban wave.
+/// </summary>
+[WHSWaveTemplateTypeFactoryAttribute(WHSWaveTemplateType::Kanban)]
+public class WhsWorkCreateWaveKanban extends WHSWorkCreateWave
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates the temporary work lines for the kanban job picking list pool.
+    /// </summary>
+    public void createTempTable()
+    {
+        WHSKanbanWaveLine           kanbanWaveLine;
+        WHSKanbanJobPickingListPool kanbanJobPickingListPool;
+        KanbanJobPickingListAll     kanbanJobPickingListAll;
+        WHSPoolKanbanJobPickingList whsPoolKanbanJobPickingList;
+        InventQty                   openWorkQty;
+        Qty                         workCreateQty;
+        InventTable                 inventTable;
+        InventDim                   inventDim;
+        InventTrans                 inventTrans;
+        InventTransOrigin           inventTransOrigin;
+        boolean                     lockResult = false;
+
+        if (!waveTable.WorkBuildId)
+        {
+            ttsbegin;
+
+            tmpWorkLine.WorkType             = WHSWorkType::Pick;
+            tmpWorkLine.OriginType           = WHSOriginType::Wave;
+            tmpWorkLine.OriginRefId          = waveTable.WaveId;
+            tmpWorkLine.WorkCreateId         = workCreateId;
+            tmpWorkLine.WaveAttributeCode    = waveTable.WaveAttributeCode;
+            tmpWorkLine.WorkTransType        = workTransType;
+            tmpWorkLine.WaveId               = waveTable.WaveId;
+            tmpWorkLine.RefTableId           = tableNum(KanbanJobPickingListAll);
+            tmpWorkLine.StartLocationId      = startLocationId;
+
+            this.setGlobals();
+
+            using (var waveLockManager = WHSWaveLockManager::newStandard())
+            {
+                while select DataAreaId, InventDimId, InventTransOrigin, StatusIssue, sum(Qty) from  inventTrans
+                    group by DataAreaId, InventDimId, InventTransOrigin, StatusIssue
+                    where (inventTrans.StatusIssue      == StatusIssue::ReservPhysical
+                    ||    inventTrans.StatusIssue       == StatusIssue::ReservOrdered
+                    ||    inventTrans.StatusIssue       == StatusIssue::OnOrder)
+                    &&    inventTrans.StatusReceipt     == StatusReceipt::None
+                        exists join inventTransOrigin
+                        where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                            join InventTransId, WaveId from kanbanWaveLine
+                            where kanbanWaveLine.InventTransId    == inventTransOrigin.InventTransId
+                            &&    kanbanWaveLine.WaveId           == waveTable.WaveId
+                {
+                    inventTransOrigin 		= InventTransOrigin::find(inventTrans.InventTransOrigin);
+                    kanbanJobPickingListAll     = KanbanJobPickingListAll::findInventTransId(inventTransOrigin.InventTransId, inventTrans.DataAreaId);
+                    kanbanJobPickingListPool    = WHSKanbanJobPickingListPool::find(kanbanJobPickingListAll.InventTransId, true);
+                
+                    // Try to get a lock on for item allocation.
+                    lockResult = waveLockManager.tryLockForItemDemandWaveAllocation(
+                                                        kanbanJobPickingListPool.ItemId,
+                                                        kanbanJobPickingListPool.InventDimId,
+                                                        waveTable.WaveId,
+                                                        WHSParameters::find().WaveLockWait);
+
+                    // If we get a lock then we can try to allocate.
+                    if (lockResult)
+                    {
+                        whsPoolKanbanJobPickingList = kanbanJobPickingListPool.whsPoolKanbanJobPickingList();
+                        inventTable = InventTable::find(kanbanJobPickingListPool.ItemId);
+                        inventDim   = inventTrans.inventDim();
+
+                        // Always set these values early so they can be used for work creation history.
+                        tmpWorkLine.InventDimId   = inventDim.InventDimId;
+                        tmpWorkLine.OrderNum      = kanbanJobPickingListAll.kanban().KanbanId;
+                        tmpWorkLine.RefRecId      = kanbanJobPickingListAll.kanbanJobPickingList().RecId;
+                        tmpWorkLine.InventTransId = kanbanJobPickingListAll.InventTransId;
+                        tmpWorkLine.ItemId        = kanbanJobPickingListAll.ItemId;
+
+                        // Only create work for reserved physical transactions.
+                        if (inventTrans.StatusIssue != StatusIssue::ReservPhysical)
+                        {
+                            WHSWorkCreateHistory::createWorkHistoryLineFromTmpWorkLine(workCreateId, "@WAX4686", true, tmpWorkLine);
+                        }
+                        else
+                        {
+                            openWorkQty = WHSPool::calcOpenAndFrozenWorkHandlingQty(kanbanJobPickingListAll.InventTransId, inventDim);
+
+                            if (-inventTrans.Qty > openWorkQty)
+                            {
+                                tmpWorkLine.PackingQty    = WHSInventTable::getDefaultPackingQty(kanbanJobPickingListAll.ItemId);
+
+                                // If the item is batch active, and batch is above location in the resrvation hierarchy, validate that the selected batch does not contain a disposition code making it unavailable for picking.
+                                if (inventDim.InventBatchId
+                                &&  WHSReservationHierarchyInventDimUtil::isBatchAboveLocation(inventTable)
+                                &&  !InventBatch::find(inventDim.InventBatchId, inventTable.ItemId).validateBatchDispCodeForPicking(workTransType))
+                                {
+                                    WHSWorkCreateHistory::createWorkHistoryLineFromTmpWorkLine(workCreateId, strFmt("@WAX5580", inventDim.InventBatchId), true, tmpWorkLine);
+                                }
+                                else
+                                {
+                                    workCreateQty = -inventTrans.Qty - openWorkQty;
+                                    this.createTempLine(tmpWorkLine, workCreateQty);
+
+                                    kanbanJobPickingListPool.WavedQty += this.parmWorkCreatedQty();
+                                    kanbanJobPickingListPool.update();
+                                }
+                            }
+                        }
+
+                        // Release the lock since we are done allocating this demand.
+                        waveLockManager.releaseForItemDemandWaveAllocation(kanbanJobPickingListPool.ItemId, kanbanJobPickingListPool.InventDimId);
+                    }
+                    else
+                    {
+                        throw error(strFmt("@WAX:WaveAllocationLockFailureError", kanbanJobPickingListPool.ItemId, kanbanJobPickingListPool.InventDimId, inventDim::find(kanbanJobPickingListPool.InventDimId), whsParameters.WaveLockWait));
+                    }
+                }
+            }
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    public void new(
+        Common          _common,
+        WHSWorkCreateId _workCreateId = '')
+    {
+        waveTable       = _common;
+        workCreateId    = _workCreateId ? _workCreateId : NumberSeq::newGetNum(WHSParameters::numRefWHSWorkCreateId()).num();
+        workTransType   = WHSWorkTransType::KanbanPick;
+
+        super(waveTable,workCreateId);
+
+        waveId = waveTable.WaveId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfSteps</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the total number of steps for the wave.
+    /// </summary>
+    /// <returns>
+    ///    The total number of steps.
+    /// </returns>
+    protected int numberOfSteps()
+    {
+        WHSKanbanWaveLine           kanbanWaveLine;
+        InventTrans                 inventTrans;
+        InventTransOrigin           inventTransOrigin;
+
+        select count(RecId) from inventTrans
+            group by DataAreaId, InventDimId, InventTransOrigin, StatusIssue
+            where (inventTrans.StatusIssue      == StatusIssue::ReservPhysical
+            ||    inventTrans.StatusIssue       == StatusIssue::ReservOrdered
+            ||    inventTrans.StatusIssue       == StatusIssue::OnOrder)
+            &&    inventTrans.StatusReceipt     == StatusReceipt::None
+                exists join inventTransOrigin
+                where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                    exists join kanbanWaveLine
+                    where kanbanWaveLine.InventTransId    == inventTransOrigin.InventTransId
+                    &&    kanbanWaveLine.WaveId           == waveTable.WaveId;
+
+        return int642int(inventTrans.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLocationByWorkCell</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the warehouse location for a kanban job picking list.
+    /// </summary>
+    /// <param name="_inventTransId">
+    ///    The inventory transaction ID of the picking list.
+    /// </param>
+    /// <param name="_kanbanId">
+    ///    The kanban ID of the picking list.
+    /// </param>
+    /// <returns>
+    ///    The work cell input warehouse location.
+    /// </returns>
+    public static WMSLocationId getLocationByWorkCell(
+        InventTransId   _inventTransId,
+        KanbanId        _kanbanId)
+    {
+        KanbanJobPickingListAll     kanbanJobPickingListAll;
+        KanbanJob                   kanbanJob;
+        InventTrans                 inventTrans;
+
+        if (_inventTransId)
+        {
+            kanbanJobPickingListAll = KanbanJobPickingListAll::findInventTransId(_inventTransId, inventTrans.DataAreaId);
+            kanbanJob               = kanbanJobPickingListAll.kanbanJob();
+        }
+        else
+        {
+            kanbanJob = Kanban::findKanbanId(_kanbanId).firstKanbanJob();
+        }
+
+        WMSLocationId	wmsLocationId;
+
+        if (kanbanJob.Type == LeanKanbanJobType::Transfer)
+        {
+            wmsLocationId = kanbanJob.planActivity().issueLocation().WMSLocationId;
+        }
+        else
+        {
+            wmsLocationId = kanbanJob.wrkCtrResourceGroup().InputWMSLocationId;
+        }
+
+        return wmsLocationId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

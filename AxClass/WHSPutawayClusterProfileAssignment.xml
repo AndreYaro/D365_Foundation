@@ -1,0 +1,522 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSPutawayClusterProfileAssignment</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WHSPutawayClusterProfileAssignment</c> class manages the assignment of work to a putaway cluster profile and to clusters within the assigned profile.
+/// </summary>
+public final class WHSPutawayClusterProfileAssignment
+{
+    private WHSWorkId               workId;
+    private WHSClusterProfileName   assignedClusterProfileName;
+    private WHSClusterId            assignedClusterId;
+    private boolean                 mustPromptForClusterId;
+    private boolean                 workHeaderHasConsecutivePutlines = false;
+
+    private WHSInstrumentationLogger    instrumentationLogger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>assignClusterProfile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns the first valid cluster profile to the work header.
+    /// </summary>
+    /// <returns>
+    /// The putaway cluster profile that is assigned to the work.
+    /// </returns>
+    private WHSClusterProfile assignClusterProfile()
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().assignClusterProfile())
+        {
+            int         clusterProfileCount;
+            WHSWorkLine putWorkLine;
+
+            select firstOnly putWorkLine
+                order by LineNum desc
+                where putWorkLine.WorkId    == workId
+                &&    putWorkLine.WorkType  == WHSWorkType::Put;
+
+            WHSWorkTable workTable = putWorkLine.whsWorkTable();
+    
+            WHSClusterProfile clusterProfile;
+            WHSPutawayClusterWorkTemplate clusterWorkTemplate;
+
+            while select clusterProfile
+                order by clusterProfile.SequenceNumber
+                where (clusterProfile.UnitRestriction == putWorkLine.UnitId
+                ||     !clusterProfile.UnitRestriction)
+                exists join clusterWorkTemplate
+                    where clusterWorkTemplate.ClusterProfileId == clusterProfile.ClusterProfileId
+                    &&    ((clusterWorkTemplate.WorkTemplateCode    == workTable.WorkTemplateCode
+                    &&      clusterWorkTemplate.WorkTransType       == workTable.WorkTransType)
+                    ||     !clusterWorkTemplate.WorkTemplateCode)
+            {
+                clusterProfileCount++;
+
+                this.instrumentationLogger().logRecordInformation(clusterProfile);
+
+                if (this.validateClusterProfileFilter(clusterProfile, putWorkLine))
+                {
+                    ttsbegin;
+    
+                    workTable = putWorkLine.whsWorkTable(true);
+
+                    workTable.ClusterProfileId = clusterProfile.ClusterProfileId;
+                    workTable.update();
+    
+                    assignedClusterProfileName = clusterProfile.ClusterProfileName;
+    
+                    ttscommit;
+    
+                    if (clusterProfile.PutawayClusterLocate != WHSPutawayClusterLocate::Receipt)
+                    {
+                        this.clearPutLocations();
+                    }
+    
+                    break;
+                }
+            }
+    
+            this.instrumentationLogger().clusterPutawayActivities().assignedClusterProfile(activityContext, clusterProfileCount, clusterProfile.RecId != 0);
+
+            return clusterProfile;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignPutawayClusterProfile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns a cluster profile to the work header and auto assigns or creates a cluster as needed.
+    /// </summary>
+    [Hookable(false)]
+    public final void assignPutawayClusterProfile()
+    {
+        if (appl.ttsLevel() == 0)
+        {
+            throw error(strFmt("@SCM:TransactionExpected", funcName()));
+        }
+
+        mustPromptForClusterId      = false;
+        assignedClusterProfileName  = '';
+        assignedClusterId           = '';
+
+        // Determine if the work header meets the conditions to be added to a cluster
+        if (!this.validateWorkHeader())
+        {
+            return;
+        }
+
+        // Determine the cluster profile to assign
+        WHSClusterProfile clusterProfile = this.assignClusterProfile();
+
+        // If Cluster profile is not found, throw error.
+        if (!clusterProfile)
+        {
+            throw error("@WAX:ClusterProfileCouldNotBeFoundCheckConfiguration");
+        }
+        
+        // If auto assigning is on for the profile, then try to assign the work to an open cluster.
+        if (clusterProfile.PutawayClusterAssignmentTiming == WHSPutawayClusterAssignmentTiming::Receipt)
+        {
+            if (clusterProfile.PutawayClusterAssignmentRule == WHSPutawayClusterAssignmentRule::Automatic)
+            {
+                assignedClusterId = this.autoAssignWorkToOpenCluster(clusterProfile);
+            }
+
+            if (!assignedClusterId)
+            {
+                // If work could not be auto assigned to a cluster and cluster ID generation is not turned on
+                // then we must prompt the user for a new cluster Id.
+                mustPromptForClusterId = true;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>autoAssignWorkToOpenCluster</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Assigns the work header to an existing open cluster, or generates a new cluster.
+    /// </summary>
+    /// <param name="_putawayClusterProfile">
+    /// The <c>WHSClusterProfile</c> of the work header.
+    /// </param>
+    /// <returns>
+    /// The cluster Id that the work was assigned to.
+    /// </returns>
+    private WHSClusterId autoAssignWorkToOpenCluster(WHSClusterProfile _putawayClusterProfile)
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().autoAssignWorkToOpenCluster())
+        {
+            boolean newClusterGenerated;
+            ttsbegin;
+
+            WHSWorkTable workTable = WHSWorkTable::find(workId);
+
+            WHSClusterId clusterId = this.findExistingOpenCluster(_putawayClusterProfile, workTable);
+    
+            if (!clusterId && _putawayClusterProfile.GenerateClusterId)
+            {
+                // Create a new cluster for the cluster profile.
+                clusterId = NumberSeq::newGetNum(WHSParameters::numRefWHSClusterId()).num();
+                WHSWorkClusterTable::createWorkClusterTable(clusterId,
+                                                            _putawayClusterProfile.ClusterProfileId);
+                   
+                // Add the work to the new cluster.
+                WHSWorkClusterLine::createWorkClusterLine(clusterId, workTable.WorkId, workTable.TargetLicensePlateId);
+                
+                newClusterGenerated = true;
+            }
+    
+            ttscommit;
+    
+            this.instrumentationLogger().clusterPutawayActivities().autoAssignedWorkToOpenCluster(activityContext, clusterId != '', newClusterGenerated);
+
+            return clusterId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findExistingOpenCluster</Name>
+				<Source><![CDATA[
+    private WHSClusterId findExistingOpenCluster(WHSClusterProfile _putawayClusterProfile, WHSWorkTable _workTable)
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().findExistingOpenCluster())
+        {
+            WHSClusterId clusterId;
+
+            WHSWorkClusterTable workClusterTable;
+            WHSWorkTable        clusteredWork;
+            WHSWorkClusterLine  workClusterLine;
+
+            int                 openClusterCount;
+
+            // See if there are any existing clusters the work can be assigned to.
+            while select workClusterTable
+                where workClusterTable.WorkClusterStatus    == WHSWorkClusterStatus::Open
+                &&    workClusterTable.ClusterType          == WHSClusterType::Putaway
+                &&    workClusterTable.ClusterProfileId     == _putawayClusterProfile.ClusterProfileId
+                exists join workClusterLine
+                    where workClusterLine.ClusterId == workClusterTable.ClusterId
+                exists join clusteredWork
+                    where clusteredWork.WorkId          == workClusterLine.WorkId
+                    &&    (clusteredWork.WorkCreatedBy  == _workTable.WorkCreatedBy
+                    ||     !_putawayClusterProfile.PutawayClusterPerUser)
+            {
+                openClusterCount++;
+
+                this.instrumentationLogger().logRecordInformation(workClusterTable);
+
+                if (this.validateClusterWorkTransType(workClusterTable,  _workTable.WorkTransType, _putawayClusterProfile))
+                {
+                    WHSWorkClusterLine::createWorkClusterLine(workClusterTable.ClusterId, _workTable.WorkId, _workTable.TargetLicensePlateId);
+    
+                    clusterId = workClusterTable.ClusterId;
+                    break;
+                }
+            }
+
+            this.instrumentationLogger().clusterPutawayActivities().foundExistingOpenCluster(activityContext, openClusterCount, clusterId != '');
+
+            return clusterId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateClusterWorkTransType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates if the workTransType is valid for the work cluster.
+    /// </summary>
+    /// <param name="_clusterTable">
+    /// The cluster being validated.
+    /// </param>
+    /// <param name="_workTransType">
+    /// The  work type being validated.
+    /// </param>
+    /// <param name="_putawayClusterProfile">
+    /// The cluster profile assiciated with the cluster.
+    /// </param>
+    /// <returns>
+    /// true if the work type is the same as all work associated to the cluster; otherwise, false.
+    /// </returns>
+    private boolean validateClusterWorkTransType(
+        WHSWorkClusterTable _clusterTable,
+        WHSWorkTransType    _workTransType,
+        WHSClusterProfile   _putawayClusterProfile)
+    {
+        WHSWorkTable workTable;
+
+        if (_putawayClusterProfile.WorkUnitBreak == WHSWorkUnitBreak::Consolidate)
+        {
+            WHSWorkClusterLine workClusterLine;
+
+            // Check for a workTable associated to this cluster that is a different work trans type.
+            select firstOnly RecId from workTable
+                where workTable.WorkTransType != _workTransType
+                    exists join workClusterLine
+                    where workClusterLine.WorkId    == workTable.WorkId
+                    &&    workClusterLine.ClusterId == _clusterTable.ClusterId;
+        }
+    
+        return workTable.RecId == 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearPutLocations</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Clears location and sums put work lines if deferred locating.
+    /// </summary>
+    private void clearPutLocations()
+    {
+        ttsbegin;
+
+        WHSWorkLine workLine;
+        WHSWorkLine tmpWorkLine;
+    
+        while select forUpdate workLine
+            order by LineNum desc
+            where workLine.WorkId == workId
+        {
+            // If not a put, done
+            if (workLine.WorkType != WHSWorkType::Put)
+            {
+                break;
+            }
+    
+            // If previous put, roll into current work line
+            if (tmpWorkLine.WorkId)
+            {
+                workLine.QtyWork            += tmpWorkLine.QtyWork;
+                workLine.QtyRemain          += tmpWorkLine.QtyRemain;
+                workLine.InventQtyRemain    += tmpWorkLine.InventQtyRemain;
+                workLine.InventQtyWork      += tmpWorkLine.InventQtyWork;
+    
+                if (workLine.UnitId != tmpWorkLine.UnitId)
+                {
+                    workLine.UnitId     = WHSCatchWeightHelper::inventHandlingUnitId(workLine.ItemId);
+                    workLine.QtyWork    = workLine.InventQtyWork;
+                    workLine.QtyRemain  = workLine.InventQtyRemain;
+                }
+            }
+    
+            workLine.WMSLocationId = '';
+            workLine.update();
+              
+            buf2Buf(workLine, tmpWorkLine);
+        }
+    
+        delete_from workLine
+            where workLine.WorkId   == workId
+            &&    workLine.LineNum   > tmpWorkLine.LineNum;
+    
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateWorkHeader</Name>
+				<Source><![CDATA[
+    private boolean validateWorkHeader()
+    {
+        // A work header cannot have consecutive putlines as the framework for registerning cluster puts does not allow it. 
+        if (WHSWorkTable::workTableHasConsecutivePutLines(workId))
+        {
+            workHeaderHasConsecutivePutlines = true;
+            return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateClusterProfileFilter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the cluster profile's filter criteria is met for the workLine.
+    /// </summary>
+    /// <param name="_clusterProfile">
+    /// The cluster profile being evaluated.
+    /// </param>
+    /// <param name="_putWorkLine">
+    /// The final put work line of the work we are determining the cluster profile for.
+    /// </param>
+    /// <returns>
+    /// true if the cluster profile filter criteria is met; otherwise, false.
+    /// </returns>
+    private boolean validateClusterProfileFilter(
+        WHSClusterProfile   _clusterProfile,
+        WHSWorkLine         _putWorkLine)
+    {
+        using (var activityContext = this.instrumentationLogger().clusterPutawayActivities().validateClusterProfileFilter())
+        {
+            var query = new query(_clusterProfile.PackedQueryRun);
+    
+            SysQuery::findOrCreateRange(query.dataSourceTable(tableNum(WHSWorkLine)), fieldNum(WHSWorkLine, RecId)).value(queryValue(_putWorkLine.RecId));
+    
+            var qr = new QueryRun(query);
+
+            qr.query().firstOnly1(true);
+
+            boolean isValidClusterProfile = qr.next();
+
+            this.instrumentationLogger().clusterPutawayActivities().validatedClusterProfileFilter(activityContext, isValidClusterProfile);
+
+            return isValidClusterProfile;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clusterAssignmentInfoLog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gives an infolog message for cluster assignment to be used on the RF.
+    /// </summary>
+    /// <returns>
+    /// An infolog message with automatic cluster assignment information.
+    /// </returns>
+    [Hookable(false)]
+    public final InfologText clusterAssignmentInfoLog()
+    {
+        InfologText ret;
+    
+        if (workId && assignedClusterId)
+        {
+            ret = strFmt("@WAX:WorkAssignedClusterPutaway", workId, WHSWorkTable::find(workId).TargetLicensePlateId, assignedClusterId);
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clusterAssignmentError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gives an infolog error message for cluster assignment to be used on the RF.
+    /// </summary>
+    /// <returns>
+    /// An infolog error message with automatic cluster assignment information.
+    /// </returns>
+    [Hookable(false)]
+    internal final InfologText clusterAssignmentError()
+    {
+        InfologText ret;
+    
+        if (workId && !assignedClusterId && workHeaderHasConsecutivePutlines)
+        {
+            ret = strFmt("@WAX:ClusterAssignmentNotSupportedConsecutivePutlines", workId);
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustPromptForClusterId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Whether or not we should we prompt for cluster ID.
+    /// </summary>
+    /// <returns>true if we should prompt; false, otherwise</returns>
+    [Hookable(false)]
+    public final boolean mustPromptForClusterId()
+    {
+        return mustPromptForClusterId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>profileAssignmentInfoLog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gives an infolog message for putaway cluster profile assignment to be used on the RF.
+    /// </summary>
+    /// <returns>
+    /// An infolog message with putaway cluster profile assignment information.
+    /// </returns>
+    [Hookable(false)]
+    public final InfologText profileAssignmentInfoLog()
+    {
+        InfologText ret;
+    
+        if (workId && assignedClusterProfileName)
+        {
+            ret = strFmt("@WAX:WorkSortedClusterPutaway", workId, WHSWorkTable::find(workId).TargetLicensePlateId, assignedClusterProfileName);
+        }
+    
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    private void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructPutawayClusterAssignment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of class <c>WHSPutawayClusterProfileAssignment</c>
+    /// </summary>
+    /// <param name="_workId">
+    /// The work ID of the work header to be assigned a cluster profile.
+    /// </param>
+    /// <returns>The created instance.</returns>
+    [Hookable(false)]
+    public static WHSPutawayClusterProfileAssignment constructPutawayClusterAssignment(WHSWorkId _workId)
+    {
+        WHSPutawayClusterProfileAssignment putawayClusterAssignment = new WHSPutawayClusterProfileAssignment();
+        putawayClusterAssignment.workId = _workId;
+        return putawayClusterAssignment;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    private WHSInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = WHSInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

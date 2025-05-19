@@ -1,0 +1,635 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WrkCtrScheduler_PmfSeq</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WrkCtrScheduler_PmfSeq</c> class is a processor that is in charge of loading sequenced planned
+/// production orders information and feeding them to the scheduling engine.
+/// Only one order should be loaded at a time.
+/// </summary>
+/// <remarks>
+/// It also writes the results provided by the scheduling engine back to the sequencing tables.
+/// </remarks>
+class WrkCtrScheduler_PmfSeq extends WrkCtrScheduler_Req
+{
+    PMFSequencingRoute      refOpr;
+    boolean                 refOprSeen;
+    utcDateTime             refOprMinStartDateTime;
+    SchedMethod             origReqPoSchedMethod;
+
+    ReqRoute                currentReqRoute;
+
+    Map                     operationJobs;              // Map<ReqRouteJob.RecId,ReqRoute.RecId>
+    Map                     operationRecords;           // Map<ReqRoute.RecId,record:PmfSeqReqRouteChanges>
+    Map                     prevResources;              // Map<keyRoute(),WrkCtrId>
+
+    RecordInsertList        seqCapResInsertList;        // RecordInsertList<PmfSeqWrkCtrCapRes>
+
+    #define.ConstraintLevelForwardBackward(1)
+    #define.ConstraintLevelFallbackAllForward(0)
+    #define.ConstraintLevelSequencingBucket(0)
+
+    #define.JobPriorityReferenceOperation(2)
+    #define.JobPriorityReferenceOperationParalellJobs(1)
+    #define.JobPriorityRefPredecessors(-1)
+    #define.JobPriorityRefSuccessors(-2)
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addToUpdatedOrdersMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds a new order to the map of updated orders.
+    /// </summary>
+    /// <param name="_wrkCtrParmSchedule">
+    /// A <c>WrkCtrParmSchedule</c> table buffer that contains all the scheduling parameters needed for
+    /// scheduling the order.
+    /// </param>
+    /// <param name="_order">
+    /// The order to add.
+    /// </param>
+    /// <param name="_bomCalcData">
+    /// The BOM data to add.
+    /// </param>
+    protected void addToUpdatedOrdersMap(WrkCtrParmSchedule             _wrkCtrParmSchedule,
+                                         Common                         _order,
+                                         BOMCalcData                    _bomCalcData)
+    {
+        ReqTrans    reqTrans    = _order as ReqTrans;
+        ReqPO       reqPo       = reqTrans.getReqPo(reqPlanData);
+        origReqPoSchedMethod    = reqPo.SchedMethod;
+
+        super(_wrkCtrParmSchedule, _order, _bomCalcData);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>flushCachedSaveData</Name>
+				<Source><![CDATA[
+        public void flushCachedSaveData()
+    {
+        seqCapResInsertList.insertDatabase();
+        this.writeAllCapacityReservationProperties();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPrevResourceAssignedToOpr</Name>
+				<Source><![CDATA[
+        private WrkCtrId getPrevResourceAssignedToOpr(str _keyRoute)
+    {
+        WrkCtrId        resourceId = '';
+
+        if (prevResources.exists(_keyRoute))
+        {
+            resourceId = prevResources.lookup(_keyRoute);
+        }
+
+        return resourceId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initPrevResources</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Collects information about which resources are currently assigned to which operations,
+    /// based on capacity reservations.
+    /// </summary>
+    /// <param name="_schedMethod">
+    /// The scheduling method currently being used.
+    /// </param>
+    private void initPrevResources(SchedMethod _schedMethod)
+    {
+        WrkCtrCapRes    wrkCtrCapRes;
+
+        prevResources = new Map(Types::String, Types::String);
+
+        if (_schedMethod == SchedMethod::Rough)
+        {
+            while select RefId, OprNum, OprPriority, WrkCtrId
+                from wrkCtrCapRes
+                group by RefId, OprNum, OprPriority, WrkCtrId
+                where  wrkCtrCapRes.PlanVersion == refOpr.reqRoute().PlanVersion
+                    && wrkCtrCapRes.RefId       == refOpr.reqRoute().RefId
+                    && wrkCtrCapRes.RefType     == WrkCtrCapRefType::PlannedOrder
+            {
+                prevResources.insert(this.keyRoute(wrkCtrCapRes.RefId, wrkCtrCapRes.OprNum, wrkCtrCapRes.OprPriority), wrkCtrCapRes.WrkCtrId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertJobAndConstraints</Name>
+				<Source><![CDATA[
+        protected container insertJobAndConstraints(RouteJobMap                    _routeJobMap,
+                                                WrkCtrParmSchedule             _wrkCtrParmSchedule,
+                                                ProdUnitId                     _prodUnitId,
+                                                InventLocationIdInput          _inputWarehouse,
+                                                Map                            _requirementProperties,
+                                                Map                            _jobTimes,
+                                                WrkCtrActivityRequirementSet   _wrkCtrActivityRequirementSet,
+                                                OprNum                         _oprNumNext,
+                                                ProdJobType                    _prodJobType,
+                                                RouteGroup                     _routeGroup,
+                                                WrkCtrSchedulerGoal            _goal,
+                                                boolean                        _useFastSetup,
+                                                real                           _jobTimeForAllResources,
+                                                recId                          _jobNumPrev,
+                                                Map                            _mapJobNumPrevNumPrimSec,
+                                                List                           _resourceList,
+                                                boolean                        _isFirstJob,
+                                                RouteJobType                   _jobTypePrev,
+                                                SchedJobLink                   _primaryLink,
+                                                SchedJobLinkType               _primaryLinkType,
+                                                recId                          _jobNumFirst,
+                                                RecId                          _primaryParallelJobRecId = 0)
+    {
+        List        newResourceList = _resourceList;
+        Map         newJobTimes     = _jobTimes;
+
+        RecId       jobId;
+        WrkCtrId    currentReqRouteResource;
+        WrkCtrId    resourceId;
+        container   result;
+
+        // keep previous resource assignments
+        resourceId = '';
+        if (_wrkCtrParmSchedule.schedMethod() == SchedMethod::Detail)
+        {
+            // in job scheduling, keep the specific resource
+            resourceId = _routeJobMap.WrkCtrId;
+        }
+        else
+        {
+            // in operation scheduling, force keeping the resource assignment only if it is a group
+            // (important for capability requirements, skill requirements, etc.)
+            // in case a specific resource requirement is given, the assignemnt will be kept anyway
+            currentReqRouteResource = this.getPrevResourceAssignedToOpr(this.keyRoute(_routeJobMap.RefId, _routeJobMap.OprNum, _routeJobMap.OprPriority));
+            if (WrkCtrResourceGroup::findWrkCtrId(currentReqRouteResource).RecId != 0)
+            {
+                resourceId = currentReqRouteResource;
+            }
+        }
+
+        if (resourceId != '' && _jobTimes.exists(resourceId))
+        {
+            newResourceList = new List(_resourceList.typeId());
+            newResourceList.addEnd(resourceId);
+
+            newJobTimes = new Map(_jobTimes.keyType(), _jobTimes.valueType());
+            newJobTimes.insert(resourceId, _jobTimes.lookup(resourceId));
+        }
+
+        result = super(
+                    _routeJobMap,
+                    _wrkCtrParmSchedule,
+                    _prodUnitId,
+                    _inputWarehouse,
+                    _requirementProperties,
+                    newJobTimes,
+                    _wrkCtrActivityRequirementSet,
+                    _oprNumNext,
+                    _prodJobType,
+                    _routeGroup,
+                    _goal,
+                    _useFastSetup,
+                    _jobTimeForAllResources,
+                    _jobNumPrev,
+                    _mapJobNumPrevNumPrimSec,
+                    newResourceList,
+                    _isFirstJob,
+                    _jobTypePrev,
+                    _primaryLink,
+                    _primaryLinkType,
+                    _jobNumFirst,
+                    _primaryParallelJobRecId);
+
+        jobId = _routeJobMap.RecId;
+
+        operationJobs.insert(jobId, currentReqRoute.RecId);
+
+        if (!PmfSequencingWithOverlapFlight::instance().isEnabled() || _routeJobMap.JobType != RouteJobType::Overlap)
+        {
+            // emit direction and bind priority constraints
+            if (_routeJobMap.OprNum == refOpr.reqRoute().OprNum)
+            {
+                refOprSeen = true;
+
+                if (_routeJobMap.OprPriority == RouteOprPriority::Primary)
+                {
+                    scheduleEngine.addJobGoal(jobId, #ConstraintLevelForwardBackward, WrkCtrSchedulerGoal::EarliestEndTime);
+                    scheduleEngine.addJobBindPriority(jobId, #ConstraintLevelForwardBackward, #JobPriorityReferenceOperation);
+
+                    // if scheduling around the reference operation fails (constraint level 1),
+                    // the whole route is scheduled forward, but the reference operation still needs to
+                    // start no sooner than the given minimum start date and time (constraint level 0).
+                    scheduleEngine.addConstraintJobStartsAt(jobId, #ConstraintLevelFallbackAllForward, refOprMinStartDateTime);
+
+                    // emit sequencing bucket constraints only for the sequenced operation
+                    scheduleEngine.addConstraintJobStartsAt(jobId, #ConstraintLevelSequencingBucket, refOpr.parmMinDateTime());
+                    scheduleEngine.addConstraintJobEndsAt(jobId, #ConstraintLevelSequencingBucket, refOpr.parmMaxDateTime());
+                }
+                else
+                {
+                    scheduleEngine.addJobBindPriority(jobId, #ConstraintLevelForwardBackward, #JobPriorityReferenceOperationParalellJobs);
+                }
+            }
+            else
+            {
+                // due to the constraint that the routes have to be linear,
+                // it can be assumed that all jobs added before the reference operation jobs
+                // are successors, and all jobs added after are predecessors
+                if (refOprSeen)
+                {
+                    scheduleEngine.addJobGoal(jobId, #ConstraintLevelForwardBackward, WrkCtrSchedulerGoal::LatestStartTime);
+                    scheduleEngine.addJobBindPriority(jobId, #ConstraintLevelForwardBackward, #JobPriorityRefPredecessors);
+                }
+                else
+                {
+                    scheduleEngine.addJobGoal(jobId, #ConstraintLevelForwardBackward, WrkCtrSchedulerGoal::EarliestEndTime);
+                    scheduleEngine.addJobBindPriority(jobId, #ConstraintLevelForwardBackward, #JobPriorityRefSuccessors);
+                }
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertWrkCtrCapResUsingInsertList</Name>
+				<Source><![CDATA[
+        protected void insertWrkCtrCapResUsingInsertList(WrkCtrCapRes _wrkCtrCapRes)
+    {
+        PMFSeqWrkCtrCapRes seqCapRes;
+
+        seqCapRes.LoadType      = _wrkCtrCapRes.LoadType;
+        seqCapRes.TransDate     = _wrkCtrCapRes.TransDate;
+        seqCapRes.PlanVersion   = _wrkCtrCapRes.PlanVersion;
+        seqCapRes.PropertyId    = _wrkCtrCapRes.PropertyId;
+        seqCapRes.JobId         = _wrkCtrCapRes.JobId;
+        seqCapRes.JobType       = _wrkCtrCapRes.JobType;
+        seqCapRes.Locked        = _wrkCtrCapRes.Locked;
+        seqCapRes.OprNum        = _wrkCtrCapRes.OprNum;
+        seqCapRes.RefId         = _wrkCtrCapRes.RefId;
+        seqCapRes.RefType       = _wrkCtrCapRes.RefType;
+        seqCapRes.WrkCtrLoadPct = _wrkCtrCapRes.WrkCtrLoadPct;
+        seqCapRes.WrkCtrId      = _wrkCtrCapRes.WrkCtrId;
+        seqCapRes.WrkCtrSec     = _wrkCtrCapRes.WrkCtrSec;
+        seqCapRes.OprPriority   = _wrkCtrCapRes.OprPriority;
+        seqCapRes.EndTime       = _wrkCtrCapRes.EndTime;
+        seqCapRes.StartTime     = _wrkCtrCapRes.StartTime;
+        seqCapRes.IntvQr        = _wrkCtrCapRes.IntvQr;
+        seqCapRes.IntvMth       = _wrkCtrCapRes.IntvMth;
+        seqCapRes.IntvWk        = _wrkCtrCapRes.IntvWk;
+        seqCapRes.OrigJobRecId  = _wrkCtrCapRes.OrigJobRecId;
+        seqCapRes.Timestamp     = _wrkCtrCapRes.Timestamp;
+
+        seqCapResInsertList.add(seqCapRes);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadJobsDetail</Name>
+				<Source><![CDATA[
+        protected container loadJobsDetail(WrkCtrParmSchedule _wrkCtrParmSchedule, Common _order, BOMCalcData _bomCalcData, RouteMap _routeMap, InventSiteId _siteId, Common _orderNext, BOMLevel _startCollectRefLevel, BOMLevel _maxCollectRefLevel, RecId _jobNumNextOprFirst, RecId _jobNumNextOprLast)
+    {
+        currentReqRoute = _routeMap;
+
+        return super(
+                   _wrkCtrParmSchedule,
+                   _order,
+                   _bomCalcData,
+                   _routeMap,
+                   _siteId,
+                   _orderNext,
+                   _startCollectRefLevel,
+                   _maxCollectRefLevel,
+                   _jobNumNextOprFirst,
+                   _jobNumNextOprLast);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadOrder</Name>
+				<Source><![CDATA[
+        protected void loadOrder(WrkCtrParmSchedule _wrkCtrParmSchedule,
+                             Common             _common)
+    {
+        this.initPrevResources(_wrkCtrParmSchedule.schedMethod());
+        super(_wrkCtrParmSchedule, _common);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>requirementsAllowFastSetup</Name>
+				<Source><![CDATA[
+        protected boolean requirementsAllowFastSetup(Map _requirements)
+    {
+        // not using fast setup, since the applicable resources may have to be modified
+        // to keep previous resource assignments
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Performs a scheduling run.
+    /// </summary>
+    /// <param name="_referenceOperation">
+    /// A <c>PMFSequencingRoute</c> representing the reference operation to schedule the route around.
+    /// </param>
+    /// <param name="_minStartDateTime">
+    /// The minimum start date and time of the reference operation, without time zone information.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// Thrown if a reference operation is not passed to this method.
+    /// </exception>
+    public void run(
+        PMFSequencingRoute      _referenceOperation = null,
+        utcDateTime             _minStartDateTime   = DateTimeUtil::newDateTime(reqPlanData.todaysdate(), 0))
+    {
+        if (_referenceOperation == null)
+        {
+            throw error(strFmt("@SYS22828", funcName()));
+        }
+
+        refOpr                  = _referenceOperation;
+        refOprMinStartDateTime  = _minStartDateTime;
+        operationJobs           = new Map(Types::Int64, Types::Int64);
+        refOprSeen              = false;
+
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveJobs</Name>
+				<Source><![CDATA[
+        protected void saveJobs()
+    {
+        seqCapResInsertList = new RecordInsertList(tableNum(PMFSeqWrkCtrCapRes));
+        jobCapResProperties = new Map(Types::Int64, Types::Container);
+
+        try
+        {
+            ttsBegin;
+
+            this.onSaveJobsStart();
+
+            timestamp = WrkCtrScheduler::incrementWrkCtrCapResTimestampUsingConnection();
+
+            scheduleEngine.setReservationsTimeStamp(timestamp);
+
+            scheduleEngine.writeScheduledData();
+            this.flushCachedSaveData();
+
+            this.onSaveJobsDone();
+
+            ttsCommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            if (ReqTransientSqlConnectionErrorHandlingHelper::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveOperation</Name>
+				<Source><![CDATA[
+        protected void saveOperation(WrkCtrParmSchedule _wrkCtrParmSchedule,
+                                 Common             _reqRoute,
+                                 container          _operationData)
+    {
+        ReqRoute                reqRoute = _reqRoute as ReqRoute;
+        PMFSeqReqRouteChanges   seqReqRoute;
+        boolean                 isRefOperation;
+        SchedFromDate           fromDate;
+        SchedFromTime           fromTime;
+        SchedToDate             toDate;
+        SchedToTime             toTime;
+
+        [fromDate, fromTime, toDate, toTime] = _operationData;
+
+        if (_wrkCtrParmSchedule.schedMethod() == SchedMethod::Rough)
+        {
+            fromTime = 0;
+            toTime   = 0;
+        }
+
+        isRefOperation = _reqRoute.RecId == refOpr.reqRoute().RecId;
+
+        if (isRefOperation)
+        {
+            seqReqRoute = refOpr.parmReqRouteChange();
+        }
+        else
+        {
+            seqReqRoute.initFromReqRoute(_reqRoute);
+        }
+
+        seqReqRoute.NewFromDateTime = DateTimeUtil::newDateTime(fromDate, fromTime);
+        seqReqRoute.NewToDateTime   = DateTimeUtil::newDateTime(toDate,   toTime);
+
+        if (isRefOperation)
+        {
+            seqReqRoute.setAction();
+        }
+
+        seqReqRoute.insert();
+
+        // signal that there is a result from this order
+        mapOrderData.insert(_wrkCtrParmSchedule.schedNumId(), conNull());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveOrder</Name>
+				<Source><![CDATA[
+        protected void saveOrder(WrkCtrParmSchedule _wrkCtrParmSchedule, Common _reqTrans, container _orderData)
+    {
+        ReqTrans            reqTrans    = _reqTrans as ReqTrans;
+        ReqPO               reqPO       = reqTrans.getReqPo(reqPlanData, true);
+        boolean             updateOrder = false;
+
+        // jobs still get created for operation scheduling, and need to be cleaned up
+        if (    this.capacityTypeReservation(_wrkCtrParmSchedule) == WrkCtrCapacityType::OperationSched
+            &&  origReqPoSchedMethod == SchedMethod::Rough
+            &&  mapUpdatedOrders.exists(reqTrans))
+        {
+            reqPO.RouteJobsUpdated = NoYes::No;
+            ReqRouteJob::deletePO(reqTrans.PlanVersion, reqTrans.RefId);
+            updateOrder = true;
+        }
+
+        if (reqPO.SchedMethod != origReqPoSchedMethod)
+        {
+            reqPO.SchedMethod = origReqPoSchedMethod;
+            updateOrder = true;
+        }
+
+        if (updateOrder)
+        {
+            reqPO.doUpdate();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>writeAllCapacityReservationProperties</Name>
+				<Source><![CDATA[
+        protected void writeAllCapacityReservationProperties()
+    {
+        int                     propertyIndex;
+        str                     propertyString;
+        PmfSeqWrkCtrCapResProperty    wrkCtrCapResProperty;
+        RecId                   jobId;
+        container               properties;
+        RecordInsertList        recordInsertList = new RecordInsertList(tableNum(PmfSeqWrkCtrCapResProperty), true);
+        ListEnumerator          parmScheduleEnumerator;
+        ListEnumerator          le;
+        WrkCtrParmSchedule      wrkCtrParmSchedule;
+        List                    capResIdentifiers;
+        RecId                   capResRecId;
+
+        // loop orders
+        parmScheduleEnumerator = listWrkCtrParmSchedule.getEnumerator();
+        while (parmScheduleEnumerator.moveNext())
+        {
+            wrkCtrParmSchedule = parmScheduleEnumerator.current();
+
+            // re-read reservation identifiers
+            capResIdentifiers = PmfSeqWrkCtrCapRes::getCapResIdentifiers(wrkCtrParmSchedule.schedNumId(),
+                                                                   this.capacityRefType(),
+                                                                   wrkCtrParmSchedule.parmReqPlanVersionRefRecId());
+            // loop capacity reservations
+            le = capResIdentifiers.getEnumerator();
+            while (le.moveNext())
+            {
+                [capResRecId, jobId] = le.current();
+
+                // find the properties for the job marked on the reservation
+                if (jobCapResProperties.exists(jobId))
+                {
+                    properties = jobCapResProperties.lookup(jobId);
+
+                    // insert the properties
+                    for (propertyIndex=1; propertyIndex <= conLen(properties); ++propertyIndex)
+                    {
+                        propertyString = conPeek(properties, propertyIndex);
+                        wrkCtrCapResProperty.SchedulingPropertyId = propertyString;
+                        wrkCtrCapResProperty.CapResRefRecId = capResRecId;
+                        recordInsertList.add(wrkCtrCapResProperty);
+                    }
+                }
+            }
+        }
+
+        recordInsertList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>writeJobData</Name>
+				<Source><![CDATA[
+        public void writeJobData(recId          _jobId,
+                             WrkCtrId       _resourceId,
+                             date           _fromDate,
+                             timeOfDay      _fromTime,
+                             date           _toDate,
+                             timeOfDay      _toTime,
+                             Seconds        _runtime,
+                             container      _reservationProperties,
+                             container      _capacityReservations,
+                             boolean        _physicalUpdateJobs     = true)
+    {
+        super(
+            _jobId,
+            _resourceId,
+            _fromDate,
+            _fromTime,
+            _toDate,
+            _toTime,
+            _runtime,
+            _reservationProperties,
+            _capacityReservations,
+            false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Constructs an instance of the <c>WrkCtrScheduler_PmfSeq</c> class with the default parameters.
+    /// </summary>
+    /// <returns>
+    ///     An object of the <c>WrkCtrScheduler_PmfSeq</c> class.
+    /// </returns>
+    public static WrkCtrScheduler_PmfSeq construct()
+    {
+        WrkCtrScheduler_PmfSeq wrkCtrScheduler;
+
+        wrkCtrScheduler = new WrkCtrScheduler_PmfSeq();
+        wrkCtrScheduler.parmCheckLockingTTSLevel(false);
+        wrkCtrScheduler.parmCapResHandler(WrkCtrCapResHandler_PmfSeq::construct());
+
+        return wrkCtrScheduler;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

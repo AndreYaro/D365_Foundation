@@ -1,0 +1,1611 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ResWBSActivityTeam</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This class is used for WBS auto planned resource team generation feature.  This feature will first calculate the
+/// minimal number of planned resource to fulfill the entire project or quotation WBS tasks according to the task
+/// role requirement.  During the calculation, result will be written to table ResPlannedResourceInstance.
+/// Then the number of planned resource will be shown to user in a message box.  User can then choose to commit
+/// to the suggested planned resource or cancel.  If user has committed to the suggested planned resource, then
+/// all existing planned resource to this project or quotation will be removed.  As replacement, the suggested
+/// planned resource will be assigned to each WBS task with role requirement.  Note that if the WBS already has
+/// a staffed resource assigned to the task, this staffed resource will be kept assigned.  The new planned
+/// resource or resources will then be assigned with the task effort hours minus the staffed resource assigned
+/// hours.
+/// As for assignment, the logic of this class will assign using insert record set with the minimal number of
+/// SQL transaction.  This is done during the propsePlannedResource phase, the table ResAutoPlannedResource
+/// will contains record with ReserveFullCapacity as Yes or No. If yes, the planned resource will assign with
+/// full capacity according to the project or quotation associated calendar capacity.  If no, then special logic
+/// in assignPlannedResourceOnSpecifiedDay() method will be carry out to assign with exact number of seconds
+/// required for that planned resource on the specified day of the specified task.
+/// </summary>
+class ResWBSActivityTeam
+{
+    HierarchyIdBase     hierarchyId;
+    PSARSEntityType     entityType;
+
+    #TimeConstants
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>proposePlannedResource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Propose the minimal number of planned resources for the WBS activities for the specified hierarchy Id.
+    /// </summary>
+    /// <returns>Container of propose status as boolean and proposal message.</returns>
+    public container proposePlannedResource()
+    {
+        ResAutoPlannedResource  plannedResourceTable;
+        str                     engagementId;
+        CalendarId              calendarId;
+        boolean                 succeed;
+        str                     outputMessage;
+
+        // remove previous records in the table
+        delete_from plannedResourceTable;
+
+        //Lookup engagement Id by hierarchy Id. This feature only supports project WBS.
+        [succeed, engagementId] = this.getEngagementId();
+        if (succeed)
+        {
+            [succeed, calendarId] = this.getEngagementCalendarId(engagementId);
+            if (succeed)
+            {
+                // calculcate the minmimal activity team from the WBS role assignment
+                [succeed, outputMessage] = this.calculateMinimalActivityTeam(calendarId);
+                if (succeed)
+                {
+                    [succeed, outputMessage] = this.getProposeMessage();
+                }
+            }
+        }
+        return [succeed, outputMessage];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reservePlannedResource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reserve planned resources to the WBS activities for the specified hierarchy Id.
+    /// </summary>
+    /// <returns>Container of reserve status as boolean and error message in case of failure.</returns>
+    public container reservePlannedResource()
+    {
+        str         engagementId;
+        CalendarId  calendarId;
+        boolean     succeed;
+        str         outputMessage;
+
+        //Lookup project Id by hierarchy Id.  This feature only support project WBS.
+        [succeed, engagementId] = this.getEngagementId();
+        if (succeed)
+        {
+            [succeed, calendarId] = this.getEngagementCalendarId(engagementId);
+            if (succeed)
+            {
+                ttsbegin;
+                
+                if (!ResUtil::isPerformanceEnhancementFeatureEnabled(ResEnableByDefaultPerfEnhancementFeatureFlight::instance().isEnabled()))
+                {
+                    // remove roll-up records for the existing planned resources
+                    this.removeRollUp(engagementId);
+                }
+
+                // delete existing planned resource activity booking and assignment
+                this.deletePlannedResourceReservation(engagementId);
+                // if planned reosurce table does not contains any record for this hierarchy, general the records
+                if (!this.plannedResourceTableRecordExists())
+                {
+                    this.proposePlannedResource();
+                }
+                // add enagement team member
+                this.addEnagementTeamMember(engagementId);
+                // add planned resources to project team, then assignment generic resources to appropriate WBS tasks
+                this.insertPlannedResourceReservation(WorkCalendarTable::find(calendarId).RecId, engagementId);
+
+                if (!ResUtil::isPerformanceEnhancementFeatureEnabled(ResEnableByDefaultPerfEnhancementFeatureFlight::instance().isEnabled()))
+                {
+                    // update roll-up records for the newly added planned resources
+                    this.updateRollUp(engagementId);
+                }
+
+                ttscommit;
+            }
+        }
+
+        return [succeed, outputMessage];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>plannedResourceTableRecordExists</Name>
+				<Source><![CDATA[
+    private boolean plannedResourceTableRecordExists()
+    {
+        ResAutoPlannedResource plannedResourceTable;
+
+        select count(RecId) from plannedResourceTable
+            where plannedResourceTable.HierarchyId == hierarchyId;
+
+        return plannedResourceTable.RecId ? true : false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateMinimalActivityTeam</Name>
+				<Source><![CDATA[
+    private container calculateMinimalActivityTeam(CalendarId _calendarId)
+    {
+        ProjPlanVersion         projPlanVersion;
+        HierarchyTreeTable      hierarchyTreeTable;
+        smmActivities           smmActivities;
+        PSASchedRole            psaSchedRole;
+        WorkCalendarTable       calendarTable;
+        boolean                 succeed = true;
+        str                     outputMessage;
+
+        // calculate the minimal activity team base on all tasks in this WBS hierarchy which is assigned to planned resource only
+        ProjPlanVersionDetail planVersionDetail = ProjPlanVersionDetail::findLatestByHierarchyId(hierarchyId, false, false, ProjPlanVersionType::PublishedCurrent);
+        
+        while select TaskEffort, TaskStartDate, TaskFinishDate, ResourceCategory, TaskSchedulingStatus from projPlanVersion
+            order by projPlanVersion.TaskStartDate desc
+            where projPlanVersion.HierarchyId == planVersionDetail.HierarchyId
+                && projPlanVersion.ResourceCategory != 0
+                && projPlanVersion.TaskEffort > 0
+            join RecId from hierarchyTreeTable
+                where hierarchyTreeTable.RecId == projPlanVersion.HierarchyTreeTableRefRecId
+            join RecId from smmActivities
+                where smmActivities.RecId == hierarchyTreeTable.RefRecId
+            join RoleId from psaSchedRole
+                where psaSchedRole.RecId == projPlanVersion.ResourceCategory
+        {
+            if ((projPlanVersion.TaskSchedulingStatus == PSAScheduled::NotScheduled) ||
+                (projPlanVersion.TaskSchedulingStatus == PSAScheduled::PartiallyScheduled))
+            {
+                // get sum of assigned hours which is not assigned to the planned resource
+                ResAssignmentView   resAssignmentView;
+                PSAProjSchedRole    psaProjSchedRole;
+                select sum(Capacity) from resAssignmentView
+                    where resAssignmentView.Activity == smmActivities.RecId
+                        && ((entityType == PSARSEntityType::Project
+                                && resAssignmentView.CommitType == ResCommitType::HardBook) ||
+                            (entityType == PSARSEntityType::Quotation
+                                && resAssignmentView.CommitType == ResCommitType::SoftBook))
+                    join psaProjSchedRole
+                        where psaProjSchedRole.RecId == resAssignmentView.ActivityResource
+                            && psaProjSchedRole.Resource != 0;
+
+                // get the specified task effort minus task effort which is assigned to named resource
+                real taskCapacityInSeconds = decRound((projPlanVersion.TaskEffort * #SecondsPerHour) - resAssignmentView.Capacity, 0);
+                utcdatetime activityStartDateTime = DateTimeUtil::newDateTime(projPlanVersion.TaskStartDate, 0);
+                utcdatetime activityEndDateTime = datetimeUtil::newDateTime(projPlanVersion.TaskFinishDate, #LastSecondOfTheDay);
+
+                CalendarRecId calendarRecId = WorkCalendarTable::find(_calendarId).RecId;
+                real calendarCapacityInSeconds;
+                Map calendarCapacityMap, calendarNextDayMap;
+
+                if (calendarRecId)
+                {
+                    calendarCapacityMap = new Map(Types::UtcDateTime, Types::Real);
+                    calendarNextDayMap = new Map(Types::UtcDateTime, Types::UtcDateTime);
+                    calendarCapacityInSeconds = this.getCalendarCapacityAndUpateCalendarMapByDay(calendarCapacityMap,
+                        calendarNextDayMap, calendarRecId, activityStartDateTime, activityEndDateTime);
+                }
+
+                // show error message if no capacity is return
+                if (!calendarCapacityInSeconds)
+                {
+                    outputMessage = strfmt("@Res:NoGenericResourceDueToCalendarIsNotEstablished", _calendarId,
+                        date2str(projPlanVersion.TaskStartDate, 321, DateDay::Digits2, DateSeparator::Hyphen,
+                            DateMonth::Digits2, DateSeparator::Hyphen, DateYear::Digits4),
+                        date2str(projPlanVersion.TaskFinishDate, 321, DateDay::Digits2, DateSeparator::Hyphen,
+                            DateMonth::Digits2, DateSeparator::Hyphen, DateYear::Digits4),
+                        hierarchyTreeTable.Name);
+                    succeed = false;
+                    return [succeed, outputMessage];
+                }
+                else
+                {
+                    // calculate the minimal planned resource for the specified task
+                    this.calculatePlannedResourceForSpecificTask(calendarCapacityMap, calendarNextDayMap,
+                        calendarRecId, smmActivities.RecId, projPlanVersion.ResourceCategory, psaSchedRole.RoleId,
+                        activityStartDateTime, activityEndDateTime, taskCapacityInSeconds, calendarCapacityInSeconds);
+                }
+            }
+        }
+
+        return [succeed, outputMessage];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCalendarCapacityAndUpateCalendarMapByDay</Name>
+				<Source><![CDATA[
+    private real getCalendarCapacityAndUpateCalendarMapByDay(Map _calendarCapacityMap, Map _calendarNextDateMap,
+        CalendarRecId _calendar, utcdatetime _startDateTime, utcdatetime _endDateTime)
+    {
+        ResCalendarCapacityView calendarCapacityView;
+        utcdatetime             currentDay = DateTimeUtil::minValue();
+        utcdatetime             previousDay = DateTimeUtil::minValue();
+        real                    totalCapacity;
+
+        while select Day, sum(Capacity) from calendarCapacityView
+            group by Calendar, Day
+            order by Day
+            where calendarCapacityView.Calendar == _calendar
+                && calendarCapacityView.Day >= _startDateTime
+                && calendarCapacityView.Day <= _endDateTime
+        {
+            currentDay = calendarCapacityView.Day;
+            // add each working day into the calendar capacity map with capacity
+            if (calendarCapacityView.Capacity > 0)
+            {
+                _calendarCapacityMap.insert(currentDay, calendarCapacityView.Capacity);
+            }
+
+            // add the next working day for each day into the calendar next day map
+            if (previousDay != DateTimeUtil::minValue())
+            {
+                _calendarNextDateMap.insert(previousDay, currentDay);
+            }
+            totalCapacity += calendarCapacityView.Capacity;
+            previousDay = currentDay;
+        }
+
+        // add the last day next day as the same date since there is no next date
+        if (currentDay != DateTimeUtil::minValue())
+        {
+            _calendarNextDateMap.insert(currentDay, currentDay);
+        }
+
+        return totalCapacity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCalendarCapacityAndUpateCalendarMapByHour</Name>
+				<Source><![CDATA[
+    private void getCalendarCapacityAndUpateCalendarMapByHour(Map _calendarHourCapacityMap, Map _calendarNextHourMap,
+        CalendarRecId _calendar, utcdatetime _startDateTime, utcdatetime _endDateTime)
+    {
+        ResCalendarCapacity  calendarCapacity;
+        utcdatetime          currentHour = DateTimeUtil::minValue();
+        utcdatetime          previousHour = DateTimeUtil::minValue();
+        real                 totalCapacity;
+
+        while select Hour, Start, End from calendarCapacity
+            order by Hour
+            where calendarCapacity.Calendar == _calendar
+                && calendarCapacity.Hour >= _startDateTime
+                && calendarCapacity.Hour <= _endDateTime
+                && calendarCapacity.End != 0
+        {
+            currentHour = calendarCapacity.Hour;
+            // add each working day into the calendar capacity map with capacity
+            ResCalendarInstance calendarInstance = ResCalendarInstance::construct(calendarCapacity.Start, calendarCapacity.End);
+            _calendarHourCapacityMap.insert(calendarCapacity.Hour, calendarInstance);
+
+            // add the next working hour for each hour into the calendar next hour map
+            if (previousHour != DateTimeUtil::minValue())
+            {
+                _calendarNextHourMap.insert(previousHour, currentHour);
+            }
+
+            previousHour = currentHour;
+        }
+
+        // add the last hour next hour as the same hour since there is no next hour
+        if (currentHour != DateTimeUtil::minValue())
+        {
+            _calendarNextHourMap.insert(currentHour, currentHour);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCalendarCapacityForSpecificDayFromCalendarCapacityMap</Name>
+				<Source><![CDATA[
+    private real getCalendarCapacityForSpecificDayFromCalendarCapacityMap (Map _calendarCapacityMap, utcdatetime _targetDate)
+    {
+        return _calendarCapacityMap.lookup(_targetDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNextDayFromCalendarNextDayMap</Name>
+				<Source><![CDATA[
+    private utcdatetime getNextDayFromCalendarNextDayMap (Map _calendarNextDayMap, utcdatetime _targetDate)
+    {
+        return _calendarNextDayMap.lookup(_targetDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertPlannedResourceTable</Name>
+				<Source><![CDATA[
+    private void insertPlannedResourceTable (ResourceCategoryRecId _resouceCategory,
+        PSASchedRoleId _roleId, int _roleIndex, utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime,
+        real _reservationCapacity, NoYes _reserveFullCapacity, ActivityRecId _activity)
+    {
+        ResAutoPlannedResource  plannedResourceTable;
+
+        ttsbegin;
+        plannedResourceTable.HierarchyId = hierarchyId;
+        plannedResourceTable.ResourceCategory = _resouceCategory;
+        plannedResourceTable.RoleId = _roleId;
+        plannedResourceTable.RoleIndex = _roleIndex;
+        plannedResourceTable.Name = _roleId + ' ' + int2Str(_roleIndex);
+        plannedResourceTable.ReservationStart = _taskStartDateTime;
+        plannedResourceTable.ReservationEnd = _taskEndDateTime;
+        plannedResourceTable.ReservationCapacity = _reservationCapacity;
+        plannedResourceTable.ReserveFullCapacity = _reserveFullCapacity;
+        plannedResourceTable.Activity = _activity;
+        plannedResourceTable.insert();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculatePlannedResourceForSpecificTask</Name>
+				<Source><![CDATA[
+    private void calculatePlannedResourceForSpecificTask(Map _calendarCapacityMap, Map _calendarNextDayMap,
+        CalendarRecId _calendar, ActivityRecId _activity, ResourceCategoryRecId _resouceCategory, PSASchedRoleId _roleId,
+        utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime, real _taskCapacity, real _calendarCapacity)
+    {
+        real    assignCapacity;
+        real    taskRemainingCapacity = _taskCapacity;
+        Set     existingPlannedResourceSet = new Set(Types::Class);
+        Set     existingPlannedResourceNonReserveFullCapacityDateSet = new Set(Types::Class);
+        boolean assignAllCapacity;
+
+        // 59 seconds as the remaining capacity margin
+        const int remainingCapacityMargin = 59;
+
+        this.updateExistingPlannedResourceSet(existingPlannedResourceSet, existingPlannedResourceNonReserveFullCapacityDateSet,
+            _calendarCapacityMap, _calendarNextDayMap, _resouceCategory, _taskStartDateTime, _taskEndDateTime, _calendarCapacity);
+
+        // keep adding records to ResAutoPlannedResource table as long as remaining task capacity is greater than the remaining capacity margin
+        while (taskRemainingCapacity > remainingCapacityMargin)
+        {
+            if (taskRemainingCapacity >= _calendarCapacity)
+            {
+                assignCapacity = _calendarCapacity;
+                assignAllCapacity = true;
+            }
+            else
+            {
+                assignCapacity = taskRemainingCapacity;
+                assignAllCapacity = false;
+            }
+
+            // attempt to look for existing planned resource to fulfill the required capacity
+            boolean assignExistingResource = this.attemptAssignExistingPlannedResource(_calendarCapacityMap,
+                existingPlannedResourceSet, existingPlannedResourceNonReserveFullCapacityDateSet, _activity,
+                _taskStartDateTime, _taskEndDateTime, _resouceCategory, _roleId, assignCapacity, assignAllCapacity);
+
+            // if existing planned resource cannot be found, then fulfill the required capacity by a new planned resource
+            if (!assignExistingResource)
+            {
+                if (assignAllCapacity)
+                {
+                    this.insertPlannedResourceTable(_resouceCategory, _roleId, this.getNextRoleIndex(_resouceCategory),
+                        _taskStartDateTime, _taskEndDateTime, _calendarCapacity, NoYes::Yes, _activity);
+                }
+                else
+                {
+                    this.assignNewPlannedResource(_calendarCapacityMap, this.getNextRoleIndex(_resouceCategory),
+                        _activity, _resouceCategory, _roleId, assignCapacity);
+                }
+            }
+
+            taskRemainingCapacity -= assignCapacity;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getResourceRemainingCapacityForSpecifiedDateFromNonReserveFullCapacityDateSet</Name>
+				<Source><![CDATA[
+    private real getResourceRemainingCapacityForSpecifiedDateFromNonReserveFullCapacityDateSet(Map _calendarCapacityMap,
+        Set _existingPlannedResourceNonReserveFullCapacityDateSet, int _roleIndex, utcdatetime _targetDate)
+    {
+        SetEnumerator  nonReserveFullCapacityDateSetEnum = _existingPlannedResourceNonReserveFullCapacityDateset.getEnumerator();
+        real            resourceRemainingCapacity;
+
+        while (nonReserveFullCapacityDateSetEnum.moveNext())
+        {
+            ResPlannedResourceInstance plannedResourceInstance = nonReserveFullCapacityDateSetEnum.current();
+            if (plannedResourceInstance.parmAvailableStartDateTime() == _targetDate)
+            {
+                resourceRemainingCapacity = plannedResourceInstance.parmResourceCapacity();
+                break;
+            }
+        }
+
+        return resourceRemainingCapacity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignNewPlannedResource</Name>
+				<Source><![CDATA[
+    private void assignNewPlannedResource(Map _calendarCapacityMap, int _roleIndex,
+        ActivityRecId _activity, ResourceCategoryRecId _resouceCategory,
+        PSASchedRoleId _roleId, real _taskCapacity)
+    {
+        MapEnumerator   calendarCapacityMapEnum = _calendarCapacityMap.getEnumerator();
+        utcdatetime     startDate = DateTimeUtil::minValue();
+        utcdatetime     endDate = DateTimeUtil::minValue();
+        real            remainingTaskCapacity = _taskCapacity;
+        real            tmpResourceFullReserveCapacity;
+
+        while (remainingTaskCapacity > 0 && calendarCapacityMapEnum.moveNext())
+        {
+            utcdatetime currentDate = calendarCapacityMapEnum.currentKey();
+
+            if (startDate == DateTimeUtil::minValue())
+            {
+                startDate = currentDate;
+            }
+
+            real currentDateCalendarCapacity = this.getCalendarCapacityForSpecificDayFromCalendarCapacityMap(
+                _calendarCapacityMap, currentDate);
+
+            if (currentDateCalendarCapacity)
+            {
+                if (currentDateCalendarCapacity < remainingTaskCapacity)
+                {
+                    remainingTaskCapacity -= currentDateCalendarCapacity;
+                    tmpResourceFullReserveCapacity += currentDateCalendarCapacity;
+                }
+                else if (currentDateCalendarCapacity == remainingTaskCapacity)
+                {
+                    tmpResourceFullReserveCapacity += remainingTaskCapacity;
+                    this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, startDate, currentDate,
+                        tmpResourceFullReserveCapacity, NoYes::Yes, _activity);
+                    remainingTaskCapacity = 0;
+                }
+                else
+                {
+                    // current date calendar capacity is larger than remaining task capacity
+                    if (startDate != currentDate && endDate != DateTimeUtil::minValue())
+                    {
+                        this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, startDate, endDate,
+                           tmpResourceFullReserveCapacity, NoYes::Yes, _activity);
+                    }
+                    this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, currentDate, currentDate,
+                        remainingTaskCapacity, NoYes::No, _activity);
+                    remainingTaskCapacity = 0;
+                }
+            }
+
+            endDate = currentDate;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignExistingPlannedResource</Name>
+				<Source><![CDATA[
+    private void assignExistingPlannedResource (Map _calendarCapacityMap,
+        Set _existingPlannedResourceNonReserveFullCapacityDateSet, int _roleIndex,
+        utcdatetime _taskStartDateTime, ActivityRecId _activity, ResourceCategoryRecId _resouceCategory,
+        PSASchedRoleId _roleId, real _taskCapacity)
+    {
+        MapEnumerator   calendarCapacityMapEnum = _calendarCapacityMap.getEnumerator();
+        utcdatetime     startDate = DateTimeUtil::minValue();
+        utcdatetime     endDate = DateTimeUtil::minValue();
+        real            remainingTaskCapacity = _taskCapacity;
+        real            tmpResourceFullReserveCapacity;
+
+        while (remainingTaskCapacity > 0 && calendarCapacityMapEnum.moveNext())
+        {
+            utcdatetime currentDate = calendarCapacityMapEnum.currentKey();
+            if (currentDate >= _taskStartDateTime)
+            {
+                if (startDate == DateTimeUtil::minValue())
+                {
+                    startDate = currentDate;
+                }
+
+                real remainingResourceNonFullReserveCapacity = this.getResourceRemainingCapacityForSpecifiedDateFromNonReserveFullCapacityDateSet(
+                    _calendarCapacityMap, _existingPlannedResourceNonReserveFullCapacityDateSet, _roleIndex, currentDate);
+
+                // if existing resource has any non full reservation capacity assigned
+                if (remainingResourceNonFullReserveCapacity)
+                {
+                    if (remainingResourceNonFullReserveCapacity < remainingTaskCapacity)
+                    {
+                        remainingTaskCapacity -= remainingResourceNonFullReserveCapacity;
+
+                        if (startDate != currentDate && endDate != DateTimeUtil::minValue())
+                        {
+                            // assign previously calculated full assignment capacity
+                            this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, startDate, endDate,
+                                tmpResourceFullReserveCapacity, NoYes::Yes, _activity);
+                        }
+
+                        // assign current date remaining capacity
+                        this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, currentDate, currentDate,
+                            remainingResourceNonFullReserveCapacity, NoYes::No, _activity);
+
+                        startDate = DateTimeUtil::minValue();
+                        endDate = DateTimeUtil::minValue();
+                        tmpResourceFullReserveCapacity = 0;
+                    }
+                    else
+                    {
+                        // assign remaining capacity to currnt date
+                        this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, currentDate, currentDate,
+                            remainingTaskCapacity, NoYes::No, _activity);
+                        remainingTaskCapacity = 0;
+                    }
+                }
+                else
+                {
+                    real currentDateCalendarCapacity = this.getCalendarCapacityForSpecificDayFromCalendarCapacityMap(
+                        _calendarCapacityMap, currentDate);
+
+                    if (currentDateCalendarCapacity)
+                    {
+                        if (currentDateCalendarCapacity < remainingTaskCapacity)
+                        {
+                            remainingTaskCapacity -= currentDateCalendarCapacity;
+                            tmpResourceFullReserveCapacity += currentDateCalendarCapacity;
+                        }
+                        else if (currentDateCalendarCapacity == remainingTaskCapacity)
+                        {
+                            tmpResourceFullReserveCapacity += remainingTaskCapacity;
+                            this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, startDate, currentDate,
+                                tmpResourceFullReserveCapacity, NoYes::Yes, _activity);
+                            remainingTaskCapacity = 0;
+                        }
+                        else
+                        {
+                            // current date calendar capacity is larger than remaining task capacity
+                            if (startDate != currentDate && endDate != DateTimeUtil::minValue())
+                            {
+                                this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, startDate, endDate,
+                                    tmpResourceFullReserveCapacity, NoYes::Yes, _activity);
+                            }
+                            this.insertPlannedResourceTable(_resouceCategory, _roleId, _roleIndex, currentDate, currentDate,
+                                remainingTaskCapacity, NoYes::No, _activity);
+                            remainingTaskCapacity = 0;
+                        }
+                    }
+                }
+                endDate = currentDate;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>attemptAssignExistingPlannedResource</Name>
+				<Source><![CDATA[
+    private boolean attemptAssignExistingPlannedResource(Map _calendarCapacityMap, Set _existingPlannedResourceSet,
+        Set _existingPlannedResourceNonReserveFullCapacityDateSet, ActivityRecId _activity,
+        utcdatetime _taskStartDate, utcDateTime _taskEndDate, ResourceCategoryRecId _resouceCategory,
+        PSASchedRoleId _roleId, real _taskCapacity, boolean assignAllCapacity)
+    {
+        SetEnumerator existingPlannedResourceSetEnum = _existingPlannedResourceSet.getEnumerator();
+        boolean foundAndAssign = false;
+
+        while (existingPlannedResourceSetEnum.moveNext())
+        {
+            ResPlannedResourceInstance plannedResourceInstance = existingPlannedResourceSetEnum.current();
+            if (plannedResourceInstance.parmResourceCapacity() >= _taskCapacity)
+            {
+                if (assignAllCapacity)
+                {
+                    //assign all capacity int this date range for this resource
+                    this.insertPlannedResourceTable(_resouceCategory, _roleId, plannedResourceInstance.parmRoleIndex(),
+                        _taskStartDate, _taskEndDate, _taskCapacity, NoYes::Yes, _activity);
+                }
+                else
+                {
+                    // assign this planned resource according to task capacity requirment
+                    this.assignExistingPlannedResource(_calendarCapacityMap,
+                    _existingPlannedResourceNonReserveFullCapacityDateSet,
+                    plannedResourceInstance.parmRoleIndex(), plannedResourceInstance.parmAvailableStartDateTime(),
+                    _activity, _resouceCategory, _roleId, _taskCapacity);
+                }
+
+                // remove this planned resource from the existing planned resource list
+                this.removeResourceFromExistingPlannedResourceSet(plannedResourceInstance.parmRoleIndex(),
+                    _existingPlannedResourceSet);
+
+                foundAndAssign = true;
+                break;
+            }
+        }
+
+        return foundAndAssign;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExistingPlannedResourceSet</Name>
+				<Source><![CDATA[
+    private void updateExistingPlannedResourceSet(Set _existingPlannedResourceSet,
+        Set _existingPlannedResourceNonReserveFullCapacityDateSet, Map _calendarCapacityMap,
+        Map _calendarNextDayMap, ResourceCategoryRecId _resouceCategory, utcdatetime _taskStartDateTime,
+        utcdatetime _taskEndDateTime, real _calendarCapacity)
+    {
+        ResAutoPlannedResource  plannedResourceTable;
+
+        while select RoleIndex from plannedResourceTable
+            group by ResourceCategory, RoleIndex
+            order by RoleIndex
+            where plannedResourceTable.HierarchyId == hierarchyId
+                && plannedResourceTable.ResourceCategory == _resouceCategory
+        {
+            this.getPlannedResourceAvailableCapacity(_existingPlannedResourceSet,
+                _existingPlannedResourceNonReserveFullCapacityDateSet,
+                _calendarCapacityMap, _calendarNextDayMap, _resouceCategory, plannedResourceTable.RoleIndex,
+                _taskStartDateTime, _taskEndDateTime, _calendarCapacity);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeCapacityDayMap</Name>
+				<Source><![CDATA[
+    private void initializeCapacityDayMap(Map _calendarCapacityMap, Map _dayCapacityMap,
+        utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime)
+    {
+        MapEnumerator calendarCapacityMapEnum = _calendarCapacityMap.getEnumerator();
+
+        while (calendarCapacityMapEnum.moveNext())
+        {
+            _dayCapacityMap.insert(calendarCapacityMapEnum.currentKey(), calendarCapacityMapEnum.currentValue());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeDayCapacityMapByDateRange</Name>
+				<Source><![CDATA[
+    private void removeDayCapacityMapByDateRange (Map _dateCapacityMap,
+        utcdatetime _startDateTime, utcdatetime _endDateTime)
+    {
+        MapEnumerator dayCapacityMapEnum = _dateCapacityMap.getEnumerator();
+        Set           removeDateCapacitySet = new Set(Types::UtcDateTime);
+
+        while (dayCapacityMapEnum.moveNext())
+        {
+            if (dayCapacityMapEnum.currentKey() >= _startDateTime && dayCapacityMapEnum.currentKey() <= _endDateTime)
+            {
+                removeDateCapacitySet.add(dayCapacityMapEnum.currentKey());
+            }
+        }
+
+        SetEnumerator removeDateCapacitySetEnum = removeDateCapacitySet.getEnumerator();
+
+        while (removeDateCapacitySetEnum.moveNext())
+        {
+            _dateCapacityMap.remove(removeDateCapacitySetEnum.current());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDayCapacityMapBySpecifiedDateAndCapacity</Name>
+				<Source><![CDATA[
+    private void updateDayCapacityMapBySpecifiedDateAndCapacity (Map _dateCapacityMap,
+        utcdatetime _targetDateTime, real _reduceCapacity)
+    {
+        if (_dateCapacityMap.exists(_targetDateTime))
+        {
+            real originalCapacity = _dateCapacityMap.lookup(_targetDateTime);
+            _dateCapacityMap.remove(_targetDateTime);
+            real newRemainingCapacity = originalCapacity - _reduceCapacity;
+            if (newRemainingCapacity >= #SecondsPerHour)
+            {
+                _dateCapacityMap.insert(_targetDateTime, newRemainingCapacity);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExistingPlannedResourceNonReserveFullCapacityDateSet</Name>
+				<Source><![CDATA[
+    private void updateExistingPlannedResourceNonReserveFullCapacityDateSet(int _roleIndex,
+        Set _existingPlannedResourceNonReserveFullCapacityDateSet, Map _calendarCapacityMap,
+        utcdatetime _targetDate, real _resourceCapacity)
+    {
+        real listTotalCapacity;
+
+        if (_calendarCapacityMap.exists(_targetDate))
+        {
+            SetEnumerator plannedResourceNonReserveFullCapacityDateSet = _existingPlannedResourceNonReserveFullCapacityDateSet.getEnumerator();
+            while (plannedResourceNonReserveFullCapacityDateSet.moveNext())
+            {
+                ResPlannedResourceInstance plannedResourceInstance = plannedResourceNonReserveFullCapacityDateSet.current();
+                if (plannedResourceInstance.parmAvailableStartDateTime() == _targetDate)
+                {
+                    listTotalCapacity += plannedResourceInstance.parmResourceCapacity();
+                    _existingPlannedResourceNonReserveFullCapacityDateSet.remove(plannedResourceInstance);
+                    break;
+                }
+            }
+
+            real calendarCapacity = _calendarCapacityMap.lookup(_targetDate);
+            real resourceRemainingCapacity = calendarCapacity - _resourceCapacity - listTotalCapacity;
+
+            if (resourceRemainingCapacity > 0)
+            {
+                ResPlannedResourceInstance plannedResourceInstance = ResPlannedResourceInstance::construct();
+                plannedResourceInstance.parmRoleIndex(_roleIndex);
+                plannedResourceInstance.parmResourceCapacity(resourceRemainingCapacity);
+                plannedResourceInstance.parmAvailableStartDateTime(_targetDate);
+                plannedResourceInstance.parmAvailableEndDateTime(_targetDate);
+                _existingPlannedResourceNonReserveFullCapacityDateSet.add(plannedResourceInstance);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeResourceFromExistingPlannedResourceSet</Name>
+				<Source><![CDATA[
+    private void removeResourceFromExistingPlannedResourceSet(int _roleIndex, Set _existingPlannedResourceSet)
+    {
+        SetEnumerator   existingPlannedResourceSetEnum = _existingPlannedResourceSet.getEnumerator();
+        Set             removeSet = new Set(Types::Class);
+
+        // add all planned resource instance with the target role index to the remove set
+        while (existingPlannedResourceSetEnum.moveNext())
+        {
+            ResPlannedResourceInstance plannedResourceInstance = existingPlannedResourceSetEnum.current();
+            if (plannedResourceInstance.parmRoleIndex() == _roleIndex)
+            {
+                removeSet.add(plannedResourceInstance);
+            }
+        }
+
+        SetEnumerator   removeSetEnum = removeSet.getEnumerator();
+
+        // remove all planned resource instance with the target role index from the existing planned resource set
+        while (removeSetEnum.moveNext())
+        {
+            ResPlannedResourceInstance plannedResourceInstance = removeSetEnum.current();
+            _existingPlannedResourceSet.remove(plannedResourceInstance);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addPlannedResourceinstanceToExistingPlannedResourceSet</Name>
+				<Source><![CDATA[
+    private void addPlannedResourceinstanceToExistingPlannedResourceSet(Set _existingPlannedResourceSet,
+        int _roleIndex, real _capacity, utcdatetime _startDate, utcdatetime _endDate)
+    {
+        if (_startDate != DateTimeUtil::minValue() && _capacity != 0)
+        {
+            ResPlannedResourceInstance plannedResourceInstance = ResPlannedResourceInstance::construct();
+            plannedResourceInstance.parmRoleIndex(_roleIndex);
+            plannedResourceInstance.parmResourceCapacity(_capacity);
+            plannedResourceInstance.parmAvailableStartDateTime(_startDate);
+            plannedResourceInstance.parmAvailableEndDateTime(_endDate);
+            _existingPlannedResourceSet.add(plannedResourceInstance);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getExistingPlannedResourceSet</Name>
+				<Source><![CDATA[
+    private void getExistingPlannedResourceSet(int _roleIndex, Set _existingPlannedResourceSet,
+        Map _calendarNextDayMap, Map _dateCapacityMap)
+    {
+        MapEnumerator   calendarNextDayMapEnum = _calendarNextDayMap.getEnumerator();
+        utcdatetime     startDate = DateTimeUtil::minValue();
+        utcdatetime     previousDate;
+        real            capacity;
+
+        while (calendarNextDayMapEnum.moveNext())
+        {
+            utcdatetime currentDate = calendarNextDayMapEnum.currentKey();
+            if (_dateCapacityMap.exists(currentDate))
+            {
+                if (startDate == DateTimeUtil::minValue())
+                {
+                    startDate = currentDate;
+                    capacity = _dateCapacityMap.lookup(currentDate);
+                }
+                else
+                {
+                    capacity += _dateCapacityMap.lookup(currentDate);
+                }
+                previousDate = currentDate;
+            }
+            else
+            {
+                this.addPlannedResourceinstanceToExistingPlannedResourceSet(_existingPlannedResourceSet,
+                    _roleIndex, capacity, startDate, previousDate);
+            }
+        }
+
+        this.addPlannedResourceinstanceToExistingPlannedResourceSet(_existingPlannedResourceSet,
+            _roleIndex, capacity, startDate, previousDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPlannedResourceAvailableCapacity</Name>
+				<Source><![CDATA[
+    private void getPlannedResourceAvailableCapacity(Set _existingPlannedResourceSet,
+        Set _existingPlannedResourceNonReserveFullCapacityDateSet,
+        Map _calendarCapacityMap, Map _calendarNextDayMap, ResourceCategoryRecId _resouceCategory,
+        int _roleIndex, utcdatetime _taskStartDateTime, utcdatetime _taskEndDateTime, real _calendarCapacity)
+    {
+        ResAutoPlannedResource  plannedResourceTable;
+        real                    resoruceRemainingCapacity = _calendarCapacity;
+        utcdatetime             currentDay = _taskStartDateTime;
+        utcdatetime             startDay, EndDay;
+        Map                     _dateCapacityMap = new Map(Types::UtcDateTime, Types::Real);
+
+        this.initializeCapacityDayMap(_calendarCapacityMap, _dateCapacityMap, _taskStartDateTime, _taskEndDateTime);
+
+        // get existing planned resource
+        while select ReservationCapacity, ReserveFullCapacity, ReservationStart, ReservationEnd
+            from plannedResourceTable
+                where plannedResourceTable.HierarchyId == hierarchyId
+                    && plannedResourceTable.ResourceCategory == _resouceCategory
+                    && plannedResourceTable.RoleIndex == _roleIndex
+                    && !(plannedResourceTable.ReservationStart > _taskEndDateTime)
+                    && !(plannedResourceTable.ReservationEnd < _taskStartDateTime)
+        {
+            if (plannedResourceTable.ReserveFullCapacity == NoYes::Yes)
+            {
+                this.removeDayCapacityMapByDateRange(_dateCapacityMap, plannedResourceTable.ReservationStart,
+                    plannedResourceTable.ReservationEnd);
+            }
+            else
+            {
+                this.updateExistingPlannedResourceNonReserveFullCapacityDateSet(_roleIndex,
+                    _existingPlannedResourceNonReserveFullCapacityDateSet, _calendarCapacityMap,
+                    plannedResourceTable.ReservationEnd, plannedResourceTable.ReservationCapacity);
+                this.updateDayCapacityMapBySpecifiedDateAndCapacity(
+                    _dateCapacityMap, plannedResourceTable.ReservationEnd, plannedResourceTable.ReservationCapacity);
+            }
+        }
+
+        this.getExistingPlannedResourceSet(_roleIndex, _existingPlannedResourceSet, _calendarNextDayMap, _dateCapacityMap);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNextRoleIndex</Name>
+				<Source><![CDATA[
+    private int getNextRoleIndex(ResourceCategoryRecId _resouceCategory)
+    {
+        ResAutoPlannedResource  plannedResourceTable;
+        int                     nextRoleIndex = 1;
+
+        select maxof(RoleIndex) from plannedResourceTable
+            group by ResourceCategory
+            where plannedResourceTable.HierarchyId == hierarchyId
+                && plannedResourceTable.ResourceCategory == _resouceCategory;
+
+        if (plannedResourceTable.RoleIndex)
+        {
+            nextRoleIndex = plannedResourceTable.RoleIndex + 1;
+        }
+
+        return nextRoleIndex;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProposeMessage</Name>
+				<Source><![CDATA[
+    private container getProposeMessage()
+    {
+        ResAutoPlannedResource  plannedResourceTable;
+        str                     proposeMessage;
+        boolean                 succeed = true;
+
+        // get total planned resource in the planned resource table
+        select count(RecId) from plannedResourceTable;
+        if (!plannedResourceTable.RecId)
+        {
+            succeed = false;
+            proposeMessage = "@Res:NoGenericResourceCanBeProposed";
+        }
+        else
+        {
+            // compose the planned resource proposal message
+            int listCounter = 1;
+            int listLength = int642int(plannedResourceTable.RecId);
+            plannedResourceTable.clear();
+
+            while select maxof(RoleIndex) from plannedResourceTable
+                group by RoleId
+                where plannedResourceTable.HierarchyId == hierarchyId
+            {
+                if (listCounter ==  1)
+                {
+                    proposeMessage = strfmt("@Res:ProposeGenericResourceMessagePrefix",
+                        int2str(plannedResourceTable.RoleIndex),
+                        plannedResourceTable.RoleId);
+                }
+                else if (listCounter == listLength)
+                {
+                    proposeMessage = proposeMessage + strfmt(' ' + "@Res:ProposeGenericResourceMessageAnd",
+                        int2str(plannedResourceTable.RoleIndex),
+                        plannedResourceTable.RoleId);
+                }
+                else
+                {
+                    proposeMessage = proposeMessage + strfmt("@Res:ProposeGenericResourceMessageComma",
+                        int2str(plannedResourceTable.RoleIndex),
+                        plannedResourceTable.RoleId);
+                }
+                listCounter++;
+            }
+            proposeMessage = proposeMessage + ' ' + "@Res:ProposeGenericResourceMessageSuffix";
+        }
+        return [succeed, proposeMessage];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addEnagementTeamMember</Name>
+				<Source><![CDATA[
+    private void addEnagementTeamMember(str _engagementId)
+    {
+        ResAutoPlannedResource  autoPlannedResource;
+        PSAProjSchedRole        projectTeam;
+
+        boolean perfEnhancedFeatureEnabled = ResUtil::isPerformanceEnhancementFeatureEnabled(true) ? true : false;
+        ActivityRecId rootActivityRecId = this.getRootActivityRecId(perfEnhancedFeatureEnabled, _engagementId);
+        
+        // add planned resources project team records
+        RecordInsertList projectTeamInsertList = new RecordInsertList(projectTeam.TableId, true, true, true);
+
+        while select ResourceCategory, RoleId, RoleIndex, Name, minof(ReservationStart), maxof(ReservationEnd) from autoPlannedResource
+            group by ResourceCategory, RoleId, RoleIndex, Name
+            where autoPlannedResource.HierarchyId == hierarchyId
+        {
+            projectTeam.clear();
+            if (entityType == PSARSEntityType::Project)
+            {
+                projectTeam.ProjId = _engagementId;
+            }
+            else if (entityType == PSARSEntityType::Quotation)
+            {
+                projectTeam.QuotationId = _engagementId;
+            }
+
+            if (perfEnhancedFeatureEnabled)
+            {
+                projectTeam.RootActivity = rootActivityRecId;
+            }
+
+            projectTeam.Name = autoPlannedResource.Name;
+            projectTeam.PSARoleStartDate = DateTimeUtil::date(autoPlannedResource.ReservationStart);
+            projectTeam.PSARoleEndDate = DateTimeUtil::date(autoPlannedResource.ReservationEnd);
+            projectTeam.Resource = 0;
+            projectTeam.ResourceCategory = autoPlannedResource.ResourceCategory;
+            projectTeamInsertList.add(projectTeam);
+        }
+
+        projectTeamInsertList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRootActivityRecId</Name>
+				<Source><![CDATA[
+    private ActivityRecId getRootActivityRecId(boolean _perfEnhancedFeatureEnabled, str _engagementId)
+    {
+        ActivityRecId rootActivityRecId;
+
+        if (_perfEnhancedFeatureEnabled)
+        {
+            if (entityType == PSARSEntityType::Project)
+            {
+                rootActivityRecId = ActivityFacade::findActivityByProjectId(_engagementId);
+            }
+            else if (entityType == PSARSEntityType::Quotation)
+            {
+                rootActivityRecId = ActivityFacade::findActivityByQuotationId(_engagementId);
+            }
+        }
+
+        return rootActivityRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDateTimeAsEndOfDateTime</Name>
+				<Source><![CDATA[
+    private utcdatetime getDateTimeAsEndOfDateTime(utcdateTime _targetDateTime)
+    {
+        return DateTimeUtil::newDateTime(DateTimeUtil::date(_targetDateTime), #LastSecondOfTheDay);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSpecifiedHourStartSecondByCalendarHourCapacityMap</Name>
+				<Source><![CDATA[
+    private real getSpecifiedHourStartSecondByCalendarHourCapacityMap(Map _calendarHourCapacityMap, utcdatetime _targetHour)
+    {
+        ResCalendarInstance calendarHour = _calendarHourCapacityMap.lookup(_targetHour);
+        return calendarHour.parmStartSecond();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSpecifiedHourEndSecondByCalendarHourCapacityMap</Name>
+				<Source><![CDATA[
+    private real getSpecifiedHourEndSecondByCalendarHourCapacityMap(Map _calendarHourCapacityMap, utcdatetime _targetHour)
+    {
+        ResCalendarInstance calendarHour = _calendarHourCapacityMap.lookup(_targetHour);
+        return calendarHour.parmEndSecond();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSpecifiedCapacityByCalendarHourCapacityMap</Name>
+				<Source><![CDATA[
+    private real getSpecifiedCapacityByCalendarHourCapacityMap(Map _calendarHourCapacityMap, utcdatetime _targetHour)
+    {
+        ResCalendarInstance calendarHour = _calendarHourCapacityMap.lookup(_targetHour);
+        return calendarHour.parmCapacity();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNextHourByCalendarNextHourMap</Name>
+				<Source><![CDATA[
+    private utcdatetime getNextHourByCalendarNextHourMap(Map _calendarNextHourMap, utcdatetime _targetHour)
+    {
+        return _calendarNextHourMap.lookup(_targetHour);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAssignmentStartDateTime</Name>
+				<Source><![CDATA[
+    private container getAssignmentStartDateTime(Map _calendarHourCapacityMap, Map _calendarNextHourMap,
+        ActivityResourceRecId _activityResource, utcdatetime _targetDate)
+    {
+        ResAssignment   resAssignment;
+        utcdatetime     lastSecondOfTheDay = this.getDateTimeAsEndOfDateTime(_targetDate);
+        real            startSecond;
+
+        // initialize StartDateTime to beep the first working hour of the day
+        MapEnumerator calendarHourCapacityMapEnum = _calendarHourCapacityMap.getEnumerator();
+        calendarHourCapacityMapEnum.moveNext();
+        utcdatetime startDateTime = calendarHourCapacityMapEnum.currentKey();
+
+        select End, Hour from resAssignment
+            order by Hour desc
+            where resAssignment.ActivityResource == _activityResource
+                && resAssignment.Hour >= _targetDate
+                && resAssignment.Hour <= lastSecondOfTheDay
+                && resAssignment.End != 0;
+
+        if (resAssignment)
+        {
+            ResCalendarCapacity calendarCapacity;
+
+            real calendarHourLastSecond = this.getSpecifiedHourEndSecondByCalendarHourCapacityMap(
+                _calendarHourCapacityMap, resAssignment.Hour);
+
+            if (resAssignment.End < calendarHourLastSecond)
+            {
+                startSecond = roundDownDec(resAssignment.End, 0) + 1;
+                startDateTime = resAssignment.Hour;
+            }
+            else
+            {
+                startDateTime = this.getNextHourByCalendarNextHourMap(_calendarNextHourMap, resAssignment.Hour);
+                startSecond = this.getSpecifiedHourStartSecondByCalendarHourCapacityMap(_calendarHourCapacityMap, startDateTime);
+            }
+        }
+
+        return [startSecond, startDateTime];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignPlannedResourceOnSpecifiedDay</Name>
+				<Source><![CDATA[
+    private void assignPlannedResourceOnSpecifiedDay(Map _calendarHourCapacityMap, Map _calendarNextHourMap,
+        CalendarRecId _calendar, utcdatetime _startHour, real _startSecond, ActivityResourceRecId _activityResource,
+        ActivityRecId _activity, ResCommitType _commitType, real _taskCapacity)
+    {
+        real            remainingCapacity = _taskCapacity;
+        real            curretHourStartSecond = _startSecond;
+        utcdatetime     currentHour = _startHour;
+        utcdatetime     assignFullCapacityStartHour = DateTimeUtil::minValue();
+        utcdatetime     assignFullCapacityEndHour = DateTimeUtil::minValue();
+        real            endSecond;
+
+        while (remainingCapacity > 0)
+        {
+            // get seconds left in this hour
+            real currentHourEndSecond = this.getSpecifiedHourEndSecondByCalendarHourCapacityMap(_calendarHourCapacityMap, currentHour);
+            if (curretHourStartSecond == 0)
+            {
+                curretHourStartSecond = this.getSpecifiedHourStartSecondByCalendarHourCapacityMap(_calendarHourCapacityMap, currentHour);
+            }
+            real currentHourResourceCapacity = currentHourEndSecond - curretHourStartSecond;
+
+            if (currentHourResourceCapacity < remainingCapacity)
+            {
+                // calculate if the current assignable hour capacity is equal to the calendar capacity
+                if (currentHourResourceCapacity == this.getSpecifiedCapacityByCalendarHourCapacityMap(_calendarHourCapacityMap, currentHour))
+                {
+                    // if hour capacity match, then keep the start hour and end hour so that we can use this info to insert the entire hour at a later time
+                    if (assignFullCapacityStartHour == DateTimeUtil::minValue())
+                    {
+                        assignFullCapacityStartHour = currentHour;
+                    }
+                    assignFullCapacityEndHour = currentHour;
+                }
+                else
+                {
+                    // in case reservation won't take up the entire capacity of the hour, insert this record to the reservation tables
+                    this.insertRecordToReservationTable(_calendar, currentHour, currentHour, _activityResource,
+                        _activity, _commitType, curretHourStartSecond, currentHourEndSecond);
+                }
+
+                remainingCapacity -= currentHourResourceCapacity;
+                curretHourStartSecond = 0;
+
+                // get next hour
+                currentHour = this.getNextHourByCalendarNextHourMap(_calendarNextHourMap, currentHour);
+            }
+            else
+            {
+                // add this reservation record which won't take up the entire capacity of the calendar hour
+                this.insertRecordToReservationTable(_calendar, currentHour, currentHour, _activityResource,
+                        _activity, _commitType, curretHourStartSecond, curretHourStartSecond + remainingCapacity);
+                remainingCapacity = 0;
+            }
+        }
+
+        // insert reservation record which the entire hour capacity should be reserved
+        if ((assignFullCapacityStartHour != DateTimeUtil::minValue()) && (assignFullCapacityEndHour != DateTimeUtil::minValue()))
+        {
+            this.insertRecordToReservationTable(_calendar, assignFullCapacityStartHour, assignFullCapacityEndHour, _activityResource,
+                _activity, _commitType);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecordToReservationTable</Name>
+				<Source><![CDATA[
+    private void insertRecordToReservationTable(CalendarRecId _calendar, utcdatetime _startHour, utcdatetime _endHour,
+        ActivityResourceRecId _activityResource, ActivityRecId _activity, ResCommitType _commitType,
+        real _startSecond = 0, real _endSecond = 0)
+    {
+        ResBooking          resBooking;
+        ResAssignment       resAssignment;
+        ResCalendarCapacity calendarCapacity;
+
+        ResUtil::skipDatabaseLogAndEvent(resBooking);
+        ResUtil::skipDatabaseLogAndEvent(resAssignment);
+
+        // Get root activity from task activity
+        ActivityRecId rootActivity = ActivityFacade::getRootActivity(_activity);
+
+        if (prmIsDefault(_endSecond))
+        {
+            // if end second is not specified, assign the entire calendar capacity for each hour in range
+            insert_recordset resBooking (ActivityResource, Activity, CommitType,
+                Start, End, Hour, Day, Week, Month, Quarter, HalfYear)
+                select _activityResource, rootActivity, _commitType, Start, End,
+                    Hour, Day, Week, Month, Quarter, HalfYear
+                from calendarCapacity
+                    where calendarCapacity.Calendar == _calendar
+                        && calendarCapacity.Hour >= _startHour
+                        && calendarCapacity.Hour <= _endHour
+                        && calendarCapacity.End != 0;
+
+            insert_recordset resAssignment (ActivityResource, Activity, CommitType,
+                Start, End, Hour, Day, Week, Month, Quarter, HalfYear)
+                select _activityResource, _activity, _commitType, Start, End,
+                    Hour, Day, Week, Month, Quarter, HalfYear
+                from calendarCapacity
+                    where calendarCapacity.Calendar == _calendar
+                        && calendarCapacity.Hour >= _startHour
+                        && calendarCapacity.Hour <= _endHour
+                        && calendarCapacity.End != 0;
+        }
+        else
+        {
+            // else assign the specified start and end seconds accordingly
+            insert_recordset resBooking (ActivityResource, Activity, CommitType,
+                Start, End, Hour, Day, Week, Month, Quarter, HalfYear)
+                select _activityResource, rootActivity, _commitType, _startSecond, _endSecond,
+                    Hour, Day, Week, Month, Quarter, HalfYear
+                from calendarCapacity
+                    where calendarCapacity.Calendar == _calendar
+                        && calendarCapacity.Hour >= _startHour
+                        && calendarCapacity.Hour <= _endHour
+                        && calendarCapacity.End != 0;
+
+            insert_recordset resAssignment (ActivityResource, Activity, CommitType,
+                Start, End, Hour, Day, Week, Month, Quarter, HalfYear)
+                select _activityResource, _activity, _commitType, _startSecond, _endSecond,
+                    Hour, Day, Week, Month, Quarter, HalfYear
+                from calendarCapacity
+                    where calendarCapacity.Calendar == _calendar
+                        && calendarCapacity.Hour >= _startHour
+                        && calendarCapacity.Hour <= _endHour
+                        && calendarCapacity.End != 0;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertPlannedResourceReservation</Name>
+				<Source><![CDATA[
+    private void insertPlannedResourceReservation(CalendarRecId _calendar, str _engagementId)
+    {
+        ResAutoPlannedResource  autoPlannedResource;
+        PSAProjSchedRole        engagementTeamTable;
+        ResCommitType           commitType;
+
+        if (entityType == PSARSEntityType::Project)
+        {
+            commitType = ResCommitType::HardBook;
+        }
+        else if (entityType == PSARSEntityType::Quotation)
+        {
+            commitType = ResCommitType::SoftBook;
+        }
+
+        // read the records from ResAutoPlannedResource and assign accordingly
+        while select ResourceCategory, Activity, RoleId, RoleIndex, ReservationStart,
+            ReservationEnd, ReservationCapacity, ReserveFullCapacity from autoPlannedResource
+                where autoPlannedResource.HierarchyId == hierarchyId
+            join RecId from engagementTeamTable
+                where engagementTeamTable.Name == autoPlannedResource.Name
+                    && ((entityType == PSARSEntityType::Project && engagementTeamTable.ProjId == _engagementId)
+                        || (entityType == PSARSEntityType::Quotation && engagementTeamTable.QuotationId == _engagementId))
+        {
+            activityresourcerecid   activityResource = engagementTeamTable.RecId;
+            ActivityRecId           activity = autoPlannedResource.Activity;
+            utcdatetime             assignmentStartHour = autoPlannedResource.ReservationStart;
+            utcdatetime             assignmentEndHour = this.getDateTimeAsEndOfDateTime(autoPlannedResource.ReservationEnd);
+
+            // if reserve full capaicty = yes, then it should in case it will take up the entire calendar capacity
+            if (autoPlannedResource.ReserveFullCapacity == NoYes::Yes)
+            {
+                this.insertRecordToReservationTable(_calendar, assignmentStartHour, assignmentEndHour, activityResource, activity, commitType);
+            }
+            else
+            {
+                Map calendarHourCapacityMap = new Map(Types::UtcDateTime, Types::Class);
+                Map calendarNextHourMap = new Map(Types::UtcDateTime, Types::UtcDateTime);
+                this.getCalendarCapacityAndUpateCalendarMapByHour(calendarHourCapacityMap,
+                    calendarNextHourMap, _calendar, assignmentStartHour, assignmentEndHour);
+
+                real        startSecond;
+                utcdatetime startDateTime;
+
+                [startSecond, startDateTime] = this.getAssignmentStartDateTime(calendarHourCapacityMap,
+                    calendarNextHourMap, activityResource, assignmentStartHour);
+                this.assignPlannedResourceOnSpecifiedDay(calendarHourCapacityMap, calendarNextHourMap, _calendar, startDateTime,
+                    startSecond, activityResource, activity, commitType, autoPlannedResource.ReservationCapacity);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEngagementId</Name>
+				<Source><![CDATA[
+    private container getEngagementId()
+    {
+        boolean succeed = true;
+        str     output;
+
+        if (entityType ==PSARSEntityType::Project)
+        {
+            IProjWBS wbs = ProjWBS::construct(hierarchyId);
+            IProjProject project = wbs.getProject();
+            ProjId projectId = project.getId();
+
+            if (!projectId)
+            {
+                succeed = false;
+                output = strfmt("@Res:ProjectIdCannotBeIdentifiedFromHierarchyId", hierarchyId);
+            }
+            else
+            {
+                output = projectId;
+            }
+        }
+        else if (entityType ==PSARSEntityType::Quotation)
+        {
+            SalesQuotationTable quotationTable = ProjTask::getQuotationTableByHierarchyId(hierarchyId);
+
+            if (!quotationTable)
+            {
+                succeed = false;
+                output = strfmt("@Res:QuotationIdCannotBeIdentifiedFromHierarchyId", hierarchyId);
+            }
+            else
+            {
+                output = quotationTable.QuotationId;
+            }
+        }
+
+        return [true, output];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEngagementCalendarId</Name>
+				<Source><![CDATA[
+    private container getEngagementCalendarId(str _enagementId)
+    {
+        boolean succeed = true;
+        str     output;
+
+        if (entityType ==PSARSEntityType::Project)
+        {
+            ProjTable projTable;
+            select PSASchedCalendarId from projTable
+                where projTable.ProjId == _enagementId;
+
+            if (!projTable)
+            {
+                succeed = false;
+                output = strfmt("@Res:CalendarIdCannotBeFoundFromProjectId", _enagementId);
+            }
+            else
+            {
+                output = projTable.PSASchedCalendarId;
+            }
+        }
+        else if (entityType ==PSARSEntityType::Quotation)
+        {
+            SalesQuotationTable quotationTable;
+            select PSASchedCalendarId from quotationTable
+                where quotationTable.QuotationId == _enagementId;
+
+            if (!quotationTable)
+            {
+                succeed = false;
+                output = strfmt("@Res:CalendarIdCannotBeFoundFromQuotationId", _enagementId);
+            }
+            else
+            {
+                output = quotationTable.PSASchedCalendarId;
+            }
+        }
+
+        return [succeed, output];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeRollUp</Name>
+				<Source><![CDATA[
+    private void removeRollUp(str _engagementId)
+    {
+        PSAProjSchedRole                engagementTeam;
+        ResActivityResourceDetailView   resourceDetailView;
+
+        while select PSARoleStartDate, PSARoleEndDate from engagementTeam
+            where ((entityType == PSARSEntityType::Project
+                        && engagementTeam.ProjId == _engagementId) ||
+                    (entityType == PSARSEntityType::Quotation
+                        && engagementTeam.QuotationId == _engagementId))
+                && engagementTeam.Resource == 0
+            join ActivityResourceId from resourceDetailView
+                where resourceDetailView.ActivityResource == engagementTeam.RecId
+        {
+            // remove roll-up records for the project existing planned resources
+            container arguments = [resourceDetailView.ActivityResourceId];
+            Global::runAsync(classNum(ResRollUpWriter),
+                staticMethodStr(ResRollUpWriter, removeRollUpForSpecificActivityResourceIdAsync), arguments);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRollUp</Name>
+				<Source><![CDATA[
+    private void updateRollUp(str _engagementId)
+    {
+        if (!ResUtil::isPerformanceEnhancementFeatureEnabled(ResEnableByDefaultPerfEnhancementFeatureFlight::instance().isEnabled()))
+        {
+
+            ResActivityResourceEngagementView activityResourceEngagementView;
+
+            select count(RecId) from activityResourceEngagementView
+            where ((entityType == PSARSEntityType::Project
+                        && activityResourceEngagementView.ProjId == _engagementId) ||
+                    (entityType == PSARSEntityType::Quotation
+                        && activityResourceEngagementView.QuotationId == _engagementId))
+                && activityResourceEngagementView.Resource == 0;
+
+            boolean updateRollUpAsync = int642int(activityResourceEngagementView.RecId) <= ResUtil::numberOfAsyncProcessAllow;
+
+            while select Activity, ActivityResource, EngagementStartDate, EngagementEndDate from activityResourceEngagementView
+            where ((entityType == PSARSEntityType::Project
+                        && activityResourceEngagementView.ProjId == _engagementId) ||
+                    (entityType == PSARSEntityType::Quotation
+                        && activityResourceEngagementView.QuotationId == _engagementId))
+                && activityResourceEngagementView.Resource == 0
+            {
+                ActivityResourceId activityResourceId = strFmt(ResUtil::activityResourceIdStrFormat,
+                activityResourceEngagementView.Activity,
+                '0',
+                activityResourceEngagementView.ActivityResource);
+
+                utcdatetime start = AVTimeframe::getTimeframe(
+                DateTimeUtil::newDateTime(
+                    min(ActivityResourceFacade::getEarliestReservationDate(activityResourceEngagementView.ActivityResource),
+                        activityResourceEngagementView.EngagementStartDate), 0),
+                    AVTimeframeType::Month).start();
+                
+                utcdatetime end = AVTimeframe::getTimeframe(
+                DateTimeUtil::newDateTime(
+                    max(ActivityResourceFacade::getLatestReservationDate(activityResourceEngagementView.ActivityResource),
+                        activityResourceEngagementView.EngagementEndDate), #LastSecondOfTheDay),
+                    AVTimeframeType::Month).end();
+
+                if (updateRollUpAsync)
+                {
+                    // update roll-up records for the project existing planned resources
+                    container arguments = [activityResourceId, start, end];
+                    Global::runAsync(classNum(ResRollUpWriter),
+                    staticMethodStr(ResRollUpWriter, updateRollUpForSpecificActivityResourceIdAsync), arguments);
+                }
+                else
+                {
+                    ResRollUpWriter::updateRollUpForSpecificActivityResourceId(activityResourceId, start, end);
+                }                
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deletePlannedResourceReservation</Name>
+				<Source><![CDATA[
+    private void deletePlannedResourceReservation(str _engagementId)
+    {
+        HierarchyTreeTable  hierarchyTreeTable;
+        ResBooking          resBooking;
+        ResAssignment       resAssignment;
+        PSAProjSchedRole    engagementTeam;
+        MapEnumerator       activityMapEnum;
+
+        // delete the existing planned resources booking records by root activity rec Id
+        select RefRecId from hierarchyTreeTable
+            where hierarchyTreeTable.HierarchyId == hierarchyId
+                && hierarchyTreeTable.Level == 0;
+
+        if (hierarchyTreeTable)
+        {
+            delete_from resBooking
+                where resBooking.Activity == hierarchyTreeTable.RefRecId
+                    exists join engagementTeam
+                        where engagementTeam.RecId == resBooking.ActivityResource
+                            && engagementTeam.Resource == 0;
+        }
+
+        // delete the existing planned resources assignment records by each task's activity rec Id
+        hierarchyTreeTable.clear();
+        engagementTeam.clear();
+        while select RefRecId from hierarchyTreeTable
+            where hierarchyTreeTable.HierarchyId == hierarchyId
+                && hierarchyTreeTable.Level != 0
+        {
+            delete_from resAssignment
+                where resAssignment.Activity == hierarchyTreeTable.RefRecId
+                    exists join engagementTeam
+                        where engagementTeam.RecId == resAssignment.ActivityResource
+                            && engagementTeam.Resource == 0;
+        }
+
+        // delete the planned resources project team records by engagement Id
+        engagementTeam.clear();
+        delete_from engagementTeam
+            where ((entityType == PSARSEntityType::Project
+                        && engagementTeam.ProjId == _engagementId) ||
+                    (entityType == PSARSEntityType::Quotation
+                        && engagementTeam.QuotationId == _engagementId))
+                && engagementTeam.Resource ==  0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a new instance of <c>ResWBSActivityTeam</c>.
+    /// </summary>
+    /// <param name = "_selectedHierarchyId">The selected hierarchyId.</param>
+    /// <param name = "_wbsType">WBS type.</param>
+    protected void new(HierarchyIdBase _selectedHierarchyId,
+        PSARSEntityType _wbsType)
+    {
+        hierarchyId = _selectedHierarchyId;
+        entityType = _wbsType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build activity team from WBS constructor.
+    /// </summary>
+    /// <param name = "_selectedHierarchyId">The selected hierarchyId.</param>
+    /// <param name = "_wbsType">WBS type.</param>
+    /// <returns>Instance of <c>ResWBSActivityTeam</c>.</returns>
+    public static ResWBSActivityTeam construct(HierarchyIdBase _selectedHierarchyId,
+        PSARSEntityType _wbsType)
+    {
+        ResWBSActivityTeam activityTeam = new ResWBSActivityTeam(_selectedHierarchyId, _wbsType);
+        return activityTeam;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

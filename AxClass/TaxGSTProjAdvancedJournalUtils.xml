@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TaxGSTProjAdvancedJournalUtils</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This util class handles any tax GST operations with project advanced journal transaction.
+/// </summary>
+internal final class TaxGSTProjAdvancedJournalUtils
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>correctTaxAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Overrides the tax amount calculated by the tax engine with the provided tax amount
+    /// and clears the calculated tax amount from the project advanced journal line.
+    /// </summary>
+    /// <param name = "_taxEngineHeader">The <c>TaxEngineProjAdvancedJournalLineHeader</c> record.</param>
+    /// <param name = "_projAdvancedJournalLine">The <c>ProjAdvancedJournalLine</c> record.</param>
+    /// <param name = "_silent">true if it throws error while calculation is failed; otherwise, false. Optional.</param>
+    internal static void correctTaxAmount(TaxEngineProjAdvancedJournalLineHeader _taxEngineHeader, ProjAdvancedJournalLine _projAdvancedJournalLine, boolean _silent = true)
+    {
+        if (!_projAdvancedJournalLine.RecId || _projAdvancedJournalLine.ProvidedTaxAmount == 0)
+        {
+            return;
+        }
+
+        TaxableDocumentDescriptor taxableDocDescriptor = TaxableDocumentDescriptorFactory::getTaxableDocumentDescriptor(_taxEngineHeader);
+        if (taxableDocDescriptor.hasTaxAdjustment())
+        {
+            return;
+        }
+
+        ITaxDocument taxDocument = TaxBusinessService::calculateTax(TaxableDocumentObject::construct(taxableDocDescriptor), _silent);
+        if (taxDocument)
+        {
+            ITaxDocumentLine taxDocumentLine = taxDocument.findLineBySource(_projAdvancedJournalLine.TableId, _projAdvancedJournalLine.RecId);
+
+            AmountCur taxAmount;
+            if (taxDocumentLine)
+            {
+                taxAmount = taxDocumentLine.getLineTax().amountTransactionCurrency();
+            }
+
+            if (taxAmount && _projAdvancedJournalLine.ProvidedTaxAmount && taxAmount != _projAdvancedJournalLine.ProvidedTaxAmount)
+            {
+                TableId headingTableId = taxDocument.getOriginSourceTableId();
+                RecId headingRecId = taxDocument.getOriginSourceRecId();
+                real factor = _projAdvancedJournalLine.ProvidedTaxAmount / taxAmount;
+
+                ttsbegin;
+                RecordInsertList recordInsertList = new RecordInsertList(tableNum(TaxDocumentRowMeasureAdjustment));
+                TaxDocumentRowMeasureAdjustment taxDocRowMeasureAdj;
+                ITaxDocumentComponentLineEnumerator componentLineEnumerator= taxDocumentLine.componentLines();
+
+                while (componentLineEnumerator.moveNext())
+                {
+                    ITaxDocumentComponentLine componentLineObject = componentLineEnumerator.current();
+                    ITaxDocumentMeasureEnumerator measureEnumerator = componentLineObject.measures();
+                    while (measureEnumerator.moveNext())
+                    {
+                        ITaxDocumentMeasure measureObject = measureEnumerator.current();
+                        if (measureObject.metaData().type() == classStr(TaxMeasureTaxAmount))
+                        {
+                            TaxRuntimeDocComponentMeasureVersion taxDocComponentMeasureVersion;
+                            TaxRuntimeDocComponentMeasure taxDocComponentMeasure;
+
+                            select firstonly Path from taxDocComponentMeasure
+                                exists join taxDocComponentMeasureVersion
+                                where taxDocComponentMeasureVersion.TaxRuntimeDocComponentMeasure == taxDocComponentMeasure.RecId
+                                    && taxDocComponentMeasureVersion.RecId == measureObject.metaData().id();
+
+                            if (taxDocComponentMeasure.Path)
+                            {
+                                ITaxDocumentMeasureValue measureValue = measureObject.value();
+                                taxDocRowMeasureAdj.clear();
+                                taxDocRowMeasureAdj.HeadingTableId = headingTableId;
+                                taxDocRowMeasureAdj.HeadingRecId = headingRecId;
+                                taxDocRowMeasureAdj.SourceTableId = taxDocumentLine.sourceTableId();
+                                taxDocRowMeasureAdj.SourceRecId = taxDocumentLine.sourceRecId();
+                                taxDocRowMeasureAdj.Path = taxDocComponentMeasure.Path;
+                                taxDocRowMeasureAdj.AdjustAmount = factor * measureValue.value();
+                                taxDocRowMeasureAdj.AdjustAmount_Trans = factor * measureValue.value();
+                                recordInsertList.add(taxDocRowMeasureAdj);
+                            }
+                        }
+                    }
+                }
+
+                recordInsertList.insertDatabase();
+                taxDocument.updateTaxDocumentTaxStatus(TaxDocumentCalculationLevel::Dirty);
+                ttscommit;
+
+                if (_projAdvancedJournalLine.CalculatedTaxAmount != 0)
+                {
+                    ProjAdvancedJournalLine::updateCalculatedTaxAmount(_projAdvancedJournalLine.RecId, 0);
+                }
+            }
+            else
+            {
+                if (_projAdvancedJournalLine.CalculatedTaxAmount != taxAmount)
+                {
+                    ProjAdvancedJournalLine::updateCalculatedTaxAmount(_projAdvancedJournalLine.RecId, taxAmount);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateChildDistributionsForEvent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the child distributions for event.
+    /// </summary>
+    /// <param name = "_accountingEventRecId">The accounting event rec id.</param>
+    /// <param name = "_accountingDate">The accounting date.</param>
+    /// <param name = "_sourceDocumentRecId">The source document rec id.</param>
+    internal static void updateChildDistributionsForEvent(RecId _accountingEventRecId, AccountingDate _accountingDate, RecId _sourceDocumentRecId)
+    {
+        /*
+            1. The source relation type of the parameter passed in is <c>ProjAdvancedJournalLine</c>.
+            2. The tree structure of GST is: transaction line -> tax component -> tax measure.
+            3. System creates accounting distribution for the <c>SourceDocumentLine</c> of tax measure, but not tax component.
+            So here it should only update account event for tax measure accounting distribution.
+        */
+
+        if (FeatureStateProvider::isFeatureEnabled(TaxProjOpsIntegrationJournal_INFeature::instance()))
+        {
+            AccountingDistribution accountingDistribution;
+            SourceDocumentLine sourceDocumentLineParent;
+            SourceDocumentLine sourceDocumentLineChild;
+
+            accountingDistribution.skipDataMethods(true);
+            accountingDistribution.skipEvents(true);
+            accountingDistribution.skipDatabaseLog(true);
+            update_recordset accountingDistribution
+                setting AccountingEvent = _accountingEventRecId
+                where accountingDistribution.AccountingEvent == 0
+                    && accountingdistribution.AccountingDate == _accountingDate
+                join sourceDocumentLineParent
+                    where sourceDocumentLineParent.ParentSourceDocumentLine == _sourceDocumentRecId
+                        && accountingDistribution.SourceDocumentHeader == sourceDocumentLineParent.SourceDocumentHeader
+                join sourceDocumentLineChild
+                    where SourceDocumentLineChild.ParentSourceDocumentLine == sourceDocumentLineParent.RecId
+                        && sourceDocumentLineChild.RecId == accountingDistribution.SourceDocumentLine
+                        && (sourceDocumentLineChild.AccountingStatus == SourceDocumentLineAccountingStatus::Completed
+                            || sourceDocumentLineChild.AccountingStatus == SourceDocumentLineAccountingStatus::Canceled);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTaxEnabledForProjOps_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether India tax is enabled for project operation integration.
+    /// </summary>
+    /// <returns>
+    /// true if India tax is enabled for project operation integration; otherwise, false.
+    /// </returns>
+    internal static boolean isTaxEnabledForProjOps_IN()
+    {
+        return FeatureStateProvider::isFeatureEnabled(TaxProjOpsIntegrationJournal_INFeature::instance())
+            && ProjProjectOperationsIntegrationFeatureHelper::isFeatureEnabled()
+            && TaxParameters::checkTaxParameters_IN();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTaxSolutionEnabledForProjOps_IN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether India tax solution is enabled for project operation integration.
+    /// </summary>
+    /// <returns>
+    /// true if India tax solution is enabled for project operation integration; otherwise, false.
+    /// </returns>
+    internal static boolean isTaxSolutionEnabledForProjOps_IN()
+    {
+        return TaxGSTProjAdvancedJournalUtils::isTaxEnabledForProjOps_IN()
+            && TaxSolutionScopeIntegrationUtil::isCompanyEnabled();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyTaxDocumentFromOriginalInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copies tax document from original posted invoice.
+    /// </summary>
+    /// <param name = "_sourceLine">The source <c>ProjAdvancedJournalLine</c> record.</param>
+    /// <param name = "_targetLine">The target <c>ProjAdvancedJournalLine</c> record.</param>
+    internal static void copyTaxDocumentFromOriginalInvoice(ProjAdvancedJournalLine _sourceLine, ProjAdvancedJournalLine _targetLine)
+    {
+        // Target
+        TaxEngineProjAdvancedJournalLineHeader headerTarget = _targetLine.salesPurchJournalTable();
+        ITaxDocument taxDocumentTarget = TaxBusinessService::getTaxDocumentBySource(headerTarget.TableId, headerTarget.RecId);
+
+        if (!taxDocumentTarget)
+        {
+            // Source
+            TaxEngineProjAdvancedJournalLineHeader headerSource = _sourceLine.salesPurchJournalTable();
+            ITaxDocument taxDocumentSource = TaxBusinessService::getTaxDocumentBySource(headerSource.TableId, headerSource.RecId);
+
+            // Copies from source tax document.
+            TaxBusinessService::copyTaxDocumentForProjectCreditNote(_sourceLine, _targetLine, taxDocumentSource, headerTarget);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOrigTaxDocExtForProjAdvancedJournalByTaxEngineHeaderRecId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the original tax document extension for project advanced journal by tax engine header rec id.
+    /// </summary>
+    /// <param name = "_refRecId">The reference record id.</param>
+    /// <returns>The <c>TaxDocumentExtension_IN</c> record.</returns>
+    internal static TaxDocumentExtension_IN getOrigTaxDocExtForProjAdvancedJournalByTaxEngineHeaderRecId(RefRecId _refRecId)
+    {
+        TaxDocumentExtension_IN refTaxDocumentExtensionIN;
+        TaxEngineProjAdvancedJournalLineHeader taxEngineHeader = TaxEngineProjAdvancedJournalLineHeader::find(_refRecId);
+        ProjAdvancedJournalLine projAdvancedJournalLine = taxEngineHeader.getProjAdvancedJournalLine();
+        ProjAdvancedJournalLine projAdvancedJournalLineOrig = TaxProjOperationUtils::getOrigProjAdvancedJournalLine(projAdvancedJournalLine);
+        if (projAdvancedJournalLineOrig)
+        {
+            TaxEngineProjAdvancedJournalLineHeader taxEngineHeaderOrig = TaxEngineProjAdvancedJournalLineHeader::findByVoucher(projAdvancedJournalLineOrig.Voucher);
+            refTaxDocumentExtensionIN = TaxDocumentExtensionUtils::getTaxDocumentExtension_IN(taxEngineHeaderOrig);
+        }
+        return refTaxDocumentExtensionIN;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

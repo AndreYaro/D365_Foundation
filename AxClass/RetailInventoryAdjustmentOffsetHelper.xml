@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailInventoryAdjustmentOffsetHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+internal final class RetailInventoryAdjustmentOffsetHelper
+{
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>ProcessInventoryAdjustmentOffset</Name>
+				<Source><![CDATA[
+    public static void ProcessInventoryAdjustmentOffset(RetailTransactionTable transactionTable)
+    {
+        if (transactionTable.CreatedOffline == NoYes::Yes)
+        {
+            return;
+        }
+
+        utcdatetime transactionDateTime = transactionTable.transactionDateTime();
+        RetailSharedParameters retailSharedParameters = RetailSharedParameters::find();
+        if (transactionDateTime < retailSharedParameters.InventoryServiceIntegrationResetDateTime)
+        {
+            eventSource.EventWriteInventoryAdjustmentOffsetTransactionPriorToReset(curExt(), transactionTable.RecId, transactionTable.Channel, transactionTable.transactionId, enum2int(transactionTable.type), DateTimeUtil::toStr(transactionDateTime), DateTimeUtil::toStr(retailSharedParameters.InventoryServiceIntegrationResetDateTime));
+            return;
+        }
+
+        eventSource.EventWriteInventoryAdjustmentOffsetStart(curExt(), transactionTable.RecId, transactionTable.Channel, transactionTable.transactionId, enum2int(transactionTable.type));
+
+        StatusIssue statusIssue = StatusIssue::None; // Only for backward compatibility, remove it after 10.0.39
+        str dataSource = InventInventoryDataServiceCommerceIntegrationHelper::Datasource;
+        str physicalMeasure;
+        if (transactionTable.type == RetailTransactionType::Sales)
+        {
+            statusIssue = StatusIssue::Sold;
+            physicalMeasure = InventInventoryDataServiceCommerceIntegrationHelper::SoldOffset;
+        }
+        else
+        {
+            if (SalesParameters::find().Reservation == ItemReservation::Automatic)
+            {
+                statusIssue = StatusIssue::ReservPhysical;
+                physicalMeasure = InventInventoryDataServiceCommerceIntegrationHelper::ReservPhysicalOffset;
+            }
+            else
+            {
+                statusIssue = StatusIssue::OnOrder;
+                physicalMeasure = InventInventoryDataServiceCommerceIntegrationHelper::OnOrderOffset;
+            }
+        }
+
+        int totalCount = 0;
+
+        RetailTransactionSalesTrans transactionSalesTrans;
+        while select transactionSalesTrans
+            where transactionSalesTrans.Channel           == transactionTable.Channel
+               && transactionSalesTrans.store             == transactionTable.store
+               && transactionSalesTrans.terminalId        == transactionTable.terminal
+               && transactionSalesTrans.transactionId     == transactionTable.transactionId
+               && transactionSalesTrans.transactionStatus != RetailEntryStatus::Voided
+        {
+            if (transactionSalesTrans.giftcard == NoYes::Yes || !InventTable::find(transactionSalesTrans.ItemId).isStocked())
+            {
+                continue;
+            }
+
+            InventDim productDimensionDim;
+            if (transactionSalesTrans.variantId)
+            {
+                InventDimCombination idc;
+                select firstonly productDimensionDim
+                    exists join idc
+                    where productDimensionDim.InventDimId == idc.InventDimId && idc.RetailVariantId == transactionSalesTrans.variantId;
+            }
+            else
+            {
+                productDimensionDim = InventDim::findOrCreateBlank();
+            }
+
+            real quantity = transactionSalesTrans.qty;
+            str inventoryUnit = InventTableModule::find(transactionSalesTrans.itemId, ModuleInventPurchSales::Invent).UnitId;
+            if (transactionSalesTrans.unit != inventoryUnit)
+            {
+                quantity = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(transactionSalesTrans.itemId, productDimensionDim.inventDimId, quantity, transactionSalesTrans.unit, inventoryUnit);
+            }
+
+            InventDim offsetDim;
+            offsetDim.InventSiteId     = InventLocation::find(transactionSalesTrans.InventLocationId).InventSiteId;
+            offsetDim.InventLocationId = transactionSalesTrans.InventLocationId;
+            offsetDim.InventColorId    = productDimensionDim.InventColorId;
+            offsetDim.configId         = productDimensionDim.configId;
+            offsetDim.InventSizeId     = productDimensionDim.InventSizeId;
+            offsetDim.InventStyleId    = productDimensionDim.InventStyleId;
+            offsetDim = InventDim::findOrCreate(offsetDim);
+            
+            InventInventoryDataServiceAdjustmentOffsetQueue adjustmentOffsetQueue;
+
+            // Only for backward compatibility, remove it after 10.0.39
+            adjustmentOffsetQueue.InventTransType   = InventTransType::Sales;
+            adjustmentOffsetQueue.StatusReceipt     = StatusReceipt::None;
+            adjustmentOffsetQueue.StatusIssue       = statusIssue;
+
+            adjustmentOffsetQueue.Datasource        = dataSource;
+            adjustmentOffsetQueue.PhysicalMeasure   = physicalMeasure;
+            adjustmentOffsetQueue.ItemId            = transactionSalesTrans.itemId;
+            adjustmentOffsetQueue.OffsetInventDimId = offsetDim.inventDimId;
+            adjustmentOffsetQueue.Company           = transactionSalesTrans.DataAreaId;
+
+            if (transactionTable.type == RetailTransactionType::Sales)
+            {
+                adjustmentOffsetQueue.OffsetQty = quantity;
+                adjustmentOffsetQueue.InventDimId = transactionSalesTrans.inventDimId;
+            }
+            else
+            {
+                adjustmentOffsetQueue.OffsetQty = -quantity;
+                
+                SalesLine salesLine;
+                select firstonly inventDimId from salesLine
+                    where salesLine.SalesId == transactionTable.salesOrderId && salesLine.LineNum == transactionSalesTrans.lineNum;
+
+                adjustmentOffsetQueue.InventDimId = salesLine.InventDimId;
+            }
+
+            adjustmentOffsetQueue.insert();
+
+            eventSource.EventWriteInventoryAdjustmentOffsetInsert(
+                curExt(), transactionTable.RecId, transactionTable.Channel, transactionTable.transactionId, enum2int(transactionTable.type), num2Str(transactionSalesTrans.lineNum, 0, 6, 1, 0),
+                num2Str(adjustmentOffsetQueue.OffsetQty, 0, 6, 1, 0), adjustmentOffsetQueue.OffsetInventDimId, adjustmentOffsetQueue.InventDimId, dataSource, physicalMeasure);
+            ++totalCount;
+        }
+
+        eventSource.EventWriteInventoryAdjustmentOffsetFinish(curExt(), transactionTable.RecId, transactionTable.Channel, transactionTable.transactionId, enum2int(transactionTable.type), totalCount);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

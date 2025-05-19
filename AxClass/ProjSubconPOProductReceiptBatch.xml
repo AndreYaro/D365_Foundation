@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>ProjSubconPOProductReceiptBatch</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>ProjSubconPOProductReceiptBatch</c> batch creates product receipts from the actuals.
+/// </summary>
+public class ProjSubconPOProductReceiptBatch extends RunBaseBatch implements BatchRetryable
+{
+    private ProjPurchSubConInstrumentationLogger logger;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static ProjSubconPOProductReceiptBatch construct()
+    {
+        return new ProjSubconPOProductReceiptBatch();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@Proj:ProductReceiptCreationFromActuals";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args args)
+    {
+        ProjSubconPOProductReceiptBatch projSubconPOProductReceiptBatch = ProjSubconPOProductReceiptBatch::construct();
+
+        if (!projSubconPOProductReceiptBatch.prompt())
+        {
+            return;
+        }
+
+        projSubconPOProductReceiptBatch.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        boolean subconPoIntegEnabled = FeatureStateProvider::isFeatureEnabled(ProjOpsSubContractPurchaseOrderFeature::instance());
+
+        if (subconPoIntegEnabled)
+        {
+            this.processImportQueue();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processImportQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes actuals from the import queue.
+    /// </summary>
+    protected void processImportQueue()
+    {
+        #OCCRetryCount
+        ProjCDSActualsImport import;
+        ProjAdvancedJournalLine projAdvancedJournalLine;
+        ProjSubconPOProductReceiptDetails projSubconPOProductReceiptDetails;
+        logger = ProjPurchSubConInstrumentationLogger::createLogger(classStr(ProjSubconPOProductReceiptBatch));
+
+        while select import
+            where import.SubcontractLine != ''
+                && import.SubConProductReceiptId == ''
+                && import.Quantity != 0
+            && import.AdjustmentStatus != ProjCDSConstants::TransactionAdjustmentStatus_Unadjustable
+                && import.ExternalReference == ''
+            join projAdvancedJournalLine
+                where projAdvancedJournalLine.RecId == import.ProjAdvancedJournalLine
+                    && projAdvancedJournalLine.Status == ProjAdvancedJournalLineStatus::Posted
+            notexists join projSubconPOProductReceiptDetails 
+                where projSubconPOProductReceiptDetails.ActualsImportId == import.ActualsImportId
+        {
+            try
+            {
+                ttsbegin;
+                this.processRecord(import, projAdvancedJournalLine);
+                ttscommit;
+            }
+            catch (Exception::TransientSqlConnectionError)  // In case of error with sql connection, db can't be updated to reflect error status. Log data to telemetry.
+            {
+                if (xSession::currentRetryCount() <= #RetryNum && ProjTransientSQLConnectionRetryProvider::retryTransientSqlConnectionError())
+                {
+                    logger.logWarning(strFmt("@Proj:SubconActualsProcessingSkippedError",
+                        this.parmCurrentBatch(), import.SubcontractLine, import.ActualsImportId,
+                        Exception::TransientSqlConnectionError, xSession::currentRetryCount()));
+                    retry;
+                }
+                else
+                {
+                    logger.logError(strFmt("@Proj:SubconActualsProcessingSkippedError",
+                        this.parmCurrentBatch(), import.SubcontractLine, import.ActualsImportId,
+                        Exception::TransientSqlConnectionError, xSession::currentRetryCount()));
+                    Error (strFmt("@Proj:SubconActualsProcessingSkipped", import.SubcontractLine, import.ActualsImportId));
+                    continue;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    logger.logError(strFmt("@Proj:SubconActualsProcessingSkippedError",
+                        this.parmCurrentBatch(), import.SubcontractLine, import.ActualsImportId,
+                        Exception::Deadlock, xSession::currentRetryCount()));
+                    Error (strFmt("@Proj:SubconActualsProcessingSkipped", import.SubcontractLine, import.ActualsImportId));
+                    continue;
+                }
+                else
+                {
+                    logger.logWarning(strFmt("@Proj:SubconActualsProcessingSkippedError",
+                        this.parmCurrentBatch(), import.SubcontractLine, import.ActualsImportId,
+                        Exception::Deadlock, xSession::currentRetryCount()));
+                    sleep(ProjConstants::DeadLockRetryInterval * xSession::currentRetryCount());
+                    retry;
+                }
+            }
+            
+            catch (Exception::Error)
+            {
+                logger.logError(strFmt("@Proj:SubconActualsProcessingSkippedError",
+                        this.parmCurrentBatch(), import.SubcontractLine, import.ActualsImportId,
+                        Exception::Error, xSession::currentRetryCount()));
+                Error (strFmt("@Proj:SubconActualsProcessingSkipped", import.SubcontractLine, import.ActualsImportId));
+                // Assumes that any error message was already raised at the point that threw the exception, so continue to the next record.
+                continue;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process actuals and create product receipts
+    /// </summary>
+    /// <param name = "_import">The actual record to process.</param>
+    /// <param name = "_line">The project advanced journal line to process.</param>
+    protected void processRecord(ProjCDSActualsImport _import, ProjAdvancedJournalLine _line)
+    {
+        try 
+        {
+            ProjSubConProductReceipt productReceiptHeader = this.findOrInsertProjSubconPoProductReceipt(_line);
+
+            this.insertProjSubconPoProductReceiptDetails(productReceiptHeader, _import);
+        }
+        catch 
+        {
+            Error("@Proj:UnableToSaveDueToErrors");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOrInsertProjSubconPoProductReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find or insert <c>ProjSubConProductReceipt</c> record.
+    /// </summary>
+    /// <param name = "_line">The project advanced journal line to process.</param>
+    /// <returns>The find or created <c>ProjSubConProductReceipt record.</c> record.</returns>
+    protected internal ProjSubConProductReceipt findOrInsertProjSubconPoProductReceipt(ProjAdvancedJournalLine _line)
+    {
+        PurchLine purchLine = PurchLine::findBySubConLineNumber(_line.SubcontractLine);
+        PurchTable purchTable = PurchTable::find(purchLine.PurchId);
+        ProjSubConProductReceipt projSubConProductReceipt;
+
+        select firstonly projSubConProductReceipt
+            where projSubConProductReceipt.Posted == NoYes::No
+                && projSubConProductReceipt.PurchId == purchLine.purchID
+                && projSubConProductReceipt.ReceiptDate == _line.AccountingDate;
+        
+        // create projSubConProductReceipt if not found
+        if (!projSubConProductReceipt)
+        {
+            projSubConProductReceipt.PurchId = purchLine.purchID;
+            projSubConProductReceipt.SubConNumber = purchTable.ProjSubContractNumber;
+            projSubConProductReceipt.Posted = NoYes::No;
+            // need to update number sequence code once after number sequence pushed into the master.
+            projSubConProductReceipt.SubConProductReceiptId = this.newPackingSlipId();
+            projSubConProductReceipt.ReceiptDate = _line.AccountingDate;
+            if (projSubConProductReceipt.validateWrite())
+            {
+                projSubConProductReceipt.insert();
+            }
+            else
+            {
+                throw Error("@Proj:UnableToSaveDueToErrors");
+            }
+        }
+
+        return projSubConProductReceipt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertProjSubconPoProductReceiptDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert <c>ProjSubconPOProductReceiptDetails</c> record.
+    /// </summary>
+    /// <param name = "_projSubConProductReceipt">The related <c>ProjSubConProductReceipt</c> record to use for inserting the new record.</param>
+    /// <param name = "_import">The related <c>ProjCDSActualsImport</c> record to use for inserting the new record.</param>
+    /// <returns>The created <c>ProjSubconPOProductReceiptDetails</c> record.</returns>
+    protected internal ProjSubconPOProductReceiptDetails insertProjSubconPoProductReceiptDetails(ProjSubConProductReceipt _projSubConProductReceipt, ProjCDSActualsImport _import)
+    {
+        ProjSubconPOProductReceiptDetails projSubconPOProductReceiptDetails = projSubconPOProductReceiptDetails::findByActualId(_import.ActualsImportId);
+
+        if (!projSubconPOProductReceiptDetails)
+        {
+            projSubconPOProductReceiptDetails.PurchId = _projSubConProductReceipt.PurchId;
+            projSubconPOProductReceiptDetails.SubConNumber = _projSubConProductReceipt.SubConNumber;
+            projSubconPOProductReceiptDetails.SubConProductReceiptId = _projSubConProductReceipt.SubConProductReceiptId;
+            projSubconPOProductReceiptDetails.ActualsImportId = _import.ActualsImportId;
+            projSubconPOProductReceiptDetails.Qty = _import.Quantity;
+            projSubconPOProductReceiptDetails.SubConLineNumber = _import.SubcontractLine;
+            projSubconPOProductReceiptDetails.ProjSubconProductReceipt = _projSubConProductReceipt.RecId;
+
+            if (projSubconPOProductReceiptDetails.validateWrite())
+            {
+                projSubconPOProductReceiptDetails.insert();
+            }
+            else
+            {
+                throw Error("@Proj:UnableToSaveDueToErrors");
+            }
+        }
+
+        return projSubconPOProductReceiptDetails;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    // <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newPackingSlipId</Name>
+				<Source><![CDATA[
+    private Num newPackingSlipId()
+    {
+        NumberSeq   numberSeq;
+
+        numberSeq = NumberSeq::newGetNum(ProjParameters::numRefPackingSlipId());
+        return numberSeq.num();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

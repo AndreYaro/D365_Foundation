@@ -1,0 +1,808 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SelfServicePackageManager</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.DynamicsOnline.Infrastructure.Components.SharedServiceUnitStorage;
+using EventLogger = Microsoft.Dynamics.Application.Instrumentation.ApplicationEventSource;
+
+/// <summary>
+/// The <c>SelfServicePackageManager</c> class provides basic Azure Cloud Storage package management functionality along with package metadata manipulation in AX db.
+/// Currently supported package based operations are:
+/// 1) Uploading a Package.
+/// 2) Generating a download link for a package.
+/// 3) Deleting a package.
+/// Miscellaneous operations/ information.
+/// 1) All packages are stored into a container on the tenant cloud storage account called 'selfservicepackages'.
+/// 2) All package information is stored into the database table "RetailSelfServicePackageInfo".
+/// 3) To download a file please generate a download link and open a new browser tab for user.
+/// </summary>
+class SelfServicePackageManager
+{
+    // Azure does not support container names with upper case.
+    private static const str SELFSERVICE_CONTAINERNAME = 'selfservicepackages';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>UploadPackage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Uploads a package from the local machine to the tenant storage.
+    /// </summary>
+    /// <param name = "packageLocationOnDisk">Local disk location of the package to upload.</param>
+    /// <param name = "packageFriendlyName">Friendly name used to be displayed to the users on the AX UI.Default = FilenameMinusExtension.</param>
+    /// <param name = "packageDescription">Brief description of the package. Default = Version %1 of package %2.</param>
+    /// <param name = "typeOfPackage">The type of package being uploaded. Default = Miscellaneous.</param>
+    /// <param name = "packageVersion">The version of the package. Default = Deployed AOS build version.</param>
+    /// <param name = "pkgReplaceMode">Specifies how to deal with any pre-existing package of given name or version.</param>
+    /// <param name = "maximumRetries">Number of times to attempt uploading a package incase of failures.</param>
+    /// <returns>True if upload successful; otherwise, false.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static boolean UploadPackage(str packageLocationOnDisk, str packageFriendlyName = '', str packageDescription = '', PackageType typeOfPackage = PackageType::Miscellaneous,str packageVersion = SelfServicePackageManager::GetApplicationVersion(), PackageReplaceMode pkgReplaceMode = PackageReplaceMode::None, int maximumRetries = 5)
+    {
+        // Check if the package location is valid.
+        if (System.String::IsNullOrWhiteSpace(packageLocationOnDisk))
+        {
+            //Show message :: Source file path of the package is required.
+            EventLogger::EventWriteSelfServiceError("@RETAIL:SourceFilePathIsRequired", "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error("@RETAIL:SourceFilePathIsRequired");
+        }
+
+        if (!System.IO.File::Exists(packageLocationOnDisk))
+        {
+            // Show message :: File does not exist: %1.
+            str errorMsg = strFmt("@SYS315466", packageLocationOnDisk);
+            EventLogger::EventWriteSelfServiceError(errorMsg, 'User does not have permissions to access the file or the file does not exist.', System.Environment::StackTrace);
+            throw Global::error(errorMsg);
+        }
+
+        // Generate blob name
+        str blobName = SelfServicePackageManager::GenerateBlobName(packageLocationOnDisk, packageVersion);
+        str filenameWithoutExtension = System.IO.Path::GetFileNameWithoutExtension(packageLocationOnDisk);
+
+        // Fix Blob friendly name and description
+        packageFriendlyName = System.String::IsNullOrWhiteSpace(packageFriendlyName) ? filenameWithoutExtension: packageFriendlyName;
+        str blobDesc = System.String::IsNullOrWhiteSpace(packageDescription) ? strFmt("@Retail:SelfServiceBlobDescFormat", packageVersion, filenameWithoutExtension): packageDescription;
+
+        // Remove all packages with said friendly name.
+        if (pkgReplaceMode == PackageReplaceMode::ReplaceExistingByName)
+        {
+            SelfServicePackageManager::DeleteAllPackagesWithFriendlyName(packageFriendlyName);
+        }
+
+        // Remove all packages of same type.
+        if (pkgReplaceMode == PackageReplaceMode::ReplaceExistingByType)
+        {
+            SelfServicePackageManager::DeleteAllPackagesOfType(typeOfPackage);
+        }
+
+        // Proceed to upload package.
+        EventLogger::EventWriteSelfServicePackageUploadStart(blobName, packageLocationOnDisk);
+        str packageStorageUID = SelfServicePackageManager::InitatePackageUpload(packageLocationOnDisk, blobName, blobDesc, maximumRetries);
+        boolean UploadSuccessful = !System.String::IsNullOrWhiteSpace(packageStorageUID);
+
+        if (UploadSuccessful)
+        {
+            // Upsert an entry in the RetailSelfServicePackageInfo Table
+            SelfServicePackageManager::UpsertTableEntryForUploadedPackage(blobName, packageFriendlyName, blobDesc, packageVersion, typeOfPackage, packageStorageUID);
+        }
+
+        EventLogger::EventWriteSelfServicePackageUploadStop(blobName, packageLocationOnDisk);
+        return UploadSuccessful;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetPackageFilename</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the filename associated with the given package.
+    /// </summary>
+    /// <param name = "packageStorageUID">The unique identifier for the package.</param>
+    /// <param name = "suppressErrors">Specify if error message generation should be suppressed.</param>
+    /// <returns>The filename or emptystring.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GetPackageFilename(str packageStorageUID, boolean suppressErrors = false)
+    {
+        // Input parameter validation.
+        if (System.String::IsNullOrWhiteSpace(packageStorageUID))
+        {
+            str errorMsg = strFmt("@RETAIL:InvalidPackageReferenced", packageStorageUID);
+            EventLogger::EventWriteSelfServiceError(errorMsg, "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+
+            if (!suppressErrors)
+            {
+                throw Global::error(errorMsg);
+            }
+            else
+            {
+                return '';
+            }
+        }
+
+        str result = '';
+        System.Exception exception;
+
+        try
+        {
+            // Set a time span of 1 mins.
+            System.TimeSpan timeSpan = new System.TimeSpan(0, 1, 0);
+
+            // Get a connection instance to the cloud storage.
+            StorageContext storageContext = SelfServicePackageManager::GetStorageConnectionInstance();
+
+            // Create shared storage wrapper
+            SharedServiceUnitStorage storage = new SharedServiceUnitStorage(storageContext);
+
+            // Create storage data descriptor
+            SharedServiceUnitStorageData storageData = storage.GetData(packageStorageUID, SELFSERVICE_CONTAINERNAME, BlobUrlPermission::Read, timeSpan);
+
+            result = storageData.Name;
+        }
+        catch (exception)
+        {
+            if (!suppressErrors)
+            {
+                EventLogger::EventWriteSelfServiceError('Exception raised during get package filename.', exception.Message, exception.StackTrace);
+                throw Global::error("@RETAIL:GetPackageFilenameFailed");
+            }
+            else
+            {
+                EventLogger::EventWriteSelfServiceWarning('Exception raised during get package filename.');
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetPackageFromStorageAsMemoryStream</Name>
+				<Source><![CDATA[
+	/// <summary>
+    /// Get package from storage as a memory stream.
+    /// </summary>
+    /// <param name = "packageStorageUID">The unique identifier for the package.</param>
+    /// <param name = "suppressErrors">Specify if error message generation should be suppressed.</param>
+    /// <returns>.NET memory stream for the package or null.  NOTE: Caller must dispose.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static System.IO.MemoryStream  GetPackageFromStorageAsMemoryStream(str packageStorageUID, boolean suppressErrors = false)
+    {
+        System.IO.MemoryStream memStream = null;
+        System.TimeSpan timeSpan;
+        StorageContext storageContext;
+        SharedServiceUnitStorage storage;
+
+        // Input parameter validation.
+        if (System.String::IsNullOrWhiteSpace(packageStorageUID))
+        {
+            str errorMsg = strFmt("@RETAIL:InvalidPackageReferenced", packageStorageUID);
+            EventLogger::EventWriteSelfServiceError(errorMsg, "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+
+            if (!suppressErrors)
+            {
+                throw Global::error(errorMsg);
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        // Set a time span of 30 mins.
+        timeSpan = new System.TimeSpan(0, 30, 0);
+
+        // Get a connection instance to the cloud storage.
+        storageContext = SharedServiceUnitStorage::GetDefaultStorageContext();
+
+        // Create shared storage wrapper
+        storage = new SharedServiceUnitStorage(storageContext);
+
+        try
+        {
+            memStream = new System.IO.MemoryStream();
+
+            storage.DownloadData(packageStorageUID,SELFSERVICE_CONTAINERNAME, memStream);
+            memStream.Flush();
+            memStream.Seek(0, System.IO.SeekOrigin::Begin);
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception interopException = CLRInterop::getLastException();
+            str errorMsg = SelfServicePackageManager::getFriendlyExceptionMessage(interopException);
+            EventLogger::EventWriteSelfServiceError(errorMsg, "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+
+            // cleanup the memory stream since it isn't being returned.
+            if (memStream != null)
+            {
+                memStream.Dispose();
+                memStream = null;
+            }
+
+            if (!suppressErrors)
+            {
+                throw Global::error(errorMsg);
+            }
+			// otherwise - null is returned for the stream.
+        }
+
+        return memStream;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GeneratePackageDownloadLink</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates a download link for a package with provided unique identifier.
+    /// </summary>
+    /// <param name = "packageStorageUID">The unique identifier for the package.</param>
+    /// <param name = "suppressErrors">Specify if error message generation should be suppressed.</param>
+    /// <returns>Valid download link on success else empty string.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GeneratePackageDownloadLink(str packageStorageUID, boolean suppressErrors = false)
+    {
+        // Input parameter validation.
+        if (System.String::IsNullOrWhiteSpace(packageStorageUID))
+        {
+            str errorMsg = strFmt("@RETAIL:InvalidPackageReferenced", packageStorageUID);
+            EventLogger::EventWriteSelfServiceError(errorMsg, "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+
+            if (!suppressErrors)
+            {
+                throw Global::error(errorMsg);
+            }
+            else
+            {
+                return '';
+            }
+        }
+
+        str downloadLinkToReturn = '';
+        System.Exception exception;
+        EventLogger::EventWriteSelfServicePackageDownloadStart(packageStorageUID, '');
+
+        try
+        {
+            // Set a time span of 30 mins.
+            System.TimeSpan timeSpan = new System.TimeSpan(0, 30, 0);
+
+            // Get a connection instance to the cloud storage.
+            StorageContext storageContext = SelfServicePackageManager::GetStorageConnectionInstance();
+
+            // Create shared storage wrapper
+            SharedServiceUnitStorage storage = new SharedServiceUnitStorage(storageContext);
+
+            // Create storage data descriptor
+            SharedServiceUnitStorageData storageData = storage.GetData(packageStorageUID, SELFSERVICE_CONTAINERNAME, BlobUrlPermission::Read, timeSpan);
+
+            // Returns a Url valid for 30 mins.
+            downloadLinkToReturn = storageData.BlobLink;
+
+            // To resolve this: stackoverflow.com/questions/2185570/internet-explorer-removes-exe-extension-from-download-when-followed-by-url-para
+            downloadLinkToReturn = downloadLinkToReturn + '&FixForIE=.exe';
+        }
+        catch (exception)
+        {
+            if (!suppressErrors)
+            {
+                EventLogger::EventWriteSelfServiceError('Exception raised during download link generation.', exception.Message, exception.StackTrace);
+                throw Global::error("@RETAIL:DownloadLinkGenerationFailed");
+            }
+            else
+            {
+                EventLogger::EventWriteSelfServiceWarning('Exception raised during download link generation.');
+            }
+        }
+
+        EventLogger::EventWriteSelfServicePackageDownloadStop(packageStorageUID, downloadLinkToReturn);
+        return downloadLinkToReturn;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DeletePackage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes a previously uploaded package from cloud storage.
+    /// The sufficient conditions for package deletion is removal of metadata stored in AX db.
+    /// This prevents future access to the packages via our codebases.
+    /// Any issues during actual package deletion from cloud storage are ignored as they can no longer be accessed by code.
+    /// </summary>
+    /// <param name = "packageStorageUID">The unique identifier for the package.</param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void DeletePackage(str packageStorageUID)
+    {
+        System.Exception exception;
+
+        // Input parameter validation.
+        if (System.String::IsNullOrWhiteSpace(packageStorageUID))
+        {
+            str errorMsg = strFmt("@RETAIL:InvalidPackageReferenced", packageStorageUID);
+            EventLogger::EventWriteSelfServiceError(errorMsg, "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error(errorMsg);
+        }
+
+        try
+        {
+            // Remove the metadata related to the package.
+            SelfServicePackageManager::RemoveTableEntryForDeletedPackage(packageStorageUID);
+
+            // Get a connection instance to the cloud storage.
+            StorageContext storageContext = SelfServicePackageManager::GetStorageConnectionInstance();
+
+            // Create shared storage wrapper
+            SharedServiceUnitStorage storage = new SharedServiceUnitStorage(storageContext);
+            storage.DeleteData(packageStorageUID, SELFSERVICE_CONTAINERNAME);
+        }
+        catch (exception)
+        {
+            // An exception can only occur during deleting from the cloud storage. In this case we can simply document it.
+            str errorMessage = strFmt('Exception raised during deletion of package with id %1 from cloud storage. No further action required.', packageStorageUID);
+            EventLogger::EventWriteSelfServiceError(errorMessage, exception.Message, exception.StackTrace);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DeletePackageWithFriendlyName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes a previously uploaded package from cloud storage.
+    /// The sufficient conditions for package deletion is removal of metadata stored in AX db.
+    /// This prevents future access to the packages via our codebases.
+    /// Any issues during actual package deletion from cloud storage are ignored as they can no longer be accessed by code.
+    /// </summary>
+    /// <param name = "packageFriendlyName">Friendly name of the package as visible in AX UI.</param>
+    /// <param name = "packageVersion">Version of the package.</param>
+    /// <param name = "typeOfPackage">Enumerator identifying the type of package.</param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static void DeletePackageWithFriendlyName(str packageFriendlyName, str packageVersion, PackageType typeOfPackage)
+    {
+        System.Exception exception;
+        boolean wasValidPackageFound = true;
+
+        if (System.String::IsNullOrWhiteSpace(packageFriendlyName))
+        {
+            //Show message :: Package friendly name is required.
+            EventLogger::EventWriteSelfServiceError("@RETAIL:PackageFriendlyNameIsRequired", "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error("@RETAIL:InvalidFunctionParameter");
+        }
+
+        if (System.String::IsNullOrWhiteSpace(packageVersion))
+        {
+            //Show message :: Package version is required.
+            EventLogger::EventWriteSelfServiceError("@RETAIL:PackageVersionIsRequired", "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error("@RETAIL:InvalidFunctionParameter");
+        }
+
+        try
+        {
+            RetailSelfServicePackageInfo pkgInfoTable;
+
+            select forupdate firstonly1 * from pkgInfoTable where pkgInfoTable.PackageFriendlyName == packageFriendlyName
+                                                        && pkgInfoTable.PackageType == typeOfPackage
+                                                        && pkgInfoTable.PackageVersion == packageVersion;
+
+            str packageStorageUID = pkgInfoTable.PackageStorageUID;
+            if (!System.String::IsNullOrWhiteSpace(packageStorageUID))
+            {
+                // Remove the metadata related to the package.
+                ttsbegin;
+                pkgInfoTable.delete();
+
+                ttscommit;
+                Global::info('Package deletion successful');
+
+                // Get a connection instance to the cloud storage.
+                StorageContext storageContext = SelfServicePackageManager::GetStorageConnectionInstance();
+
+                // Create shared storage wrapper
+                SharedServiceUnitStorage storage = new SharedServiceUnitStorage(storageContext);
+                storage.DeleteData(packageStorageUID, SELFSERVICE_CONTAINERNAME);
+            }
+            else
+            {
+                wasValidPackageFound = false;
+            }
+        }
+        catch (exception)
+        {
+            // An exception can only occur during deleting from the cloud storage. In this case we can simply document it.
+            str errorMessage = 'Exception raised during deletion of package from cloud storage. No further action required.';
+            EventLogger::EventWriteSelfServiceError(errorMessage, exception.Message, exception.StackTrace);
+        }
+
+        if (!wasValidPackageFound)
+        {
+            str errorMessage = strFmt ("Error: No package found matching FriendlyName: '%1', PackageType: '%2' and PackageVersion: '%3'.", packageFriendlyName, enum2Str(typeOfPackage), packageVersion);
+            Global::error(errorMessage);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetPackageIdentifierByName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieve the unique identifier for a package using a package name.
+    /// </summary>
+    /// <param name = "packageName">Name of the package to lookup.</param>
+    /// <returns>Unique identifier for a package.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GetPackageIdentifierByName(str packageName)
+    {
+        str result = '';
+
+        try
+        {
+            // Get the reference Id for the package type provided.
+            RetailSelfServicePackageInfo pkgInfoTable;
+
+            select firstonly1 * from pkgInfoTable where pkgInfoTable.PackageName == packageName;
+            result = pkgInfoTable.PackageStorageUID;
+        }
+        catch
+        {
+            // swallow the exception and return empty string
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GenerateBlobName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate a blob name from a given package path and package version.
+    /// </summary>
+    /// <param name = "packagePath">Path to the package on local file system.</param>
+    /// <param name = "packageVersion">Package file version.</param>
+    /// <returns>Blob name as available on the cloud storage.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GenerateBlobName(str packagePath, str packageVersion)
+    {
+        if (System.String::IsNullOrWhiteSpace(packagePath))
+        {
+            //Show message :: Source file path of the package is required.
+            EventLogger::EventWriteSelfServiceError("@RETAIL:SourceFilePathIsRequired", "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error("@RETAIL:InvalidFunctionParameter");
+        }
+
+        if (System.String::IsNullOrWhiteSpace(packageVersion))
+        {
+            //Show message :: Source file path of the package is required.
+            EventLogger::EventWriteSelfServiceError("@RETAIL:PackageVersionIsRequired", "@Retail:InvalidFunctionParameter", System.Environment::StackTrace);
+            throw Global::error("@RETAIL:InvalidFunctionParameter");
+        }
+
+        str filenameWithoutExtension = System.IO.Path::GetFileNameWithoutExtension(packagePath);
+        str fileExtension = System.IO.Path::GetExtension(packagePath);
+
+        str blobName = strFmt("@Retail:SelfServiceBlobNameFormat", filenameWithoutExtension, Global::strReplace(packageVersion, ".", ''), fileExtension);
+        return blobName;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetApplicationVersion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieve the Application Suite version.
+    /// </summary>
+    /// <returns>A string which contains the application suite version.</returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static str GetApplicationVersion()
+    {
+        const str ApplicationSuiteModuleName = 'ApplicationSuite';
+        str applicationSuiteVersion = '';
+
+        Microsoft.Dynamics.AX.Metadata.MetaModel.ModelInfo modelInfo;
+        CLRObject modelsInAppSuiteModule, modelsInAppSuiteModuleEnumerator;
+
+        // Retrieve the set of all models in the 'ApplicationSuite' module.
+        modelsInAppSuiteModule = Microsoft.Dynamics.Ax.Xpp.MetadataSupport::GetModelsInModuleSortedByDisplayName(ApplicationSuiteModuleName);
+        modelsInAppSuiteModuleEnumerator = modelsInAppSuiteModule.GetEnumerator();
+
+        // Extract the version of the first model within the 'ApplicationSuite' module.
+        while (modelsInAppSuiteModuleEnumerator.MoveNext())
+        {
+            modelInfo = modelsInAppSuiteModuleEnumerator.get_Current();
+
+            applicationSuiteVersion = strFmt("%1.%2.%3.%4",
+                                            modelInfo.VersionMajor,
+                                            modelInfo.VersionMinor,
+                                            modelInfo.VersionBuild,
+                                            modelInfo.VersionRevision);
+            break;
+        }
+
+        // If the version retrieved is null or empty then throw an error.
+        if (System.String::IsNullOrWhiteSpace(applicationSuiteVersion))
+        {
+            throw Global::error("@Retail:CannotRetrieveApplicationVersion");
+        }
+
+        return applicationSuiteVersion;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DeleteAllPackagesOfType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes all packages from AX Db and cloud storage of given type.
+    /// </summary>
+    /// <param name = "targetPackageType">Type of packages to remove.</param>
+    private static void DeleteAllPackagesOfType(PackageType targetPackageType)
+    {
+        List packageStorageUIDsToRemove = new List(Types::String);
+        RetailSelfServicePackageInfo pkgInfoTable;
+
+        while select * from pkgInfoTable where pkgInfoTable.PackageType == targetPackageType
+        {
+            packageStorageUIDsToRemove.addStart(pkgInfoTable.PackageStorageUID);
+        }
+
+        ListIterator packageStorageUIDIterator = new ListIterator(packageStorageUIDsToRemove);
+
+        while  (packageStorageUIDIterator.more())
+        {
+            SelfServicePackageManager::DeletePackage(packageStorageUIDIterator.value());
+            packageStorageUIDIterator.next();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DeleteAllPackagesWithFriendlyName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes all packages from AX Db and cloud storage with given friendly name.
+    /// </summary>
+    /// <param name = "packageFriendlyName">Friendly name of the packages to remove.</param>
+    private static void DeleteAllPackagesWithFriendlyName(str packageFriendlyName)
+    {
+        List packageStorageUIDsToRemove = new List(Types::String);
+        RetailSelfServicePackageInfo pkgInfoTable;
+
+        while select * from pkgInfoTable where pkgInfoTable.PackageFriendlyName == packageFriendlyName
+        {
+            packageStorageUIDsToRemove.addStart(pkgInfoTable.PackageStorageUID);
+        }
+
+        ListIterator packageStorageUIDIterator = new ListIterator(packageStorageUIDsToRemove);
+
+        while (packageStorageUIDIterator.more())
+        {
+            SelfServicePackageManager::DeletePackage(packageStorageUIDIterator.value());
+            packageStorageUIDIterator.next();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InitatePackageUpload</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Connects to cloud storage and uploads a package from a provided location.
+    /// </summary>
+    /// <param name = "packageLocationOnDisk">Location of the package on local system.</param>
+    /// <param name = "blobName">Name identifier for the blob on the storage.</param>
+    /// <param name = "blobDesc">Description for the blob.</param>
+    /// <param name = "maximumRetries">Number of times to attempt uploading a package in case of upload failure.</param>
+    /// <returns>On success: returns Unique identifier for the blob else returns empty string.</returns>
+    private static str InitatePackageUpload(str packageLocationOnDisk, str blobName, str blobDesc, int maximumRetries)
+    {
+        int uploadAttempt = 1;
+        boolean UploadSuccessful = false;
+
+        str packageStorageUID = null;
+        System.Exception exception;
+
+        // Get a connection instance to the cloud storage.
+        StorageContext storageContext = SelfServicePackageManager::GetStorageConnectionInstance();
+        // Create shared storage wrapper
+        SharedServiceUnitStorage storage = new SharedServiceUnitStorage(storageContext);
+
+        while (!UploadSuccessful && uploadAttempt <= maximumRetries)
+        {
+            try
+            {
+                // Create storage data descriptor to hold blob metadata.
+                SharedServiceUnitStorageData storageData = new SharedServiceUnitStorageData();
+                packageStorageUID = System.Guid::NewGuid().ToString();
+
+                storageData.Id = packageStorageUID;
+                storageData.Name = blobName;
+                storageData.Description = blobDesc;
+
+                storageData.Accessibility = Accessibility::Public;
+                storageData.Retention = Retention::Permanent;
+                storageData.Category = SELFSERVICE_CONTAINERNAME;
+
+                storage.UploadData(storageData, packageLocationOnDisk, "application/x-msdos-program");
+                UploadSuccessful  = SelfServicePackageManager::VerifyIfBlobUploadedSuccessfully(packageStorageUID);
+            }
+            catch(exception)
+            {
+                str warningMessage = strFmt('Upload attempt %1 failed for blob %2 with an exception %3', uploadAttempt, blobName, exception.Message);
+                EventLogger::EventWriteSelfServiceWarning(warningMessage);
+            }
+
+            if (!UploadSuccessful)
+            {
+                uploadAttempt++;
+            }
+        }
+
+        return UploadSuccessful ? packageStorageUID : '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>VerifyIfBlobUploadedSuccessfully</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Attempts to verify if the package was successfully uploaded by trying to generate a download link for the blob.
+    /// This way we can guarantee:-
+    /// 1) Upload was completed.
+    /// 2) Storage state has been updated to allow customer to download blob.
+    /// </summary>
+    /// <param name = "packageStorageUID">Unique identifier used to identify the package in the blob storage.</param>
+    /// <returns>True if upload successful; otherwise, false.</returns>
+    private static boolean VerifyIfBlobUploadedSuccessfully(str packageStorageUID)
+    {
+        int retryCount = 5;
+        int sleepTime = 1000;
+        boolean uploadSuccessful = false;
+
+        while (!uploadSuccessful && retryCount > 0)
+        {
+            if (!System.String::IsNullOrWhiteSpace(SelfServicePackageManager::GeneratePackageDownloadLink(packageStorageUID, true)))
+            {
+                uploadSuccessful = true;
+            }
+            else
+            {
+                retryCount--;
+            }
+
+            sleep(sleepTime);
+            sleepTime = real2int(sleepTime * 1.5);
+        }
+
+        return uploadSuccessful;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetStorageConnectionInstance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets an instance of a connection to the tenant cloud storage.
+    /// </summary>
+    /// <returns>Returns the default storage context.</returns>
+    private static StorageContext GetStorageConnectionInstance()
+    {
+        return SharedServiceUnitStorage::GetDefaultStorageContext();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>UpsertTableEntryForUploadedPackage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Add or update an existing record in the RetailSelfServicePackageInfo table.
+    /// This table holds all the metadata related to all uploaded packages.
+    /// </summary>
+    /// <param name = "fileName">Name of the file uploaded.</param>
+    /// <param name = "packageFriendlyName">Friendly name to be displayed to the user.</param>
+    /// <param name = "fileDescription">Description of the file uploaded.</param>
+    /// <param name = "packageVersion">File version.</param>
+    /// <param name = "typeOfPackage">Specify the type of package.</param>
+    /// <param name = "packageStorageUID">Unique identifier for the package used to locate the package on the cloud storage.</param>
+    private static void UpsertTableEntryForUploadedPackage(str fileName, str packageFriendlyName, str fileDescription, str packageVersion, PackageType typeOfPackage, str packageStorageUID)
+    {
+        RetailSelfServicePackageInfo pkgInfoTable;
+        str tableDataAdded;
+        str actionPerformed;
+
+        select forupdate pkgInfoTable where pkgInfoTable.PackageName == fileName;
+        ttsbegin;
+
+        pkgInfoTable.PackageName = fileName;
+        pkgInfoTable.PackageFriendlyName = packageFriendlyName;
+        pkgInfoTable.PackageDescription = fileDescription;
+        pkgInfoTable.PackageVersion = packageVersion;
+        pkgInfoTable.PackageType = typeOfPackage;
+        pkgInfoTable.PackageStorageUID = packageStorageUID;
+
+        // If an existing record is found, then update it else create a new one.
+        if (pkgInfoTable.RecId == 0)
+        {
+            pkgInfoTable.insert();
+            actionPerformed = "Created record";
+        }
+        else
+        {
+            pkgInfoTable.update();
+            actionPerformed = "Updated record";
+        }
+
+        ttscommit;
+
+        tableDataAdded = strFmt('PackageName = %1, PackageFriendlyName = %2, PackageDescription = %3, PackageVersion = %4, PackageType = %5, packageStorageUID = %6', fileName, packageFriendlyName, fileDescription, packageVersion, enum2int(typeOfPackage), packageStorageUID);
+        EventLogger::EventWriteDatabaseEntryInformation("RetailSelfServicePackageInfo", actionPerformed, tableDataAdded);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>RemoveTableEntryForDeletedPackage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete the package metadata stored in the database.
+    /// </summary>
+    /// <param name = "packageStorageUID">Unique identifier used to locate the file on the cloud storage.</param>
+    private static void RemoveTableEntryForDeletedPackage(str packageStorageUID)
+    {
+        RetailSelfServicePackageInfo pkgInfoTable;
+        delete_from pkgInfoTable where pkgInfoTable.PackageStorageUID == packageStorageUID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFriendlyExceptionMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a simple error message from a CLR error while unwrapping <see cref="System.Reflection.TargetInvocationException"/>s to its root exception.
+    /// </summary>
+    /// <param name="ex">The CLR exception to get the message of.</param>
+    /// <returns>The message from the CLR exception with any TargetInvocationExceptions removed.</returns>
+    private static str getFriendlyExceptionMessage(System.Exception ex)
+    {
+        str exceptionMessage;
+
+        if (ex != null)
+        {
+            if (ex is System.Reflection.TargetInvocationException)
+            {
+                System.Exception innerException = ex.InnerException;
+                if (innerException != null)
+                {
+                    exceptionMessage = innerException.Message;
+                }
+            }
+            else
+            {
+                exceptionMessage = ex.Message;
+            }
+        }
+
+        return exceptionMessage;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

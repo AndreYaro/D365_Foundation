@@ -1,0 +1,1619 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>PayrollPayStatementGenerationTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>PayrollPayStatementGenerationTask</c> class initiates the payment process for the worker or group of workers specified by the calling payment process driver class.
+/// </summary>
+class PayrollPayStatementGenerationTask extends RunBaseBatch implements BatchRetryable
+{
+    #PayrollConstants
+    PayrollPayPeriodRecId   payPeriodRecId;
+    PayrollPaymentType      paymentType;
+    PayrollPaymentMethodTypeOverrideOption paymentMethodOverride;
+    PayrollPaymDate         paymentDate;
+    PayrollPayStatementBatchNumber batchNumber;
+    HcmWorkerRecId          workerRecId;
+    LegalEntityRecId        legalEntityRecId;
+    PayrollStatementAccountingCurrencyAmount    createdEarningsTotal,
+                                                createdDeductionsTotal,
+                                                createdTaxesTotal,
+                                                arrearTolerance;
+    boolean                 inPreTaxArrearRecalc,
+                            calledWithPaymentRecord,
+                            newTaskCreated;
+    utcdatetime             companyEndOfPayPeriod;
+    container               batchTaskGroupList;
+
+    PayrollPayStatement     payStatement;
+    HcmWorker               worker;
+    List                    workerPositions;
+    PayrollParameters       parameters;
+    PayrollCalculatePayStatementTaxes       calculateTaxes;
+    PayrollPayPeriod        payPeriod;
+    Map                     templatePosRecIdMap;
+    Map                     templateNegRecIdMap;
+
+    AccountingDistributionTemplate  accDistributionTemplate;
+    TemplateName                    templateName;
+    AccountingDistributionTemplateRecId accDistrTemplPosRecId;
+    AccountingDistributionTemplateRecId accDistrTemplNegRecId;
+
+    NoYes                   disableAccounting;
+    boolean                 isManualPayStatementGeneration;
+    boolean                 isManualPayStatementRecalculation;
+    boolean                 calcBenefitsOnManualPayStatement;
+
+    #DEFINE.CurrentVersion(1)
+
+    #LOCALMACRO.CurrentList
+        payPeriodRecId,
+        paymentDate,
+        paymentType,
+        batchNumber,
+        batchTaskGroupList,
+        disableAccounting,
+        paymentMethodOverride
+    #ENDMACRO
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>calcBenefitsAndTaxes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Drives the process of generating tax and benefit lines for the pay statement.
+    /// </summary>
+    /// <param name="_createdTaxableEarningsTotal">
+    /// The amount of earnings that are not exempt from taxes and are not fringe benefit
+    /// recovery.
+    /// </param>
+    public void calcBenefitsAndTaxes(PayrollStatementAccountingCurrencyAmount _createdTaxableEarningsTotal)
+    {
+        PayrollCalculatePayStatementBenefits    calculateBenefits;
+
+        calculateBenefits = PayrollCalculatePayStatementBenefits::Construct();
+
+        calculateBenefits.initializeForPayment(payStatement,
+                companyEndOfPayPeriod,
+                accDistrTemplPosRecId,
+                accDistrTemplNegRecId,
+                templatePosRecIdMap,
+                templateNegRecIdMap);
+
+        this.calcBenefits(calculateBenefits);
+
+        if (_createdTaxableEarningsTotal > 0)
+        {
+            this.calcTaxes(_createdTaxableEarningsTotal);
+
+            // Verify that sufficient payable earnings (non-imputed) exist to cover all taxes
+            this.validateFundsAvailableForTaxes();
+        }
+
+        this.calcPostTaxBenefits(calculateBenefits);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcGrossMinusTaxes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the net disposable earnings for the pay statement.
+    /// </summary>
+    /// <returns>
+    /// The net disposable earnings for the payment.
+    /// </returns>
+    /// <remarks>
+    /// Net disposable is calculated as earnings, negative benefits, and negative taxes, minus positive taxes.
+    /// </remarks>
+    public Amount calcGrossMinusTaxes()
+    {
+        Amount                                  payableEarnings,
+                                                employeeTaxes;
+        PayrollPayStatementEarningLine          earningLine;
+        PayrollPayStatementBenefitLine          benefitLine;
+        PayrollPayStatementTaxLine              taxLine;
+
+        // Sum up the earnings for this payment
+        select sum(AccountingCurrencyAmount) from earningLine
+            where earningLine.PayStatement == payStatement.RecId
+            &&    earningLine.IsMarkedForRemoval == NoYes::No;
+
+        // Sum all negative employee benefits for the payment
+        select sum(AccountingCurrencyAmount) from benefitLine
+            where benefitLine.PayStatement  == payStatement.RecId
+            &&    benefitLine.AccountingCurrencyAmount < 0
+            &&    benefitLine.IsEmployer == NoYes::No
+            &&    benefitLine.IsMarkedForRemoval == NoYes::No;
+
+        // Sum all negative employee taxes for the payment
+        select sum(AccountingCurrencyAmount) from taxLine
+            where taxLine.PayStatement  == payStatement.RecId
+            &&    taxLine.AccountingCurrencyAmount < 0
+            &&    taxLine.IsEmployer == NoYes::No
+            &&    taxLine.IsMarkedForRemoval == NoYes::No;
+
+        payableEarnings = earningLine.AccountingCurrencyAmount + abs(benefitLine.AccountingCurrencyAmount) + abs(taxLine.AccountingCurrencyAmount);
+
+        // Sum all employee taxes for the payment
+        select sum(AccountingCurrencyAmount) from taxLine
+            where taxLine.PayStatement  == payStatement.RecId
+            &&    taxLine.AccountingCurrencyAmount > 0
+            &&    taxLine.IsEmployer == NoYes::No
+            &&    taxLine.IsMarkedForRemoval == NoYes::No;
+
+        employeeTaxes = taxLine.AccountingCurrencyAmount;
+
+        return (payableEarnings - employeeTaxes);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createArrears</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the pay statement has enough earnings to cover all deductions, and if
+    /// not it takes away deductive benefits and creates arrears until there are sufficient
+    /// earnings for the pay statement.
+    /// </summary>
+    /// <param name="_amountInArrears">
+    /// The amount that the pay statement does not have enough earnings to have a
+    /// positive amount.
+    /// </param>
+    /// <returns>
+    /// True indicates that benefit lines were either modified, removed, or added.
+    /// </returns>
+    /// <remarks>
+    /// This method expects the amount in arrears to be a positive number even
+    /// though as far as the pay statement is concerned it is logically a negative number.
+    /// If taxable earnings are affected by arrearing one or more deductions, the
+    /// payment process is called again to adjust taxes accordingly.
+    /// </remarks>
+    private boolean createArrears(Amount _amountInArrears)
+    {
+        PayrollPayStatementGenerationTask   task;
+        PRLDeductionArrear                  deductionArrear;
+        PayrollArrearProcessingTmp          arrearProcessingTmp;
+        PayrollPayStatementBenefitLine      benefitLine,
+                                            benefitLineApportion,
+                                            benefitLineCount;
+        PayrollBenefitPlanDetail            benefitPlanDetail;
+        PayrollBenefitTaxRule_US            benefitTaxRuleUS;
+        HcmBenefit                          benefit;
+        HcmBenefitPlan                      benefitPlan;
+        HcmWorkerEnrolledBenefit            workerEnrolledBenefit;
+        PayrollWorkerEnrolledBenefitDetail  workerEnrolledBenefitDetail;
+        Amount                              currentDeductionAmount,
+                                            deductionAmountApplied,
+                                            apportionedAmount,
+                                            apportionedAmountRunningTotal,
+                                            apportionedTotalDifference;
+        boolean                             preTaxImpact,
+                                            benefitsTotalChanged,
+                                            arrearToleranceMet;
+        int                                 currentLine;
+
+        //
+        // If the amount currently in arrears is already within the specified arrear tolerance,
+        // we still need to take arrears until we are no longer in arrears, but at that point we won't
+        // need to recalc due to taxable changes nor will we need to attempt to recover arrears.
+        //
+        if (_amountInArrears <= arrearTolerance)
+        {
+            arrearToleranceMet = true;
+        }
+
+        // Build the list of benefits to process so that it can be processed in the correct sequence
+        while select Benefit, sum(AccountingCurrencyAmount) from benefitLine
+            group by benefitLine.Benefit
+            where benefitLine.PayStatement == payStatement.RecId
+            &&    benefitLine.IsEmployer == NoYes::No
+            &&    benefitLine.IsMarkedForRemoval == NoYes::No
+        {
+            if (benefitLine.AccountingCurrencyAmount < 0)
+            {
+                // If the sum of the benefit is negative then we won't even consider it for arrears
+                continue;
+            }
+
+            benefit = HcmBenefit::findByTimeState(benefitLine.Benefit, companyEndOfPayPeriod);
+            benefitPlanDetail = PayrollBenefitPlanDetail::findByBenefitPlan(benefit.BenefitPlan);
+
+            // Get the worker enrolled benefit if it exists
+            workerEnrolledBenefit = HcmWorkerEnrolledBenefit::findByWorkerBenefit(workerRecId, benefitLine.Benefit, companyEndOfPayPeriod);
+            workerEnrolledBenefitDetail = PayrollWorkerEnrolledBenefitDetail::findByWorkerEnrolledBenefitLegalEntity(workerEnrolledBenefit.RecId, legalEntityRecId, payPeriod.PeriodEndDate);
+
+            if (workerEnrolledBenefitDetail.RecId)
+            {
+                // Pull the deduction sequence off of the worker enrolled benefit detail
+                arrearProcessingTmp.DeductionPriorityNumber = workerEnrolledBenefitDetail.DeductionPriorityNumber;
+            }
+            else
+            {
+                // The benefit doesn't exist for the worker and was manually entered, so get the sequence from the benefit itself
+                arrearProcessingTmp.DeductionPriorityNumber = benefitPlanDetail.DefaultDeductionPriorityNumber;
+            }
+            arrearProcessingTmp.ArrearLimitMethod = benefitPlanDetail.ArrearLimitMethod;
+            arrearProcessingTmp.IsArrearGenerated = benefitPlanDetail.IsArrearGenerated;
+
+            // Retrieve the benefit plan ID to use as a secondary sort after the sequence number
+            benefitPlan = HcmBenefitPlan::find(benefit.BenefitPlan);
+            arrearProcessingTmp.BenefitPlanID  = benefitPlan.BenefitPlanID;
+            arrearProcessingTmp.Benefit = benefit.RecId;
+
+            // Determine the number of benefit lines for this benefit in order to know how to apportion (if needed)
+            select count(RecId) from benefitLineCount
+                where benefitLineCount.PayStatement == payStatement.RecId
+                &&    benefitLineCount.Benefit == benefitLine.Benefit
+                &&    benefitLineCount.IsEmployer == NoYes::No
+                &&    benefitLineCount.IsMarkedForRemoval == NoYes::No;
+
+            arrearProcessingTmp.LineCount = int642int(benefitLineCount.RecId);
+
+            arrearProcessingTmp.AccountingCurrencyAmount = benefitLine.AccountingCurrencyAmount;
+            arrearProcessingTmp.insert();
+        }
+
+        // Process the pay statement benefits in order of sequence and then benefit plan ID
+        while select arrearProcessingTmp
+            order by DeductionPriorityNumber desc, BenefitPlanID asc
+        {
+            currentDeductionAmount = arrearProcessingTmp.AccountingCurrencyAmount;
+
+            if (arrearProcessingTmp.ArrearLimitMethod == PayrollArrearLimitMethod::AllOrNothing)
+            {
+                // The adjustment will be for the entire deduction amount, so clear out all benefit lines for the given benefit
+                update_recordset benefitLine
+                    setting IsMarkedForRemoval = NoYes::Yes,
+                            IsPayStatementLineOverridden = NoYes::Yes,
+                            Source = PayrollPayStatementLineSource::ArrearCalculation,
+                            AccountingCurrencyAmount = 0.0
+                    where benefitLine.PayStatement == payStatement.RecId
+                    &&    benefitLine.Benefit == arrearProcessingTmp.Benefit
+                    &&    benefitLine.IsEmployer == NoYes::No;
+
+                deductionAmountApplied = currentDeductionAmount;
+            }
+            else // Partial: the adjustment will not exceed the remaining amount in arrears
+            {
+                // Take as much as the deduction as possible without dipping below zero, else just take what remains
+                deductionAmountApplied = _amountInArrears - currentDeductionAmount;
+                if (deductionAmountApplied < 0)
+                {
+                    deductionAmountApplied = _amountInArrears;
+                }
+                else
+                {
+                    // Don't arrear the deduction for more than its current amount
+                    deductionAmountApplied = currentDeductionAmount;
+                }
+
+                currentLine = 0;
+                apportionedAmountRunningTotal = 0;
+
+                // The deduction amount could have been spread across multiple lines so loop through all lines to update/remove
+                while select forupdate benefitLineApportion
+                    where benefitLineApportion.PayStatement == payStatement.RecId
+                    &&    benefitLineApportion.Benefit == arrearProcessingTmp.Benefit
+                    &&    benefitLineApportion.IsMarkedForRemoval == NoYes::No
+                    &&    benefitLineApportion.IsEmployer == NoYes::No
+                {
+                    currentLine++;
+
+                    // Calculate the rounded apportioned deduction amount
+                    apportionedAmount = CurrencyExchange::round((benefitLineApportion.AccountingCurrencyAmount / currentDeductionAmount) * deductionAmountApplied, PayrollSetup::currencyCode());
+                    apportionedAmountRunningTotal += apportionedAmount;
+
+                    // If this is the last line created, adjust due to rounding error, if necessary
+                    if (currentLine == arrearProcessingTmp.LineCount)
+                    {
+                        // Determine if there is a difference due to rounding
+                        apportionedTotalDifference = (deductionAmountApplied - apportionedAmountRunningTotal);
+                        if (apportionedTotalDifference != 0)
+                        {
+                            // Adjust the last deduction line's amount to account for the rounding difference
+                            apportionedAmount += apportionedTotalDifference;
+                        }
+                    }
+
+                    // Adjust the original amount with the new apportioned deduction arrear amount
+                    benefitLineApportion.AccountingCurrencyAmount -= apportionedAmount;
+
+                    // If the entire deduction has been used for the arrear, remove it
+                    if (benefitLineApportion.AccountingCurrencyAmount == 0)
+                    {
+                        benefitLineApportion.IsMarkedForRemoval = NoYes::Yes;
+                    }
+
+                    // Update the benefit line
+                    benefitLineApportion.IsPayStatementLineOverridden = NoYes::Yes;
+                    benefitLineApportion.Source = PayrollPayStatementLineSource::ArrearCalculation;
+                    benefitLineApportion.update();
+                }
+            }
+
+            benefitsTotalChanged = true;
+
+            // Adjust the net amount of the pay statement accordingly
+            createdDeductionsTotal -= deductionAmountApplied;
+            this.updatePayStatementTotals();
+
+            // Reduce the amount that is in arrears
+            _amountInArrears -= deductionAmountApplied;
+
+            // Arrears will only be created if Yes is specified
+            if (arrearProcessingTmp.IsArrearGenerated == NoYes::Yes)
+            {
+                //
+                // Create/update the arrear record for the current benefit for the current pay statement and the amount adjusted.
+                // Since the arrears process is recursive if pretax benefits are involved, additional arrears for a benefit may
+                // need to be added to what was taken in previous iterations of the pay statement generation process.
+                //
+                select firstonly forUpdate deductionArrear
+                    where deductionArrear.PayStatement == payStatement.RecId
+                    &&    deductionArrear.Benefit == arrearProcessingTmp.Benefit;
+                deductionArrear.PayStatement                = payStatement.RecId;
+                deductionArrear.Benefit                     = arrearProcessingTmp.Benefit;
+                deductionArrear.AccountingCurrencyAmount    += deductionAmountApplied;
+                deductionArrear.write();
+            }
+
+            // Determine if the affected benefit line(s) was a pre-tax benefit
+            select firstonly benefitPlan where benefitPlan.BenefitPlanID == arrearProcessingTmp.BenefitPlanID;
+            benefitTaxRuleUS = PayrollBenefitTaxRule_US::findByBenefitPlan(benefitPlan.RecId);
+            preTaxImpact = (preTaxImpact || (benefitTaxRuleUS.PreTaxBasis != PayrollPreTaxBasis::None));
+
+            // If the amount in arrears is negative then the pay statment's net pay is positive, so stop trying to take more arrears
+            if (_amountInArrears <= 0)
+            {
+                break;
+            }
+        }
+        // while select arrearProcessingTmp
+
+        // Only recalc the payment and potentially recover additional arrears if we are not yet within the arrear tolerance
+        if (!arrearToleranceMet)
+        {
+            //
+            // If there is a potential that a pretax deduction has affected our taxable earnings, we must
+            // rerun the process again to get updated taxes; this occurs recursively
+            //
+            if (preTaxImpact)
+            {
+                task = new PayrollPayStatementGenerationTask();
+                task.parmCalcBenefitsOnManualPayStatement(calcBenefitsOnManualPayStatement);
+                task.initializeFromPayment(payStatement, true, accDistrTemplPosRecId, accDistrTemplNegRecId, templatePosRecIdMap, templateNegRecIdMap);
+                task.runOperation();
+            }
+            else
+            {
+                //
+                // There are wages left over to attempt to recover, so do so with that positive amount, but
+                // only attempt to recover during non-regular runtypes if parameters has specified to do so.
+                //
+                if (paymentType == PayrollPaymentType::Primary || parameters.RecoverArrearInAllRunTypes)
+                {
+                    this.recoverArrears(abs(_amountInArrears));
+                }
+            }
+        }
+        return benefitsTotalChanged;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPayStatement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the pay statement and associated line and distribution records for the specified worker.
+    /// </summary>
+    /// <remarks>
+    /// This is the main process driver for the creation of an individual pay statement.
+    /// </remarks>
+    private void createPayStatement()
+    {
+        PayrollStatementAccountingCurrencyAmount createdTaxableEarningsTotal;
+
+        // Validations that are applicable to the currently-being-processed worker
+        this.validateWorker();
+
+        // Update the existing payment header only if one was supplied (e.g. a recalc of a modified payment)
+        if (calledWithPaymentRecord)
+        {
+            // In a recalc situation, some lines need to be cleared out to make way for new versions and totals updated
+            this.prepareForRecalc();
+        }
+        else
+        {
+            // Create the new payment header (also marked as processed)
+            payStatement = PayrollPayStatement::create(workerRecId, payPeriodRecId, paymentDate, paymentType, batchNumber, !disableAccounting, paymentMethodOverride);
+
+            // Create the earnings for the specified positions and return the total earnings created
+            createdEarningsTotal = PayrollCalculatePayStatementEarnings::createPayStatementEarningLines(payStatement, workerPositions, !disableAccounting);
+            createdTaxesTotal = 0;
+            createdDeductionsTotal = 0;
+        }
+
+        // Validate that the earnings will allow the pay statement generation to proceed; calculate taxable earnings at the same time.
+        createdTaxableEarningsTotal = this.validateEarnings();
+
+        //
+        // Generated Manual Pay Statements are processed slightly differently than standard and user entry Pay Statements. Manual Pay Statements do not
+        // have benefits calculated by this process unless CalcBenefitsOnManualPayStatement is set, and only have PRLUSTaxTransactionHistory records created during
+        // the recalculation process. No PayrollPayStatementTaxLine records are written. In addition, the accounting
+        // can be disabled for manual pay statements.
+        //
+
+        if (!disableAccounting)
+        {
+            // Create the accounting distribution template
+            if (accDistrTemplPosRecId == 0)
+            {
+                accDistrTemplPosRecId = PayrollPayStatementLine::createAccountingDistributionTemplate();
+                templatePosRecIdMap = PayrollPayStatementLine::createAccountingDistributionDetail(payStatement, accDistrTemplPosRecId, true);
+            }
+
+            if (accDistrTemplNegRecId == 0)
+            {
+                accDistrTemplNegRecId = PayrollPayStatementLine::createAccountingDistributionTemplate();
+                templateNegRecIdMap = PayrollPayStatementLine::createAccountingDistributionDetail(payStatement, accDistrTemplNegRecId, false);
+            }
+        }
+
+        // if we are in the initial generation state, then we do not do any tax calculations
+        if (!isManualPayStatementGeneration)
+        {
+            // Process taxes and benefits for the payment
+            this.calcBenefitsAndTaxes(createdTaxableEarningsTotal);
+        }
+        payStatement.selectForUpdate(true);
+
+        // Update the pay statement totals, both gross and net
+        this.updatePayStatementTotals(true);
+
+        // Invoke arrear processing logic to remove or add benefit lines based on the lack of or surplus of net pay
+        if (this.handleArrears())
+        {
+            // If benefit lines were impacted, then recalc the net here since the potential recursion in arrears complicates getting this updated from within.
+            payStatement.NetAccountingCurrencyAmount = payStatement.GrossAccountingCurrencyAmount - payStatement.getDeductionAmount();
+        }
+
+        // Delete the distribution template
+        this.deleteAccountingDistributionTemplate();
+
+        // Only perform the update is no child tasks were created
+        if (!inPreTaxArrearRecalc)
+        {
+            // in initial generation state, we set pay statement status to RequiresRecalculation
+            if (isManualPayStatementGeneration)
+            {
+                payStatement.PaymentStatus = PayrollPaymentStatus::RequiresRecalculation;
+            }
+            // in recalculatiopn generation state, we set pay statement status to PaymentIssued
+            else if (isManualPayStatementRecalculation)
+            {
+                payStatement.PaymentStatus = PayrollPaymentStatus::PaymentIssued;
+
+                if (disableAccounting)
+                {
+                    payStatement.PostedStatus = PayrollPayStatementPostedStatus::Posted;
+                }
+            }
+            else
+            {
+                payStatement.PaymentStatus = PayrollPaymentStatus::Calculated;
+            }
+            payStatement.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteAccountingDistributionTemplate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes the <c>AccountingDistributionTemplate</c> records used in the payment generation process.
+    /// </summary>
+    private void deleteAccountingDistributionTemplate()
+    {
+        // Delete the accounting distribution template for positive earning lines
+        accDistributionTemplate = AccountingDistributionTemplate::find(accDistrTemplPosRecId, true);
+
+        if (accDistributionTemplate.RecId)
+        {
+            accDistributionTemplate.delete();
+        }
+
+        // Delete the accounting distribution template for negative earning lines
+        accDistributionTemplate = AccountingDistributionTemplate::find(accDistrTemplNegRecId, true);
+
+        if (accDistributionTemplate.RecId)
+        {
+            accDistributionTemplate.delete();
+        }
+
+        // Clear the recId values
+        accDistrTemplPosRecId = 0;
+        accDistrTemplNegRecId = 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleArrears</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if arrears need to be created or if arrear recovery
+    /// should be attempted.
+    /// </summary>
+    /// <returns>
+    /// True indicates that benefit lines were either modified, removed, or added.
+    /// </returns>
+    /// <remarks>
+    /// If benefit lines were impacted, the caller may need to adjust the net amount
+    /// for the pay statement.
+    /// </remarks>
+    public boolean handleArrears()
+    {
+        boolean benefitsTotalChanged = false;
+
+        // Determine if the pay statement has a negative net pay
+        if (payStatement.NetAccountingCurrencyAmount < 0)
+        {
+            // Create arrears to bring the net pay into the positive
+            benefitsTotalChanged = this.createArrears(abs(payStatement.NetAccountingCurrencyAmount));
+        }
+        else
+        {
+            // Only attempt to recover during non-regular runtypes if parameters has specified to do so
+            if (paymentType == PayrollPaymentType::Primary || parameters.RecoverArrearInAllRunTypes)
+            {
+                // Recover arrears from the net available balance of the pay statement
+                benefitsTotalChanged = this.recoverArrears(payStatement.NetAccountingCurrencyAmount);
+            }
+        }
+        return benefitsTotalChanged;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeFromPayment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the pay statement generation process to recalculate the existing
+    /// <c>PayrollPayStatement</c> record with which it is supplied.
+    /// </summary>
+    /// <param name="_payStatement">
+    /// The <c>PayrollPayStatement</c> to reprocess.
+    /// </param>
+    /// <param name="_preTaxArrear">
+    /// Indicates if the pay statement to be recalculated is being done so as part
+    /// of the arrear creation or recovery process.
+    /// </param>
+    /// <param name="_distributionTemplatePositiveRecId">
+    /// The distribution for positive lines with which to base the accounting distribution.
+    /// </param>
+    /// <param name="_distributionTemplateNegativeRecId">
+    /// The distribution for negative lines with which to base the accounting distribution.
+    /// </param>
+    /// <param name="_templatePositiveRecIdMap">
+    /// The project distribution information for positive lines to use for creating the project acccountnig distribution.
+    /// </param>
+    /// <param name="_templateNegativeRecIdMap">
+    /// The project distribution information for negative lines to use for creating the project acccountnig distribution.
+    /// </param>
+    public void initializeFromPayment(
+    PayrollPayStatement                 _payStatement,
+    boolean                             _preTaxArrear = false,
+    AccountingDistributionTemplateRecId _distributionTemplatePositiveRecId = 0,
+    AccountingDistributionTemplateRecId _distributionTemplateNegativeRecId = 0,
+    Map                                 _templatePositiveRecIdMap = null,
+    Map                                 _templateNegativeRecIdMap = null
+    )
+    {
+        List        emptyPositionsList = new List(Types::Int64);
+
+        // Initialize the state of the process from the existing payment
+        payStatement.data(_payStatement);
+        paymentDate = _payStatement.PaymentDate;
+        workerRecId = _payStatement.Worker;
+        payPeriodRecId = _payStatement.PayPeriod;
+        paymentType = _payStatement.PaymentType;
+        accDistrTemplPosRecId = _distributionTemplatePositiveRecId;
+        accDistrTemplNegRecId = _distributionTemplateNegativeRecId;
+        templatePosRecIdMap = _templatePositiveRecIdMap;
+        templateNegRecIdMap = _templateNegativeRecIdMap;
+
+        ttsbegin;
+        // Delete the accounting distribution template (if any exist)
+        this.deleteAccountingDistributionTemplate();
+        ttscommit;
+
+        // Indicates that we are recalculating an existing payment
+        calledWithPaymentRecord = true;
+
+        // Indicates that the current process is a recalc due to the arrear process creating arrears or
+        // recovering arrears of at least one pre-tax benefit.
+        inPreTaxArrearRecalc = _preTaxArrear;
+
+        //
+        // Positions container not needed for a recalc since earnings already created
+        // ...it's just the single worker payment to process.
+        //
+        batchTaskGroupList = conNull();
+        batchTaskGroupList += [[workerRecId, emptyPositionsList.pack()]];
+
+        // determines if this is the generation process for a Manual PayStatement, keep at bottom of method as it relies on other state variables set above
+        this.setIsManualPayStatementGeneration();
+
+        // determines if this is the recalculation process for a Manual PayStatement, keep at bottom of method as it relies on other state variables set above
+        this.setIsManualPayStatementRecalculation();
+
+        // determines if accounting was disabled for this pay statement
+        this.setDisableAccountingForRecalculation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Drives the process of generating tax and benefit lines for the pay statement.
+    /// </summary>
+    private void loadParameters()
+    {
+        // Retrieve the LE-specific payroll parameters
+        parameters = PayrollParameters::find();
+
+        // Look to the parameters to determine the arrear tolerance
+        if (parameters.ArrearThresholdOverride)
+        {
+            arrearTolerance = parameters.ArrearThresholdOverride;
+        }
+        else
+        {
+            arrearTolerance = #ARREARTHRESHOLDDEFAULT;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBatchNumber</Name>
+				<Source><![CDATA[
+    public PayrollPayStatementBatchNumber parmBatchNumber(PayrollPayStatementBatchNumber _batchNumber = batchNumber)
+    {
+        batchNumber = _batchNumber;
+
+        return batchNumber;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBatchTaskGroupList</Name>
+				<Source><![CDATA[
+    public container parmBatchTaskGroupList(container _batchTaskGroupList = batchTaskGroupList)
+    {
+        batchTaskGroupList = _batchTaskGroupList;
+
+        return batchTaskGroupList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDisableAccounting</Name>
+				<Source><![CDATA[
+    public NoYes parmDisableAccounting(NoYes _disableAccounting = disableAccounting)
+    {
+        disableAccounting = _disableAccounting;
+
+        return disableAccounting;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPaymentDate</Name>
+				<Source><![CDATA[
+    public PayrollPaymDate parmPaymentDate(PayrollPaymDate _paymentDate = paymentDate)
+    {
+        paymentDate = _paymentDate;
+
+        return paymentDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPaymentType</Name>
+				<Source><![CDATA[
+    public PayrollPaymentType parmPaymentType(PayrollPaymentType _paymentType = paymentType)
+    {
+        paymentType = _paymentType;
+
+        return paymentType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPaymentMethodOverride</Name>
+				<Source><![CDATA[
+    public PayrollPaymentMethodTypeOverrideOption parmPaymentMethodOverride(PayrollPaymentMethodTypeOverrideOption _paymentMethodOverride = paymentMethodOverride)
+    {
+        paymentMethodOverride = _paymentMethodOverride;
+
+        return paymentMethodOverride;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmPayPeriodRecId</Name>
+				<Source><![CDATA[
+    public PayrollPayCycleRecId parmPayPeriodRecId(PayrollPayPeriodRecId _payPeriodRecId = payPeriodRecId)
+    {
+        payPeriodRecId = _payPeriodRecId;
+
+        return payPeriodRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>prepareForRecalc</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes records that need to be recalculated by the payment process when
+    /// recalculating the current payment.
+    /// </summary>
+    private void prepareForRecalc()
+    {
+        PayrollPayStatementTaxLine      taxLines;
+        PayrollPayStatementEarningLine  earningLines;
+        PayrollPayStatementBenefitLine  benefitLines;
+        PRLDeductionArrear              arrear;
+        PRLDeductionArrearRecovery      arrearRecovery;
+        PayrollUSTaxTransactionHistory  usTaxTransactionHistory;
+
+        if (paymentType == PayrollPaymentType::GrossUp)
+        {
+            // The gross up "recovery" earnings must be deleted prior to a recalc
+            delete_from earningLines
+                where earningLines.PayStatement == payStatement.RecId
+                &&    earningLines.Source == PayrollPayStatementLineSource::GrossUpEarning;
+        }
+
+        if (payStatement.CreationType == PayrollPayStatementCreationType::UserEntry)
+        {
+            select firstOnly RecId from benefitLines
+                where benefitLines.PayStatement == payStatement.RecId
+                &&    benefitLines.IsPayStatementLineOverridden == NoYes::No
+                &&    benefitLines.Source != PayrollPayStatementLineSource::ArrearRecover;
+
+            if (benefitLines.RecId)
+            {
+                calcBenefitsOnManualPayStatement = true;
+            }
+        }
+
+        if (inPreTaxArrearRecalc)
+        {
+            //
+            // Remove all benefit lines related to the payment, except for any records that
+            // have been modified and are not arrear recovery
+            //
+            delete_from benefitLines
+                where benefitLines.PayStatement == payStatement.RecId
+                &&    benefitLines.IsPayStatementLineOverridden == NoYes::No
+                &&    benefitLines.Source != PayrollPayStatementLineSource::ArrearRecover;
+        }
+        else
+        {
+            //
+            // For a normal recalc, remove all benefit lines related to the payment, except for any
+            // records that have been modified unless they were adjusted by the arrears process, in
+            // which case remove those so that they can be recreated if still necessary.
+            //
+            delete_from benefitLines
+                where benefitLines.PayStatement == payStatement.RecId
+                &&    (benefitLines.IsPayStatementLineOverridden == NoYes::No
+                        || benefitLines.Source == PayrollPayStatementLineSource::ArrearCalculation);
+
+            // Remove all arrears for the being-recalced payment since they will be regenerated based on the new information
+            delete_from arrear
+                where arrear.PayStatement == payStatement.RecId;
+
+            // Remove all arrear recovery records for the being-recalced payment since they will be regenerated based on the new information
+            delete_from arrearRecovery
+                where arrearRecovery.PayStatement == payStatement.RecId;
+        }
+
+        // Remove all tax lines related to the payment, except for any records that have been modified
+        delete_from taxLines
+            where taxLines.PayStatement == payStatement.RecId
+            &&    taxLines.IsPayStatementLineOverridden == NoYes::No;
+
+        // Always delete existing statutory tax data records for the pay statement and let them get rewritten
+        delete_from usTaxTransactionHistory
+            where usTaxTransactionHistory.PayStatement == payStatement.RecId;
+
+        //
+        // Sum the earnings, taxes, and benefit lines to start off the recalculation process since any
+        // already-existing and modified lines will not be written by the benefit and tax creation processes
+        // and won't be included in their totals (and the earnings process is not run at all).
+        //
+        select sum(AccountingCurrencyAmount) from earningLines
+            where earningLines.PayStatement == payStatement.RecId
+            &&    earningLines.IsMarkedForRemoval == NoYes::No;
+
+        select sum(AccountingCurrencyAmount) from taxLines
+            where taxLines.PayStatement == payStatement.RecId
+            &&    taxLines.IsEmployer == NoYes::No
+            &&    taxLines.IsMarkedForRemoval == NoYes::No;
+
+        select sum(AccountingCurrencyAmount) from benefitLines
+            where benefitLines.PayStatement == payStatement.RecId
+            &&    benefitLines.IsEmployer == NoYes::No
+            &&    benefitLines.IsMarkedForRemoval == NoYes::No;
+
+        createdEarningsTotal = earningLines.AccountingCurrencyAmount;
+        createdTaxesTotal = taxLines.AccountingCurrencyAmount;
+        createdDeductionsTotal = benefitLines.AccountingCurrencyAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recoverArrears</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if there are arrears that can be recovered by the available
+    /// earnings on the current pay statement, and if so they are recovered and
+    /// benefit lines are created on the pay statement for the recovered amounts.
+    /// </summary>
+    /// <param name="_earningsRemaining">
+    /// Specifies how much earnings the pay statement has available to apply to
+    /// recovering existing arrears.
+    /// </param>
+    /// <returns>
+    /// True indicates that benefit lines were either modified, removed, or added.
+    /// </returns>
+    /// <remarks>
+    /// If taxable earnings are affected by recovering one or more deductions, the
+    /// payment process is called again to adjust taxes accordingly.
+    /// </remarks>
+    private boolean recoverArrears(Amount _earningsRemaining)
+    {
+        PayrollPayStatementGenerationTask   task;
+        PayrollPayStatementBenefitLine      benefitLine;
+        PayrollArrearRecoveryProcessingTmp  recoveryProcessingTmp;
+        PRLDeductionArrearRecovery          deductionArrearRecovery;
+        PRLArrearsWithRecoveryBalance       arrears;
+        HcmBenefit                          benefit;
+        HcmBenefitPlan                      benefitPlan;
+        PayrollBenefitPlanDetail            benefitPlanDetail;
+        PayrollBenefitTaxRule_US            benefitTaxRuleUS;
+        HcmWorkerEnrolledBenefit            workerEnrolledBenefit;
+        PayrollWorkerEnrolledBenefitDetail  workerEnrolledBenefitDetail;
+        Amount                              currentDeductionAmount,
+                                            deductionAmountApplied;
+        boolean                             preTaxArrearRecovered,
+                                            benefitsTotalChanged;
+
+        // If we are within the arrear tolerance then no more recoveries need to be attempted
+        if (_earningsRemaining <= arrearTolerance)
+        {
+            return false;
+        }
+
+        // Build tmp table of unrecovered arrears to potentially recover with proper sequencing assigned
+        while select arrears
+            where arrears.Worker == payStatement.Worker
+            &&    arrears.PayStatement != payStatement.RecId
+            &&    arrears.FullyRecovered == NoYes::No
+        {
+            benefit = HcmBenefit::find(arrears.Benefit);
+            benefitPlanDetail = PayrollBenefitPlanDetail::findByBenefitPlan(benefit.BenefitPlan);
+
+            // Get the worker enrolled benefit if it exists
+            workerEnrolledBenefit = HcmWorkerEnrolledBenefit::findByWorkerBenefit(workerRecId, arrears.Benefit, companyEndOfPayPeriod);
+            workerEnrolledBenefitDetail = PayrollWorkerEnrolledBenefitDetail::findByWorkerEnrolledBenefitLegalEntity(workerEnrolledBenefit.RecId, legalEntityRecId, payPeriod.PeriodEndDate);
+
+            if (workerEnrolledBenefitDetail.RecId)
+            {
+                // Pull the deduction sequence off of the worker enrolled benefit
+                recoveryProcessingTmp.DeductionPriorityNumber = workerEnrolledBenefitDetail.DeductionPriorityNumber;
+            }
+            else
+            {
+                // The benefit doesn't exist for the worker and was manually entered, so get the sequence from the benefit itself
+                recoveryProcessingTmp.DeductionPriorityNumber = benefitPlanDetail.DefaultDeductionPriorityNumber;
+            }
+            recoveryProcessingTmp.ArrearLimitMethod = benefitPlanDetail.ArrearLimitMethod;
+
+            // Retrieve the benefit plan ID to use as a secondary sort after the sequence number
+            benefitPlan = HcmBenefitPlan::find(benefit.BenefitPlan);
+            recoveryProcessingTmp.BenefitPlanID  = benefitPlan.BenefitPlanID;
+
+            recoveryProcessingTmp.Benefit = arrears.Benefit;
+            recoveryProcessingTmp.Position = workerEnrolledBenefitDetail.Position;
+            recoveryProcessingTmp.GeneratingPayStatementRecId = arrears.PayStatement;
+            recoveryProcessingTmp.DeductionArrear = arrears.ArrearRecId;
+            recoveryProcessingTmp.AmountRemaining = arrears.ArrearAmount + arrears.RecoveryAmount;
+            recoveryProcessingTmp.insert();
+        }
+
+        //
+        // Recover arrears in the proper sequence until the net pay is positive; oldest pay statements'
+        // to newest by recid (order actually created, not by payment date), then within each pay statement
+        // recover arrears in reservse order of creation.
+        //
+        while select recoveryProcessingTmp
+            order by GeneratingPayStatementRecId asc, DeductionArrear desc
+        {
+            // Determine the amount of this arrear that can be recovered
+            currentDeductionAmount = recoveryProcessingTmp.AmountRemaining;
+
+            // The adjustment will be for the entire deduction amount if enough earnings available
+            if (recoveryProcessingTmp.ArrearLimitMethod == PayrollArrearLimitMethod::AllOrNothing)
+            {
+                //
+                // If the current deduction exceeds the available earnings then none of it can be recovered
+                // and so skip to the next arrear.
+                //
+                if (currentDeductionAmount > _earningsRemaining)
+                {
+                    continue;
+                }
+                deductionAmountApplied = currentDeductionAmount;
+            }
+            else // Partial: the adjustment will not exceed the remaining amount in arrears
+            {
+                // Take as much as the deduction as possible without dipping below zero, else just take what remains to be recovered
+                deductionAmountApplied = _earningsRemaining - currentDeductionAmount;
+                if (deductionAmountApplied < 0)
+                {
+                    deductionAmountApplied = _earningsRemaining;
+                }
+                else
+                {
+                    // If funds available do not try to over-recover more than is necessary
+                    deductionAmountApplied = currentDeductionAmount;
+                }
+            }
+
+            // Adjust the net amount of the pay statement accordingly
+            createdDeductionsTotal += deductionAmountApplied;
+            this.updatePayStatementTotals();
+
+            // Reduce the amount that is in arrears
+            _earningsRemaining -= deductionAmountApplied;
+
+            //
+            // Create the recovery record for the arrear and created benefit line, saving the amount as a negative.
+            // This needs to be done before the recovery benefitline is created so that limit amount remaining of
+            // the benefit is increased by the amount of the benefitline that is about to be created which will
+            // in turn reduce it back down again. Doing so in the reverse order could cause the limit to be exceeded
+            // and a warning displayed in the infolog.
+            //
+            deductionArrearRecovery = PRLDeductionArrearRecovery::create(recoveryProcessingTmp.DeductionArrear, PRLArrearOffsetType::Recovery, -deductionAmountApplied, payStatement.RecId);
+
+            // Recover the deduction arrear amount, creating a PayrollPayStatementBenefitLine
+            benefitLine = PayrollPayStatementBenefitLine::create(payStatement,
+                payPeriod.PeriodEndDate,
+                HcmBenefit::find(recoveryProcessingTmp.Benefit),
+                accDistrTemplPosRecId,
+                deductionAmountApplied,
+                PayrollType::Deduction,
+                recoveryProcessingTmp.Position,
+                PayrollPayStatementLineSource::ArrearRecover);
+
+            benefitsTotalChanged = true;
+
+            select firstonly benefitPlan where benefitPlan.BenefitPlanID == recoveryProcessingTmp.BenefitPlanID;
+            benefitTaxRuleUS = PayrollBenefitTaxRule_US::findByBenefitPlan(benefitPlan.RecId);
+            preTaxArrearRecovered = (preTaxArrearRecovered || (benefitTaxRuleUS.PreTaxBasis != PayrollPreTaxBasis::None));
+
+            //
+            // Evaluate if the remaining amount in arrears is now within the defined Arrear Tolerance; if so, no more arrears
+            // need be processed so break out of loop.
+            //
+            if (_earningsRemaining == 0)
+            {
+                break;
+            }
+        }
+        // while select recoveryProcessingTmp
+
+        //
+        // If there is a potential that a pretax deduction has affected our taxable earnings, we must
+        // rerun the process again to get updated taxes; this occurs recursively.
+        //
+        if (preTaxArrearRecovered)
+        {
+            task = new PayrollPayStatementGenerationTask();
+            task.initializeFromPayment(payStatement, true, accDistrTemplPosRecId, accDistrTemplNegRecId, templatePosRecIdMap, templateNegRecIdMap);
+            task.runOperation();
+        }
+        return benefitsTotalChanged;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        #OCCRetryCount
+        InteropPermission                       permission = new InteropPermission(InteropKind::ClrInterop);
+        container                               pairedContainer;
+        int                                     i = 1;
+        System.Exception                        netException;
+
+        // Initialize the tax engine instance to be used for the payment calculation process
+        try
+        {
+            calculateTaxes = new PayrollCalculatePayStatementTaxes();
+            calculateTaxes.initializeTaxEngine();
+        }
+        catch (Exception::CLRError)
+        {
+            // This exception will always display in the infolog even when caught, so remove it from the infolog.
+            infolog.clear(Global::infologLine()-1);
+            error("@Payroll:AnErrorOccurredAccessingTheTaxEnginePleaseCheckYourInstallat");
+            return;
+        }
+
+        // Retrieve into state the parameters needed for the task execution
+        this.loadParameters();
+
+        legalEntityRecId = CompanyInfo::current();
+
+        // Create the utcdatetime used to retrieve from utcdatetime-based date effective tables
+        payPeriod = PayrollPayPeriod::find(payPeriodRecId);
+        companyEndOfPayPeriod = DateTimeUtil::removeTimeZoneOffset(DateTimeUtil::newDateTime(payPeriod.PeriodEndDate, timeMax()), DateTimeUtil::getCompanyTimeZone());
+
+        this.setIsManualPayStatementGeneration();
+
+        //
+        // The calling process has supplied a container comprised of 1..n pairings of workerRecId values paired
+        // with a container of their corresponding applicable Positions, so loop through this list of workers to process
+        //
+        for (i=1; i<= conLen(batchTaskGroupList); i++)
+        {
+            pairedContainer = conPeek(batchTaskGroupList, i);
+
+            //
+            // The workerRecId is always the first element of the current container and the
+            // container of positions is always the second element of the current container.
+            //
+            workerRecId = conPeek(pairedContainer, 1);
+            workerPositions = List::create(conPeek(pairedContainer, 2));
+            // Validations that are applicable to the currently-being-processed worker
+            try
+            {
+                //
+                // Create the pay statement header, earning lines, benefit lines, and taxes lines, as well
+                // as associated distributions.
+                //
+                ttsbegin;
+                this.createPayStatement();
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                //
+                // Assumes that any error message was already raised at the point that threw the exception,
+                // so continue to the next worker.
+                //
+                continue;
+            }
+
+            catch (Exception::CLRError)
+            {
+                //
+                // If the tax engine threw an exception, report the worker that it occurred on,
+                // display the exception message and call stack, and continue to the next worker.
+                //
+
+                if (worker.RecId != workerRecId)
+                {
+                    worker = HcmWorker::find(workerRecId);
+                }
+                setPrefix(strFmt("@Payroll:ATaxEngineExceptionHasOccurredProcessingTaxesForWorker1", worker.PersonnelNumber));
+                permission.assert();
+                netException = CLRInterop::getLastException();
+                if (!CLRInterop::isNull(netException))
+                {
+                    error(netException.ToString());
+                }
+                else
+                {
+                    // If no .net exception is available then at least report something
+                    error("@SYS83461");
+                }
+                CodeAccessPermission::revertAssert();
+                continue;
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error(strFmt("@Payroll:DeadlockCreatingPaymentForWorker1", HcmWorker::find(workerRecId).PersonnelNumber));
+                    continue;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        error(strFmt("@Payroll:UpdateconflictCreatingPaymentForWorker1", HcmWorker::find(workerRecId).PersonnelNumber));
+                        continue;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    error(strFmt("@Payroll:UpdateconflictCreatingPaymentForWorker1", HcmWorker::find(workerRecId).PersonnelNumber));
+                    continue;
+                }
+            }
+        }
+
+        calculateTaxes.disposeTaxEngine();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDisableAccountingForRecalculation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deterimes whether the pay statement has accounting disabled.
+    /// </summary>
+    /// <remarks>
+    /// This method stores the result of the logic in the class disableAccounting variable.
+    /// </remarks>
+    protected void setDisableAccountingForRecalculation()
+    {
+        if (isManualPayStatementRecalculation
+            && payStatement.SourceDocumentHeader == 0)
+        {
+            disableAccounting = true;
+        }
+        else
+        {
+            disableAccounting = false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setIsManualPayStatementGeneration</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deterimes whether the pay statement has been just created from the generation process and is for manual <c>PayrollEarningStatementLine</c> records.
+    /// </summary>
+    /// <remarks>
+    /// This method will set the isManualPayStatementGeneration class variable to true if we are in a Pay Statement Generation for a manual Pay Statement.
+    /// </remarks>
+    protected void setIsManualPayStatementGeneration()
+    {
+        if (!calledWithPaymentRecord
+            && paymentType == PayrollPaymentType::Manual)
+        {
+            isManualPayStatementGeneration = true;
+        }
+        else
+        {
+            isManualPayStatementGeneration = false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setIsManualPayStatementRecalculation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deterimes whether the pay statement is for a existing generated manual <c>PayrollEarningStatementLine</c> records.
+    /// </summary>
+    /// <remarks>
+    /// This method will set the isManualPayStatementRecalculation class variable to true if we are in a Pay Statement Recalculation for a manual Pay Statement.
+    /// </remarks>
+    protected void setIsManualPayStatementRecalculation()
+    {
+        if (calledWithPaymentRecord
+            && payStatement.PaymentType == PayrollPaymentType::Manual
+            && payStatement.CreationType == PayrollPayStatementCreationType::Generated)
+        {
+            isManualPayStatementRecalculation = true;
+        }
+        else
+        {
+            isManualPayStatementRecalculation = false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version     version = RunBase::getVersion(packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = packedClass;
+
+                break;
+
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePayStatementTotals</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the net and gross totals on the pay statement.
+    /// </summary>
+    /// <param name="_updateGross">
+    /// Indicates if the gross amount for the pay statement should get updated
+    /// as well as the net amount; optional.
+    /// </param>
+    /// <remarks>
+    /// The gross amount is the sum of all earnings whereas the net amount is
+    /// earnings minus deductive benefits and taxes.
+    /// </remarks>
+    public void updatePayStatementTotals(boolean _updateGross = false)
+    {
+        PayrollStatementAccountingCurrencyAmount netAmount;
+
+        if (_updateGross)
+        {
+            payStatement.GrossAccountingCurrencyAmount = createdEarningsTotal;
+        }
+
+        netAmount = createdEarningsTotal - createdDeductionsTotal - createdTaxesTotal;
+        payStatement.NetAccountingCurrencyAmount = netAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateEarnings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the earnings for the pay statement.
+    /// </summary>
+    /// <returns>
+    /// The total taxable earnings for the pay statement.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// The sum of earnings for the worker is less than zero.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// No earnings records exist for the worker.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// The sum of earnings for the worker is less than zero due to
+    /// imputed earnings recovery.
+    /// </exception>
+    public PayrollStatementAccountingCurrencyAmount validateEarnings()
+    {
+        PayrollPayStatementEarningLine      earningLine;
+        HcmPositionWorkerAssignment         positionWorkerAssignment;
+        PayrollEarningCode                  earningCode;
+        PayrollStatementAccountingCurrencyAmount    totalEarnings,
+                                                    totalTaxableEarnings;
+        int                                 totalEarningsRecordCount;
+
+        // Sum pay statement earning lines to get all earnings for the pay statement
+        select sum(AccountingCurrencyAmount), count(RecId) from earningLine
+            where earningLine.PayStatement == payStatement.RecId
+            &&    earningLine.IsMarkedForRemoval == NoYes::No;
+
+        totalEarnings = earningLine.AccountingCurrencyAmount;
+        totalEarningsRecordCount = int642int(earningLine.RecId);
+
+        if (totalEarnings < 0)
+        {
+            // The sum of earnings for worker %1 is less than zero. No payment has been created for this employee.
+            throw error(strFmt("@Payroll:TheSumOfEarningsIsLessThanZeroForWorker1NoPayStatementWasGen", HcmWorker::find(workerRecId).PersonnelNumber));
+        }
+
+        if (totalEarnings == 0 && totalEarningsRecordCount == 0 && payStatement.CreationType == PayrollPayStatementCreationType::Generated)
+        {
+            select firstonly validTimeState(companyEndOfPayPeriod) RecId from positionWorkerAssignment where positionWorkerAssignment.Worker == workerRecId;
+
+            // Only throw error if the worker has an active position assignment as of the end of the pay period
+            if (positionWorkerAssignment.RecId)
+            {
+                // No earnings records exist for worker %1. No payment has been created for this worker.
+                throw error(strFmt("@Payroll:NoEarningsThatMatchTheSelectionCriteriaExistForWorker1NoPayS", HcmWorker::find(workerRecId).PersonnelNumber));
+            }
+            else
+            {
+                // We still want to rollback the transaction and continue to the next pay statement to create
+                throw Exception::Error;
+            }
+        }
+
+        // If earnings are zero and there are imputed earnings
+        select sum(AccountingCurrencyAmount) from earningLine
+            where earningLine.PayStatement == payStatement.RecId
+            &&    earningLine.Source == PayrollPayStatementLineSource::FringeBenefitRecover
+            &&    earningLine.IsMarkedForRemoval == NoYes::No;
+
+        if (totalEarnings == 0 && earningLine.AccountingCurrencyAmount < 0 && paymentType != PayrollPaymentType::GrossUp)
+        {
+            // The sum of earnings for worker %1 is less than zero due to fringe benefit recovery. No pay statement has been created for this worker.
+            throw error(strFmt("@Payroll:TheSumOfEarningsForWorker1IsLessThanZeroDueToFringeBenefitRe", HcmWorker::find(workerRecId).PersonnelNumber));
+        }
+
+        //
+        // Due to the tax engine not being able to handle negative earnings, we must validate that there
+        // will be no negative earning amounts passed into it.  Also must exclude fringe benefit recovery records.
+        //
+        while select sum(AccountingCurrencyAmount) from earningLine
+            where earningLine.PayStatement == payStatement.RecId
+            &&    earningLine.IsMarkedForRemoval == NoYes::No
+            &&    earningLine.Source != PayrollPayStatementLineSource::FringeBenefitRecover
+            join RecId, TaxMethod from earningCode
+                group by earningLine.WorkerTaxRegion, earningCode.TaxMethod
+                where earningCode.RecId == earningLine.EarningCode
+                && earningCode.TaxMethod != PayrollTaxMethod::Exempt
+        {
+            if (earningLine.AccountingCurrencyAmount < 0)
+            {
+                // The sum of %1 earnings for at least one tax region for worker %2 is less than zero. No pay statement has been created for this worker.
+                throw error(strFmt("@Payroll:TheSumOf1EarningsForAtLeastOneTaxRegionForWorker2IsLessThanZ", earningCode.TaxMethod, HcmWorker::find(workerRecId).PersonnelNumber));
+            }
+            totalTaxableEarnings += earningLine.AccountingCurrencyAmount;
+        }
+        return totalTaxableEarnings;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFundsAvailableForTaxes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that sufficient payable earnings (non-imputed) exist to
+    /// cover all taxes for the payment.
+    /// </summary>
+    /// <returns>
+    /// True indicates that the payment passed validation.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// Taxes for the payment are greater than earnings.
+    /// </exception>
+    boolean validateFundsAvailableForTaxes()
+    {
+        // Verify that sufficient payable earnings (non-imputed) exist to cover all taxes
+        if (this.calcGrossMinusTaxes() < 0)
+        {
+            throw error(strFmt("@Payroll:TaxesForWorker1AreGreaterThanEarningsThePayStatementHasNotBe", worker.PersonnelNumber));
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateWorker</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the payment for the current worker will
+    /// be able to proceed without errors.
+    /// </summary>
+    /// <returns>
+    /// True if the worker passed validation.
+    /// </returns>
+    /// <exception cref="Exception::Error">
+    /// The worker is missing a resident tax region.
+    /// </exception>
+    /// <exception cref="Exception::Error">
+    /// The worker has already received a primary pay statement for the
+    /// current pay period.
+    /// </exception>
+    boolean validateWorker()
+    {
+        //
+        // Validate that there is no primary payment existing for the worker for this pay period
+        // that has not been voided (validation not needed during a recalc).
+        //
+        if (paymentType == PayrollPaymentType::Primary && !calledWithPaymentRecord)
+        {
+            PayrollPayStatement payStatementExistenceCheck;
+
+            select firstonly RecId from payStatementExistenceCheck
+                where payStatementExistenceCheck.Worker == workerRecId
+                &&    payStatementExistenceCheck.PayPeriod == payPeriodRecId
+                &&    payStatementExistenceCheck.PaymentType == PayrollPaymentType::Primary
+                &&    payStatementExistenceCheck.IsReversed == NoYes::No;
+
+            if (payStatementExistenceCheck.RecId)
+            {
+                throw error(strFmt("@Payroll:NoPayStatementWasGeneratedForWorker1ThisWorkerHasAlreadyRece", HcmWorker::find(workerRecId).PersonnelNumber));
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcBenefits</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Drives the process of generating benefits for the pay statement.
+    /// </summary>
+    /// <param name="_calculateBenefits">
+    /// The initialized instance of PayrollCalculatePayStatementBenefits used for calculate benefits
+    /// recovery.
+    /// </param>
+    private void calcBenefits(PayrollCalculatePayStatementBenefits _calculateBenefits)
+    {
+        if (paymentType != PayrollPaymentType::Manual || calcBenefitsOnManualPayStatement)
+        {
+            // Process benefits for the current pay statement
+            createdDeductionsTotal += _calculateBenefits.calculateBenefits();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcPostTaxBenefits</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Drives the process of generating post tax benefits for the pay statement.
+    /// </summary>
+    /// <param name="_calculateBenefits">
+    /// The initialized instance of PayrollCalculatePayStatementBenefits used for calculate post tax benefits
+    /// recovery.
+    /// </param>
+    private void calcPostTaxBenefits(PayrollCalculatePayStatementBenefits _calculateBenefits)
+    {
+        if (paymentType != PayrollPaymentType::Manual)
+        {
+            // Process garnishment benefits for the current pay statement
+            createdDeductionsTotal += _calculateBenefits.processGarnishment(PayrollCategory::Garnishment, paymentType);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcTaxes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Drives the process of generating tax lines for the pay statement.
+    /// </summary>
+    /// <param name="_createdTaxableEarningsTotal">
+    /// The amount of earnings that are not exempt from taxes and are not fringe benefit
+    /// recovery.
+    /// </param>
+    private void calcTaxes(PayrollStatementAccountingCurrencyAmount _createdTaxableEarningsTotal)
+    {
+        // Initializes the state of the tax calculation class to process the specified payment
+        calculateTaxes.initializeForPayment(payStatement);
+
+        // Total and pass all wage amounts to the tax engine across all locations
+        calculateTaxes.setWages();
+
+        // Call all applicable tax engine methods for the tax codes set up for this worker
+        calculateTaxes.setTaxes();
+
+        calculateTaxes.setBenefitsWageImpact();
+
+        // Process Grossup, if applicable, and adjust earnings accordingly
+        if (payStatement.PaymentType == PayrollPaymentType::GrossUp)
+        {
+            createdEarningsTotal += calculateTaxes.createGrossUp(_createdTaxableEarningsTotal);
+        }
+        else
+        {
+            // Update the tax engine for unemployment taxes only if not gross-up
+            calculateTaxes.setUnemployment();
+        }
+
+        // Initiate the tax calculation process of the tax engine
+        calculateTaxes.calculate();
+
+        // Process the results of the tax engine and create tax lines, distributions, and statutory records
+        calculateTaxes.createLines(accDistrTemplPosRecId, accDistrTemplNegRecId, templatePosRecIdMap, templateNegRecIdMap);
+       
+        // Process the results of the tax engine and create tax lines, distributions, and statutory records
+        createdTaxesTotal += calculateTaxes.getDeductedTaxTotal();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCalcBenefitsOnManualPayStatement</Name>
+				<Source><![CDATA[
+    public boolean parmCalcBenefitsOnManualPayStatement(boolean _calcBenefitsOnManualPayStatement = calcBenefitsOnManualPayStatement)
+    {
+        calcBenefitsOnManualPayStatement = _calcBenefitsOnManualPayStatement;
+
+        return calcBenefitsOnManualPayStatement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public final boolean isRetryable() 
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

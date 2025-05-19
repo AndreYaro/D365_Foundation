@@ -1,0 +1,2489 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSUnShip</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WhsUnShip</c> class is used to unship a load line and move it to a specified location.
+/// </summary>
+public class WhsUnShip
+{
+    WHSLoadLine       loadLine;
+    boolean           decrementLoadLine;
+    WMSLocation       moveToLocation;
+    WHSLicensePlateId moveToLicensePlate;
+    WHSParameters     parameters;
+    boolean           isMoveToLocationLPControlled;
+
+    private boolean             unshipFullLine;
+    private WHSWorkLineRecId    reduceQuantityWorkLineRecId;
+    private boolean             skipLpValidationOnUnShipping;
+
+    private WHSContainerId      cancellingWorkFromContainerId;
+    private UnknownNoYes        allowRemovingQuantityFromCloseContainer = UnknownNoYes::Unknown;
+
+    private boolean inventTransTypeSalesRefactoringFlightIsEnabled = WHSInventTransTypeSalesRefactoringFlight::instance().isEnabled();
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>setAllowRemovingQuantityFromCloseContainer</Name>
+				<Source><![CDATA[
+    internal void setAllowRemovingQuantityFromCloseContainer(boolean _allow)
+    {
+        if (_allow)
+        {
+            allowRemovingQuantityFromCloseContainer = UnknownNoYes::Yes;
+        }
+        else
+        {
+            allowRemovingQuantityFromCloseContainer = UnknownNoYes::No;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setLoadLine</Name>
+				<Source><![CDATA[
+    private void setLoadLine(WHSLoadLine _loadLine)
+    {
+        loadLine = _loadLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildUnshipForm</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the <c>WHSUnShipLoadLine</c> form with temporary load line record.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// Load line to be unshipped.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// Exception is thrown when no closed work found for load line.
+    /// </exception>
+    void buildUnshipForm(WHSLoadLine _loadLine)
+    {
+        this.setLoadLine(_loadLine);
+
+        WHSTmpLoadLineInventory         tmpLoadLineInv;
+        WHSUnShipLoadLineTmpDataCreator unShipTmpDataCreator = WHSUnShipLoadLineTmpDataCreator::newFromLoadLine(_loadLine);
+
+        // Create temp table for form.
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightItemLogic(funcName(), _loadLine.ItemId))
+        {
+            tmpLoadLineInv = unShipTmpDataCreator.buildTmpTableCatchWeight();
+        }
+        else
+        {
+            tmpLoadLineInv = unShipTmpDataCreator.buildTmpTable();
+        }
+
+        if (!tmpLoadLineInv)
+        {
+            throw error("@WAX2759");
+        }
+
+        Args  args = new Args();
+
+        args.name(formStr(WHSUnShipLoadLine));
+        args.record(tmpLoadLineInv);
+
+        FormRun formRun = classfactory.formRunClass(args);
+        formRun.init();
+        formRun.run();
+        formRun.wait();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelAllConsolidatedWork</Name>
+				<Source><![CDATA[
+    private boolean cancelAllConsolidatedWork(
+        WHSWorkTable    _lastConsolidatedWorkTable,
+        WHSWorkLine     _workLine,
+        InventQty       _reduceQty)
+    {
+        boolean cancelAllConsolidatedWork = this.canCancelAllConsolidatedWork(_lastConsolidatedWorkTable, _workLine, _reduceQty);
+
+        if (cancelAllConsolidatedWork)
+        {
+            //update this work table
+            WHSWorkTable::updateWorkStatusToCancelled(_lastConsolidatedWorkTable.workId);
+            //and all the consolidated ones
+            WHSWorkTable::updateWorkStatusToCancelledForOriginWork(_lastConsolidatedWorkTable.workId);
+        }
+
+        this.reduceQtyOnWHSWorkLineLoadLineDetails(_lastConsolidatedWorkTable, _workLine, _reduceQty);
+
+        return cancelAllConsolidatedWork;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelConsolidatedWork</Name>
+				<Source><![CDATA[
+    private container cancelConsolidatedWork(
+        WHSWorkTable _workTable,
+        WHSWorkLine  _workLine,
+        InventQty    _runningQty)
+    {
+        boolean isConsolidatedWork = false;
+        boolean isAllConsolidatedWorkCancelled = false;
+
+        WHSWorkTable lastConsolidatedWorkTable;
+
+        //We need to find the last consolidated work since a work can be consolidated multiple times
+        if (_workTable.isOriginForConsolidatedWork())
+        {
+            lastConsolidatedWorkTable = WHSWorkTable::findLastConsolidatedWork(_workLine);
+        }
+        else if (_workTable.isConsolidatedWork())
+        {
+            //The current work is the last consolidated work, because it is not an origin for any other consolidated work.
+            lastConsolidatedWorkTable = _workTable;
+        }
+
+        if (lastConsolidatedWorkTable)
+        {
+            if (lastConsolidatedWorkTable.workStatus != WHSWorkStatus::Closed)
+            {
+                throw error(strFmt("@WAX:MergeLP_reducePickedQuantityForNonCompleteConsolidatedWork", _workTable.workId));
+            }
+
+            //if we are the one carrying the loadLine details we need to handle that specially
+            if (lastConsolidatedWorkTable.HasWorkLineLoadLineDetails)
+            {
+                isConsolidatedWork = true;
+                isAllConsolidatedWorkCancelled = this.cancelAllConsolidatedWork(lastConsolidatedWorkTable, _workLine, _runningQty);
+            }
+        }
+
+        return [isConsolidatedWork, isAllConsolidatedWorkCancelled];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelDimTrackingWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reduces quantity from dimension tracking lines for work lines of a load.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// The load line.
+    /// </param>
+    /// <param name="_inventDim">
+    /// The inventory dimensions.
+    /// </param>
+    /// <param name="_qtyToReduce">
+    /// The quantity to be reduced.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// Failed to reduce whole quantity.
+    /// </exception>
+    [SysObsolete('Method is obsoleted to support catch weight items. Please file an extensibility request if access is required.', false, 30\9\2019)]
+    protected void cancelDimTrackingWork(
+        WHSLoadLine         _loadLine,
+        InventDim           _inventDim,
+        InventQty           _qtyToReduce)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), _loadLine.ItemId);
+
+        this.cancelDimTrackingWorkQty(_loadLine,
+                                      _inventDim,
+                                      _qtyToReduce,
+                                      0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelDimTrackingWorkQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reduces quantities from dimension tracking lines for work lines of a load.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// The load line.
+    /// </param>
+    /// <param name="_inventDim">
+    /// The inventory dimensions.
+    /// </param>
+    /// <param name="_handlingQtyToReduce">
+    /// The handling quantity to be reduced.
+    /// </param>
+    /// <param name="_weightToReduce">
+    /// The weight to be reduced.
+    /// </param>
+    final internal protected void cancelDimTrackingWorkQuantities(
+        WHSLoadLine         _loadLine,
+        InventDim           _inventDim,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce)
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightHandlingWeightLogic(funcName(), _loadLine.ItemId, _weightToReduce))
+        {
+            this.cancelDimTrackingWorkQty(_loadLine,
+                                          _inventDim,
+                                          _handlingQtyToReduce,
+                                          _weightToReduce);
+        }
+        else
+        {
+            this.cancelDimTrackingWork(_loadLine,
+                                       _inventDim,
+                                       _handlingQtyToReduce);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelDimTrackingWorkQty</Name>
+				<Source><![CDATA[
+    private void cancelDimTrackingWorkQty(
+        WHSLoadLine         _loadLine,
+        InventDim           _inventDim,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce)
+    {
+        WHSCatchWeightTelemetryLogger::logCatchWeightConflictingQuantities(funcName(), _loadLine.ItemId, _handlingQtyToReduce, _weightToReduce);
+
+        WHSWorkLine         workLine;
+        WHSWorkTable        workTable;
+        WHSDimTracking      dimTracking;
+        InventDim           trackingInventDim;
+        InventDim           tmpInventDim;
+        InventHandlingQty   trackingRunningQty    = _handlingQtyToReduce;
+        InventHandlingQty   trackingRunningWeight = _weightToReduce;
+        InventDimParm       inventDimParm;
+        RefRecId			prevWorkLineRecId;
+
+        InventHandlingUnitId inventUnit = WHSCatchWeightHelper::inventHandlingUnitId(_loadLine.ItemId);
+
+        inventDimParm.setAllProductDimensions();
+        inventDimParm.setAllTrackingDimensions();
+
+        while select forupdate workLine
+            where workLine.LoadLineRefRecId == _loadLine.RecId
+                && workLine.InventQtyWork   > 0
+                && workLine.WorkStatus      == WHSWorkStatus::Closed
+                && (!reduceQuantityWorkLineRecId || workLine.RecId == reduceQuantityWorkLineRecId)
+        join workTable
+            where workTable.WorkId           == workLine.WorkId
+                && workTable.WorkStatus      != WHSWorkStatus::Cancelled
+                && workTable.WorkStatus      != WHSWorkStatus::Combined
+        join forupdate dimTracking
+            where dimTracking.WorkId        == workLine.WorkId
+                && dimTracking.LineNum      == workLine.LineNum
+        join trackingInventDim
+            where trackingInventDim.InventDimId == dimTracking.InventDimId
+        #InventDimExistsJoin(_inventDim.InventDimId, tmpInventDim, trackingInventDim, inventDimParm)
+        {
+            if (workLine.RecId == prevWorkLineRecId)
+            {
+                workLine.reread();
+            }
+
+            if (this.isMatchingTargetLicensePlate(workTable, _inventDim, trackingInventDim))
+            {
+                boolean isConsolidatedWork;
+                boolean isAllConsolidatedWorkCancelled;
+
+                //determine if we need to handle a consolidated work and cancel it
+                [isConsolidatedWork, isAllConsolidatedWorkCancelled] = this.cancelConsolidatedWork(workTable, workLine, trackingRunningQty);
+
+                if (dimTracking.Qty > trackingRunningQty)
+                {
+                    // Do not allow CapturedWeight to go below 0.
+                    if (trackingRunningWeight > workLine.CapturedWeight)
+                    {
+                        throw error("@WAX:Error_ReducedWeight");
+                    }
+                    
+                    workLine.InventQtyWork  -=  trackingRunningQty;
+                    workLine.CapturedWeight -= trackingRunningWeight;
+
+                    workLine.QtyWork -= this.calculateInventWorkQtyCorrectRounding(trackingRunningQty, inventUnit, workLine);
+
+                    workLine.update();
+
+                    if (!isConsolidatedWork)
+                    {
+                        this.propagateCanceledWorkQty(workLine.WorkId, workLine.ItemId, workLine.InventDimId, inventUnit, trackingRunningQty, trackingRunningWeight);
+                    }
+
+                    WHSOrderCommittedReservationFacade::updateOrderCommittedReservation(workLine.InventTransId,
+                                                                                        workLine.orderCommittedInventDimId,
+                                                                                        trackingRunningQty);
+
+                    dimTracking.Qty -= trackingRunningQty;
+                    if (dimTracking.CapturedWeight != 0)
+                    {
+                        dimTracking.CapturedWeight -= trackingRunningWeight;
+                    }
+
+                    trackingRunningQty    = 0;
+                    trackingRunningWeight = 0;
+                    dimTracking.update();
+                }
+                else
+                {
+                    boolean rereadDimTracking = false;
+
+                    //use dedicated logic for consolidated work since we need to cancel all or nothing
+                    if (isConsolidatedWork)
+                    {
+                        //we only cancel the line if the header is cancelled to avoid a situation where we have a single line work where the line is cancelled but the header is closed.
+                        if (isAllConsolidatedWorkCancelled)
+                        {
+                            workLine.WorkStatus = WHSWorkStatus::Cancelled;
+                            workLine.update();
+                        }
+                        //if current workline refers to the origin work but not to consolidated work and is fully reduced then we cancel it
+                        else if (!workTable.isConsolidatedWork() && this.canCancelOriginWorkLineInConsolidatedWork(workLine))
+                        {
+                            WHSWorkLine::cancelLineNoLoadLineUpdate(workLine.WorkId, workLine.LineNum, workLine.InventQtyWork, workLine.ItemId, false, true, true);
+                            rereadDimTracking = true;
+                        }
+                    }
+                    else if (dimTracking.Qty == workLine.InventQtyWork)
+                    {
+                        //In this case, if this will result in the work getting completely cancelled, we want to mark the work header as cancelled, even if it is closed.
+                        WHSWorkLine::cancelLineNoLoadLineUpdate(workLine.WorkId, workLine.LineNum, workLine.InventQtyWork, workLine.ItemId, false, true, true);
+                        
+                        rereadDimTracking = true;
+
+                        //Return order-committed reservation in case work is not cancelled completely.
+                        if (workLine.OrderCommittedInventDimId)
+                        {
+                            workTable.reread();
+
+                            if (workTable.WorkStatus != WHSWorkStatus::Cancelled)
+                            {
+                                WHSOrderCommittedReservationFacade::updateOrderCommittedReservation(workLine.InventTransId,
+                                                                                                    workLine.orderCommittedInventDimId,
+                                                                                                    workLine.InventQtyWork);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Do not allow CapturedWeight to go below 0.
+                        if (dimTracking.CapturedWeight > workLine.CapturedWeight)
+                        {
+                            throw error("@WAX:Error_ReducedWeight");
+                        }
+                        
+                        workLine.CapturedWeight -= dimTracking.CapturedWeight;
+                        workLine.InventQtyWork  -= dimTracking.Qty;
+
+                        workLine.QtyWork -= this.calculateInventWorkQtyCorrectRounding(dimTracking.Qty, inventUnit, workLine);
+
+                        workLine.update();
+
+                        if (WHSUnShipPutWorkLinePropagateCancelledQtyFlight::instance().isEnabled())
+                        {
+                            this.propagateCanceledWorkQty(workLine.WorkId, workLine.ItemId, workLine.InventDimId, inventUnit, trackingRunningQty, trackingRunningWeight);
+                        }
+
+                        WHSOrderCommittedReservationFacade::updateOrderCommittedReservation(workLine.InventTransId,
+                                                                                            workLine.orderCommittedInventDimId,
+                                                                                            dimTracking.Qty);
+
+                    }
+
+                    trackingRunningQty    -= dimTracking.Qty;
+                    trackingRunningWeight -= dimTracking.CapturedWeight;
+
+                    // We need to reread the record since the WHSWorkLine::cancelLineNoLoadLineUpdate might have deleted the record causing this to throw exception.
+                    if (rereadDimTracking)
+                    {
+                        dimTracking.reread();
+                    }
+
+                    if (dimTracking.RecId != 0)
+                    {
+                        dimTracking.delete();
+                    }
+                }
+
+                if (trackingRunningQty <= 0)
+                {
+                    break;
+                }
+
+                prevWorkLineRecId = workLine.RecId;
+
+                if (workLine.whsWorkTable().WorkTransType == WHSWorkTransType::CrossDocking &&
+                    workLine.InventTransOriginIdSupply)
+                {
+                    WHSCrossDockLoadLine::updateQuantityForCrossDockLoadLine(_loadLine.RecId, workLine.InventTransOriginIdSupply, _handlingQtyToReduce);
+                }
+            }
+        }
+
+        if (trackingRunningQty > 0)
+        {
+            throw error ("@WAX3939");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateInventWorkQtyCorrectRounding</Name>
+				<Source><![CDATA[
+    private InventHandlingQty calculateInventWorkQtyCorrectRounding(
+        InventHandlingQty   _runningQty,
+        InventHandlingUnitId _inventUnit,
+        WHSWorkLine         _workLine)
+    {
+        if (_workLine.InventQtyWork == 0)
+        {
+            return _workLine.QtyWork;
+        }
+
+        EcoResReleasedProductUnitConverter releasedProductUnitConverter = EcoResReleasedProductUnitConverter::construct();
+        
+        return releasedProductUnitConverter.convert(_runningQty,
+                                                    UnitOfMeasure::findBySymbol(_inventUnit).RecId,
+                                                    UnitOfMeasure::findBySymbol(_workLine.UnitId).RecId,
+                                                    NoYes::No,
+                                                    _workLine.ItemId,
+                                                    _workLine.InventDimId,
+                                                    NoYes::No);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCancelAllConsolidatedWork</Name>
+				<Source><![CDATA[
+    private boolean canCancelAllConsolidatedWork(
+        WHSWorkTable    _lastConsolidatedWorkTable,
+        WHSWorkLine     _workLine,
+        InventQty       _qtyToReduce)
+    {
+        boolean canCancelAllConsolidatedWork = true;
+        boolean workLineLoadLineDetailsFound = false;
+
+        WHSWorkLineLoadLineDetailsEnumerator workLineLoadLineDetailsEnumerator = WHSWorkLineLoadLineDetailsEnumerator::newFromWorkId(_lastConsolidatedWorkTable.WorkId, true);
+        //go through all the lines to determine if any are picked
+        while (workLineLoadLineDetailsEnumerator.moveNext())
+        {
+            RefRecId loadLineRefRecId = workLineLoadLineDetailsEnumerator.currentLoadLineRefRecId();
+            InventQty InventQtyWork = workLineLoadLineDetailsEnumerator.currentInventQtyWork();
+            //we are not reducing the last line fully if other lines still have qty or if we have more than what we reduce
+            if ((loadLineRefRecId != _workLine.LoadLineRefRecId) && (InventQtyWork > 0))
+            {
+                canCancelAllConsolidatedWork = false;
+                break;
+            }
+
+            if ((loadLineRefRecId == _workLine.LoadLineRefRecId) && (InventQtyWork > _qtyToReduce))
+            {
+                canCancelAllConsolidatedWork = false;
+                break;
+            }
+
+            workLineLoadLineDetailsFound = true;
+        }
+
+        return (canCancelAllConsolidatedWork && workLineLoadLineDetailsFound);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reduceQtyOnWHSWorkLineLoadLineDetails</Name>
+				<Source><![CDATA[
+    private void reduceQtyOnWHSWorkLineLoadLineDetails(
+        WHSWorkTable    _lastConsolidatedWorkTable,
+        WHSWorkLine     _workLine,
+        InventQty       _reduceQty)
+    {
+        //we don't reduce lines below 0
+        if (_reduceQty <= 0)
+        {
+            return;
+        }
+
+        //go through and reduce the load line details for the last workline on the consolidated work
+        WHSWorkLine lastClosedPickLine = WHSWorkLine::lastClosedPickLine(_lastConsolidatedWorkTable.WorkId);
+
+        WHSWorkLineLoadLineDetails::reduceInventQtyWork(lastClosedPickLine, _workLine.LoadLineRefRecId, _reduceQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTargetLPDifferentThanUnPickInventDimLP</Name>
+				<Source><![CDATA[
+    private boolean isTargetLPDifferentThanUnPickInventDimLP(
+        InventDim       _inventDimUnPick,
+        WHSWorkTable    _workTable)
+    {
+        return (_workTable.TargetLicensePlateId != _inventDimUnPick.LicensePlateId
+            && WMSLocation::find(_workTable.getFinalPutLocation(), _inventDimUnPick.InventLocationId).whsLocationType() == parameters.ShipFinalLocType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancels work created for a specified load line.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// Load line that work has created for.
+    /// </param>
+    /// <param name="_inventDim">
+    /// Inventory dimension level of the load line.
+    /// </param>
+    /// <param name="_qtyToReduce">
+    /// Quantity to be cancelled.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// Exception is thrown if there are not enough work created for the quantity to be cancelled.
+    /// </exception>
+    [SysObsolete('Method is obsoleted to support catch weight items. Please file an extensibility request if access is required.', false, 30\9\2019)]
+    protected void cancelWork(
+        WHSLoadLine  _loadLine,
+        InventDim    _inventDim,
+        InventQty    _qtyToReduce)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), _loadLine.ItemId);
+
+        this.cancelWorkQty(_loadLine,
+                            _inventDim,
+                            _qtyToReduce,
+                            0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelWorkQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancels work created for a specified load line.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// Load line that work has created for.
+    /// </param>
+    /// <param name="_inventDim">
+    /// Inventory dimension level of the load line.
+    /// </param>
+    /// <param name="_handlingQtyToReduce">
+    /// Quantity to be cancelled.
+    /// </param>
+    /// <param name="_weightToReduce">
+    /// Weight to be cancelled.
+    /// </param>
+    final internal protected void cancelWorkQuantities(
+        WHSLoadLine       _loadLine,
+        InventDim         _inventDim,
+        InventHandlingQty _handlingQtyToReduce,
+        WHSWeightToReduce _weightToReduce)
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightHandlingWeightLogic(funcName(), _loadLine.ItemId, _weightToReduce))
+        {
+            this.cancelWorkQty(_loadLine,
+                               _inventDim,
+                               _handlingQtyToReduce,
+                               _weightToReduce);
+        }
+        else
+        {
+            this.cancelWork(_loadLine,
+                            _inventDim,
+                            _handlingQtyToReduce);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelWorkQty</Name>
+				<Source><![CDATA[
+    private void cancelWorkQty(
+        WHSLoadLine       _loadLine,
+        InventDim         _inventDim,
+        InventHandlingQty _handlingQtyToReduce,
+        WHSWeightToReduce _weightToReduce)
+    {
+        WHSCatchWeightTelemetryLogger::logCatchWeightConflictingQuantities(funcName(), _loadLine.ItemId, _handlingQtyToReduce, _weightToReduce);
+
+        WHSWorkLine         workLine;
+        WHSWorkTable        workTable;
+        InventHandlingQty   runningQty = _handlingQtyToReduce;
+
+        InventHandlingUnitId inventUnit  = WHSCatchWeightHelper::inventHandlingUnitId(_loadLine.ItemId);
+
+        // Handle packing work first
+        runningQty = this.cancelPackingWorkQty(_loadLine, _inventDim, _handlingQtyToReduce, _weightToReduce);
+
+        if (!runningQty)
+        {
+            return;
+        }
+        
+        //Go through the initial closed picks
+        while select forupdate workLine
+            Where workLine.LoadLineRefRecId == _loadLine.RecId
+                && workLine.InventQtyWork   > 0
+                && (workLine.WorkStatus      == WHSWorkStatus::Closed
+                   || workLine.WorkStatus == WHSWorkStatus::Combined)
+                && (!reduceQuantityWorkLineRecId || workLine.RecId == reduceQuantityWorkLineRecId)
+        join workTable
+            where workLine.WorkId           == workTable.WorkId
+                && workTable.WorkStatus     != WHSWorkStatus::Cancelled
+        {
+            runningQty = this.cancelWorkQtyForWorkLine(workLine, workTable, runningQty, inventUnit, _inventDim, _weightToReduce);
+            
+            if (workLine.whsWorkTable().WorkTransType == WHSWorkTransType::CrossDocking && workLine.InventTransOriginIdSupply)
+            {
+                WHSCrossDockLoadLine::updateQuantityForCrossDockLoadLine(_loadLine.RecId, workLine.InventTransOriginIdSupply, _handlingQtyToReduce);
+            }
+
+            if (!runningQty)
+            {
+                break;
+            }
+        }
+
+        if (runningQty > 0 && reduceQuantityWorkLineRecId)
+        {
+            select firstonly forupdate workLine
+                Where workLine.RecId == reduceQuantityWorkLineRecId
+                   && workLine.InventQtyWork > 0
+                   && (workLine.WorkStatus == WHSWorkStatus::Closed
+                        || workLine.WorkStatus == WHSWorkStatus::Combined)
+                join workTable
+                    where workTable.WorkId == workLine.WorkId
+                       && workTable.WorkTransType == WHSWorkTransType::SortedInventoryPicking
+                       && workTable.WorkStatus != WHSWorkStatus::Cancelled;
+            if (workLine)
+            {
+                runningQty = this.cancelWorkQtyForWorkLine(workLine, workTable, runningQty, inventUnit, _inventDim, _weightToReduce);
+            }
+        }
+
+        if (runningQty > 0)
+        {
+            throw error ("@WAX3939");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelWorkQtyForWorkLine</Name>
+				<Source><![CDATA[
+    private InventHandlingQty cancelWorkQtyForWorkLine(WHSWorkLine _workLine, WHSWorkTable _workTable, InventHandlingQty _runningQty, InventHandlingUnitId _inventUnit, InventDim _inventDim, WHSWeightToReduce _weightToReduce)
+    {
+        // Check to make sure Target LP matches for anything put to final ship locations.
+        // Anything put down to a pack station can have different Target LP then what was picked against the order.
+        if (this.isTargetLPDifferentThanUnPickInventDimLP(_inventDim, _workTable))
+        {
+            return _runningQty;
+        }
+
+        // Do not allow CapturedWeight to go below 0.
+        if (_weightToReduce > _workLine.CapturedWeight)
+        {
+            throw error("@WAX:Error_ReducedWeight");
+        }
+            
+        boolean isConsolidatedWork;
+        boolean isAllConsolidatedWorkCancelled;
+
+        //determine if we need to handle a consolidated work and cancel it
+        [isConsolidatedWork, isAllConsolidatedWorkCancelled] = this.cancelConsolidatedWork(_workTable, _workLine, _runningQty);
+
+        if (_workLine.InventQtyWork > _runningQty)
+        {
+            if (!_runningQty)
+            {
+                return _runningQty;
+            }
+                
+            WHSCapturedWeight reducedCapturedWeight = 0;
+            if (_workLine.CapturedWeight)
+            {
+                reducedCapturedWeight = _weightToReduce;
+                _workLine.CapturedWeight -= _weightToReduce;
+            }
+
+            var reducedInventQtyWork = _runningQty;
+            _workLine.InventQtyWork -= reducedInventQtyWork;
+
+            _workLine.QtyWork -= this.calculateInventWorkQtyCorrectRounding(_runningQty, _inventUnit, _workLine);
+
+            _workLine.update();
+
+            if (!isConsolidatedWork)
+            {
+                this.propagateCanceledWorkQty(_workLine.WorkId, _workLine.ItemId, _workLine.InventDimId, _inventUnit, reducedInventQtyWork, reducedCapturedWeight);
+            }
+
+            if (WHSUnShipCancelWorkQtyHandleOrderCommitedReservationFlight::instance().isEnabled())
+            {
+                WHSOrderCommittedReservationFacade::updateOrderCommittedReservation(_workLine.InventTransId,
+                                                                                    _workLine.orderCommittedInventDimId,
+                                                                                    _runningQty);
+            }
+
+            _runningQty = 0;
+        }
+        else //full reduction of line
+        {
+            _runningQty -= _workLine.InventQtyWork;
+
+            //use dedicated logic for consolidated work
+            if (isConsolidatedWork)
+            {
+                //we only cancel the line if the header is cancelled to avoid a situation where we have a single line work where the line is cancelled but the header is closed.
+                if (isAllConsolidatedWorkCancelled)
+                {
+                    _workLine.WorkStatus = WHSWorkStatus::Cancelled;
+                    _workLine.update();
+                }
+                //if current workline refers to the origin work but not to consolidated work and is fully reduced then we cancel it
+                else if (!_workTable.isConsolidatedWork() && this.canCancelOriginWorkLineInConsolidatedWork(_workLine))
+                {
+                    WHSWorkLine::cancelLineNoLoadLineUpdate(_workLine.WorkId, _workLine.LineNum, _workLine.InventQtyWork, _workLine.ItemId, false, true, true);
+                }
+            }
+            else
+            {
+                //In this case, if this will result in the work getting completely cancelled, we want to mark the work header as cancelled, even if it is closed.
+                WHSWorkLine::cancelLineNoLoadLineUpdate(_workLine.WorkId, _workLine.LineNum, _workLine.InventQtyWork, _workLine.ItemId, false, true, true);
+
+                if (WHSUnShipCancelWorkQtyHandleOrderCommitedReservationFlight::instance().isEnabled())
+                {
+                    //Return order-committed reservation in case work is not cancelled completely.
+                    if (_workLine.OrderCommittedInventDimId)
+                    {
+                        _workTable.reread();
+
+                        if (_workTable.WorkStatus != WHSWorkStatus::Cancelled)
+                        {
+                            WHSOrderCommittedReservationFacade::updateOrderCommittedReservation(_workLine.InventTransId,
+                                                                                                _workLine.orderCommittedInventDimId,
+                                                                                                _workLine.InventQtyWork);
+                        }
+                    }
+                }
+            }
+        }
+            
+        return _runningQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>propagateCanceledWorkQty</Name>
+				<Source><![CDATA[
+    private void propagateCanceledWorkQty(
+        WHSWorkId _workId,
+        ItemId _itemId,
+        InventDimId _inventDimId,
+        InventHandlingUnitId _inventUnit,
+        WHSInventQtyWork _inventQtyWork,
+        WHSCapturedWeight _capturedWeight)
+    {
+        WHSWorkLine firstPutOrPrintLine;
+
+        select firstonly firstPutOrPrintLine
+            order by firstPutOrPrintLine.LineNum asc
+            where firstPutOrPrintLine.WorkId      == _workId
+                && firstPutOrPrintLine.WorkType   != WHSWorkType::Pick
+                && firstPutOrPrintLine.WorkStatus != WHSWorkStatus::Cancelled;
+
+        // First put line, and all subsequent lines, should have the respective quantities accumulated,
+        // so we are subtracting the desired values directly.
+        WHSWorkLine workLine;
+        while select forupdate workLine
+            where workLine.WorkId == _workId
+                  && workLine.LineNum >= firstPutOrPrintLine.LineNum
+        {
+            // Make sure that we don't go negative when reducing quantities
+            if (workLine.InventQtyWork >= _inventQtyWork)
+            {
+                workLine.InventQtyWork -= _inventQtyWork;
+            }
+
+            
+            [workLine.QtyWork, workLine.QtyRemain, workLine.UnitId] = WHSInventTable::getHighestCommonUnitQtyByUOMSeqGroup(workLine.ItemId,
+                                                                    workLine.InventQtyWork,
+                                                                    workLine.InventQtyRemain,
+                                                                    workLine.handlingUnitId(),
+                                                                        workLine.InventDimId);            
+
+            if (workLine.CapturedWeight >= _capturedWeight)
+            {
+                workLine.CapturedWeight -= _capturedWeight;
+            }
+
+            workLine.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>containerPackingWork</Name>
+				<Source><![CDATA[
+    private WHSWorkTable containerPackingWork()
+    {
+        WHSWorkTable containerClosedPackingWork;
+
+        if (!cancellingWorkFromContainerId)
+        {
+            return containerClosedPackingWork;
+        }
+
+        select firstonly containerClosedPackingWork
+            where containerClosedPackingWork.WorkTransType == WHSWorkTransType::Packing
+               && containerClosedPackingWork.WorkStatus == WHSWorkStatus::Closed
+               && containerClosedPackingWork.TargetLicensePlateId == cancellingWorkFromContainerId;
+
+        return containerClosedPackingWork;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelPackingWorkQty</Name>
+				<Source><![CDATA[
+    private InventQty cancelPackingWorkQty(
+        WHSLoadLine       _loadLine,
+        InventDim         _inventDim,
+        InventHandlingQty _runningQty,
+        WHSWeightToReduce _weightToReduce)
+    {
+        // We need to take care of potential unshipping of open (=picking tote) packing works and closed packing work
+        // One unship operation should only touch one or the other
+
+        InventHandlingUnitId inventUnit = WHSCatchWeightHelper::inventHandlingUnitId(_loadLine.ItemId);
+        
+        WHSWorkTable toteWorkTable = WHSWorkTable::findOpenPackingWorkByTargetLicensePlate(_inventDim.LicensePlateId);
+        WHSWorkTable containerWorkTable = this.containerPackingWork();
+        WHSWorkId workIdToReduce;
+        WHSWorkStatus expectedWorkStatus;
+
+        switch (true)
+        {
+            case toteWorkTable && containerWorkTable:
+                throw error(Error::wrongUseOfFunction(funcName()));
+
+            case toteWorkTable.RecId != 0:
+                workIdToReduce = toteWorkTable.WorkId;
+                expectedWorkStatus = WHSWorkStatus::Open;
+                break;
+
+            case containerWorkTable.RecId != 0:
+                workIdToReduce = containerWorkTable.WorkId;
+                expectedWorkStatus = WHSWorkStatus::Closed;
+                break;
+
+            default:
+                return _runningQty;
+        }
+
+        
+        WHSWorkLine workLine;
+        InventDim workLineInventDim;
+        boolean workChanged;
+
+        InventDimParm belowLocationInventDimParm;
+               
+        // We need below-location tracking dimensions to find the correct work line, so we take below locations and clear the storage dimensions
+        // (LP is always below location)
+        belowLocationInventDimParm = WhsReservationHierarchyInventDimUtil::initInventDimParmBelowLocation(InventTable::find(_loadLine.ItemId));
+        belowLocationInventDimParm.clearStorageDimensions();
+        
+
+        while select forupdate workLine
+            where workLine.LoadLineRefRecId == _loadLine.RecId
+               && workLine.InventQtyWork > 0
+               && workLine.WorkStatus == expectedWorkStatus
+               && workLine.WorkId == workIdToReduce
+            #InventDimExistsJoin(workLine.InventDimId, workLineInventDim, _inventDim, belowLocationInventDimParm)
+        {
+            if (workLine.InventQtyWork > _runningQty)
+            {
+                if (_runningQty <= 0)
+                {
+                    break;
+                }
+                
+                if (workLine.CapturedWeight)
+                {
+                    workLine.CapturedWeight -= _weightToReduce;
+                }
+
+                WHSQtyWork qtyWork = this.calculateInventWorkQtyCorrectRounding(_runningQty, inventUnit, workLine);
+
+                workLine.InventQtyWork -= _runningQty;
+                workLine.QtyWork -= qtyWork;
+
+                if (workLine.WorkStatus == WHSWorkStatus::Open)
+                {
+                    workLine.InventQtyRemain -= _runningQty;
+                    workLine.QtyRemain -= qtyWork;
+                }
+
+                workLine.update();
+
+                _runningQty = 0;
+            }
+            else
+            {
+                _runningQty -= workLine.InventQtyWork;
+
+                workLine.delete();
+            }
+
+            workChanged = true;
+        }
+
+        if (workChanged)
+        {
+            WHSPackingWorkHelper::updatePutLineQty(workIdToReduce);
+        }
+
+        return _runningQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canCancelOriginWorkLineInConsolidatedWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks for origin workline within consolidated work if quantity was fully reduced.
+    /// </summary>
+    /// <param name = "_workLine">The origin work line.</param>
+    /// <returns>true if quantity on workLine was fully reduced; otherwise, false.</returns>
+    private boolean canCancelOriginWorkLineInConsolidatedWork(WHSWorkLine _workLine)
+    {
+        WHSWorkId lastConsolidatedWorkId = WHSWorkTable::findLastConsolidatedWork(_workLine).WorkId;
+        WHSWorkLineLoadLineDetails workLineLoadLineDetails = WHSWorkLineLoadLineDetails::find(lastConsolidatedWorkId, WHSWorkLine::lastClosedPickLine(lastConsolidatedWorkId).LineNum, _workLine.LoadLineRefRecId);
+            
+        return (workLineLoadLineDetails && workLineLoadLineDetails.InventQtyWork == 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpTransferLineInventTransDimensionParm</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns which inventory dimensions that should be used for the clean up of transfer order lines inventory transaction dimensions.
+    /// </summary>
+    /// <param name = "_transferLine">The transfer order line.</param>
+    /// <returns>An <c>InventDimParm</c> record with the dimensions to clean up.</returns>
+    protected InventDimParm cleanUpTransferLineInventTransDimensionParm(InventTransferLine _transferLine)
+    {
+        InventTransferTable inventTransferTable = _transferLine.inventTransferTable();
+
+        InventDimParm inventDimParm;
+        inventDimParm.InventBatchIdFlag = NoYes::Yes;
+        inventDimParm.InventSerialIdFlag = NoYes::Yes;
+        inventDimParm.LicensePlateFlag = _transferLine.defaultWMSLocation(inventTransferTable.InventLocationIdTo, inventTransferTable, _transferLine.inventDimReceive()).whsLocationIsLPControlled();
+
+        return inventDimParm;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUpTransferLineInventTransDims</Name>
+				<Source><![CDATA[
+    private void cleanUpTransferLineInventTransDims(
+        InventTransferLine  _transferLine,
+        InventDim           _inventDim,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        boolean             _isCWItem)
+    {
+        InventTrans inventTrans;
+        InventDimParm inventDimParm = this.cleanUpTransferLineInventTransDimensionParm(_transferLine);
+
+        // clean up receiving inventTrans
+        InventHandlingQty runningQty = _handlingQtyToReduce;
+
+        while (runningQty > 0)
+        {
+            InventTransOrigin   inventTransOrigin;
+            InventDim           inventDim;
+
+            select firstonly forceselectorder RecId, InventTransId from inventTransOrigin
+                where inventTransOrigin.InventTransId	== _transferLine.InventTransIdReceive
+                join forupdate inventTrans
+                    where inventTrans.InventTransOrigin	== inventTransOrigin.RecId
+                        && inventTrans.StatusIssue		== StatusIssue::None
+                        && inventTrans.StatusReceipt	== StatusReceipt::Ordered
+                #InventDimInnerJoin(inventTrans.InventDimId, inventDim, _inventDim, inventDimParm);
+            
+            if (!inventTrans.RecId)
+            {
+                throw error("@WAX3938");
+            }
+            
+            if (_isCWItem)
+            {
+                if (inventTrans.PdsCWQty > runningQty)
+                {
+                    inventTrans.updateSplit(_weightToReduce, runningQty);
+                }
+
+                // Set the weight to the min weight since the issues line will be in the min weight.
+                inventTrans.Qty = WHSInvent::defaultCatchWeightReserveQuantity(inventTrans.ItemId, inventTrans.PdsCWQty);
+            }
+            else
+            {
+                if (inventTrans.Qty > runningQty)
+                {
+                    // split inventTrans
+                    inventTrans.updateSplit(runningQty);
+                }
+            }
+
+            InventDim inventTransInventDim = inventTrans.inventDim();
+            inventTransInventDim.clearBelowLocationDim(inventTrans.ItemId);
+
+            inventTrans.InventDimId = InventDim::findOrCreate(inventTransInventDim).InventDimId;
+            inventTrans.update();
+
+            runningQty -= !_isCWItem ? inventTrans.Qty : inventTrans.PdsCWQty;
+        }
+
+        inventTrans.updateSumUp();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reduceLoadLinePickedQty</Name>
+				<Source><![CDATA[
+    private void reduceLoadLinePickedQty(
+        RecId               _loadLineRecId,
+        Qty                 _qtyToReduce,
+        WHSWeightToReduce   _weightToReduce)
+    {
+        ttsbegin;
+
+        var locloadLine = WHSLoadLine::findbyRecId(_loadLineRecId, true);
+
+        // In some scenarios when packing is used, material is handed to the packing station and the pick and put work is completed.
+        // For this scenario the pickedQty is not yet updated, since this will happen when the packing is completed.
+        if (locloadLine.PickedQty >= _qtyToReduce)
+        {
+            locloadLine.PickedQty    -= _qtyToReduce;
+            locloadLine.PickedWeight -= _weightToReduce;
+        }
+        else
+        {
+            locloadLine.PickedQty    = 0;
+            locloadLine.PickedWeight = 0;
+        }
+
+        locloadLine.update();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>decrementLoadLine</Name>
+				<Source><![CDATA[
+    private void decrementLoadLine(
+        RecId               _loadLineRecId,
+        InventHandlingQty   _handlingQtyToReduce)
+    {
+        ttsbegin;
+
+        WHSLoadLine locloadLine = WHSLoadLine::findbyRecId(_loadLineRecId, true);
+        boolean loadLineUpdated = this.adjustLoadLineQuantitiesForDecrementLoadLine(locloadLine, _handlingQtyToReduce);
+
+        if (locloadLine.Qty > 0)
+        {
+            if (loadLineUpdated)
+            {
+                locloadLine.update();
+            }
+        }
+        else
+        {
+            locloadLine.delete();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustLoadLineQuantitiesForDecrementLoadLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adjust the load line quantities.
+    /// </summary>
+    /// <param name = "_loadLine">The load line record</param>
+    /// <param name = "_handlingQtyToReduce">The handling quantity to reduce.</param>
+    /// <returns>true if quantities have been updated; otherwise, false.</returns>
+    protected boolean adjustLoadLineQuantitiesForDecrementLoadLine(
+        WHSLoadLine         _loadLine,
+        InventHandlingQty   _handlingQtyToReduce)
+    {
+        boolean loadLineUpdated;
+
+        if (_loadLine.WorkCreatedQty >= _handlingQtyToReduce)
+        {
+            _loadLine.WorkCreatedQty -= _handlingQtyToReduce;
+            loadLineUpdated = true;
+        }
+
+        if (decrementLoadLine)
+        {
+            // Decrement the qty off the loadLine
+            _loadLine.Qty -= EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(_loadLine.ItemId,
+                                                                                                   _loadLine.InventDimId,
+                                                                                                   _handlingQtyToReduce,
+                                                                                                   WHSCatchWeightHelper::inventHandlingUnitId(_loadLine.ItemId),
+                                                                                                   _loadLine.uom,
+                                                                                                   NoYes::No,
+                                                                                                   NoYes::No);
+            loadLineUpdated = true;
+        }
+
+        return loadLineUpdated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isMatchingTargetLicensePlate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Checks that the Target License Plate matches for anything put to final ship locations.
+    ///     Anything put down to a pack station can have different Target License Plate then what was picked against the order.
+    /// </summary>
+    /// <param name="_whsWorkTable">
+    ///     The <c>WHSWorkTable</c> table.
+    /// </param>
+    /// <param name="_inventDim">
+    ///     The inventory dimensions to be matched against.
+    /// </param>
+    /// <param name="_trackingInventDim">
+    ///     The tracking inventory dimensions.
+    /// </param>
+    /// <returns>
+    ///     true if Target License Plate matches; otherwise false.
+    /// </returns>
+    protected boolean isMatchingTargetLicensePlate(
+        WHSWorkTable   _whsWorkTable,
+        InventDim      _inventDim,
+        InventDim      _trackingInventDim)
+    {
+        return (_whsWorkTable.TargetLicensePlateId                                                                    == _inventDim.LicensePlateId
+             || WMSLocation::find(_whsWorkTable.getFinalPutLocation(), _inventDim.InventLocationId).whsLocationType() != parameters.ShipFinalLocType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    void new()
+    {
+        parameters = WHSParameters::find();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDecrementLoadLine</Name>
+				<Source><![CDATA[
+    boolean parmDecrementLoadLine(boolean _decrementLoadLine)
+    {
+        decrementLoadLine = _decrementLoadLine;
+
+        return decrementLoadLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmMoveToLocation</Name>
+				<Source><![CDATA[
+    WMSLocation parmMoveToLocation(WMSLocation _moveToLocation)
+    {
+        moveToLocation = _moveToLocation;
+
+        return moveToLocation;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmMoveToLicensePlate</Name>
+				<Source><![CDATA[
+    public WHSLicensePlateId parmMoveToLicensePlate(WHSLicensePlateId _moveToLicensePlate = moveToLicensePlate)
+    {
+        moveToLicensePlate = _moveToLicensePlate;
+
+        return moveToLicensePlate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUnshipFullLine</Name>
+				<Source><![CDATA[
+    public boolean parmUnshipFullLine(boolean _unshipFullLine)
+    {
+        unshipFullLine = _unshipFullLine;
+
+        return unshipFullLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSkipLpValidationOnUnShipping</Name>
+				<Source><![CDATA[
+    public boolean parmSkipLpValidationOnUnShipping(boolean _skipLpValidationOnUnShipping)
+    {
+        skipLpValidationOnUnShipping = _skipLpValidationOnUnShipping;
+
+        return skipLpValidationOnUnShipping;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWorkLineRecId</Name>
+				<Source><![CDATA[
+    public WHSWorkLineRecId parmWorkLineRecId(WHSWorkLineRecId _workLineRecId)
+    {
+        reduceQuantityWorkLineRecId = _workLineRecId;
+
+        return reduceQuantityWorkLineRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWorkLineRecId</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal WHSWorkLineRecId getWorkLineRecId()
+    {
+        return reduceQuantityWorkLineRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>revertSalesReservation</Name>
+				<Source><![CDATA[
+    private void revertSalesReservation(
+        SalesLine   _salesLine,
+        InventDimId _inventDimId,
+        WHSLoadLine _loadLine)
+    {
+        boolean didUpdate;
+
+        ttsbegin;
+
+        // Change reservation inventDim from full dim back to salesLine dim
+        if (SalesTable::find(_salesLine.SalesId).Reservation == ItemReservation::None)
+        {
+            didUpdate = this.revertReservation(StatusIssue::OnOrder, _salesLine.InventTransId, _inventDimId, _loadLine);
+        }
+
+        if (!didUpdate)
+        {
+            this.revertReservation(StatusIssue::ReservPhysical, _salesLine.InventTransId, _inventDimId, _loadLine);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>revertTransferReservation</Name>
+				<Source><![CDATA[
+    private void revertTransferReservation(
+        InventTransferLine  _transferLine,
+        InventDim           _inventDim,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        boolean             _isCWItem,
+        WHSLoadLine         _loadLine)
+    {
+        boolean             didUpdate;
+
+        ttsbegin;
+
+        // Change reservation inventDim from full dim back to inventTransferLine dim
+        if (_transferLine.AutoReservation == NoYes::No)
+        {
+            didUpdate = this.revertReservation(StatusIssue::OnOrder, _transferLine.InventTransId, _inventDim.InventDimId, _loadLine);
+        }
+        
+        if (!didUpdate)
+        {
+            didUpdate = this.revertReservation(StatusIssue::ReservPhysical, _transferLine.InventTransId, _inventDim.InventDimId, _loadLine);
+        }
+        
+        if (didUpdate)
+        {
+            this.cleanUpTransferLineInventTransDims(_transferLine, _inventDim, _handlingQtyToReduce, _weightToReduce, _isCWItem);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>revertReservation</Name>
+				<Source><![CDATA[
+    internal boolean revertReservation(
+        StatusIssue _statusIssue,
+        InventTransId _inventTransId,
+        InventDimId _inventDimId,
+        WHSLoadLine _loadLine)
+    {
+        boolean didUpdate;
+        InventTrans inventTrans;
+        InventTransOrigin inventTransOrigin;
+        InventTrans lastTrans;
+        RecId lastTransRecId;
+
+        while select forupdate inventTrans
+            where inventTrans.StatusIssue == _statusIssue
+               && inventTrans.InventDimId == _inventDimId
+            exists join inventTransOrigin
+                where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                   && inventTransOrigin.InventTransId == _inventTransId
+        {
+            inventTrans.StatusIssue = StatusIssue::ReservPhysical;
+            inventTrans.InventDimId = _loadLine.InventDimId;
+            inventTrans.update();
+            didUpdate = true;
+            lastTransRecId = inventTrans.RecId;
+        }
+
+        if (lastTransRecId)
+        {
+            lastTrans = InventTrans::findRecId(lastTransRecId, true);
+            lastTrans.updateSumUp();
+            lastTrans.clear();
+        }
+
+        return didUpdate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>revertSalesReservationDeprecated</Name>
+				<Source><![CDATA[
+    private void revertSalesReservationDeprecated(
+        SalesLine   _salesLine,
+        InventDimId _inventDimId,
+        WHSLoadLine _loadLine)
+    {
+        InventTrans         inventTrans;
+        InventTransOrigin   inventTransOrigin;
+        InventTrans         lastTrans;
+        RecId               lastTransRecId;
+        boolean             didUpdate;
+
+        ttsbegin;
+
+        // Change reservation inventDim from full dim back to salesLine dim
+        if (SalesTable::find(_salesLine.SalesId).Reservation == ItemReservation::None)
+        {
+            while select forupdate inventTrans
+                join inventTransOrigin
+                where inventTrans.InventTransOrigin     == inventTransOrigin.RecId
+                &&    inventTransOrigin.InventTransId   == _salesLine.InventTransId
+                &&    inventTrans.StatusIssue           == StatusIssue::OnOrder
+                &&    inventTrans.InventDimId           == _inventDimId
+            {
+                inventTrans.StatusIssue = StatusIssue::ReservPhysical;
+                inventTrans.InventDimId = _loadLine.InventDimId;
+                inventTrans.update();
+                didUpdate = true;
+                lastTransRecId = inventTrans.RecId;
+            }
+
+            if (lastTransRecId)
+            {
+                lastTrans = InventTrans::findRecId(lastTransRecId, true);
+                lastTrans.updateSumUp();
+                lastTransRecId = 0;
+                lastTrans.clear();
+            }
+        }
+
+        if (!didUpdate)
+        {
+            while select forupdate inventTrans
+                join inventTransOrigin
+                where inventTrans.InventTransOrigin     == inventTransOrigin.RecId
+                &&    inventTransOrigin.InventTransId   == _salesLine.InventTransId
+                &&    inventTrans.StatusIssue           == StatusIssue::ReservPhysical
+                &&    inventTrans.InventDimId           == _inventDimId
+            {
+                inventTrans.InventDimId = _loadLine.InventDimId;
+                inventTrans.update();
+                lastTransRecId = inventTrans.RecId;
+            }
+
+            if (lastTransRecId)
+            {
+                lastTrans = InventTrans::findRecId(lastTransRecId, true);
+                lastTrans.updateSumUp();
+                lastTransRecId = 0;
+                lastTrans.clear();
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>revertTransferReservationDeprecated</Name>
+				<Source><![CDATA[
+    private void revertTransferReservationDeprecated(
+        InventTransferLine  _transferLine,
+        InventDim           _inventDim,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        boolean             _isCWItem,
+        WHSLoadLine         _loadLine)
+    {
+        InventTrans         inventTrans;
+        InventTransOrigin   inventTransOrigin;
+        InventTrans         lastTrans;
+        RecId               lastTransRecId;
+        boolean             didUpdate;
+
+        ttsbegin;
+
+        // Change reservation inventDim from full dim back to inventTransferLine dim
+        if (_transferLine.AutoReservation == NoYes::No)
+        {
+            while select forupdate inventTrans
+                join inventTransOrigin
+                where inventTrans.InventTransOrigin     == inventTransOrigin.RecId
+                &&    inventTransOrigin.InventTransId   == _transferLine.InventTransId
+                &&    inventTrans.StatusIssue           == StatusIssue::OnOrder
+                &&    inventTrans.InventDimId           == _inventDim.InventDimId
+            {
+                inventTrans.StatusIssue = StatusIssue::ReservPhysical;
+                inventTrans.InventDimId = _loadLine.InventDimId;
+                inventTrans.update();
+                didUpdate = true;
+                lastTransRecId = inventTrans.RecId;
+            }
+
+            if (lastTransRecId)
+            {
+                lastTrans = InventTrans::findRecId(lastTransRecId, true);
+                lastTrans.updateSumUp();
+                lastTransRecId = 0;
+                lastTrans.clear();
+                
+                this.cleanUpTransferLineInventTransDims(_transferLine, _inventDim, _handlingQtyToReduce, _weightToReduce, _isCWItem);
+            }
+        }
+
+        if (!didUpdate)
+        {
+            while select forupdate inventTrans
+                join inventTransOrigin
+                where inventTrans.InventTransOrigin     == inventTransOrigin.RecId
+                &&    inventTransOrigin.InventTransId   == _transferLine.InventTransId
+                &&    inventTrans.StatusIssue           == StatusIssue::ReservPhysical
+                &&    inventTrans.InventDimId           == _inventDim.InventDimId
+            {
+                inventTrans.InventDimId = _loadLine.InventDimId;
+                inventTrans.update();
+                lastTransRecId = inventTrans.RecId;
+            }
+
+            if (lastTransRecId)
+            {
+                lastTrans = InventTrans::findRecId(lastTransRecId, true);
+                lastTrans.updateSumUp();
+                lastTransRecId = 0;
+                lastTrans.clear();
+                
+                this.cleanUpTransferLineInventTransDims(_transferLine, _inventDim, _handlingQtyToReduce, _weightToReduce, _isCWItem);
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unShip</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unships previously picked inventory and moves to shipment maintenance location. Adjusts load lines accordingly.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The full inventory dimensions of inventory being unshipped.
+    /// </param>
+    /// <param name="_qtyToReduce">
+    /// The quantity in inventory unit to be unshipped.
+    /// </param>
+    /// <param name="_loadLine">
+    /// The load line tied to the inventory being unshipped.
+    /// </param>
+    /// <param name="_containerId">
+    /// The Id of the container which holds the inventory being unshipped if packed.
+    /// </param>
+    /// <param name="_availQtyToReduce">
+    /// The total qty of inventory that was available to be reduced for this dimension.
+    /// </param>
+    [SysObsolete('Method is obsoleted to support catch weight items. Callers should redirect their calls to the unShipQuantities method. Extenders should move their logic to wrap or override the unShipQty method.', false, 30\9\2019)]
+    public void unShip(
+        InventDim       _inventDim,
+        InventQty       _qtyToReduce,
+        WHSLoadLine     _loadLine,
+        WHSContainerId  _containerId,
+        InventQty       _availQtyToReduce)
+    {
+        WHSCatchWeightConfigurationKeyManager::instance().executingNonCatchWeightItemLogic(funcName(), _loadLine.ItemId);
+
+        this.unShipQty(_inventDim,
+                       _qtyToReduce,
+                       _loadLine,
+                       _containerId,
+                       _availQtyToReduce,
+                       0,
+                       null);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unShipQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unships previously picked inventory and moves to shipment maintenance location. Adjusts load lines accordingly.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The full inventory dimensions of inventory being unshipped.
+    /// </param>
+    /// <param name="_handlingQtyToReduce">
+    /// The quantity in inventory unit to be unshipped.
+    /// </param>
+    /// <param name="_loadLine">
+    /// The load line tied to the inventory being unshipped.
+    /// </param>
+    /// <param name="_containerId">
+    /// The Id of the container which holds the inventory being unshipped if packed.
+    /// </param>
+    /// <param name="_availHandlingQtyToReduce">
+    /// The total qty of inventory that was available to be reduced for this dimension.
+    /// </param>
+    /// <param name="_weightToReduce">
+    /// The weight to be unshipped.
+    /// </param>
+    /// <param name="_cwTags">
+    /// Set of catch weight tags.
+    /// </param>
+    [Hookable(false)]
+    final public void unShipQuantities(
+        InventDim         _inventDim,
+        InventHandlingQty _handlingQtyToReduce,
+        WHSLoadLine       _loadLine,
+        WHSContainerId    _containerId,
+        InventHandlingQty _availHandlingQtyToReduce,
+        WHSWeightToReduce _weightToReduce,
+        Set               _cwTags)
+    {
+        if (!WHSCatchWeightConfigurationKeyManager::instance().mustExecuteNonCatchWeightHandlingWeightLogic(funcName(), _loadLine.ItemId, _weightToReduce))
+        {
+            this.unShipQty(_inventDim,
+                           _handlingQtyToReduce,
+                           _loadLine,
+                           _containerId,
+                           _availHandlingQtyToReduce,
+                           _weightToReduce,
+                           _cwTags);
+        }
+        else
+        {
+            this.unShip(_inventDim,
+                        _handlingQtyToReduce,
+                        _loadLine,
+                        _containerId,
+                        _availHandlingQtyToReduce);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reduceSourcePickedQuantity</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal void reduceSourcePickedQuantity(
+        InventDim           _inventDim,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        boolean             _isCWItem,
+        boolean             _skipLpValidationOnUnShipping,
+        WHSLoadLine         _loadLine)
+    {
+        using (WHSInventCheckLocationAndLPContext context = WHSInventCheckLocationAndLPContext::construct())
+        {
+            context.parmSkipLPLocationValidation(_skipLpValidationOnUnShipping);
+            this.reducePickedQty(_loadLine.getOrderCommonFromLoadLine(true), _inventDim.inventDimId, _handlingQtyToReduce, _weightToReduce, _isCWItem, _loadLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findClosedContainerLine</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal WHSContainerLine findClosedContainerLine(
+        WHSContainerId  _containerId,
+        RefRecId        _loadLineRecId,
+        InventDim       _inventDimFilter,
+        InventDimParm   _inventDimParmFilter)
+    {
+        WHSContainerLine    containerLine;
+        WHSContainerTable   containerTable;
+        InventDim           inventDimJoin;
+
+        select firstonly forupdate containerLine
+            join containerTable
+                where containerLine.ContainerId             == _containerId
+                    &&  containerLine.LoadLine              == _loadLineRecId
+                    &&  containerLine.ContainerId           == containerTable.ContainerId
+                    &&  containerTable.ContainerStatus      == WHSContainerStatus::Closed
+            #InventDimExistsJoin(containerLine.inventDimId, inventDimJoin, _inventDimFilter, _inventDimParmFilter);
+
+        return containerLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unShipQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unships previously picked inventory and moves to shipment maintenance location. Adjusts load lines accordingly.
+    /// </summary>
+    /// <param name="_inventDim">
+    /// The full inventory dimensions of inventory being unshipped.
+    /// </param>
+    /// <param name="_handlingQtyToReduce">
+    /// The quantity in inventory unit to be unshipped.
+    /// </param>
+    /// <param name="_loadLine">
+    /// The load line tied to the inventory being unshipped.
+    /// </param>
+    /// <param name="_containerId">
+    /// The Id of the container which holds the inventory being unshipped if packed.
+    /// </param>
+    /// <param name="_availHandlingQtyToReduce">
+    /// The total qty of inventory that was available to be reduced for this dimension.
+    /// </param>
+    /// <param name="_weightToReduce">
+    /// The weight to be unshipped.
+    /// </param>
+    /// <param name="_cwTags">
+    /// Set of catch weight tags.
+    /// </param>
+    /// <remarks>
+    /// The method is an extension point and is not meant to be called directly. Callers should call the unShipQuantities method.
+    /// </remarks>
+    [Wrappable(true)]
+    protected void unShipQty(
+        InventDim         _inventDim,
+        InventHandlingQty _handlingQtyToReduce,
+        WHSLoadLine       _loadLine,
+        WHSContainerId    _containerId,
+        InventHandlingQty _availHandlingQtyToReduce,
+        WHSWeightToReduce _weightToReduce,
+        Set               _cwTags)
+    {
+        WHSCatchWeightTelemetryLogger::logCatchWeightConflictingQuantities(funcName(), _loadLine.ItemId, _availHandlingQtyToReduce, _weightToReduce);
+
+        #InventDimDevelop
+
+        this.setLoadLine(_loadLine);
+
+        isMoveToLocationLPControlled = moveToLocation.whsLocationIsLPControlled();
+
+        WHSLoadLine locLoadLine;
+
+        
+        WHSUnShipValidator validator = WHSUnShipValidator::construct(_inventDim, _loadLine, _containerId, this, isMoveToLocationLPControlled);
+        validator.validate();
+
+        locLoadLine = WHSLoadLine::findbyRecId(_loadLine.RecId);
+      
+        
+        //make sure inventDim has inventDimId
+        InventDim inventDim = InventDim::findOrCreate(_inventDim);
+        InventDimParm inventDimParm = this.initInventDimParmUnShip(inventDim);
+
+        // Determine if inventory is tied to closed container
+        WHSContainerLine closedContainerLine = this.findClosedContainerLine(_containerId, locLoadLine.RecId, inventDim, inventDimParm);
+        
+        if (allowRemovingQuantityFromCloseContainer != UnknownNoYes::Yes &&
+            closedContainerLine)
+        {
+            if (allowRemovingQuantityFromCloseContainer == UnknownNoYes::No ||
+                !Box::yesNo(strFmt("@WAX2906", _containerId), DialogButton::Yes, "@WAX2907"))
+            {
+                return;
+            }
+        }
+
+        if (this.shouldDeferUnshipping(inventDim))
+        {
+            this.deferUnshipping(
+                    inventDim,
+                    _containerId,
+                    _handlingQtyToReduce,
+                    _availHandlingQtyToReduce,
+                    _weightToReduce,
+                    moveToLocation,
+                    decrementLoadLine);
+        }
+        else
+        {
+            ttsbegin;
+            boolean isCWItem = PdsGlobal::pdsIsCWItem(locLoadLine.ItemId);
+
+            boolean isLocationFinalShipLocation = this.isLocationFinalShippingLocation(inventDim);
+            // If inventory is in the final shipping location, assume we need to unpick the inventory from the sales line.
+            if (isLocationFinalShipLocation)
+            {
+                this.reduceSourcePickedQuantity(inventDim, _handlingQtyToReduce, _weightToReduce, isCWItem, skipLpValidationOnUnShipping, locLoadLine);
+            }
+
+            // Account for inventory going through outbound sorting.
+            boolean reduceSortPickQty = this.unshipOutboundSortedInventory(inventDim, _handlingQtyToReduce, _weightToReduce, _containerId, locLoadLine.RecId, isCWItem);
+        
+            boolean reduceLoadlinePickedQty = (isLocationFinalShipLocation || reduceSortPickQty);
+        
+            this.updateLoadAndContainers(closedContainerLine, inventDim, _handlingQtyToReduce, locLoadLine, _containerId, _availHandlingQtyToReduce, _weightToReduce, _cwTags, inventDimParm, reduceLoadlinePickedQty);
+            
+            WHSLicensePlateId toLicensePlateId = this.determineToLicensePlate(_inventDim.LicensePlateId);
+
+            // Move the inventory to the specified location
+            WHSWorkId workId = this.createAndExecuteMovementWork(locLoadLine.ItemId, _handlingQtyToReduce, _inventDim, toLicensePlateId);
+
+            this.reactivateCWTagsUsingToDimensions(_cwTags, _inventDim, moveToLocation.wmsLocationId, toLicensePlateId);
+            
+            WhsUnShip::createShipmentExceptionLog(_inventDim, moveToLocation.wmsLocationId, locLoadLine, _handlingQtyToReduce, _weightToReduce, parameters.GenericWorkUserId, workId);
+
+            if (WHSUnShipQtyOrderCommitedReservationMustCommitBalanceFlight::instance().isEnabled())
+            {
+                using (var context = WHSUnShipQtyOrderCommitedReservationCommitBalanceContext::construct())
+                {
+                    WHSOrderCommittedReservationBalanceGlobal::instance().orderCommittedReservationBalance().commitBalance();
+                }
+            }
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reactivateCWTagsUsingToDimensions</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal void reactivateCWTagsUsingToDimensions(
+        Set                 _cwTags,
+        InventDim           _inventDim,
+        WMSLocationId       _toLocationId,
+        WHSLicensePlateId   _toLicensePlateId)
+    {
+        if (_cwTags != null)
+        {
+            InventDim tagInventDim = _inventDim.data();
+            tagInventDim.LicensePlateId = _toLicensePlateId;
+            tagInventDim.wmsLocationId = _toLocationId;
+            tagInventDim = InventDim::findOrCreate(tagInventDim);
+
+            this.reactivateCWTags(_cwTags, tagInventDim);
+        }
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipmentExceptionLog</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static void createShipmentExceptionLog(
+        InventDim           _inventDim,
+        WMSLocationId       _moveToLocationId,
+        WHSLoadLine         _loadLine,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        WHSUserId           _whsUserId,
+        WHSWorkId           _workId
+        )
+    {
+        // Create log
+        InventDim inventDimTo;
+        inventDimTo.data(_inventDim);
+        inventDimTo.LicensePlateId = '';
+        inventDimTo.wmsLocationId = _moveToLocationId;
+        inventDimTo = InventDim::findOrCreate(inventDimTo);
+
+        WHSShipmentExceptionLog shipmentExceptionLog;
+        shipmentExceptionLog.initFromLoadLine(_loadLine);
+        shipmentExceptionLog.WorkId          = _workId;
+        shipmentExceptionLog.QtyToReduce     = _handlingQtyToReduce;
+        shipmentExceptionLog.UserId          = _whsUserId;
+        shipmentExceptionLog.InventDimIdFrom = _inventDim.InventDimId;
+        shipmentExceptionLog.InventDimIdTo   = inventDimTo.InventDimId;
+        shipmentExceptionLog.WeightToReduce  = _weightToReduce;
+        shipmentExceptionLog.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isLocationFinalShippingLocation</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal boolean isLocationFinalShippingLocation(InventDim _inventDim)
+    {
+        return (_inventDim.wmsLocation().whsLocationType() == parameters.ShipFinalLocType);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initInventDimParmUnShip</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal InventDimParm initInventDimParmUnShip(InventDim _inventDim)
+    {
+        InventDimParm inventDimParm;
+
+        inventDimParm.initFromInventDim(_inventDim);
+        inventDimParm.wmsLocationIdFlag = NoYes::No;
+        inventDimParm.LicensePlateFlag = NoYes::No;
+
+        return inventDimParm;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLoadAndContainers</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal void updateLoadAndContainers(
+        WHSContainerLine    _closedContainerLine,
+        InventDim           _inventDim,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSLoadLine         _loadLine,
+        WHSContainerId      _containerId,
+        InventHandlingQty   _availHandlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        Set                 _cwTags,
+        InventDimParm       _inventDimParm,
+        boolean             _reduceLoadLinePickedQty)
+    {
+        boolean shouldUpdatePackingWorkLines = WHSPackingWorkRemainingQtyUpdateOnPackingFlight::instance().isEnabled()
+                                            && WHSPackingWorkHelper::connectedPackingWorkToLoadLineExists(_loadLine.RecId);
+
+        ttsbegin;
+        // If containerLine was a part of a closed container delete or update the contianerLine
+        if (_closedContainerLine.RecId != 0)
+        {
+            if (_closedContainerLine.Qty <= _handlingQtyToReduce)
+            {
+                _closedContainerLine.doDelete();
+            }
+            else
+            {
+                _closedContainerLine.Qty            -= _handlingQtyToReduce;
+                _closedContainerLine.CapturedWeight -= _weightToReduce;
+                _closedContainerLine.doUpdate();
+            }
+        }
+        else
+        {
+            // Determine the qty that needs to be unpacked from containers (open containers)
+            _inventDimParm.initFromInventDim(_inventDim);
+
+            WHSContainerTable   containerTable;
+            InventDim           joinInventDim;
+            WHSContainerLine    containerLine;
+        
+            select sum(Qty) from containerLine
+                join containerTable
+                where containerLine.LoadLine            == _loadLine.RecId
+                &&    containerLine.ContainerId         == containerTable.ContainerId
+                &&    containerTable.ContainerStatus    != WHSContainerStatus::Closed
+                &&    containerTable.ContainerId == _containerId
+                #InventDimExistsJoin(containerLine.inventDimId, joinInventDim, _inventDim, _inventDimParm);
+
+            // Qty to unpack is equal to the qty we are reducing by minus what we still have available to pack
+            InventHandlingQty qtyUnpack = _handlingQtyToReduce - (_availHandlingQtyToReduce - containerLine.Qty);
+
+            // If qtyUnpack is positive then we need to unpack.
+            if (qtyUnpack > 0)
+            {
+                // Loop over open containerLines for the loadLine decrement qty as needed.
+                while select forupdate containerLine
+                order by containerLine.Qty desc
+                join containerTable
+                where containerLine.LoadLine            == _loadLine.RecId                &&
+                        containerLine.ContainerId         == containerTable.ContainerId       &&
+                        containerTable.ContainerStatus    != WHSContainerStatus::Closed       &&
+                        containerTable.ContainerId == _containerId
+                {
+                    if (containerLine.Qty <= qtyUnpack)
+                    {
+                        qtyUnpack -= containerLine.Qty;
+                        containerLine.doDelete();
+
+                        if (shouldUpdatePackingWorkLines)
+                        {
+                            WHSPackingWorkHelper::updatePackingWorkLineQtyRemainOnContainerLineChange(containerLine, -containerLine.Qty);
+                        }
+
+                        if (!qtyUnpack)
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        containerLine.Qty -= qtyUnpack;
+                        containerLine.doUpdate();                                                
+
+                        if (shouldUpdatePackingWorkLines)
+                        {
+                            WHSPackingWorkHelper::updatePackingWorkLineQtyRemainOnContainerLineChange(containerLine, -qtyUnpack);
+                        }
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Clean up empty containers.
+        if (WHSContainerTable::exist(_loadLine.ShipmentId, _containerId) && WHSContainerTable::isEmpty(_containerId))
+        {
+            WHSContainerTable containerTable = WHSContainerTable::findByContainerId(_containerId, true);
+
+            using (var context = new WHSUnshipLoadLineSkipClosedStatusValidationOnContainerDeleteContext())
+            {
+                context.skipClosedStatusValidation = true;
+
+                containerTable.delete();
+            }
+        }
+
+        if (_reduceLoadLinePickedQty)
+        {
+            //cancelation is dependent on the pickedQty so we need to set the field before potentially cancelling
+            this.reduceLoadLinePickedQty(_loadLine.RecId, _handlingQtyToReduce, _weightToReduce);
+        }
+
+        cancellingWorkFromContainerId = _containerId;
+
+        // If the work for the loadLine has dim tracking records we must update those.
+        if (_loadLine.hasDimTracking())
+        {
+            this.cancelDimTrackingWorkQuantities(_loadLine, _inventDim, _handlingQtyToReduce, _weightToReduce);
+        }
+        else
+        {
+            this.cancelWorkQuantities(_loadLine, _inventDim, _handlingQtyToReduce, _weightToReduce);
+        }
+        
+        this.decrementLoadLine(_loadLine.RecId, _handlingQtyToReduce);
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAndExecuteMovementWork</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal WHSWorkId createAndExecuteMovementWork(
+        ItemId              _itemId,
+        InventHandlingQty   _handlingQtyToReduce,
+        InventDim           _inventDim,
+        WHSLicensePlateId   _toLicensePlateId)
+    {
+        WHSWorkId workId = WHSWorkCreateMovementBasic::createBasicMovementWork(parameters.GenericWorkUserId,
+                                                            _itemId,
+                                                            _handlingQtyToReduce,
+                                                            WHSCatchWeightHelper::inventHandlingUnitId(_itemId),
+                                                            _inventDim,
+                                                            _inventDim.LicensePlateId,
+                                                            _inventDim.wmsLocationId,
+                                                            moveToLocation.wmsLocationId,
+                                                            _toLicensePlateId,
+                                                            _inventDim.InventStatusId,
+                                                            _inventDim.InventStatusId);
+
+        return workId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustWeightForUnship</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adjusts weight for unshipped items.
+    /// </summary>
+    /// <param name="_tmpLoadLineInv">
+    /// <c>WHSTmpLoadLineInventory</c> record linked to unshipped load.
+    /// </param>
+    /// <param name="_weightToReduce">
+    /// Weight to be reduced.
+    /// </param>
+    [Hookable(false)]
+    internal void adjustWeightForUnship(
+        WHSTmpLoadLineInventory _tmpLoadLineInv,
+        WHSWeightToReduce       _weightToReduce)
+    {
+        try
+        {
+            ttsBegin;
+
+            WHSLoadLine locLoadLine     = WHSLoadLine::findbyRecId(_tmpLoadLineInv.RefRecId);
+            Common      sourceOrderLine = locLoadLine.getOrderCommonFromLoadLine(true);
+
+            this.reducePickedQty(sourceOrderLine, _tmpLoadLineInv.InventDimId, 0, _weightToReduce, true, locLoadLine);
+
+            InventDim       inventDimCriteria = InventDim::find(_tmpLoadLineInv.InventDimId);
+            InventDimParm   inventDimParm;
+
+            inventDimParm.initFromInventDim(inventDimCriteria);
+            inventDimParm.WMSLocationIdFlag = NoYes::No;
+            inventDimParm.LicensePlateFlag = NoYes::No;
+
+            WHSContainerLine    containerLine;
+            InventDim           joinInventDim;
+
+            // Determine if inventory is tied to a container
+            select firstonly forupdate containerLine
+                where containerLine.ContainerId         == _tmpLoadLineInv.ContainerId
+                &&    containerLine.LoadLine            == _tmpLoadLineInv.RefRecId
+                #InventDimExistsJoin(containerLine.inventDimId, joinInventDim, inventDimCriteria, inventDimParm);
+
+            // If the container has required a weight capture at outbound packing (populating the captured weight field)
+            // it must subsequently be updated when unshipping.
+            if (containerLine.CapturedWeight > 0
+                && containerLine.RecId != 0)
+            {
+                // Do not allow CapturedWeight to go below 0.
+                if (_weightToReduce > containerLine.CapturedWeight)
+                {
+                    throw error("@WAX:Error_ReducedWeight");
+                }
+
+                containerLine.CapturedWeight -= _weightToReduce;
+                containerLine.update();
+            }
+
+            // If the work for the loadLine has dim tracking records we must update those.
+            if (locLoadLine.hasDimTracking())
+            {
+                this.cancelDimTrackingWorkQuantities(locLoadLine, inventDimCriteria, 0, _weightToReduce);
+            }
+            else
+            {
+                this.cancelWorkQuantities(locLoadLine, inventDimCriteria, 0, _weightToReduce);
+            }
+
+            ttsCommit;
+        }
+        catch
+        {
+            warning("@WAX:Error_WeightAdjustment");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reducePickedQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reduces picked quantities.
+    /// </summary>
+    /// <param name = "_sourceOrderLine">
+    /// Line to reduce from.
+    /// </param>
+    /// <param name = "_inventDimId">
+    /// Dimension Id to unpick from.
+    /// </param>
+    /// <param name = "_handlingQtyToReduce">
+    /// Handling quantity to reduce.
+    /// </param>
+    /// <param name = "_weightToReduce">
+    /// Catch weight to reduce.
+    /// </param>
+    /// <param name = "_isCWItem">
+    /// true if the item is a catch weight item; otherwise, false.
+    /// </param>
+    /// <param name = "_loadLine">
+    /// The load line being unpicked.
+    /// </param>
+    [Hookable(false)]
+    internal void reducePickedQty(
+        Common              _sourceOrderLine,
+        InventDimId         _inventDimId,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        boolean             _isCWItem,
+        WHSLoadLine         _loadLine)
+    {
+        if (_isCWItem)
+        {
+            WHSInvent::pickQuantities(_sourceOrderLine, _inventDimId, -_weightToReduce, -_handlingQtyToReduce);
+        }
+        else
+        {
+            WHSInvent::pickQuantities(_sourceOrderLine, _inventDimId, -_handlingQtyToReduce, 0);
+        }
+
+        // Don't call when we are only changing weight.
+        if (_handlingQtyToReduce)
+        {
+            if (inventTransTypeSalesRefactoringFlightIsEnabled)
+            {
+                this.revertOrderReservation(_sourceOrderLine, _inventDimId, _handlingQtyToReduce, _weightToReduce, _isCWItem, _loadLine);
+            }
+            else
+            {
+                switch (_sourceOrderLine.TableId)
+                {
+                    case tableNum(SalesLine):
+                        this.revertSalesReservationDeprecated(_sourceOrderLine, _inventDimId, _loadLine);
+                        break;
+
+                    case tableNum(InventTransferLine):
+                        this.revertTransferReservationDeprecated(_sourceOrderLine, InventDim::find(_inventDimId), _handlingQtyToReduce, _weightToReduce, _isCWItem, _loadLine);
+                        break;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>revertOrderReservation</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal void revertOrderReservation(
+        Common              _sourceOrderLine,
+        InventDimId         _inventDimId,
+        InventHandlingQty   _handlingQtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        boolean             _isCWItem,
+        WHSLoadLine         _loadLine)
+    {
+        switch (_sourceOrderLine.TableId)
+        {
+            case tableNum(SalesLine):
+                this.revertSalesReservation(_sourceOrderLine, _inventDimId, _loadLine);
+                break;
+
+            case tableNum(InventTransferLine):
+                this.revertTransferReservation(_sourceOrderLine, InventDim::find(_inventDimId), _handlingQtyToReduce, _weightToReduce, _isCWItem, _loadLine);
+                break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reactivateCWTags</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reactivates catch weight tags from unshipped items.
+    /// </summary>
+    /// <param name="_cwTags">
+    /// Set of catch weight tags to be reactivated.
+    /// </param>
+    /// <param name="_inventDim">
+    /// The inventory dimension to where the tags are being moved.
+    /// </param>
+    [Hookable(false)]
+    internal void reactivateCWTags(Set _cwTags, InventDim _inventDim)
+    {
+        if (_cwTags != null)
+        {
+            SetEnumerator se = _cwTags.getEnumerator();
+
+            WHSCatchWeightTagEventRegistration eventRegistration = WHSCatchWeightTagEventRegistration::instantiateFromTagRegistration(
+                                                                                    WHSCatchWeightTagRegistrationEvent::Unshipped);
+            eventRegistration.parmStorageInventDim(_inventDim);
+
+            while (se.moveNext())
+            {
+                WHSCatchWeightTagNumber tagNumber = se.current();
+                eventRegistration.registerEvent(WHSCatchWeightTag::find(tagNumber));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateRequest</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal boolean validateRequest(InventDim _inventDim, WHSLoadLine _loadLine)
+    {
+        boolean ret = true;
+
+        if (!moveToLocation)
+        {
+            ret = checkFailed("@WAX2752");
+        }
+
+        if (WHSLoadTable::find(_loadLine.LoadId).LoadStatus == WHSLoadStatus::Shipped)
+        {
+            ret = checkFailed("@WAX2760");
+        }
+
+        if (!parameters.GenericWorkUserId)
+        {
+            ret = checkFailed("@WAX2758");
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineToLicensePlate</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal WHSLicensePlateId determineToLicensePlate(WHSLicensePlateId _sourceLicensePlateId)
+    {
+        WHSLicensePlateId toLicensePlateId;
+
+        if (this.moveToLicensePlate)
+        {
+            return moveToLicensePlate;
+        }
+
+        if (!isMoveToLocationLPControlled)
+        {
+            toLicensePlateId = WHSLicensePlate::generateLicensePlateIdNoItem();
+        }
+        else if (unshipFullLine)
+        {
+            toLicensePlateId = _sourceLicensePlateId;
+        }
+
+        return toLicensePlateId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateMoveToLicensePlate</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal void validateMoveToLicensePlate(boolean _isMoveToLocationLPControlled)
+    {
+        if (!_isMoveToLocationLPControlled
+            && moveToLicensePlate)
+        {
+            throw error("@WAX:NoneLPControlledLicensePlateNotNeeded");
+        }
+
+        if (_isMoveToLocationLPControlled
+            && !moveToLicensePlate
+            && !unshipFullLine)
+        {
+            throw error("@WAX:LPControlledLicensePlateNeeded");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unshipOutboundSortedInventory</Name>
+				<Source><![CDATA[
+    private boolean unshipOutboundSortedInventory(
+        InventDim           _inventDim,
+        InventHandlingQty   _qtyToReduce,
+        WHSWeightToReduce   _weightToReduce,
+        WHSContainerId      _containerId,
+        WHSLoadLineRefRecId _loadLineRefRecId,
+        boolean             _isCWItem)
+    {
+        boolean reduceSortPickQty;
+
+        ttsbegin;
+        WHSOutboundSortPosition sortPosition = WhsUnShip::findSortpositionByLicensePlateId(_inventDim.LicensePlateId);
+        
+        if (sortPosition.RecId != 0)
+        {
+            if (this.mustReducePickedQtyForSortPosition(sortPosition, _inventDim))
+            {
+                WHSLoadLine loadLineLocal = WHSLoadLine::findbyRecId(_loadLineRefRecId);
+                this.reducePickedQty(loadLineLocal.getOrderCommonFromLoadLine(true), _inventDim.inventDimId, _qtyToReduce, _weightToReduce, _isCWItem, loadLineLocal);
+                reduceSortPickQty = true;
+            }
+
+            this.updateSortPositionTrans(_containerId, _qtyToReduce, _loadLineRefRecId, sortPosition.RecId);
+        }
+
+        ttscommit;
+
+        return reduceSortPickQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findSortpositionByLicensePlateId</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static WHSOutboundSortPosition findSortpositionByLicensePlateId(WHSLicensePlateId _licensePlateId)
+    {
+        WHSOutboundSortPosition sortPosition;
+        select firstOnly sortPosition
+            where sortPosition.LicensePlateId == _licensePlateId;
+
+        return sortPosition;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustReducePickedQtyForSortPosition</Name>
+				<Source><![CDATA[
+    private boolean mustReducePickedQtyForSortPosition(
+        WHSOutboundSortPosition _sortPosition,
+        InventDim               _inventDim)
+    {
+        return (_inventDim.wmsLocation().whsLocationType() == parameters.SortingLocationType
+            && _sortPosition.SortPositionStatus == WHSOutboundSortPositionStatus::Closed
+            // If not creating outbound sorting work we need to unpick inventory for closed positions.
+            && !WHSOutboundSortTemplate::find(_sortPosition.SortTemplateId).CreateWorkOnPositionClose);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSortPositionTrans</Name>
+				<Source><![CDATA[
+    private void updateSortPositionTrans(
+        WHSContainerId      _containerId,
+        InventHandlingQty   _qtyToReduce,
+        RefRecId            _loadLineRefRecId,
+        RefRecId            _sortPositionRecId)
+    {
+        // Update sort transaction quantities.
+        if (_containerId)
+        {
+            WHSOutboundSortPositionTrans sortPositionTrans;
+            select firstOnly forUpdate sortPositionTrans
+                where sortPositionTrans.OutboundSortPosition    == _sortPositionRecId
+                    &&    sortPositionTrans.SortIdentifier      == _containerId
+                    &&    sortPositionTrans.LoadLine            == _loadLineRefRecId
+                    &&    sortPositionTrans.SortTemplateType    == WHSOutboundSortTemplateType::Container;
+        
+            if (sortPositionTrans.RecId != 0)
+            {
+                if (sortPositionTrans.ProductQuantity <= _qtyToReduce)
+                {
+                    sortPositionTrans.delete();
+                }
+                else
+                {
+                    sortPositionTrans.ProductQuantity -= _qtyToReduce;
+                    sortPositionTrans.update();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldDeferUnshipping</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal boolean shouldDeferUnshipping(InventDim _inventDim)
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deferUnshipping</Name>
+				<Source><![CDATA[
+    [Wrappable(true)]
+    internal void deferUnshipping(
+        InventDim         _inventDim,
+        WHSContainerId    _containerId,
+        InventHandlingQty _handlingQtyToReduce,
+        InventHandlingQty _availHandlingQtyToReduce,
+        WHSWeightToReduce _weightToReduce,
+        WMSLocation _moveToLocation,
+        boolean _decrementLoadLine)
+    {
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

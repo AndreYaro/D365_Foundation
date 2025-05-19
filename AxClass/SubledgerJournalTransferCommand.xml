@@ -1,0 +1,1592 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SubledgerJournalTransferCommand</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>SubledgerJournalTransferCommand</c> class is used to transfer the subledger journal entries.
+/// </summary>
+class SubledgerJournalTransferCommand
+{
+    AccountingEvent                     accountingEvent;
+    SourceDocumentHeader                sourceDocumentHeader;
+    GeneralJournalEntry                 generalJournalEntry;
+
+    SubLedgerJournalAccountEntryView    subLedgerJournalAccountEntryView;
+    SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntry;
+    AccountingDistribution              accountingDistribution;
+    RefRecId                            transferidVal;
+    TaxTrans                            taxTrans;
+    SourceDocumentLine                  sourceDocumentLine;
+    RecId                               ledgerDimensionValue;
+    boolean                             doSummarization;
+    FiscalCalendarPeriodRecId           fiscalCalendarPeriodRecId;
+    NoYes                               isCreditValue;
+    NumberSequenceTable                 numberSequenceTable;
+    boolean                             moveToRowBased;
+    SysGuidString                       functionNameSuffix;
+
+    SubledgerJournalAccountEntryDistribution    subledgerJournalAccountEntryDistribution;
+    SubLedgerJournalTransferNumberSeqTmp        tmpNumberSeqGen;
+
+    GeneralLedgerTransferNumberSequenceGenerator generalLedgerTransferNumberSequenceGenerator;
+
+    //This temp table contain the current set of vouchers that are getting transferred as part of the divide and conquer pattern for x number of documents
+    SubledgerJournalEntryMarkedForTransferToGeneralLedger subledgerJournalEntryMarkedForTransferToGeneralLedger;
+
+    //This temp table is not used anymore we will deprecate it in next release
+    SubledgerJournalEntryMarkedForTransferToGeneralLedger subledgerJournalEntryForTransferToGeneralLedger;
+
+    int maxTransferBundle;
+    int maxTransferLines;
+    int64 maxRecIdToDelete;
+    private utcdatetime currentUTCDateTime;
+
+    // retry counters
+    int retryCount;
+    int line;
+
+    //Telemetery markers
+    int64 numberOfVouchersLineInTransfer;
+    int64 numberOfVouchersInTransfer;
+    real timeToPerformExtensionCallInGeneralJournalEntryTableInserted;
+    real timeToPerformExtensionCallInGeneralJournalAccountEntryTableInserted;
+    real timeToCreateTaxTrasGeneralJournalAccountEntry;
+    real timeToInsertGeneralJournalRecords;
+    real timeToInsertGeneralJournalAccountEntryRecords;
+    real timeToUpdateLedgerPostingJournalFieldOnGeneralJournalEntry;
+    real timeToAddGeneralJournalEntryRecordToLedgerPostingProcessor;
+    private real throughput;
+    private real totalTimeForTransfer;
+    private str totalTimeToInsertGeneralJournalEntryRecords;
+    private str totalTimeToInsertGeneralJournalAccountEntryRecords;
+    private str totalTimeToInsertTaxTransGeneralJournalAccountEntryRecords;
+    private str timeSpendInTransferExtensionOnGJAEInsertEvent;
+    
+    private str transferMode = 'Unknown';
+    private str sourceDocumentTypeName = 'Unknown';
+
+    private boolean isCountryRegion_BE;
+    private boolean subledgerJournalAccountEntryTransferPolicySummarizeExists;
+    private boolean subledgerJournalAccountEntryTransferPolicyTransferInDetailExists;
+
+    const int maxWaitTimeInSec = 1800; // 30 minutes
+    const int delayInterval = 1000; // 1 sec
+    const int maxRetryCount = 10;
+    const int retryWait = 500;
+
+    //Plugin class constants
+    const str DynamicsAXNamespace = 'Microsoft.Dynamics.AX.Application';
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>executeTransfer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Performs the transfer of subeledger journal entries.
+    /// </summary>
+    /// <param name="subledgerJournalTransferRequest">
+    ///    A <c>subledgerJournalTransferRequest</c> object which acts as data contract.
+    /// </param>
+    public void executeTransfer(SubledgerJournalTransferRequest subledgerJournalTransferRequest)
+    {
+        System.Exception exception;
+        int64 elapsedTimeInMs;
+
+        LedgerRecId                         ledger;
+        AccountingEventRecId                accountingEventId;
+        RefTableId                          sourceDocumentHeaderType;
+        SubledgerJournalEntry               subLedgerJournalEntryInOtherLedger;
+        TransDateTime                       startDateTime;
+        AccountingEvent                     localAccountingEvent;
+        SourceDocumentHeader                localSourceDocumentHeader;
+        Map                                 legalEntityLegerPostingJournalVoucherSeries;
+
+        SubledgerJournalTransferCommandExtList  subledgerJournalTransferCommandExtList;
+
+        #ISOCountryRegionCodes
+
+        startDateTime = DateTimeUtil::getSystemDateTime();
+
+        // Checking the transaction scope to determine whether the NumberSequence generator will take optimized path or in synchoronous case
+        // just reserve line by line, then clean up in case of exception is not required as transaction will just rollback
+        moveToRowBased = (appl.ttsLevel() == 0) ? false : true;
+
+        legalEntityLegerPostingJournalVoucherSeries = new Map(Types::String, Types::String);
+
+        // Initialize from data contract
+        ledger = subledgerJournalTransferRequest.parmledgerId();
+
+        // Check if ledger is not passed because we need it intialized for Audit trail
+        if (!ledger && !accountingEventId)
+        {
+            ledger = Ledger::current();
+        }
+
+        changecompany(CompanyInfo::getDataArea(Ledger::primaryForLegalEntity(ledger)))
+        {
+            sourceDocumentHeaderType = subledgerJournalTransferRequest.parmSourceDocumentRelationType();
+
+            doSummarization = subledgerJournalTransferRequest.parmDoSummarization();
+            fiscalCalendarPeriodRecId = subledgerJournalTransferRequest.parmFiscalCalendarPeriod();
+            accountingEventId = subledgerJournalTransferRequest.parmAccountingEventId();
+
+            if (!(ledger && sourceDocumentHeaderType) && !accountingEventId)
+            {
+                // Necessary parameters to schedule subledger journal transfer are not set correctly.
+                throw error("@SYS321152");
+            }
+
+            isCountryRegion_BE = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoBE]);
+
+            subledgerJournalTransferCommandExtList = SubledgerJournalTransferCommandExtList::newFromSubledgerJournalTransferCommand(
+            this,
+            subledgerJournalTransferRequest);
+
+            this.loadExtensions();
+
+            // If asynchronous mode and we need to wait for accounting event to be committed.
+            if (subledgerJournalTransferRequest.parmWaitInAsyncMode() && accountingEventId)
+            {
+                do
+                {
+                    select RecId from accountingEvent
+                    where accountingEvent.RecId  == accountingEventId &&
+                        accountingEvent.State == AccountingEventState::Journalized ||
+                        accountingEvent.State == AccountingEventState::Complete;
+
+                    sleep(delayInterval);
+                }
+                while (!accountingEvent.RecId && DateTimeUtil::getDifference(DateTimeUtil::getSystemDateTime(), startDateTime) < maxWaitTimeInSec);
+            }
+
+            maxTransferBundle = subledgerJournalTransferRequest.parmTransferProcessBundleSize();
+            maxTransferLines = subledgerJournalTransferRequest.parmTransferProcessLineLimit();
+            currentUTCDateTime = DateTimeUtil::utcNow();
+
+            do
+            {
+                using (SysInstrumentationActivityContext activityContext = SourceDocumentAccountingFrameworkInstrumentationLogger::getActivityContext(
+                    SourceDocumentInstrumentationConstants::InstrumentationNamespaceForBatchTransfer,
+                    classStr(SubledgerJournalTransferCommand),
+                    SourceDocumentInstrumentationConstants::SubledgerToGeneralLedgerTransferProcess))
+                {
+                    SubledgerJournalEntry subledgerJournalEntry = this.updateTransferStatusToInProcess(accountingEventId, ledger, sourceDocumentHeaderType);
+                    
+                    if (subledgerJournalEntry && transferidVal != 0)
+                    {
+                        try
+                        {
+                            if (accountingEventId)
+                            {
+                                localAccountingEvent = AccountingEvent::find(accountingEventId);
+                                accountingEvent = localAccountingEvent;
+                                localSourceDocumentHeader = SourceDocumentHeader::find(localAccountingEvent.SourceDocumentHeader);
+                            }
+                            else if (sourceDocumentHeaderType)
+                            {
+                                // get a source document header of the correct type it doesn't matter which one
+                                select firstonly localSourceDocumentHeader
+                                    where localSourceDocumentHeader.SourceRelationType == sourceDocumentHeaderType;
+
+                                accountingEvent = AccountingEvent::find(subledgerJournalEntry.AccountingEvent);
+                            }
+
+                            sourceDocumentTypeName = SourceDocumentationInstrumentation::enumValueToStr(localSourceDocumentHeader.TypeEnumName, localSourceDocumentHeader.TypeEnumValue);
+                        
+                            if (subledgerJournalTransferRequest.parmSubledgerJournalTransferMode() == SubledgerJournalTransferMode::AsynchronousBatch)
+                            {
+                                transferMode = 'AsynchronousBatch';
+                            }
+                            else if (subledgerJournalTransferRequest.parmSubledgerJournalTransferMode() == SubledgerJournalTransferMode::ScheduledBatch)
+                            {
+                                transferMode = 'ScheduledBatch';
+                            }
+                            else if (subledgerJournalTransferRequest.parmSubledgerJournalTransferMode() == SubledgerJournalTransferMode::Synchronous)
+                            {
+                                transferMode = 'Synchronous';
+                            }
+
+                            //Log transfer parameters
+                            activityContext.addCustomProperty(
+                                SourceDocumentInstrumentationConstants::TransferId,
+                                any2Str(transferidVal));
+
+                            activityContext.addCustomProperty(
+                                SourceDocumentInstrumentationConstants::TransferMode,
+                                any2Str(transferMode));
+
+                            activityContext.addCustomProperty(
+                                SourceDocumentInstrumentationConstants::TransferDocumentType,
+                                any2Str(sourceDocumentTypeName));
+
+                            generalLedgerTransferNumberSequenceGenerator = new GeneralLedgerTransferNumberSequenceGenerator(transferidVal);
+                            generalLedgerTransferNumberSequenceGenerator.createNumSeqTmpData(doSummarization);
+                            numberSequenceTable = generalLedgerTransferNumberSequenceGenerator.generateJournalNumbers(legalEntityLegerPostingJournalVoucherSeries);
+                            
+                            ttsbegin;
+
+                            TransactionLog transactionLog;
+
+                            //Create this new Transaction log record if the transfer mode is not synchronous
+                            if (localAccountingEvent)
+                            {
+                                transactionLog = this.getTransactionLogForCreatedTransactionId(localAccountingEvent.CreatedTransactionId);
+                                TransactionLog::create(transactionLog.Type, transactionLog.Txt);
+                            }
+                            else if(!localAccountingEvent && subledgerJournalEntry.AccountingEvent)
+                            {
+                                transactionLog = this.getTransactionLogForCreatedTransactionId(accountingEvent.CreatedTransactionId);
+                                TransactionLog::create(transactionLog.Type, transactionLog.Txt);
+                            }
+                            else
+                            {
+                                TransactionLog::create(TransactionLogType::System, subledgerJournalEntry.TransTxt);
+                            }
+
+                            this.insertGeneralJournalEntryRelated(legalEntityLegerPostingJournalVoucherSeries, localSourceDocumentHeader);
+                            activityContext.addCustomProperty(
+                                SourceDocumentInstrumentationConstants::TimeToInsertGeneralJournalEntryRecords,
+                                totalTimeToInsertGeneralJournalEntryRecords);
+
+                            this.recordGeneralJournalAccountEntryRelated(ledger);
+                            activityContext.addCustomProperty(
+                                SourceDocumentInstrumentationConstants::TimeToInsertGeneralJournalAccountEntryRecords,
+                                totalTimeToInsertGeneralJournalAccountEntryRecords);
+                            activityContext.addCustomProperty(
+                                SourceDocumentInstrumentationConstants::TimeSpendInTransferExtensionOnGJAEInsertEvent,
+                                timeSpendInTransferExtensionOnGJAEInsertEvent);
+                            activityContext.addCustomProperty(
+                                SourceDocumentInstrumentationConstants::TimeToInsertTaxTransGeneralJournalAccountEntryRecords,
+                                totalTimeToInsertTaxTransGeneralJournalAccountEntryRecords);
+
+                            elapsedTimeInMs = activityContext.getElapsedMilliseconds();
+                            this.validateSubledgerJournalEntriesTransferred();
+                            activityContext.addCustomProperty(
+                                SourceDocumentInstrumentationConstants::TimeToValidateTransferRecords,
+                                any2Str((activityContext.getElapsedMilliseconds() - elapsedTimeInMs) / SourceDocumentInstrumentationConstants::NumberOfMillisecondsInOneSecond));
+
+                            //validate that transferId is non zero before commiting the transfer
+                            if (transferidVal == 0)
+                            {
+                                activityContext.addCustomProperty(
+                                    'IsTransferIdZeroValidationFailed',
+                                    'Yes');
+
+                                throw error("@SourceDocumentAccountingFramework:SubledgerJournalTransferToGeneralLedgerProcessError");
+                            }
+                            
+                            localAccountingEvent.skipDataMethods(true);
+
+                            update_recordset localAccountingEvent
+                            setting State = AccountingEventState::Complete
+                            where localAccountingEvent.State == AccountingEventState::Journalized
+                            join subledgerJournalEntryMarkedForTransferToGeneralLedger
+                                where subledgerJournalEntryMarkedForTransferToGeneralLedger.AccountingEvent == localAccountingEvent.RecId;
+
+                            subledgerJournalEntry.skipDataMethods(true);
+                            update_recordset subledgerJournalEntry
+                            setting Status = SubledgerJournalEntryStatus::Transferred
+                            join subledgerJournalEntryMarkedForTransferToGeneralLedger
+                                where subledgerJournalEntryMarkedForTransferToGeneralLedger.SubledgerJournalEntry == subledgerJournalEntry.RecId;
+
+                            delete_from tmpNumberSeqGen where tmpNumberSeqGen.TransferId == transferidVal;
+
+                            ttscommit;
+                        }
+                        catch (exception)
+                        {
+                            if (transferidVal)
+                            {
+                                try
+                                {
+                                    ttsbegin;
+
+                                    // Make number sequence in list free if number sequence was consumed using SQL.
+                                    if (!moveToRowBased)
+                                    {
+                                        while select JournalNumber from tmpNumberSeqGen
+                                            where tmpNumberSeqGen.TransferId == transferidVal && tmpNumberSeqGen.JournalNumber
+                                        {
+                                            NumberSeq::releaseNumber(numberSequenceTable.RecId, tmpNumberSeqGen.JournalNumber);
+                                        }
+                                    }
+
+                                    ttscommit;
+                                }
+                                catch
+                                {
+                                    //catch all exception type when trying to free number sequence so that we can clean up
+                                    //other tables so that these records can be transferred again.
+                                }
+
+                                try
+                                {
+                                    ttsbegin;
+
+                                    delete_from tmpNumberSeqGen
+                                        where tmpNumberSeqGen.TransferId == transferidVal;
+
+                                    subledgerJournalEntry.skipDataMethods(true);
+
+                                    update_recordset subledgerJournalEntry
+                                    setting Status = SubledgerJournalEntryStatus::NotTransferred,
+                                        TransferId = 0
+                                    where subledgerJournalEntry.Status == SubledgerJournalEntryStatus::TransferInProcess
+                                        && subledgerJournalEntry.TransferId == transferidVal;
+
+                                    ttscommit;
+                                }
+                                catch (Exception::Deadlock)
+                                {
+                                    if (xSession::currentRetryCount() < maxRetryCount)
+                                    {
+                                        sleep(retryWait);
+                                        retry;
+                                    }
+                                }
+                                catch (Exception::UpdateConflict)
+                                {
+                                    if (xSession::currentRetryCount() < maxRetryCount)
+                                    {
+                                        sleep(retryWait);
+                                        retry;
+                                    }
+                                }
+
+                                activityContext.addCustomProperty(
+                                    SourceDocumentInstrumentationConstants::TransferCompletionMessageForError,
+                                    any2Str(exception.ToString()));
+
+                                throw error("@SourceDocumentAccountingFramework:SubledgerJournalTransferToGeneralLedgerProcessError");
+                            }
+                        }
+
+                        totalTimeForTransfer = activityContext.getElapsedMilliseconds() / SourceDocumentInstrumentationConstants::NumberOfMillisecondsInOneSecond;
+
+                        if (numberOfVouchersLineInTransfer != 0)
+                        {
+                            throughput = numberOfVouchersLineInTransfer / totalTimeForTransfer;
+                        }
+
+                        activityContext.addCustomProperty(
+                            'DocumentClassification',
+                            this.documentSizeClassification(numberOfVouchersLineInTransfer));
+
+                        activityContext.addCustomProperty(
+                            SourceDocumentInstrumentationConstants::TransferProcessThroughPut,
+                            any2Str(throughput));
+
+                        activityContext.addCustomProperty(
+                            SourceDocumentInstrumentationConstants::TotalTransferTime,
+                            any2Str(totalTimeForTransfer));
+
+                        activityContext.addCustomProperty(
+                            SourceDocumentInstrumentationConstants::SuccessfullyCompletedTransfer,
+                            any2Str('Success'));
+
+                        this.logTransferCompletionMessage(subledgerJournalTransferRequest);
+                    }
+
+                    delete_from subledgerJournalEntryMarkedForTransferToGeneralLedger;
+                }                
+            } while (this.isTransferRoutineDone(accountingEventId, ledger, sourceDocumentHeaderType));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>documentSizeClassification</Name>
+				<Source><![CDATA[
+    private str documentSizeClassification(int _recordsToProcess)
+    {
+        if (_recordsToProcess < 1001)
+        {
+            return 'Small';
+        }
+        else if (_recordsToProcess < 10001)
+        {
+            return 'Medium';
+        }
+        else if (_recordsToProcess < 50001)
+        {
+            return 'Large';
+        }
+        else
+        {
+            return 'XLarge';
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTransferRoutineDone</Name>
+				<Source><![CDATA[
+    private boolean isTransferRoutineDone(AccountingEventRecId _accountingEventId, LedgerRecId _ledger, RefTableId _sourceDocumentHeaderType)
+    {
+        SubledgerJournalEntry subledgerJournalEntry;
+        LedgerFiscalCalendarPeriod ledgerFiscalCalendarPeriod;
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntryLocal;
+
+        select firstonly RecId from subledgerJournalEntry
+            where subledgerJournalEntry.Status == SubledgerJournalEntryStatus::NotTransferred &&
+                !subledgerJournalEntry.TransferId &&
+                (!_ledger || subledgerJournalEntry.Ledger == _ledger) &&
+                (!fiscalCalendarPeriodRecId || subledgerJournalEntry.FiscalCalendarPeriod == fiscalCalendarPeriodRecId) &&
+                //This is to make sure we do not get into infinite loop as document will keep on posting in live system
+                subledgerJournalEntry.ModifiedDateTime <= currentUTCDateTime
+        exists join accountingEvent
+            where accountingEvent.RecId  == subledgerJournalEntry.AccountingEvent &&
+                (accountingEvent.State == AccountingEventState::Journalized || accountingEvent.State == AccountingEventState::Complete)&&
+                (!_accountingEventId || accountingEvent.RecId == _accountingEventId)
+        exists join sourceDocumentHeader
+            where sourceDocumentHeader.RecId == accountingEvent.SourceDocumentHeader &&
+                (!_sourceDocumentHeaderType || sourceDocumentHeader.SourceRelationType == _sourceDocumentHeaderType)
+        exists join ledgerFiscalCalendarPeriod
+            where ledgerFiscalCalendarPeriod.FiscalCalendarPeriod == subledgerJournalEntry.FiscalCalendarPeriod
+                && ledgerFiscalCalendarPeriod.Ledger == subledgerJournalEntry.Ledger
+                && ledgerFiscalCalendarPeriod.Status == FiscalPeriodStatus::Open
+        //This notexists join protects the scenario when we have voucher that was accidently marked as "not transferred" we want to protect from data corruption scenarios also
+        notexists join subledgerVoucherGeneralJournalEntryLocal
+            where subledgerVoucherGeneralJournalEntryLocal.SubledgerJournalEntry == subledgerJournalEntry.RecId &&
+                subledgerVoucherGeneralJournalEntryLocal.TransferId != 0;
+
+        if (subledgerJournalEntry.RecId)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logTransferCompletionMessage</Name>
+				<Source><![CDATA[
+    private void logTransferCompletionMessage(SubledgerJournalTransferRequest _subledgerJournalTransferRequest)
+    {
+        if (_subledgerJournalTransferRequest.parmExecutionId() != emptyGuid() && numberOfVouchersInTransfer != 0)
+        {
+            try
+            {
+                ttsbegin;
+
+                ProcessExecutionSourceLinkItem processExecutionSourceLinkItem = ProcessExecutionSourceLinkItem::construct();
+
+                processExecutionSourceLinkItem.parmExecutionId(_subledgerJournalTransferRequest.parmExecutionId());
+                processExecutionSourceLinkItem.parmProcessScheduleOccurrenceRecId(_subledgerJournalTransferRequest.parmProcessScheduleOccurrenceRecId());
+                processExecutionSourceLinkItem.parmProcessScheduleSeriesPatternRecId(_subledgerJournalTransferRequest.parmProcessScheduleSeriesPatternRecId());
+                processExecutionSourceLinkItem.parmExecutionSourceStatus(ProcessExecutionSourceStatus::Success);
+                processExecutionSourceLinkItem.parmHeader("@SYS317493");
+                processExecutionSourceLinkItem.parmMessage("@SourceDocumentAccountingFramework:SubledgerJournalTransferScheduledMessage");
+
+                RefRecId processExecutionSourceLinkRecId = ProcessExecutionSourceLink::writeSourceLinkItem(processExecutionSourceLinkItem).RecId;
+
+                ProcessExecutionMessageLog::insertMessage
+                        (
+                            ProcessExecutionMessageLogItem::newFromProcessExecutionSourceLinkAndLabel(
+                                processExecutionSourceLinkRecId,
+                                Exception::Info,
+                                literalStr('@SourceDocumentAccountingFramework:LogTransferToGLCompletionMessage'),
+                                [_subledgerJournalTransferRequest.parmSourceDocumentTypeEnumTranslatedName(),
+                                Ledger::name(_subledgerJournalTransferRequest.parmledgerId()),
+                                any2Str(numberOfVouchersInTransfer),
+                                SourceDocumentAccountingFrameworkInstrumentationLogger::convertSecToHoursMinuteSecondFormat(totalTimeForTransfer)])
+                        );
+
+                ttscommit;
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() < maxRetryCount)
+                {
+                    sleep(retryWait);
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (xSession::currentRetryCount() < maxRetryCount)
+                {
+                    sleep(retryWait);
+                    retry;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransactionLogForCreatedTransactionId</Name>
+				<Source><![CDATA[
+    private TransactionLog getTransactionLogForCreatedTransactionId(CreatedTransactionId _createdTransactionId)
+    {
+        TransactionLog transactionLog;
+        select transactionLog where transactionLog.CreatedTransactionId == _createdTransactionId;
+        return transactionLog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getListOfValidators</Name>
+				<Source><![CDATA[
+    private Array getListOfValidators()
+    {
+        Array subledgerJournalTransferToGeneralLedgerValidators;
+
+        SysPluginMetadataCollection validatorMetadataCollection = new SysPluginMetadataCollection();
+
+        subledgerJournalTransferToGeneralLedgerValidators = SysPluginFactory::Instances(
+            DynamicsAXNamespace,
+            classStr(SubledgerJournalTransferToGeneralLedgerValidationProvider),
+            validatorMetadataCollection);
+
+        return subledgerJournalTransferToGeneralLedgerValidators;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateSubledgerJournalEntriesTransferred</Name>
+				<Source><![CDATA[
+    private void validateSubledgerJournalEntriesTransferred()
+    {
+        //Validate the vouchers transferred
+        Array subledgerJournalTransferToGeneralLedgerValidatorList = this.getListOfValidators();
+
+        for (int i = 1; i <= subledgerJournalTransferToGeneralLedgerValidatorList.lastIndex(); i++)
+        {
+            SubledgerJournalTransferToGeneralLedgerValidationProvider subledgerJournalTransferToGeneralLedgerValidationProvider = 
+                subledgerJournalTransferToGeneralLedgerValidatorList.value(i) as SubledgerJournalTransferToGeneralLedgerValidationProvider;
+
+            subledgerJournalTransferToGeneralLedgerValidationProvider.validate(transferidVal);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSubledgerJournalEntryUsedForTransferId</Name>
+				<Source><![CDATA[
+    private SubledgerJournalEntry getSubledgerJournalEntryUsedForTransferId(SubledgerJournalEntryMarkedForTransferToGeneralLedger _subledgerJournalEntryMarkedForTransferToGeneralLedger)
+    {
+        select firstonly SubledgerJournalEntry from _subledgerJournalEntryMarkedForTransferToGeneralLedger;
+
+        return SubledgerJournalEntry::find(_subledgerJournalEntryMarkedForTransferToGeneralLedger.SubledgerJournalEntry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSubledgerJournalEntryToTransfer</Name>
+				<Source><![CDATA[
+    private void getSubledgerJournalEntryToTransfer(AccountingEventRecId _accountingEventId, LedgerRecId _ledger, RefTableId _sourceDocumentHeaderType)
+    {
+        SubledgerJournalEntry subledgerJournalEntry;
+        LedgerFiscalCalendarPeriod ledgerFiscalCalendarPeriod;
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntryLocal;
+
+        subledgerJournalEntry.readPast(true);
+
+        insert_recordset subledgerJournalEntryMarkedForTransferToGeneralLedger
+        (
+            SubledgerJournalEntry,
+            AccountingEvent
+        )
+        select pessimisticlock RecId, AccountingEvent from subledgerJournalEntry
+            where subledgerJournalEntry.Status == SubledgerJournalEntryStatus::NotTransferred &&
+                !subledgerJournalEntry.TransferId &&
+                (!_ledger || subledgerJournalEntry.Ledger == _ledger) &&
+                (!fiscalCalendarPeriodRecId || subledgerJournalEntry.FiscalCalendarPeriod == fiscalCalendarPeriodRecId)
+        exists join accountingEvent
+            where accountingEvent.RecId  == subledgerJournalEntry.AccountingEvent &&
+                (accountingEvent.State == AccountingEventState::Journalized || accountingEvent.State == AccountingEventState::Complete)&&
+                (!_accountingEventId || accountingEvent.RecId == _accountingEventId)
+        exists join sourceDocumentHeader
+            where sourceDocumentHeader.RecId == accountingEvent.SourceDocumentHeader &&
+                (!_sourceDocumentHeaderType || sourceDocumentHeader.SourceRelationType == _sourceDocumentHeaderType)
+        exists join ledgerFiscalCalendarPeriod
+            where ledgerFiscalCalendarPeriod.FiscalCalendarPeriod == subledgerJournalEntry.FiscalCalendarPeriod
+                && ledgerFiscalCalendarPeriod.Ledger == subledgerJournalEntry.Ledger
+                && ledgerFiscalCalendarPeriod.Status == FiscalPeriodStatus::Open
+        notexists join subledgerVoucherGeneralJournalEntryLocal
+            where subledgerVoucherGeneralJournalEntryLocal.SubledgerJournalEntry == subledgerJournalEntry.RecId &&
+                subledgerVoucherGeneralJournalEntryLocal.TransferId != 0;
+
+        select minof(RecId) from subledgerJournalEntryMarkedForTransferToGeneralLedger;
+
+        int minSubledgerJournalEntryRecIdMarkedForTransfer = subledgerJournalEntryMarkedForTransferToGeneralLedger.RecId;
+
+        maxRecIdToDelete = subledgerJournalEntryMarkedForTransferToGeneralLedger.RecId + maxTransferBundle;
+
+        delete_from subledgerJournalEntryMarkedForTransferToGeneralLedger where subledgerJournalEntryMarkedForTransferToGeneralLedger.RecId >= maxRecIdToDelete;
+
+        if (SubledgerTransferProcessLineLimitFlight::instance().isEnabled())
+        {
+            SubledgerJournalAccountEntry subledgerJournalAccountEntry;
+            SubledgerJournalAccountEntryMarkedForTransferToGeneralLedger subledgerJournalAccountEntryMarkedForTransferToGeneralLedger;
+
+            insert_recordset subledgerJournalAccountEntryMarkedForTransferToGeneralLedger
+                (
+                    SubledgerJournalEntry,
+                    SubledgerJournalEntryMarkedForTransferRecId,
+                    SubledgerJournalAccountEntry
+                )
+                select SubledgerJournalEntry, RecId from subledgerJournalEntryMarkedForTransferToGeneralLedger
+                    join RecId from subledgerJournalAccountEntry
+                order by subledgerJournalEntryMarkedForTransferToGeneralLedger.RecId
+                where subledgerJournalAccountEntry.SubledgerJournalEntry == subledgerJournalEntryMarkedForTransferToGeneralLedger.SubledgerJournalEntry &&
+                    subledgerJournalAccountEntry.IsTransferredInDetail != TransferPolicy::DoNotTransfer;
+
+            select count(RecId) from subledgerJournalAccountEntryMarkedForTransferToGeneralLedger;
+
+            if (subledgerJournalAccountEntryMarkedForTransferToGeneralLedger.RecId > maxTransferLines)
+            {
+                select SubledgerJournalEntryMarkedForTransferRecId from subledgerJournalAccountEntryMarkedForTransferToGeneralLedger
+                    where subledgerJournalAccountEntryMarkedForTransferToGeneralLedger.RecId == maxTransferLines + 1;
+
+                maxRecIdToDelete = subledgerJournalAccountEntryMarkedForTransferToGeneralLedger.SubledgerJournalEntryMarkedForTransferRecId;
+
+                // Checking if atleast one document would exist after delete to avoid infinite loop
+                if (maxRecIdToDelete > minSubledgerJournalEntryRecIdMarkedForTransfer)
+                {
+                    delete_from subledgerJournalEntryMarkedForTransferToGeneralLedger where subledgerJournalEntryMarkedForTransferToGeneralLedger.RecId >= maxRecIdToDelete;
+                }
+            }
+
+            subledgerJournalAccountEntryMarkedForTransferToGeneralLedger.dispose();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransferStatusToInProcess</Name>
+				<Source><![CDATA[
+    private SubledgerJournalEntry updateTransferStatusToInProcess(AccountingEventRecId _accountingEventId, LedgerRecId _ledger, RefTableId _sourceDocumentHeaderType)
+    {
+        SubledgerJournalEntry subledgerJournalEntry;
+        try
+        {
+            if (retryCount > maxRetryCount)
+            {
+                throw error("@SYS65063");
+            }
+
+            ttsbegin;
+
+            this.getSubledgerJournalEntryToTransfer(_accountingEventId, _ledger, _sourceDocumentHeaderType);
+
+            subledgerJournalEntry = this.getSubledgerJournalEntryUsedForTransferId(subledgerJournalEntryMarkedForTransferToGeneralLedger);
+
+            if (subledgerJournalEntry)
+            {
+                transferidVal = subledgerJournalEntry.RecId;
+                this.updateTransferStatus(_accountingEventId, _ledger, _sourceDocumentHeaderType);
+            }
+
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            sleep(retryWait);
+            retryCount++;
+            infolog.clear(line);
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            sleep(retryWait);
+            retryCount++;
+            infolog.clear(line);
+            retry;
+        }
+
+        return subledgerJournalEntry;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransferStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates <c>SubledgerJournalEntry</c> status to transfer in process.
+    /// </summary>
+    /// <param name="_accountingEventId">
+    /// The record identity for the <c>AccountingEvent</c> record for which subledger journal should be transferred.
+    /// </param>
+    /// <param name="_ledger">
+    /// The record identity for the <c>Ledger</c> record for which subledger journal should be transferred.
+    /// </param>
+    /// <param name="_sourceRelationType">
+    /// The source document relation type for which subledger journal should be transferred.
+    /// </param>
+    protected void updateTransferStatus(AccountingEventRecId _accountingEventId, LedgerRecId _ledger, RefTableId _sourceRelationType)
+    {
+        AccountingEvent localAccountingEvent;
+        SubledgerJournalEntry subledgerJournalEntry;
+        SubledgerJournalAccountEntry subledgerJournalAccountEntry;
+
+        subledgerJournalEntry.skipDataMethods(true);
+
+        update_recordset subledgerJournalEntry
+        setting Status  = SubledgerJournalEntryStatus::TransferInProcess,
+                TransferId = transferidVal
+            where subledgerJournalEntry.Status == SubledgerJournalEntryStatus::NotTransferred &&
+                    (!_ledger || subledgerJournalEntry.Ledger == _ledger) &&
+                    (!fiscalCalendarPeriodRecId || subledgerJournalEntry.FiscalCalendarPeriod == fiscalCalendarPeriodRecId)
+        join subledgerJournalEntryMarkedForTransferToGeneralLedger
+            where subledgerJournalEntry.RecId == subledgerJournalEntryMarkedForTransferToGeneralLedger.SubledgerJournalEntry;
+        
+        select count(RecId) from subledgerJournalAccountEntry
+        join subledgerJournalEntry
+            where subledgerJournalEntry.TransferId == transferidVal &&
+                subledgerJournalEntry.RecId == subledgerJournalAccountEntry.SubledgerJournalEntry &&
+                (subledgerJournalAccountEntry.IsTransferredInDetail == TransferPolicy::TransferIndividual ||
+                    subledgerJournalAccountEntry.IsTransferredInDetail == TransferPolicy::Summarize);
+        
+        select count(RecId) from subledgerJournalEntry
+            where subledgerJournalEntry.TransferId == transferidVal;
+
+        numberOfVouchersLineInTransfer = subledgerJournalAccountEntry.RecId;
+        numberOfVouchersInTransfer = subledgerJournalEntry.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertAccountEntriesInExtensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///   Raises event to allow extensions to override inserting <c>GeneralJournalAccountEntry</c> records.
+    /// </summary>
+    /// <param name="_transferID">
+    ///   Transfer ID.
+    /// </param>
+    /// <param name="_sourceDocument">
+    ///   The <c>SourceDocument</c> associated with the subledger journal records being transfered.
+    /// </param>
+    /// <param name="_doSummarization">
+    ///   true if <c>SubledgerJournalAccountEntry</c> records should be summarized on transfer; otherwise, false.
+    /// </param>
+    /// <returns>
+    ///   true if insertion is already done; otherwise, false.
+    /// </returns>
+    protected boolean insertAccountEntriesInExtensions(SubledgerJournalTransferId _transferID, SourceDocument _sourceDocument, boolean _doSummarization)
+    {
+        SysEventOverride override = SysEventOverride::construct();
+
+        this.insertExclusiveGenJourAcctEntry(override, _transferID, _sourceDocument, _doSummarization);
+
+        return override.isOverridden();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertedGeneralJournalAccountEntry</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes after writing of the <c>GeneralJournalAccountEntry</c> field is complete
+    /// </summary>
+    /// <param name="_transferID">
+    /// The ID of transfer process.
+    /// </param>
+    /// <param name="_doc">
+    /// The source document.
+    /// </param>
+    /// <param name="_doSummarization">
+    /// The value that indicates whether summarization is required.
+    /// </param>
+    delegate void insertedGeneralJournalAccountEntry(SubledgerJournalTransferId _transferID, SourceDocument _doc, boolean _doSummarization)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertedGeneralJournalEntryRelated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Event is called after writing of <c>GeneralJournalEntry</c> is complete
+    /// </summary>
+    /// <param name="_transferId">
+    /// Identifier of transfer process.
+    /// </param>
+    /// <param name="_doSummarization">
+    /// Is summarization across SubledgerJournalEntry boundaries required.
+    /// </param>
+    delegate void insertedGeneralJournalEntryRelated(
+        SubledgerJournalTransferId      _transferId,
+        boolean                         _doSummarization)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertExclusiveGenJourAcctEntry</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///   Event is called before insertion to <c>GeneralJournalAccountEntry</c> table is complete and allow to override standard writing algorithm.
+    /// </summary>
+    /// <param name="_sysEventOverride">
+    ///   Insertion override status.
+    /// </param>
+    /// <param name="_transferID">
+    ///   The transfer ID.
+    /// </param>
+    /// <param name="_sourceDocument">
+    ///   The SourceDocument associated with the subledger journal records being transfered.
+    /// </param>
+    /// <param name="_doSummarization">
+    ///   true if <c>SubledgerJournalAccountEntry</c> records should be summarized on transfer; false if they should not be summarized on transfer.
+    /// </param>
+    delegate void insertExclusiveGenJourAcctEntry(SysEventOverride _sysEventOverride, SubledgerJournalTransferID _transferID, SourceDocument _sourceDocument, boolean _doSummarization)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doesSubledgerGeneralAccountEntryExistForTransferPolicy</Name>
+				<Source><![CDATA[
+    private void doesSubledgerGeneralAccountEntryExistForTransferPolicy()
+    {
+        SubledgerJournalEntry subledgerJournalEntryLocalTransfer;
+        SubledgerJournalAccountEntry subledgerJournalAccountEntryLocalTransfer;
+
+        select firstonly RecId from subledgerJournalEntryLocalTransfer
+           where subledgerJournalEntryLocalTransfer.TransferId == transferidVal &&
+                subledgerJournalEntryLocalTransfer.Status == SubledgerJournalEntryStatus::TransferInProcess
+        exists join subledgerJournalAccountEntryLocalTransfer
+            where subledgerJournalAccountEntryLocalTransfer.SubledgerJournalEntry == subledgerJournalEntryLocalTransfer.RecId &&
+                subledgerJournalAccountEntryLocalTransfer.IsTransferredInDetail == TransferPolicy::Summarize;
+
+        if (subledgerJournalEntryLocalTransfer.RecId != 0)
+        {
+            subledgerJournalAccountEntryTransferPolicySummarizeExists = true;
+        }
+
+        subledgerJournalEntryLocalTransfer.clear();
+        subledgerJournalAccountEntryLocalTransfer.clear();
+
+        select firstonly RecId from subledgerJournalEntryLocalTransfer
+            where subledgerJournalEntryLocalTransfer.TransferId == transferidVal &&
+                subledgerJournalEntryLocalTransfer.Status == SubledgerJournalEntryStatus::TransferInProcess
+        exists join subledgerJournalAccountEntryLocalTransfer
+            where subledgerJournalAccountEntryLocalTransfer.SubledgerJournalEntry == subledgerJournalEntryLocalTransfer.RecId &&
+                subledgerJournalAccountEntryLocalTransfer.IsTransferredInDetail == TransferPolicy::TransferIndividual;
+
+        if (subledgerJournalEntryLocalTransfer.RecId != 0)
+        {
+            subledgerJournalAccountEntryTransferPolicyTransferInDetailExists = true;
+        }
+
+        subledgerJournalEntryLocalTransfer.dispose();
+        subledgerJournalAccountEntryLocalTransfer.dispose();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recordGeneralJournalAccountEntryRelated</Name>
+				<Source><![CDATA[
+    private void recordGeneralJournalAccountEntryRelated(LedgerRecId _ledgerRecId)
+    {
+        SourceDocument sourceDocument;
+
+        sourceDocument = SourceDocument::newFromSourceDocumentHeader(SourceDocumentHeader::find(accountingEvent.SourceDocumentHeader));
+
+        utcdatetime startTime = DateTimeUtil::utcNow();
+
+        this.doesSubledgerGeneralAccountEntryExistForTransferPolicy();
+
+        if (doSummarization)
+        {
+            this.recordGeneralJournalAccountEntryRelatedSummarized(sourceDocument);
+        }
+        else
+        {
+            this.recordGeneralJournalAccountEntryRelatedDetail(sourceDocument);
+        }
+
+        totalTimeToInsertGeneralJournalAccountEntryRecords = any2Str(DateTimeUtil::getDifference(DateTimeUtil::utcNow(), startTime));
+
+        startTime = DateTimeUtil::utcNow();
+
+        this.insertedGeneralJournalAccountEntry(transferidVal, sourceDocument, doSummarization);
+
+        timeSpendInTransferExtensionOnGJAEInsertEvent = any2Str(DateTimeUtil::getDifference(DateTimeUtil::utcNow(), startTime));
+
+        startTime = DateTimeUtil::utcNow();
+
+        TaxTransGeneralJournalAccountEntry::create(transferidVal, _ledgerRecId);
+
+        // <GIN>
+        if (TaxWithholdParameters_IN::checkTaxParameters())
+        {
+            TaxWHTTransGeneralJournalAccountEntry_IN::create(transferidVal, _ledgerRecId);
+        }
+        // </GIN>
+
+        totalTimeToInsertTaxTransGeneralJournalAccountEntryRecords = any2Str(DateTimeUtil::getDifference(DateTimeUtil::utcNow(), startTime));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recordGeneralJournalAccountEntryRelatedDetail</Name>
+				<Source><![CDATA[
+    private void recordGeneralJournalAccountEntryRelatedDetail(SourceDocument _sourceDocument)
+    {
+        GeneralJournalAccountEntry          generalJournalAccountEntry;
+        SubledgerJournalAccountEntry        subledgerJournalAccountEntry;
+        SubLedgerJournalEntryView           subLedgerJournalEntryView;
+
+        if (!this.insertAccountEntriesInExtensions(transferidVal, _sourceDocument, doSummarization))
+        {
+            generalJournalAccountEntry.skipDataMethods(true);
+            generalJournalAccountEntry.skipDatabaseLog(true);
+
+            subledgerJournalAccountEntry.skipDataMethods(true);
+            subledgerJournalAccountEntry.skipDatabaseLog(true);
+
+            this.insertGeneralJournalAccountEntryRelatedDetail();
+            
+            GeneralJournalAccountEntrySubledgerJournalAccountEntry generalJournalAccountEntrySubledgerJournalAccountEntry, generalJournalAccountEntrySubledgerJournalAccountEntryLocal;
+            SubLedgerJournalEntry subLedgerJournalEntry;
+
+            insert_recordset generalJournalAccountEntrySubledgerJournalAccountEntry(
+                subledgerJournalAccountEntry,
+                TransferId,
+                SubledgerJournalEntry,
+                generalJournalAccountEntry)
+            select RecId from subledgerJournalAccountEntry
+            join TransferId, SubledgerJournalEntry from subledgerJournalEntryView
+                where subLedgerJournalEntryView.SubLedgerJournalEntry == subledgerJournalAccountEntry.SubledgerJournalEntry &&
+                    subLedgerJournalEntryView.TransferId == transferidVal &&
+                    subLedgerJournalEntryView.Status == SubledgerJournalEntryStatus::TransferInProcess
+            join tmpNumberSeqGen
+                where tmpNumberSeqGen.SubledgerJournalEntry == subLedgerJournalEntryView.SubLedgerJournalEntry &&
+                    tmpNumberSeqGen.TransferId == subLedgerJournalEntryView.TransferId
+            join generalJournalEntry
+                where generalJournalEntry.JournalNumber == tmpNumberSeqGen.JournalNumber &&
+                    generalJournalEntry.Ledger == tmpNumberSeqGen.Ledger &&
+                    generalJournalEntry.TransferId == tmpNumberSeqGen.TransferId
+            join subledgerVoucherGeneralJournalEntry
+                where subledgerVoucherGeneralJournalEntry.GeneralJournalEntry == generalJournalEntry.RecId &&
+                    subledgerVoucherGeneralJournalEntry.AccountingDate == subLedgerJournalEntryView.AccountingDate &&
+                    subledgerVoucherGeneralJournalEntry.Voucher == subLedgerJournalEntryView.Voucher &&
+                    subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == subLedgerJournalEntryView.VoucherDataAreaId &&
+                    subledgerVoucherGeneralJournalEntry.SubledgerJournalEntry == subLedgerJournalEntryView.SubLedgerJournalEntry &&
+                    subledgerVoucherGeneralJournalEntry.TransferId == subLedgerJournalEntryView.TransferId
+            join RecId from generalJournalAccountEntry
+                where generalJournalAccountEntry.GeneralJournalEntry == generalJournalEntry.RecId &&
+                    generalJournalAccountEntry.LedgerDimension == subledgerJournalAccountEntry.LedgerDimension &&
+                    generalJournalAccountEntry.FinTag == subledgerJournalAccountEntry.FinTag &&
+                    generalJournalAccountEntry.TransactionCurrencyCode == subledgerJournalAccountEntry.TransactionCurrency &&
+                    generalJournalAccountEntry.IsCorrection == subledgerJournalAccountEntry.IsCorrection &&
+                    generalJournalAccountEntry.PostingType == subledgerJournalAccountEntry.PostingType &&
+                    (subledgerJournalAccountEntry.IsTransferredInDetail == TransferPolicy::TransferIndividual ||
+                    subledgerJournalAccountEntry.IsTransferredInDetail == TransferPolicy::Summarize) &&
+                    generalJournalAccountEntry.TransactionCurrencyAmount == subledgerJournalAccountEntry.TransactionCurrencyAmount &&
+                    generalJournalAccountEntry.AccountingCurrencyAmount == subledgerJournalAccountEntry.AccountingCurrencyAmount &&
+                    generalJournalAccountEntry.ReportingCurrencyAmount == subledgerJournalAccountEntry.ReportingCurrencyAmount &&
+                    subledgerJournalAccountEntry.GeneralJournalAccountEntry == 0
+            notexists join generalJournalAccountEntrySubledgerJournalAccountEntryLocal
+                where generalJournalAccountEntrySubledgerJournalAccountEntryLocal.SubledgerJournalEntry == subledgerJournalAccountEntry.SubledgerJournalEntry &&
+                    generalJournalAccountEntrySubledgerJournalAccountEntryLocal.TransferId == subledgerJournalEntryView.TransferId &&
+                    generalJournalAccountEntrySubledgerJournalAccountEntryLocal.SubledgerJournalAccountEntry == subledgerJournalAccountEntry.RecId &&
+                    generalJournalAccountEntrySubledgerJournalAccountEntryLocal.GeneralJournalAccountEntry == generalJournalAccountEntry.RecId;
+
+            insert_recordset generalJournalAccountEntrySubledgerJournalAccountEntry(
+                subledgerJournalAccountEntry,
+                TransferId,
+                SubledgerJournalEntry,
+                generalJournalAccountEntry)
+            select RecId from subledgerJournalAccountEntry
+            join TransferId, SubledgerJournalEntry from subLedgerJournalEntryView
+                where subLedgerJournalEntryView.SubLedgerJournalEntry == subledgerJournalAccountEntry.SubledgerJournalEntry &&
+                        subLedgerJournalEntryView.TransferId == transferidVal &&
+                        subLedgerJournalEntryView.Status == SubledgerJournalEntryStatus::TransferInProcess
+            join tmpNumberSeqGen
+                where tmpNumberSeqGen.SubledgerJournalEntry == subLedgerJournalEntryView.SubLedgerJournalEntry &&
+                    tmpNumberSeqGen.TransferId == subLedgerJournalEntryView.TransferId
+            join generalJournalEntry
+                where generalJournalEntry.JournalNumber == tmpNumberSeqGen.JournalNumber &&
+                    generalJournalEntry.Ledger == tmpNumberSeqGen.Ledger &&
+                    generalJournalEntry.TransferId == tmpNumberSeqGen.TransferId
+            join subledgerVoucherGeneralJournalEntry
+                where subledgerVoucherGeneralJournalEntry.GeneralJournalEntry == generalJournalEntry.RecId &&
+                    subledgerVoucherGeneralJournalEntry.AccountingDate == subLedgerJournalEntryView.AccountingDate &&
+                    subledgerVoucherGeneralJournalEntry.Voucher == subLedgerJournalEntryView.Voucher &&
+                    subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == subLedgerJournalEntryView.VoucherDataAreaId &&
+                    subledgerVoucherGeneralJournalEntry.SubledgerJournalEntry == subLedgerJournalEntryView.SubLedgerJournalEntry &&
+                    subledgerVoucherGeneralJournalEntry.TransferId == subLedgerJournalEntryView.TransferId
+            join RecId from generalJournalAccountEntry 
+                where generalJournalAccountEntry.GeneralJournalEntry == generalJournalEntry.RecId &&
+                    generalJournalAccountEntry.LedgerDimension == subledgerJournalAccountEntry.LedgerDimension &&
+                    generalJournalAccountEntry.FinTag == subledgerJournalAccountEntry.FinTag &&
+                    generalJournalAccountEntry.TransactionCurrencyCode == subledgerJournalAccountEntry.TransactionCurrency &&
+                    generalJournalAccountEntry.IsCorrection == subledgerJournalAccountEntry.IsCorrection &&
+                    generalJournalAccountEntry.PostingType == subledgerJournalAccountEntry.PostingType &&
+                    subledgerJournalAccountEntry.IsTransferredInDetail == TransferPolicy::Summarize &&
+                    subledgerJournalAccountEntry.GeneralJournalAccountEntry == 0
+            notexists join generalJournalAccountEntrySubledgerJournalAccountEntryLocal
+                where generalJournalAccountEntrySubledgerJournalAccountEntryLocal.SubledgerJournalEntry == subledgerJournalAccountEntry.SubledgerJournalEntry &&
+                    generalJournalAccountEntrySubledgerJournalAccountEntryLocal.TransferId == subledgerJournalEntryView.TransferId &&
+                    generalJournalAccountEntrySubledgerJournalAccountEntryLocal.SubledgerJournalAccountEntry == subledgerJournalAccountEntry.RecId &&
+                    generalJournalAccountEntrySubledgerJournalAccountEntryLocal.GeneralJournalAccountEntry == generalJournalAccountEntry.RecId;
+
+            update_recordset subledgerJournalAccountEntry
+                setting GeneralJournalAccountEntry = generalJournalAccountEntrySubledgerJournalAccountEntry.GeneralJournalAccountEntry
+            join generalJournalAccountEntrySubledgerJournalAccountEntry
+                where generalJournalAccountEntrySubledgerJournalAccountEntry.SubledgerJournalEntry == subledgerJournalAccountEntry.SubledgerJournalEntry &&
+                    generalJournalAccountEntrySubledgerJournalAccountEntry.TransferId == transferidVal &&
+                    generalJournalAccountEntrySubledgerJournalAccountEntry.SubledgerJournalAccountEntry == subledgerJournalAccountEntry.RecId;
+
+            this.updateGeneralJournalAccountEntryAmountSign();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertGeneralJournalAccountEntryRelatedDetail</Name>
+				<Source><![CDATA[
+    [ReplaceableAttribute]
+    protected void insertGeneralJournalAccountEntryRelatedDetail()
+    {
+        // insert lines that can be summarized within the scope of a SubledgerJournalEntry
+        if(subledgerJournalAccountEntryTransferPolicySummarizeExists)
+        {
+            SubledgerInsertGeneralJournalAccountEntryRelatedDetailSummarizedQuery::insert(transferidVal, isCreditValue);
+        }
+
+        // transfer non-summarizable line
+        if(subledgerJournalAccountEntryTransferPolicyTransferInDetailExists)
+        {
+            SubledgerInsertGeneralJournalAccountEntryRelatedDetailNonSummarizedQuery::insert(transferidVal, isCreditValue);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransactionText</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets description text for transactions based on <c>SourceDocument</c> type.
+    /// </summary>
+    /// <param name = "_sourceDocument">Specific source document to base description text on.</param>
+    /// <returns>
+    /// For Russia, source document <c>parmTransactionText</c> value,
+    /// if it is not null and differs form <c>parmSingularLabel</c>;
+    /// Otherwise, "Summarized" <c>parmLabel</c> text.
+    /// </returns>
+    internal static TransTxt getTransactionText(SourceDocument _sourceDocument)
+    {
+        #ISOCountryRegionCodes
+        TransTxt ret;
+
+        if (_sourceDocument)
+        {
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]))
+            {
+                TransTxt transactionText = _sourceDocument.parmTransactionText();
+
+                if (transactionText && transactionText != _sourceDocument.parmSingularLabel())
+                {
+                    ret = transactionText;
+                }
+            }
+
+            if (!ret)
+            {
+                ret = "@SYS342661" + ' ' + _sourceDocument.parmLabel();
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recordGeneralJournalAccountEntryRelatedSummarized</Name>
+				<Source><![CDATA[
+    private void recordGeneralJournalAccountEntryRelatedSummarized(SourceDocument _sourceDocument)
+    {
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+        SubledgerJournalAccountEntry subledgerJournalAccountEntry;
+        TransTxt transactionText;
+        GeneralJournalEntry generalJournalEntryNonSummarized;
+        SubLedgerJournalAccountEntryView subLedgerJournalAccountEntryViewNonSummarized;
+
+        if (!this.insertAccountEntriesInExtensions(transferidVal, _sourceDocument, doSummarization))
+        {
+            generalJournalAccountEntry.skipDataMethods(true);
+            subledgerJournalAccountEntry.skipDataMethods(true);
+
+            isCreditValue = false;
+            transactionText = SubledgerJournalTransferCommand::getTransactionText(_sourceDocument);
+                        
+            if(subledgerJournalAccountEntryTransferPolicySummarizeExists)
+            {
+                // Insert summarized lines
+                SubLedgerRecordGeneralJournalAccountEntryRelatedSummarizedQuery::insert(
+                    isCreditValue,
+                    transactionText,
+                    transferidVal);
+            }
+
+            // transfer non-summarizable line
+            if(subledgerJournalAccountEntryTransferPolicyTransferInDetailExists)
+            {
+                // Insert non-summarized lines
+                SubLedgerRecordGeneralJournalAccountEntryRelatedNonSummarizedQuery::insert(
+                    isCreditValue,
+                    transactionText,
+                    transferidVal);
+            }
+
+            SubledgerRecordGeneralJournalAccountEntryRelatedIndividualUpdateQuery::update(
+                transferidVal);
+
+            SubledgerRecordGeneralJournalAccountEntryRelatedSummarizeUpdateQuery::update(
+                transferidVal);
+
+            GeneralJournalAccountEntrySubledgerJournalAccountEntry generalJournalAccountEntrySubledgerJournalAccountEntry;
+            SubLedgerJournalEntry subLedgerJournalEntry;
+
+            insert_recordset generalJournalAccountEntrySubledgerJournalAccountEntry(
+                subledgerJournalAccountEntry,
+                generalJournalAccountEntry)
+            select RecId, GeneralJournalAccountEntry from subledgerJournalAccountEntry
+            exists join subLedgerJournalEntry
+                where subLedgerJournalEntry.RecId == subledgerJournalAccountEntry.SubledgerJournalEntry &&
+                    subLedgerJournalEntry.TransferId == transferidVal &&
+                    subledgerJournalAccountEntry.IsTransferredInDetail != TransferPolicy::DoNotTransfer &&
+                    subledgerJournalAccountEntry.GeneralJournalAccountEntry != 0;
+
+            this.updateGeneralJournalAccountEntryAmountSign();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateGeneralJournalAccountEntryAmountSign</Name>
+				<Source><![CDATA[
+    private void updateGeneralJournalAccountEntryAmountSign()
+    {
+        GeneralJournalAccountEntry generalJournalAccountEntryLocal;
+        GeneralJournalEntry generalJournalEntryLocal;
+        
+        GeneralJournalAccountEntryRecIdTmp  generalJournalAccountEntryRecIdTmp;            
+
+        insert_recordset generalJournalAccountEntryRecIdTmp
+        (
+            GeneralJournalAccountEntry
+        )
+        select RecId from generalJournalAccountEntryLocal
+        join generalJournalEntryLocal
+            where generalJournalEntryLocal.TransferId == transferidVal &&
+                generalJournalAccountEntryLocal.GeneralJournalEntry == generalJournalEntryLocal.RecId;
+
+        generalJournalEntryLocal.clear();
+        generalJournalAccountEntryLocal.clear();
+
+        // remove any corrections because some countries don't support opposite sign GL amounts
+        if (LedgerParameters::find().ReverseOppositeSignAmounts)
+        {
+            update_recordSet generalJournalAccountEntryLocal
+                setting IsCorrection = false,
+                    IsCredit = false
+            join generalJournalAccountEntryRecIdTmp
+                where generalJournalAccountEntryRecIdTmp.GeneralJournalAccountEntry == generalJournalAccountEntryLocal.RecId;
+        }
+
+        generalJournalAccountEntryLocal.clear();
+
+        update_recordset generalJournalAccountEntryLocal
+            setting IsCredit = true
+        join generalJournalAccountEntryRecIdTmp
+            where generalJournalAccountEntryRecIdTmp.GeneralJournalAccountEntry == generalJournalAccountEntryLocal.RecId
+                && (((generalJournalAccountEntryLocal.AccountingCurrencyAmount > 0 && generalJournalAccountEntryLocal.IsCorrection)
+                        || (generalJournalAccountEntryLocal.AccountingCurrencyAmount < 0 && !generalJournalAccountEntryLocal.IsCorrection))
+                    || ((generalJournalAccountEntryLocal.TransactionCurrencyAmount > 0 && generalJournalAccountEntryLocal.IsCorrection)
+                        || (generalJournalAccountEntryLocal.TransactionCurrencyAmount < 0 && !generalJournalAccountEntryLocal.IsCorrection))
+                    || ((generalJournalAccountEntryLocal.ReportingCurrencyAmount > 0 && generalJournalAccountEntryLocal.IsCorrection)
+                        || (generalJournalAccountEntryLocal.ReportingCurrencyAmount < 0 && !generalJournalAccountEntryLocal.IsCorrection)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertGeneralJournalEntryRelated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// insert a generaljournalentry, either summarized or not.
+    /// </summary>
+    /// <param name="_legalEntityLedgerPostingJournalVoucherSeries">
+    /// ledger posting journal voucher serie
+    /// </param>
+    /// <param name="_sourceDocumentHeader">
+    /// source doc header.
+    /// </param>
+    private void insertGeneralJournalEntryRelated(Map _legalEntityLedgerPostingJournalVoucherSeries, SourceDocumentHeader _sourceDocumentHeader)
+    {      
+        #ISOCountryRegionCodes        
+        FiscalCalendarPeriod                fiscalCalendarPeriod;
+        TaxTransGeneralJournalAccountEntry  taxTransGeneralJournalAccountEntry;
+        SourceDocument                      sourceDocument;
+        LedgerTransType                     journalCategoryValue;
+        AccountingEvent                     localAccountingEvent;
+        SubledgerVoucherGeneralJournalEntry localSubledgerVoucherLink;
+        SourceDocumentHeader                localSourceDocumentHeader;
+        SubledgerJournalEntry               localSubledgerJournalEntry;
+        SourceDocumentType                  sourceDocumentType;        
+        SubLedgerJournalEntryView           subLedgerJournalEntryView;
+
+        if (_sourceDocumentHeader != null)
+        {
+            sourceDocumentType = SourceDocumentType::newFromSourceDocumentHeader(_sourceDocumentHeader);
+            journalCategoryValue = sourceDocumentType.parmJournalCategory();
+            sourceDocument = SourceDocument::newFromSourceDocumentHeader(_sourceDocumentHeader);
+        }
+        else
+        {
+            journalCategoryValue = LedgerTransType::Transfer;
+        }
+
+        generalJournalEntry.skipDataMethods(true);
+        taxTransGeneralJournalAccountEntry.skipDataMethods(true);
+        subledgerVoucherGeneralJournalEntry.skipDataMethods(true);
+
+        // Perform basic data integrity checks for posting to general ledger.
+        select LedgerDimension, TransactionCurrencyCode, Ledger, AccountingDate
+        from subLedgerJournalAccountEntryView
+            where
+            (
+                !subLedgerJournalAccountEntryView.LedgerDimension ||
+                !subLedgerJournalAccountEntryView.TransactionCurrencyCode ||
+                !subLedgerJournalAccountEntryView.Ledger ||
+                !subLedgerJournalAccountEntryView.AccountingDate
+            ) &&
+            subLedgerJournalAccountEntryView.TransferId == transferidVal;
+
+        if (subLedgerJournalAccountEntryView)
+        {
+            if (!subLedgerJournalAccountEntryView.Ledger)
+            {
+                throw error("@GeneralLedger:JournalMissingLedger");
+            }
+
+            if (!subLedgerJournalAccountEntryView.AccountingDate)
+            {
+                throw error("@GeneralLedger:JournalMissingAccountingDate");
+            }
+
+            if (!subLedgerJournalAccountEntryView.LedgerDimension)
+            {
+                throw error("@GeneralLedger:TransactionMissingLedgerDimension");
+            }
+
+            if (!subLedgerJournalAccountEntryView.TransactionCurrencyCode)
+            {
+                throw error("@GeneralLedger:TransactionMissingCurrencyCode");
+            }
+        }
+
+        utcdatetime startTime = DateTimeUtil::utcNow();
+
+        if (doSummarization)
+        {
+            insert_recordset generalJournalEntry
+            (
+                AccountingDate,
+                FiscalCalendarPeriod,
+                PostingLayer,
+                Ledger,
+                TransferId,
+                JournalNumber,
+                FiscalCalendarYear,
+                JournalCategory
+            )
+            select AccountingDate,FiscalCalendarPeriod, PostingLayer,Ledger, transferidVal from subLedgerJournalEntryView
+                group by AccountingDate,FiscalCalendarPeriod,PostingLayer,Ledger
+                where subLedgerJournalEntryView.Status == SubledgerJournalEntryStatus::TransferInProcess &&
+                    subLedgerJournalEntryView.TransferId == transferidVal
+            join JournalNumber, FiscalCalendarYear, journalCategoryValue from tmpNumberSeqGen 
+                group by JournalNumber, FiscalCalendarYear
+                where tmpNumberSeqGen.AccountingDate == subLedgerJournalEntryView.AccountingDate &&
+                    tmpNumberSeqGen.FiscalCalendarPeriod == subLedgerJournalEntryView.FiscalCalendarPeriod &&
+                    tmpNumberSeqGen.Ledger == subLedgerJournalEntryView.Ledger &&
+                    tmpNumberSeqGen.PostingLayer == subLedgerJournalEntryView.PostingLayer &&
+                    tmpNumberSeqGen.TransferId == transferidVal;
+
+            insert_recordset subledgerVoucherGeneralJournalEntry
+            (
+                Voucher,
+                VoucherDataAreaId,
+                AccountingDate,
+                SubledgerJournalEntry,
+                TransferId,
+                GeneralJournalEntry
+            )
+            select Voucher, VoucherDataAreaId, AccountingDate, SubledgerJournalEntry, transferidVal from subLedgerJournalEntryView
+                group by subLedgerJournalEntryView.Voucher,
+                    subLedgerJournalEntryView.VoucherDataAreaId,
+                    subLedgerJournalEntryView.AccountingDate,
+                    subLedgerJournalEntryView.SubLedgerJournalEntry,
+                    subLedgerJournalEntryView.TransferId,
+                    generalJournalEntry.RecId
+                where subLedgerJournalEntryView.TransferId == transferidVal
+            join RecId from generalJournalEntry
+                where generalJournalEntry.PostingLayer == subLedgerJournalEntryView.PostingLayer &&
+                    generalJournalEntry.FiscalCalendarPeriod == subLedgerJournalEntryView.FiscalCalendarPeriod &&
+                    generalJournalEntry.AccountingDate == subLedgerJournalEntryView.AccountingDate &&
+                    generalJournalEntry.Ledger == subLedgerJournalEntryView.Ledger &&
+                    generalJournalEntry.TransferId == transferidVal;
+        }
+        else
+        {
+            insert_recordset generalJournalEntry
+            (
+                AccountingDate,
+                FiscalCalendarPeriod,
+                PostingLayer,
+                Ledger,
+                SubledgerVoucher,
+                SubledgerVoucherDataAreaId,
+                TransferId,
+                DocumentDate,
+                DocumentNumber,
+                JournalNumber,
+                FiscalCalendarYear,
+                JournalCategory
+            )
+            select AccountingDate, FiscalCalendarPeriod, PostingLayer, Ledger, Voucher, VoucherDataAreaId, transferidVal, DocumentDate, DocumentNumber from subLedgerJournalEntryView
+                where subLedgerJournalEntryView.Status == SubledgerJournalEntryStatus::TransferInProcess &&
+                    subLedgerJournalEntryView.TransferId == transferidVal
+            join JournalNumber from tmpNumberSeqGen
+                where tmpNumberSeqGen.SubledgerJournalEntry == subLedgerJournalEntryView.SubLedgerJournalEntry &&
+                        tmpNumberSeqGen.TransferId == transferidVal
+            join FiscalCalendarYear, journalCategoryValue from fiscalCalendarPeriod
+                where fiscalCalendarPeriod.RecId == subLedgerJournalEntryView.FiscalCalendarPeriod;
+
+            insert_recordset subledgerVoucherGeneralJournalEntry
+            (
+                Voucher,
+                VoucherDataAreaId,
+                AccountingDate,
+                SubledgerJournalEntry,
+                TransferId,
+                GeneralJournalEntry
+            )
+            select Voucher, VoucherDataAreaId, AccountingDate, SubledgerJournalEntry, transferidVal from subLedgerJournalEntryView
+                group by subLedgerJournalEntryView.Voucher,
+                    subLedgerJournalEntryView.VoucherDataAreaId,
+                    subLedgerJournalEntryView.AccountingDate,
+                    subLedgerJournalEntryView.SubLedgerJournalEntry,
+                    subLedgerJournalEntryView.TransferId,
+                    generalJournalEntry.RecId
+                where subLedgerJournalEntryView.TransferId == transferidVal
+            join tmpNumberSeqGen
+                where tmpNumberSeqGen.SubledgerJournalEntry == subLedgerJournalEntryView.SubLedgerJournalEntry
+            join RecId from generalJournalEntry
+                where generalJournalEntry.JournalNumber == tmpNumberSeqGen.JournalNumber &&
+                    generalJournalEntry.TransferId == transferidVal;
+        }
+
+        LedgerPostingProcessor::Instance().addGeneralJournalEntryTransferId(transferidVal);
+
+        this.insertedGeneralJournalEntryRelated(transferidVal, doSummarization);
+
+        sourceDocument = SourceDocument::newFromSourceDocumentHeader(_sourceDocumentHeader);
+
+        if (!doSummarization && sourceDocument is SourceDocumentIPostingJournalSeqProv)
+        {
+            while select Ledger, AccountingDate, Voucher, SourceDocumentHeader from subLedgerJournalEntryView
+                group by Ledger, AccountingDate, Voucher, SourceDocumentHeader
+                where subLedgerJournalEntryView.TransferId == transferidVal
+            {
+                NumberSequenceCode voucherSeries;
+
+                CompanyId companyId = CompanyInfo::getDataArea(Ledger::primaryForLegalEntity(subLedgerJournalEntryView.Ledger));
+
+                if (isCountryRegion_BE)
+                {
+                    SourceDocumentHeader sourceDocumentHeaderBySubLedgerJournalEntryView = SourceDocumentHeader::find(subLedgerJournalEntryView.SourceDocumentHeader);
+                    SourceDocument localSourceDocument = SourceDocument::newFromSourceDocumentHeader(sourceDocumentHeaderBySubLedgerJournalEntryView);
+
+                    if (localSourceDocument is SourceDocumentIPostingJournalSeqProv)
+                    {
+                        voucherSeries = SubledgerJournalTransferCommand::initJournalVoucherSeries(
+                            localSourceDocument as SourceDocumentIPostingJournalSeqProv,
+                            companyId,
+                            subLedgerJournalEntryView.AccountingDate,
+                            subLedgerJournalEntryView.Voucher);
+                    }
+                }
+                else
+                {
+                    voucherSeries = SubledgerJournalTransferCommand::initJournalVoucherSeries(
+                        sourceDocument as SourceDocumentIPostingJournalSeqProv,
+                        companyId,
+                        subLedgerJournalEntryView.AccountingDate,
+                        subLedgerJournalEntryView.Voucher);
+                }
+
+                if (voucherSeries)
+                {
+                    LedgerPostingJournalVoucherSeries ledgerPostingJournalVoucherSeries;
+
+                    update_recordset generalJournalEntry
+                        setting LedgerPostingJournal = ledgerPostingJournalVoucherSeries.LedgerPostingJournalId,
+                            LedgerPostingJournalDataAreaId = ledgerPostingJournalVoucherSeries.DataAreaId
+                        where generalJournalEntry.TransferId == transferidVal
+                            && generalJournalEntry.SubledgerVoucher == subLedgerJournalEntryView.Voucher
+                            && generalJournalEntry.AccountingDate == subLedgerJournalEntryView.AccountingDate
+                        join LedgerPostingJournalId, DataAreaId from ledgerPostingJournalVoucherSeries
+                            where ledgerPostingJournalVoucherSeries.VoucherSeries == voucherSeries &&
+                                (ledgerPostingJournalVoucherSeries.FromDate == dateNull() || ledgerPostingJournalVoucherSeries.FromDate <= generalJournalEntry.AccountingDate) &&
+                                (ledgerPostingJournalVoucherSeries.ToDate == dateNull() || ledgerPostingJournalVoucherSeries.ToDate >= generalJournalEntry.AccountingDate);
+                }
+            }
+        }
+
+        totalTimeToInsertGeneralJournalEntryRecords = any2Str(DateTimeUtil::getDifference(DateTimeUtil::utcNow(), startTime));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initJournalVoucherSeries</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes and validates the journal voucher number series code.
+    /// </summary>
+    /// <param name = "_numberSeqProvider">
+    /// The posting journal number sequence provider.
+    /// </param>
+    /// <param name = "_company">
+    /// The company Id of the current operation.
+    /// </param>
+    /// <param name = "_accountingDate">
+    /// The accounting date of the current operation.
+    /// </param>
+    /// <param name = "_voucher">
+    /// The voucher of the current operation.
+    /// </param>
+    /// <returns>
+    /// The voucher number series code.
+    /// </returns>
+    internal static NumberSequenceCode initJournalVoucherSeries(
+        SourceDocumentIPostingJournalSeqProv _numberSeqProvider,
+        CompanyId _company,
+        TransDate _accountingDate,
+        Voucher _voucher)
+    {
+        NumberSequenceCode voucherSeries;
+
+        if (!_numberSeqProvider)
+            return voucherSeries;
+
+        voucherSeries = _numberSeqProvider.getVoucherSeriesNumberSequence(_company);
+        if (voucherSeries)
+        {
+            LedgerPostingJournalVoucherSeries ledgerPostingJournalVoucherSeries = LedgerPostingJournalVoucherSeries::find(voucherSeries);
+
+            if (ledgerPostingJournalVoucherSeries != null)
+            {
+                // SE bug fix: also need to validate date of the new series.
+                if (!ledgerPostingJournalVoucherSeries.isDateValid(_accountingDate))
+                {
+                    throw error(strFmt("@SYS62685", _voucher, voucherSeries, ledgerPostingJournalVoucherSeries.LedgerPostingJournalId));
+                }
+            }
+            else
+            {
+                throw error(
+                    strFmt("@SYS62431", voucherSeries),
+                    '',
+                    SysInfoAction_Formrun::newFormnameDesc(formStr(LedgerPostingJournal), "@SYS60620"));
+            }
+        }
+
+        return voucherSeries;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initGeneralJournalEntryFromSourceDocument</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes a <c>GeneralJournalEntry</c> object instance from source document.
+    /// </summary>
+    /// <returns>
+    /// The initialized <c>GeneralJournalEntry</c> object instance.
+    /// </returns>
+    [Wrappable(true)]
+    protected final GeneralJournalEntry initGeneralJournalEntryFromSourceDocument(SourceDocument _sourceDocument)
+    {
+        GeneralJournalEntry localGeneralJournalEntry = GeneralJournalEntry::find(generalJournalEntry.RecId, true);
+        localGeneralJournalEntry.DocumentDate = _sourceDocument.parmDocumentDate();
+        localGeneralJournalEntry.DocumentNumber = _sourceDocument.parmDocumentNumber();
+
+        return localGeneralJournalEntry;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isUpdateGeneralJournalEntryFieldChanged</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the <c>GeneralJournalEntry</c> object has to be updated from source document.
+    /// </summary>
+    /// <returns>
+    /// True to update <c>GeneralJournalEntry</c> object; otherwise, false.
+    /// </returns>
+    [Wrappable(true)]
+    protected final boolean isUpdateGeneralJournalEntryFieldChanged(GeneralJournalEntry _localGeneralJournalEntry)
+    {
+        return _localGeneralJournalEntry.DocumentDate || _localGeneralJournalEntry.DocumentNumber;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadExtensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Loads new instances of a SubledgerJournalTransferCommandExtension class.
+    /// </summary>
+    protected void loadExtensions()
+    {
+        List        extensions  = SourceDocumentExtensionFactory::newObjectList(classNum(SubledgerJournalTransferCommandExtension), conNull());
+        Enumerator  i           = extensions.getEnumerator();
+        SubledgerJournalTransferCommandExtension extension;
+        while (i.moveNext())
+        {
+            extension = i.current();
+            extension.parmCommand(this);
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

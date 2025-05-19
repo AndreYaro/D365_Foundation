@@ -1,0 +1,1689 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailDlvModeExplodeJob</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// This class <c>RetailDlvModeExplodeJob</c> is used to push data from DlvMode to TempTable
+/// and from TempTable to Normal Tables.
+/// </summary>
+[SysObsolete('This class has been deprecated. Please use RetailDlvModeExplodeJobScheduler instead.', true, 30\06\2020)]
+class RetailDlvModeExplodeJob extends RunBaseBatch implements BatchRetryable
+{
+    TmpRetailDlvModeChannelExploded tmpChannelExploded;
+    TmpRetailDlvModeProductExploded tmpProductExploded;
+    TmpRetailDlvModeExclusions      exclusions;
+    RetailDlvModeAddressExploded    tmpAddressExploded;
+    TmpRetailDlvModeAddressExclusions   addressExclusions;
+    int64                           numItemsExploded, numItemsSkipped, numItemsError;
+    str                             traceArea;
+    const int RetryNum = 5;
+    const int RetryWaitTime = 10000;  // in ms. 10 seconds for retry.
+
+    RefRecId                                refRecIdCategory;
+    TmpRetailDlvModeExplodeAllCategories    tmpExplodeAllCategories; // table contains data for all retail categories.
+    TmpRetailDlvModeExplodeAllCategories    tmpExploded;
+    boolean                                 isAllCategoriesExploded = false; // true if All categories have been parsed in RetailDlvModeExplodeAllCategories table.
+    ItemId                                  itemId;
+    int64                                   numItemsExploded1, numItemsSkipped1, numItemsExploded2, numItemsSkipped2;
+
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addCategoryToTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the category-delivery mode associations to the temporary staging explosion table.
+    /// Explodes the category to the product/variant level.
+    /// </summary>
+    /// <param name="_dlvMode">
+    /// Delivery mode that needs to be added to the temporary table.
+    /// </param>
+    /// <param name="_categoryRecId">
+    /// Category association that needs to be exploded to the temporary table.
+    /// </param>
+    /// <param name="_productExplodedSet">
+    /// The set of product exploded records.
+    /// </param>
+    /// <param name="_productExplodedRecordInsertList">
+    /// The collection of product exploded records that must be inserted into the database.
+    /// </param>
+    private void addCategoryToTempTable(DlvMode _dlvMode, RefRecId _categoryRecId, Set _productExplodedSet, RecordInsertList _productExplodedRecordInsertList)
+    {
+        const int CommitSize = 1000;
+        int i = 0;
+        Query           query;
+        QueryRun        productsQueryRun;
+        EcoResProduct   ecoResProduct;
+        InventTable     inventTable;
+        SetEnumerator   containedCategories;
+        RefRecId        ecoResCategoryId;
+
+        // Process all the products for this category and its sub categories
+        containedCategories = RetailCategoryContainmentLookup::findContainedCategories(_categoryRecId);
+        while (containedCategories.moveNext())
+        {
+            ecoResCategoryId = containedCategories.current();
+            // Continue only if the category is not excluded
+            if (!exclusions.isCategoryExcluded(ecoResCategoryId))
+            {
+                query = RetailGroupMemberLineQueryProvider::containedProductsQuery(ecoResCategoryId, false /*don't include SubCategories*/, _dlvMode.dataAreaId);
+                productsQueryRun = new QueryRun(query);
+
+                while (productsQueryRun.next())
+                {
+                    ecoResProduct = productsQueryRun.get(tableNum(EcoResProduct));
+                    inventTable = productsQueryRun.get(tableNum(InventTable));
+                    if (!ecoResProduct)
+                    {
+                        // The product was not found under the specified category.
+                        continue;
+                    }
+
+                    try
+                    {
+                        // this bulky operation has to be committed at some point, e.g. after 1K products
+                        if (i == 0)
+                        {
+                            ttsbegin;
+                        }
+
+                        // Add the product if it is not explicitly excluded.
+                        if (!exclusions.isProductExcluded(ecoResProduct.RecId))
+                        {
+                            this.addProductToTempTable(_dlvMode, ecoResProduct.RecId, _productExplodedSet, _productExplodedRecordInsertList, inventTable);
+                        }
+
+                        i++;
+                        if (i >= CommitSize)
+                        {
+                            ttscommit;
+                            i = 0;
+                        }
+                    }
+                    catch (Exception::UpdateConflict)
+                    {
+                        // No chance to get this, but
+                        // try to resolve update conflict
+                        if (appl.ttsLevel() == 0)
+                        {
+                            if (xSession::currentRetryCount() >= RetryNum)
+                            {
+                                throw Exception::UpdateConflictNotRecovered;
+                            }
+                            else
+                            {
+                                this.warningTimestamped("@Retail:DeliveryModeExplodeJobUpdateConflictRetryProductsAndVariants");
+                                retry;
+                            }
+                        }
+                        else
+                        {
+                            throw Exception::UpdateConflict;
+                        }
+                    }
+                    catch  // any transaction exception like Exception::Deadlock, etc will come here for retry
+                    {
+                        if (xSession::currentRetryCount() >= RetryNum)
+                        {
+                            throw error("@Retail:DeliveryModeExplodeJobFailedAtProductsAndVariants"); // non-recoverable
+                        }
+                        else
+                        {
+                            // wait 10 seconds, 50 seconds in total with retries
+                            sleep(RetryWaitTime);
+
+                            // Retry after deadlock in processing products and variants.
+                            this.warningTimestamped("@Retail:DeliveryModeExplodeJobDeadlockRetryProductsAndVariants");
+                            retry;
+                        }
+                    }
+                }
+
+                if (i > 0)
+                {
+                    // if there is anything left uncommitted in this category, commit now
+                    i = 0;
+                    ttscommit;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addCountryToTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the Country-delivery mode associations to the temporary staging explosion table.
+    /// </summary>
+    /// <param name="_dlvMode">
+    /// Delivery mode that needs to be added to the temporary table.
+    /// </param>
+    /// <param name="_countryRegion">
+    /// Country association that needs to be added to the temporary table.
+    /// </param>
+    private void addCountryToTempTable(DlvMode _dlvMode, LogisticsAddressCountryRegionId _countryRegion)
+    {
+        LogisticsAddressState logisticsAddressState;
+
+        if (!LogisticsAddressCountryRegion::exist(_countryRegion))
+        {
+            // Country doesn't exist
+            error(strFmt("@RET490083", _countryRegion, _dlvMode.Code));
+            return;
+        }
+
+        // Process if country is not already excluded
+        if (!addressExclusions.isCountryExcluded(_dlvMode.RecId, _countryRegion))
+        {
+            select firstOnly tmpAddressExploded
+            where tmpAddressExploded.DlvMode == _dlvMode.RecId
+                && tmpAddressExploded.CountryRegion == _countryRegion
+                && tmpAddressExploded.State == "";
+
+            if (!tmpAddressExploded)
+            {
+                // Insert the exploded state into temp table, if it is not already excluded
+                // and hasn't been already inserted
+                tmpAddressExploded.DlvMode = _dlvMode.RecId;
+                tmpAddressExploded.CountryRegion = _countryRegion;
+                tmpAddressExploded.State = "";
+                tmpAddressExploded.doInsert();
+            }
+
+            while select StateId from logisticsAddressState
+                where logisticsAddressState.CountryRegionId == _countryRegion
+            {
+                this.addStateToTempTable(_dlvMode, _countryRegion, logisticsAddressState.StateId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addProductToTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the product-delivery mode associations to the temporary staging explosion table.
+    /// Explodes the product to the variant level.
+    /// </summary>
+    /// <param name="_dlvMode">
+    /// Delivery mode that needs to be added to the temporary table.
+    /// </param>
+    /// <param name="_productRecId">
+    /// Product association that needs to be exploded to the temporary table.
+    /// </param>
+    /// <param name="_productExplodedSet">
+    /// The set of product exploded records.
+    /// </param>
+    /// <param name="_productExplodedRecordInsertList">
+    /// The collection of product exploded records that must be inserted into the database.
+    /// </param>
+    /// <param name="_inventTable">
+    /// Released product that needs to be exploded to the temporary table.
+    /// </param>
+    private void addProductToTempTable(DlvMode _dlvMode, RefRecId _productRecId, Set _productExplodedSet, RecordInsertList _productExplodedRecordInsertList, InventTable _inventTable = null)
+    {
+        InventTable inventTable = _inventTable;
+
+        // Stores the variants to be added for a partially excluded product.
+        Set productVariantsList = new Set(Types::Int64);
+        SetEnumerator productVariantsListEnumator;
+
+        if (!inventTable)
+        {
+            inventTable = InventTable::findByProduct(_productRecId);
+        }
+
+        if (!inventTable)
+        {
+            // Skipping as item was not released to the legal entity.
+            numItemsSkipped++;
+            return;
+        }
+
+        numItemsExploded++;
+
+        tmpProductExploded.DlvMode = _dlvMode.RecId;
+        tmpProductExploded.ItemId = inventTable.ItemId;
+
+        // Check if this product has at least one variant excluded. If so,
+        // we need to insert all variants of this product except those that
+        // have been specifically excluded.
+        try
+        {
+            if (exclusions.isProductPartiallyExcluded(_productRecId))
+            {
+                productVariantsList = this.getVariantsByItemId(inventTable.ItemId);
+                productVariantsListEnumator = productVariantsList.getEnumerator();
+                ttsbegin;
+                while (productVariantsListEnumator.moveNext())
+                {
+                    tmpProductExploded.InventDim = productVariantsListEnumator.current();
+                    this.addTmpProductExploded(_productExplodedSet, _productExplodedRecordInsertList);
+                }
+                ttscommit;
+            }
+            else
+            {
+                // Reset the variant flag to ensure we include all variants of this product.
+                tmpProductExploded.InventDim = "";
+                ttsbegin;
+                this.addTmpProductExploded(_productExplodedSet, _productExplodedRecordInsertList);
+                ttscommit;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    this.warningTimestamped("@Retail:DeliveryModeExplodeJobUpdateConflictRetryProductsAndVariants");
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch  // any transaction exception like Exception::Deadlock, etc will come here for retry
+        {
+            if (xSession::currentRetryCount() >= RetryNum)
+            {
+                throw error("@Retail:DeliveryModeExplodeJobFailedAtProductsAndVariants"); // non-recoverable
+            }
+            else
+            {
+                // wait 10 seconds, 50 seconds in total with retries
+                sleep(RetryWaitTime);
+
+                // Retry after deadlock in processing products and variants.
+                this.warningTimestamped("@Retail:DeliveryModeExplodeJobDeadlockRetryProductsAndVariants");
+                retry;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAllCategoryToTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds all category-delivery mode associations to the table once.
+    /// Explodes the category to the product/variant level.
+    /// </summary>
+    /// <param name="_categoryRecId">
+    /// Category association that needs to be exploded to the temporary table.
+    /// </param>
+    /// <param name="_productExplodedSet">
+    /// The set of product exploded records.
+    /// </param>
+    /// <param name="_productExplodedRecordInsertList">
+    /// The collection of product exploded records that must be inserted into the database.
+    /// </param>
+    private void addAllCategoryToTempTable(DlvMode _dlvMode, RefRecId _categoryRecId, Set _productExplodedSet, RecordInsertList _productExplodedRecordInsertList)
+    {
+        const int CommitSize = 1000;
+        int i = 0;
+        Query           query;
+        QueryRun        productsQueryRun;
+        EcoResProduct   ecoResProduct;
+        InventTable     inventTable;
+        SetEnumerator   containedCategories;
+        RefRecId        ecoResCategoryId;
+
+        // Process all the products for this category and its sub categories
+        containedCategories = RetailCategoryContainmentLookup::findContainedCategories(_categoryRecId);
+        while (containedCategories.moveNext())
+        {
+            ecoResCategoryId = containedCategories.current();
+
+            query = RetailGroupMemberLineQueryProvider::containedProductsQuery(ecoResCategoryId, false /*don't include SubCategories*/, _dlvMode.DataAreaId);
+            productsQueryRun = new QueryRun(query);
+
+            while (productsQueryRun.next())
+            {
+                ecoResProduct = productsQueryRun.get(tableNum(EcoResProduct));
+                inventTable = productsQueryRun.get(tableNum(InventTable));
+                if (!ecoResProduct)
+                {
+                    // The product was not found under the specified category.
+                    continue;
+                }
+
+                // this bulky operation has to be committed at some point, e.g. after 1K products
+                if (i == 0)
+                {
+                    ttsbegin;
+                }
+
+                this.addProductToTempTableOnceForAllCategories(ecoResProduct.RecId, ecoResCategoryId, _productExplodedSet, _productExplodedRecordInsertList, inventTable);
+                i++;
+
+                if (i >= CommitSize)
+                {
+                    ttscommit;
+                    i = 0;
+                }
+            }
+
+            if (i > 0)
+            {
+                // if there is anything left uncommitted in this category, commit now
+                i = 0;
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addProductToTempTableOnceForAllCategories</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the product-delivery mode associations to the temporary explosion table for all categories.
+    /// Explodes the product to the variant level.
+    /// </summary>
+    /// <param name="_productRecId">
+    /// Product association that needs to be exploded to the temporary table.
+    /// </param>
+    /// <param name="_categoryRecId">
+    /// <param name="_productExplodedSet">
+    /// The set of product exploded records.
+    /// </param>
+    /// <param name="_productExplodedRecordInsertList">
+    /// The collection of product exploded records that must be inserted into the database.
+    /// </param>
+    /// Category association that needs to be exploded to the temporary table.
+    /// </param>
+    /// <param name="_inventTable">
+    /// Released product that needs to be exploded to the temporary table.
+    /// </param>
+    private void addProductToTempTableOnceForAllCategories(RefRecId _productRecId, RefRecId _categoryRecId, Set _productExplodedSet, RecordInsertList _productExplodedRecordInsertList, InventTable _inventTable = null)
+    {
+        InventTable inventTable = _inventTable;
+
+        if (!inventTable)
+        {
+            inventTable = InventTable::findByProduct(_productRecId);
+        }
+
+        if (!inventTable)
+        {
+            // Skipping as item was not released to the legal entity.
+            numItemsSkipped++;
+            return;
+        }
+
+        numItemsExploded++;
+
+        tmpExplodeAllCategories.DlvMode = 0;
+        tmpExplodeAllCategories.ItemId = inventTable.ItemId;
+        tmpExplodeAllCategories.RefRecIdProduct = _productRecId;
+        tmpExplodeAllCategories.RefRecIdCategory = _categoryRecId;
+        tmpExplodeAllCategories.RefRecIdVariant = 0;
+
+        tmpExplodeAllCategories.InventDim = "";
+        this.addTmpProductExplodedAllCategories(_productExplodedSet, _productExplodedRecordInsertList);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addTmpProductExploded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the product-delivery mode associations records to the <c>productExplodedRecordInsertList</c> RecordInsertList.
+    /// </summary>
+    private void addTmpProductExploded(Set _productExplodedSet, RecordInsertList _productExplodedRecordInsertList)
+    {
+        if (_productExplodedSet.add([tmpProductExploded.DlvMode, tmpProductExploded.ItemId, tmpProductExploded.InventDim]))
+        {
+            _productExplodedRecordInsertList.add(tmpProductExploded);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addTmpProductExplodedAllCategories</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the product-delivery mode associations records to the <c>productExplodedAllCategoriesRecordInsertList</c> RecordInsertList.
+    /// </summary>
+    private void addTmpProductExplodedAllCategories(Set _productExplodedSet, RecordInsertList _productExplodedRecordInsertList)
+    {
+        if (_productExplodedSet.add([tmpExplodeAllCategories.DlvMode, tmpExplodeAllCategories.ItemId, tmpExplodeAllCategories.InventDim, tmpExplodeAllCategories.RefRecIdCategory, tmpExplodeAllCategories.RefRecIdProduct, tmpExplodeAllCategories.RefRecIdVariant]))
+        {
+            _productExplodedRecordInsertList.add(tmpExplodeAllCategories);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addStateToTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the Address-delivery mode associations to the temporary staging explosion table.
+    /// </summary>
+    /// <param name="_dlvMode">
+    /// Delivery mode that needs to be added to the temporary table.
+    /// </param>
+    /// <param name="_countryRegion">
+    /// Country association that needs to be added to the temporary table.
+    /// </param>
+    /// <param name="_state">
+    /// State association that needs to be added to the temporary table.
+    /// </param>
+    private void addStateToTempTable(DlvMode _dlvMode, LogisticsAddressCountryRegionId _countryRegion, AddressStateId _state)
+    {
+        if (!LogisticsAddressState::exist(_countryRegion, _state))
+        {
+            // State doesn't exist
+            error(strFmt("@RET490082", _countryRegion, _state, _dlvMode.Code));
+            return;
+        }
+
+        if (!addressExclusions.isStateExcluded(_dlvMode.RecId, _countryRegion, _state))
+        {
+            select firstOnly tmpAddressExploded
+            where tmpAddressExploded.DlvMode == _dlvMode.RecId
+                && tmpAddressExploded.CountryRegion == _countryRegion
+                && tmpAddressExploded.State == _state;
+
+            if (!tmpAddressExploded)
+            {
+                // Insert the exploded state into temp table, if it is not already excluded
+                // and hasn't been already inserted
+                tmpAddressExploded.DlvMode = _dlvMode.RecId;
+                tmpAddressExploded.CountryRegion = _countryRegion;
+                tmpAddressExploded.State = _state;
+                tmpAddressExploded.doInsert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addVariantToTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds the variant-delivery mode associations to the temporary staging explosion table.
+    /// </summary>
+    /// <param name="_dlvMode">
+    /// Delivery mode that needs to be added to the temporary table.
+    /// </param>
+    /// <param name="_variantRecId">
+    /// Variant association that needs to be added to the temporary table.
+    /// </param>
+    /// <param name="_productExplodedSet">
+    /// The set of product exploded records.
+    /// </param>
+    /// <param name="_productExplodedRecordInsertList">
+    /// The collection of product exploded records that must be inserted into the database.
+    /// </param>
+    private void addVariantToTempTable(DlvMode _dlvMode, RefRecId _variantRecId, Set _productExplodedSet, RecordInsertList _productExplodedRecordInsertList)
+    {
+        InventTable                     inventTable;
+        InventDimCombination            inventDimCombination;
+
+        inventDimCombination = InventDimCombination::findByDistinctProductVariant(_variantRecId);
+        if (!inventDimCombination)
+        {
+            // Skipping as variant was not released to this legal entity.
+            return;
+        }
+
+        inventTable = InventTable::find(inventDimCombination.ItemId);
+        if (!inventTable)
+        {
+            // Skipping as item was not released to this legal entity.
+            numItemsSkipped++;
+            return;
+        }
+
+        numItemsExploded++;
+
+        try
+        {
+            // Insert the exploded variant into temp table.
+            tmpProductExploded.DlvMode = _dlvMode.RecId;
+            tmpProductExploded.ItemId = inventDimCombination.ItemId;
+            tmpProductExploded.InventDim = inventDimCombination.InventDimId;
+            ttsbegin;
+            this.addTmpProductExploded(_productExplodedSet, _productExplodedRecordInsertList);
+            ttscommit;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    this.warningTimestamped("@Retail:DeliveryModeExplodeJobUpdateConflictRetryProductsAndVariants");
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch  // any transaction exception like Exception::Deadlock, etc will come here for retry
+        {
+            if (xSession::currentRetryCount() >= RetryNum)
+            {
+                throw error("@Retail:DeliveryModeExplodeJobFailedAtProductsAndVariants"); // non-recoverable
+            }
+            else
+            {
+                // wait 10 seconds, 50 seconds in total with retries
+                sleep(RetryWaitTime);
+
+                // Retry after deadlock in processing products and variants.
+                this.warningTimestamped("@Retail:DeliveryModeExplodeJobDeadlockRetryProductsAndVariants");
+                retry;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deltaSyncAddresses</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copies only changed records from <c>tmpRetailDlvModeAddressExploded</c> to the
+    /// <c>RetailDlvModeAddressExploded</c> table. This ensures that only the changes are
+    /// captured by the PREACTION overrides.
+    /// </summary>
+    private void deltaSyncAddresses()
+    {
+        RetailDlvModeAddressExploded    exploded;
+        int                             countRecordsVisited;
+        int                             countRecordsUpdated;
+
+        // The set of recIds to keep (we delete all others).
+        Set recordsToKeep = new Set(Types::Int64);
+
+        countRecordsVisited = 0;
+        countRecordsUpdated = 0;
+
+        using(var telemetry = RetailInstrumentationSegment::construct(classId2Name(ClassIdGet(this)), funcName()))
+        {
+            while select tmpAddressExploded
+            {
+                ++countRecordsVisited;
+                select firstOnly RecId from exploded
+                where
+                    exploded.DlvMode == tmpAddressExploded.DlvMode &&
+                    exploded.CountryRegion == tmpAddressExploded.CountryRegion &&
+                    exploded.State == tmpAddressExploded.State;
+
+                if (!exploded)
+                {
+                    // No matching record found; this is the insert case.
+                    exploded.DlvMode = tmpAddressExploded.DlvMode;
+                    exploded.CountryRegion = tmpAddressExploded.CountryRegion;
+                    exploded.State = tmpAddressExploded.State;
+                    exploded.insert();
+
+                    ++countRecordsUpdated;
+                }
+
+                recordsToKeep.add(exploded.RecId);
+            }
+
+            while select forUpdate RecId
+            from exploded
+            {
+                if (!recordsToKeep.in(exploded.RecId))
+                {
+                    ++countRecordsUpdated;
+                    exploded.delete();
+                }
+            }
+            eventSource.EventWriteOrdersDeltaSyncAddressesInfo(funcName(), countRecordsVisited, countRecordsUpdated);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deltaSyncChannels</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copies only changed records from <c>tmpRetailDlvModeChannelExploded</c> to the
+    /// <c>RetailDlvModeChannelExploded</c> table. This ensures that only the changes are
+    /// captured by the PREACTION overrides.
+    /// </summary>
+    private void deltaSyncChannels()
+    {
+        RetailDlvModeChannelExploded    exploded;
+        int                             countRecordsVisited;
+        int                             countRecordsUpdated;
+
+        // The set of recIds to keep (we delete all others).
+        Set recordsToKeep = new Set(Types::Int64);
+
+        countRecordsVisited = 0;
+        countRecordsUpdated = 0;
+
+        using(var telemetry = RetailInstrumentationSegment::construct(classId2Name(ClassIdGet(this)), funcName()))
+        {
+
+            // In-Memory tables cannot be joined in X++.
+            while select tmpChannelExploded
+            {
+                ++countRecordsVisited;
+                select firstOnly RecId from exploded
+                where
+                    exploded.DlvMode == tmpChannelExploded.DlvMode &&
+                    exploded.OMOperatingUnit == tmpChannelExploded.OMOperatingUnit;
+
+                if (!exploded)
+                {
+                    // No matching record found; this is the insert case.
+                    exploded.DlvMode = tmpChannelExploded.DlvMode;
+                    exploded.OMOperatingUnit = tmpChannelExploded.OMOperatingUnit;
+                    exploded.insert();
+
+                    ++countRecordsUpdated;
+                }
+
+                recordsToKeep.add(exploded.RecId);
+            }
+
+            while select forUpdate RecId
+            from exploded
+            {
+                if (!recordsToKeep.in(exploded.RecId))
+                {
+                    ++countRecordsUpdated;
+                    exploded.delete();
+                }
+            }
+            eventSource.EventWriteOrdersDeltaSyncChannelsInfo(funcName(), countRecordsVisited, countRecordsUpdated);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deltaSyncProductsAndVariants</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copies only changed records from <c>tmpRetailDlvModeProductExploded</c> to the
+    /// <c>RetailDlvModeProductExploded</c> table. This ensures that only the changes are
+    /// captured by the PREACTION overrides.
+    /// </summary>
+    private void deltaSyncProductsAndVariants()
+    {
+        RetailDlvModeProductExploded    exploded;
+        RetailDlvModeProductExploded    checkExploded;
+
+        using(var telemetry = RetailInstrumentationSegment::construct(classId2Name(ClassIdGet(this)), funcName()))
+        {
+            // Ensure set based operations are not downgraded to record-by-record operations
+            exploded.skipDatabaseLog(true);
+            exploded.skipEvents(true);
+
+            delete_from exploded
+            notexists join tmpProductExploded
+                where tmpProductExploded.DlvMode == exploded.DlvMode
+                    && tmpProductExploded.ItemId == exploded.ItemId
+                    && tmpProductExploded.InventDim == exploded.InventDim;
+            int64 countRecordsDeleted = exploded.RowCount();
+
+            insert_recordset exploded(DlvMode, ItemId, InventDim)
+            select DlvMode, ItemId, InventDim from tmpProductExploded
+            notexists join checkExploded
+                where checkExploded.DlvMode == tmpProductExploded.DlvMode
+                    && checkExploded.ItemId == tmpProductExploded.ItemId
+                    && checkExploded.InventDim == tmpProductExploded.InventDim;
+            int64 countRecordsInserted = exploded.RowCount();
+
+            eventSource.EventWriteOrdersDeltaSyncProductsAndVariantsInfo(funcName(), countRecordsInserted, countRecordsDeleted);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>explodeAddresses</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Explodes the Address-delivery mode associations to the temporary staging explosion table.
+    /// </summary>
+    private void explodeAddresses()
+    {
+        DlvMode                     dlvMode;
+        RetailDlvModeAddressLine    addressLine;
+
+        tmpAddressExploded.setTmp();
+
+        addressExclusions.clear();
+
+        while select dlvMode
+            join addressLine
+                order by addressLine.DlvMode, addressLine.LineType // Process Exclusions first
+                where addressLine.DlvMode == dlvMode.RecId
+        {
+            if (addressLine.LineType == RetailDlvModeExcludeIncludeType::Exclude)
+            {
+                // Populate the exclusion list
+                addressExclusions.addExclusion(addressLine.DlvMode, addressLine.CountryRegion, addressLine.State);
+            }
+            else // The address line is being included
+            {
+                if (addressLine.State)
+                {
+                    this.addStateToTempTable(dlvMode, addressLine.CountryRegion, addressLine.State);
+                }
+                else
+                {
+                    this.addCountryToTempTable(dlvMode, addressLine.CountryRegion);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>explodeChannels</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Explodes the channel associations for the delivery modes
+    /// </summary>
+    private void explodeChannels()
+    {
+        DlvMode                         dlvMode;
+        RetailDlvModeChannelLine        channel;
+
+        OMOperatingUnit                 omOperatingUnit;
+        Set                             omOperatingUnits;
+        SetEnumerator                   omOperatingUnitsEnumerator;
+
+        Set organizationTypes           = new Set(Types::Enum);
+
+        // Used to filter the organization model to include only operating units.
+        organizationTypes.add(OMInternalOrganizationType::OperatingUnit);
+
+        while select RecId
+            from dlvMode
+            join OMInternalOrganization, OMHierarchyType from channel
+                where
+                    channel.DlvMode == dlvMode.RecId
+        {
+            // Filter the organization model to include only operating units effective as of right now.
+            omOperatingUnits = OMInternalOrganization::getDescendantsAndSelf(channel.OMInternalOrganization, channel.OMHierarchyType, DateTimeUtil::utcNow(), organizationTypes);
+            omOperatingUnitsEnumerator = omOperatingUnits.getEnumerator();
+            while (omOperatingUnitsEnumerator.moveNext())
+            {
+                omOperatingUnit = OMOperatingUnit::find(omOperatingUnitsEnumerator.current(), OMOperatingUnitType::RetailChannel);
+                if (!omOperatingUnit)
+                {
+                    // The operating unit was not a retail channel. No need to explode it.
+                    continue;
+                }
+
+                // Insert the delivery mode and channel association in the temporary exploded table
+                tmpChannelExploded.DlvMode = dlvMode.RecId;
+                tmpChannelExploded.OMOperatingUnit = omOperatingUnit.RecId;
+                tmpChannelExploded.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRetailHierarchyIfExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the category RecId for highest lever of hierarchy.
+    /// </summary>
+    public static EcoResCategoryHierarchy getRetailHierarchyIfExists()
+    {
+        EcoResCategoryHierarchyRole retailHierarchyRole = EcoResCategoryHierarchyRole::getHierarchiesByRole(EcoResCategoryNamedHierarchyRole::Retail);
+
+        if (!retailHierarchyRole)
+        {
+            retailHierarchyRole = EcoResCategoryHierarchyRole::getHierarchiesByRole(EcoResCategoryNamedHierarchyRole::RetailSpecialGroup);
+        }
+
+        return EcoResCategoryHierarchy::find(retailHierarchyRole.CategoryHierarchy);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>explodeProductsAndVariants</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Explodes the products and variant associations for the delivery modes
+    /// </summary>
+    private void explodeProductsAndVariants()
+    {
+        DlvMode dlvMode;
+
+        //make sure that categories are exploded before running anything.
+        RetailCategoryContainmentLookup::synchronizeCategoriesLookup(true);
+
+        delete_from tmpExplodeAllCategories;
+
+        while select RecId
+            from dlvMode
+        {
+            // Explode the products and variants for each delivery mode.
+            this.explodeProductsAndVariantsByDlvMode(dlvMode.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>explodeProductsAndVariantsByDlvMode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Explodes the products and variant associations for delivery mode
+    /// </summary>
+    /// <param name="_dlvModeId">
+    /// The id of the delivery mode for which the products/variants associations need to be exploded.
+    /// </param>
+    private void explodeProductsAndVariantsByDlvMode(RefRecId _dlvModeId)
+    {
+        QueryRun                        queryRun;
+        DlvMode                         dlvMode;
+        RetailDlvModeProductLine        product, productLine;
+        RetailGroupMemberLine           groupMemberLine;
+
+        RefRecId                        ecoResCategoryId;
+        EcoResCategory                  ecoResCategory;
+        EcoResProduct                   ecoResProduct;
+        EcoResDistinctProductVariant    ecoResDistinctProductVariant;
+        SetEnumerator                   containedCategories;
+        EcoResCategoryHierarchy         categoryHierarchy;
+        // Stores the variants to be added for a partially excluded product.
+        InventDimCombination            inventDimCombination;
+        boolean                         isAllCategoryInDlvMode = false;
+
+        // Reset the counters.
+        numItemsExploded = 0;
+        numItemsSkipped = 0;
+        numItemsError = 0;
+        numItemsExploded2 = 0;
+        numItemsSkipped2 = 0;
+
+        delete_from exclusions;
+
+        Set productExplodedSet = new Set(Types::Container);
+        RecordInsertList productExplodedRecordInsertList = new RecordInsertList(
+            tableNum(TmpRetailDlvModeProductExploded),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpProductExploded); // buffer where records will be inserted
+
+        Set productExplodedSetStaging = new Set(Types::Container);
+        RecordInsertList productExplodedInStagingRecordInsertList = new RecordInsertList(
+            tableNum(TmpRetailDlvModeExplodeAllCategories),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpExploded); // buffer where records will be inserted
+
+        Set productExplodedSetAllCategories = new Set(Types::Container);
+        RecordInsertList productExplodedAllCategoriesRecordInsertList = new RecordInsertList(
+            tableNum(TmpRetailDlvModeExplodeAllCategories),
+            true, // skip insert
+            true, // skip database log
+            true, // skip events
+            true, // skip aos validation
+            true, // skip RLS validation
+            tmpExplodeAllCategories); // buffer where records will be inserted
+
+        EcoResCategoryHierarchy retailHierarchy = RetailDlvModeExplodeJob::getRetailHierarchyIfExists();
+
+        if (!isAllCategoriesExploded)
+        {
+            select firstonly Category, RecId from groupMemberLine
+            join ecoResCategory
+                where groupMemberLine.Category == ecoResCategory.RecId
+                && ecoResCategory.CategoryHierarchy == retailHierarchy.RecId
+                && ecoResCategory.IsActive == NoYes::Yes
+                && ecoResCategory.Level == 1; // Search for category that has the highest level in retail category hierarchy.
+   
+            if (groupMemberLine)
+            {
+                dlvMode = DlvMode::findRecId(_dlvModeId);
+                refRecIdCategory = groupMemberLine.Category;
+                this.addAllCategoryToTempTable(dlvMode, refRecIdCategory, productExplodedSetAllCategories, productExplodedAllCategoriesRecordInsertList);
+                productExplodedAllCategoriesRecordInsertList.insertDatabase();
+                isAllCategoriesExploded = true;
+            }
+        }
+
+        select firstonly Variant, RecId, Category, Product from groupMemberLine
+            join productLine
+            where groupMemberLine.RecId == productLine.RetailGroupMemberLine
+            && productLine.DlvMode == _dlvModeId
+            && groupMemberLine.Category == ecoResCategory.RecId
+            && groupMemberLine.Product == 0;
+
+        if (!isAllCategoryInDlvMode && !groupMemberLine)
+        {
+            isAllCategoryInDlvMode = true; // if current delivery mode doesn't have All categories specified in Products tab then perform earlier behaviour.
+        }
+
+        if (isAllCategoriesExploded && !isAllCategoryInDlvMode)
+        {
+            delete_from tmpExploded;
+            insert_recordset tmpExploded(DlvMode, ItemId, InventDim, RefRecIdCategory, RefRecIdProduct, RefRecIdVariant)
+                select DlvMode, ItemId, InventDim, RefRecIdCategory, RefRecIdProduct, RefRecIdVariant
+                    from tmpExplodeAllCategories; // insert products for All categories into TmpRetailDlvModeExplodeAllCategories table for manipulation.
+
+            numItemsExploded2 = numItemsExploded1;
+            numItemsSkipped2 = numItemsSkipped1;
+
+            update_recordset tmpExploded
+                setting DlvMode = _dlvModeId; // update the current delivery mode in the staging table.
+        }
+       
+        queryRun = new QueryRun(this.getDlvModeProductsQuery(_dlvModeId));
+        while (queryRun.next())
+        {
+            dlvMode = queryRun.get(tableNum(DlvMode));
+            product = queryRun.get(tableNum(RetailDlvModeProductLine));
+            groupMemberLine = queryRun.get(tableNum(RetailGroupMemberLine));
+
+            if (product.LineType == RetailDlvModeExcludeIncludeType::Exclude)
+            {
+                // Here we need to check from the bottom up (variants, products and then categories).
+                if (groupMemberLine.Variant)
+                {
+                    ecoResDistinctProductVariant = EcoResDistinctProductVariant::find(groupMemberLine.Variant);
+                    if (!ecoResDistinctProductVariant)
+                    {
+                        numItemsError++;
+                        error(strFmt("@RET261118", groupMemberLine.Variant, dlvMode.Code));
+                        continue;
+                    }
+
+                    tmpExploded = TmpRetailDlvModeExplodeAllCategories::findByProduct(tmpExploded, groupMemberLine, _dlvModeId);
+                    // If not already excluded, add the variant to the exclusion list.
+                    if (!exclusions.isVariantExcluded(ecoResDistinctProductVariant.RecId) && isAllCategoryInDlvMode)
+                    {
+                        exclusions.addVariantExclusion(ecoResDistinctProductVariant.RecId);
+
+                        // If not already included, add the product to the list of
+                        // partially excluded products. A partially excluded product
+                        // is a product which has one or more of its variants excluded.
+                        ecoResProduct = EcoResProduct::find(ecoResDistinctProductVariant.ProductMaster);
+                        if (!ecoResProduct)
+                        {
+                            numItemsError++;
+                            error(strFmt("@RET261119", groupMemberLine.Variant, dlvMode.Code, ecoResDistinctProductVariant.ProductMaster));
+                            continue;
+                        }
+
+                        if (!exclusions.isProductPartiallyExcluded(ecoResProduct.RecId))
+                        {
+                            exclusions.addPartialProductExclusion(ecoResProduct.RecId);
+                        }
+                    }
+                    else if (!tmpExploded.InventDim && tmpExploded.RefRecIdProduct && isAllCategoriesExploded && !isAllCategoryInDlvMode)
+                    {
+                        itemId = tmpExploded.ItemId;
+
+                        delete_from tmpExploded
+                            where tmpExploded.ItemId == itemId
+                            && tmpExploded.RefRecIdProduct == groupMemberLine.Product
+                            && tmpExploded.RefRecIdCategory == groupMemberLine.Category
+                            && tmpExploded.DlvMode == _dlvModeId; // delete the product and include its variant.
+
+                        numItemsExploded2--;
+
+                        // Since, All categories is included
+                        // then identify the product for which variant is excluded.
+                        // insert rest of the variants.
+                        ttsbegin;
+                        while select InventDimId, DistinctProductVariant
+                            from inventDimCombination
+                            where inventDimCombination.ItemId == itemId
+                        {
+                            if (groupMemberLine.Variant != inventDimCombination.DistinctProductVariant)
+                            {
+                                tmpExploded = TmpRetailDlvModeExplodeAllCategories::findByVariant(tmpExploded, inventDimCombination.DistinctProductVariant, groupMemberLine, _dlvModeId);
+
+                                if (!tmpExploded)
+                                {
+                                    tmpExploded.InventDim = inventDimCombination.InventDimId;
+                                    tmpExploded.ItemId = itemId;
+                                    tmpExploded.DlvMode = dlvMode.RecId;
+                                    tmpExploded.RefRecIdCategory = groupMemberLine.Category;
+                                    tmpExploded.RefRecIdProduct = groupMemberLine.Product;
+                                    tmpExploded.RefRecIdVariant = inventDimCombination.DistinctProductVariant;
+                                    productExplodedInStagingRecordInsertList.add(tmpExploded);
+                                    numItemsExploded2++;
+                                }
+                            }
+                        }
+                        productExplodedInStagingRecordInsertList.insertDatabase();
+                        productExplodedInStagingRecordInsertList = null;
+                        ttscommit;
+                    }
+                    else if (TmpRetailDlvModeExplodeAllCategories::existVariant(tmpExploded, groupMemberLine, _dlvModeId) && isAllCategoriesExploded && !isAllCategoryInDlvMode)
+                    {
+                        delete_from tmpExploded
+                            where tmpExploded.RefRecIdVariant == groupMemberLine.Variant
+                            && tmpExploded.RefRecIdProduct == groupMemberLine.Product
+                            && tmpExploded.RefRecIdCategory == groupMemberLine.Category
+                            && tmpExploded.DlvMode == _dlvModeId;
+                    }
+                }
+                else if (groupMemberLine.Product)
+                {
+                    ecoResProduct = EcoResProduct::find(groupMemberLine.Product);
+                    if (!ecoResProduct)
+                    {
+                        numItemsError++;
+                        error(strFmt("@RET261120", groupMemberLine.Product, dlvMode.Code));
+                        continue;
+                    }
+
+                    // If not already excluded, add the product to the exclusion list.
+                    if (!exclusions.isProductExcluded(ecoResProduct.RecId) && isAllCategoryInDlvMode)
+                    {
+                        exclusions.addProductExclusion(ecoResProduct.RecId);
+                    }
+                    else if (isAllCategoriesExploded && !isAllCategoryInDlvMode)
+                    {
+                        // Since, All categories have the product that needs to be excluded.
+                        // Identify the record and delete it.
+                        tmpExploded = TmpRetailDlvModeExplodeAllCategories::findByProduct(tmpExploded, groupMemberLine, _dlvModeId);
+                        if (tmpExploded)
+                        {
+                            delete_from tmpExploded
+                                    where tmpExploded.RefRecIdProduct == ecoResProduct.RecId
+                                    && tmpExploded.RefRecIdCategory == groupMemberLine.Category
+                                    && tmpExploded.DlvMode == _dlvModeId;
+
+                            numItemsExploded2--;
+                        }
+                    }
+                }
+                else if (groupMemberLine.Category)
+                {
+                    ecoResCategory = EcoResCategory::find(groupMemberLine.Category);
+                    if (!ecoResCategory)
+                    {
+                        numItemsError++;
+                        error(strFmt("@RET261121", groupMemberLine.Category, dlvMode.Code));
+                        continue;
+                    }
+
+                    // If not already excluded, add the category and all of its contained
+                    // categories to the exclusion list.
+                    containedCategories = RetailCategoryContainmentLookup::findContainedCategories(ecoResCategory.RecId);
+                    while (containedCategories.moveNext())
+                    {
+                        ecoResCategoryId = containedCategories.current();
+                        if (!exclusions.isCategoryExcluded(ecoResCategoryId) && isAllCategoryInDlvMode)
+                        {
+                            exclusions.addCategoryExclusion(ecoResCategoryId);
+                        }
+                        else if (isAllCategoriesExploded && !isAllCategoryInDlvMode)
+                        {
+                            // Since, All categories have the category that needs to be excluded.
+                            // Identify the record and delete it.
+                            tmpExploded = TmpRetailDlvModeExplodeAllCategories::findByCategory(tmpExploded, ecoResCategoryId, _dlvModeId);
+                            if (tmpExploded)
+                            {
+                                select count(RecId) from tmpExploded
+                                    where tmpExploded.RefRecIdCategory == ecoResCategoryId
+                                        && tmpExploded.DlvMode == _dlvModeId;
+
+                                numItemsExploded2 = numItemsExploded2 - tmpExploded.RecId;
+
+                                delete_from tmpExploded
+                                    where tmpExploded.RefRecIdCategory == ecoResCategoryId
+                                        && tmpExploded.DlvMode == _dlvModeId;
+                            }
+                        }
+                    }
+                }
+            }
+            else // A group member line is being included.
+            {
+                // Here we need to check from the bottom up (variants, products and then categories).
+                if (groupMemberLine.Variant)
+                {
+                    ecoResDistinctProductVariant = EcoResDistinctProductVariant::find(groupMemberLine.Variant);
+                    if (!ecoResDistinctProductVariant)
+                    {
+                        numItemsError++;
+                        error(strFmt("@RET261118", groupMemberLine.Variant, dlvMode.Code));
+                        continue;
+                    }
+
+                    ecoResProduct = EcoResProduct::find(ecoResDistinctProductVariant.ProductMaster);
+                    if (!ecoResProduct)
+                    {
+                        numItemsError++;
+                        error(strFmt("@RET261119", groupMemberLine.Variant, dlvMode.Code, ecoResDistinctProductVariant.ProductMaster));
+                        continue;
+                    }
+
+                    // If the product and variant have not been excluded, check whether the
+                    // product belongs to an excluded category.
+                    if (!exclusions.isProductExcluded(ecoResProduct.RecId) &&
+                    !exclusions.isVariantExcluded(ecoResDistinctProductVariant.RecId) && isAllCategoryInDlvMode)
+                    {
+                        if (!groupMemberLine.Category)
+                        {
+                            groupMemberLine.Category = this.getEcoResCategoryIdByProduct(groupMemberLine.Product);
+                        }
+
+                        // Find the category to check whether it has been excluded.
+                        ecoResCategory = EcoResCategory::find(groupMemberLine.Category);
+
+                        // If this product variant is not a member of an excluded category,
+                        // insert this record into the staging table.
+                        if (!exclusions.isCategoryExcluded(ecoResCategory.RecId))
+                        {
+                            this.addVariantToTempTable(dlvMode, groupMemberLine.Variant, productExplodedSet, productExplodedRecordInsertList);
+                        }
+                    }
+                }
+                else if (groupMemberLine.Product)
+                {
+                    ecoResProduct = EcoResProduct::find(groupMemberLine.Product);
+                    if (!ecoResProduct)
+                    {
+                        numItemsError++;
+                        error(strFmt("@RET261120", groupMemberLine.Product, dlvMode.Code));
+                        continue;
+                    }
+
+                    // If this product has not been excluded, check whether the product
+                    // belongs to an excluded category.
+                    if (!exclusions.isProductExcluded(ecoResProduct.RecId))
+                    {
+                        if (!groupMemberLine.Category)
+                        {
+                            groupMemberLine.Category = this.getEcoResCategoryIdByProduct(groupMemberLine.Product);
+                        }
+
+                        // Find the category to check whether it has been excluded.
+                        ecoResCategory = EcoResCategory::find(groupMemberLine.Category);
+
+                        // If this product is not a member of an excluded category,
+                        // insert this record into the staging table.
+                        if (!exclusions.isCategoryExcluded(ecoResCategory.RecId) && isAllCategoryInDlvMode)
+                        {
+                            this.addProductToTempTable(dlvMode, ecoResProduct.RecId, productExplodedSet, productExplodedRecordInsertList);
+                        }
+                    }
+                }
+                else if (groupMemberLine.Category)
+                {
+                    ecoResCategory = EcoResCategory::find(groupMemberLine.Category);
+                    if (!ecoResCategory)
+                    {
+                        numItemsError++;
+                        error(strFmt("@RET261121", groupMemberLine.Category, dlvMode.Code));
+                        continue;
+                    }
+
+                    // If the category has not been excluded, expand the node to find all products.
+                    if (!exclusions.isCategoryExcluded(ecoResCategory.RecId) && isAllCategoryInDlvMode)
+                    {
+                        this.addCategoryToTempTable(dlvMode, ecoResCategory.RecId, productExplodedSet, productExplodedRecordInsertList);
+                    }
+                    else if (isAllCategoriesExploded && !isAllCategoryInDlvMode)
+                    {
+                        // Since, All categories is already included.
+                        // Skip the condition.
+                        continue;
+                    }
+                }
+            }
+        }
+
+        try
+        {           
+
+            if (!isAllCategoryInDlvMode)
+            {
+                // Insert the staging records into TmpRetailDlvModeProductExploded table for the current delivery mode.
+                insert_recordset tmpProductExploded(DlvMode, ItemId, InventDim)
+                select DlvMode, ItemId, InventDim from tmpExploded;
+
+                numItemsExploded = numItemsExploded + numItemsExploded2;
+                numItemsSkipped = numItemsSkipped + numItemsSkipped2;
+            }
+            else
+            {
+                // flushes records to the database whenever it will speed up performance.
+                productExplodedRecordInsertList.insertDatabase();
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    this.warningTimestamped("@Retail:DeliveryModeExplodeJobUpdateConflictRetryProductsAndVariants");
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch  // any transaction exception like Exception::Deadlock, etc will come here for retry
+        {
+            if (xSession::currentRetryCount() >= RetryNum)
+            {
+                throw error("@Retail:DeliveryModeExplodeJobFailedAtProductsAndVariants"); // non-recoverable
+            }
+            else
+            {
+                // wait 10 seconds, 50 seconds in total with retries
+                sleep(RetryWaitTime);
+
+                // Retry after deadlock in processing products and variants.
+                this.warningTimestamped("@Retail:DeliveryModeExplodeJobDeadlockRetryProductsAndVariants");
+                retry;
+            }
+        }
+
+        this.infoTimestamped(strFmt("@RET261122", this.getDeliveryModeCode(_dlvModeId), numItemsExploded, numItemsSkipped, numItemsError));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDeliveryModeCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the code of the current delivery mode.
+    /// </summary>
+    /// <param name="_dlvModeId">
+    /// Id of the delivery mode.
+    /// </param>
+    /// <returns>
+    /// The code for delivery mode. If none could be found, we return the RecId.
+    /// </returns>
+    private str getDeliveryModeCode(RefRecId _dlvModeId)
+    {
+        DlvMode dlvMode;
+
+        select firstOnly Code
+            from dlvMode
+            where dlvMode.RecID == _dlvModeId;
+
+        if (!dlvMode)
+        {
+            return int642str(_dlvModeId);
+        }
+
+        return dlvMode.Code;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDlvModeProductsQuery</Name>
+				<Source><![CDATA[
+    private Query getDlvModeProductsQuery(RefRecId _dlvModeId)
+    {
+        Query                       query = new Query();
+        QueryBuildDataSource        queryBuildDataSource;
+        QueryBuildRange             queryBuildRange;
+        ;
+
+        // select from DlvMode table
+        queryBuildDataSource = query.addDataSource(tableNum(DlvMode));
+        queryBuildRange = queryBuildDataSource.addRange(fieldNum(DlvMode, RecId));
+        queryBuildRange.value(queryValue(_dlvModeId));
+
+        // join RetailDlvModeProductLine, order by line type to process excludes first
+        queryBuildDataSource = queryBuildDataSource.addDataSource(tableNum(RetailDlvModeProductLine));
+        queryBuildDataSource.relations(false);
+        queryBuildDataSource.addLink(fieldNum(DlvMode, RecId), fieldNum(RetailDlvModeProductLine, DlvMode));
+        queryBuildDataSource.addOrderByField(fieldNum(RetailDlvModeProductLine, LineType));
+
+        // join RetailGroupMemberLine
+        queryBuildDataSource = queryBuildDataSource.addDataSource(tableNum(RetailGroupMemberLine));
+        queryBuildDataSource.relations(false);
+        queryBuildDataSource.addLink(fieldNum(RetailDlvModeProductLine, RetailGroupMemberLine), fieldNum(RetailGroupMemberLine, RecId));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getEcoResCategoryIdByProduct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resolves the specified product to the category.
+    /// </summary>
+    /// <param name="_productId">
+    /// The product identifier.
+    /// </param>
+    /// <returns>
+    /// The category identifier.
+    /// </returns>
+    /// <remarks>
+    /// We assume that the product comes from the Retail category hierarchy.
+    /// </remarks>
+    private EcoResCategoryId getEcoResCategoryIdByProduct(EcoResProductRecId _productId)
+    {
+        EcoResCategoryHierarchyRole ecoResCategoryHierarchyRole;
+
+        ecoResCategoryHierarchyRole = EcoResCategoryHierarchyRole::getHierarchiesByRole(EcoResCategoryNamedHierarchyRole::Retail);
+        return EcoResProductCategory::findCategoryByProduct(_productId, ecoResCategoryHierarchyRole.CategoryHierarchy).RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getVariantsByItemId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves all variants for a specific item while respecting the exclusion rules.
+    /// </summary>
+    /// <param name="_itemId">
+    /// The ItemId for the product.
+    /// </param>
+    /// <returns>
+    /// A set of InventDimCombination.InventDimId.
+    /// </returns>
+    private Set getVariantsByItemId(ItemId _itemId)
+    {
+        InventDimCombination    inventDimCombination;
+        Set records             = new Set(Types::String);
+
+        if (_itemId)
+        {
+            while select InventDimId, DistinctProductVariant
+                from inventDimCombination
+                where
+                    inventDimCombination.ItemId == _itemId
+            {
+                if (!exclusions.isVariantExcluded(inventDimCombination.DistinctProductVariant))
+                {
+                    records.add(inventDimCombination.InventDimId);
+                }
+            }
+        }
+
+        return records;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        traceArea = 'RetailDlvModeExplodeJob';
+
+        // Explode the delivery mode and channel pairs
+        try
+        {
+            ttsBegin;
+
+            // Explode the channels to a temporary staging table.
+            this.infoTimestamped("@Retail:DeliveryModeExplodeJobExplodeChannels");
+            this.explodeChannels();
+
+            // Delta sync the exploded results for channels.
+            this.infoTimestamped("@Retail:DeliveryModeExplodeJobDeltaSyncChannels");
+            this.deltaSyncChannels();
+
+            ttsCommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            // Retry after deadlock in processing channels.
+            this.warningTimestamped("@Retail:DeliveryModeExplodeJobDeadlockRetryChannels");
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    // Retry after update conflict in processing channels.
+                    this.warningTimestamped("@Retail:DeliveryModeExplodeJobUpdateConflictRetryChannels");
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+
+        // Explode the products and variants associated with the delivery modes to a temporary staging table.
+        this.infoTimestamped("@Retail:DeliveryModeExplodeJobExplodeProductsAndVariants");
+
+        // transaction wrappers are inside, designed for batch data, since data change could be very big for commit or rollback.
+        this.explodeProductsAndVariants();
+
+        try
+        {
+            ttsBegin;
+
+            // Delta sync the exploded results for products and variants.
+            this.infoTimestamped("@Retail:DeliveryModeExplodeJobDeltaSyncProductsAndVariants");
+            this.deltaSyncProductsAndVariants();
+
+            ttsCommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            // Retry after deadlock in processing products and variants.
+            this.warningTimestamped("@Retail:DeliveryModeExplodeJobDeadlockRetryProductsAndVariants");
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    // Retry after update conflict in processing products and variants.
+                    this.warningTimestamped("@Retail:DeliveryModeExplodeJobUpdateConflictRetryProductsAndVariants");
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+
+        // Explode the Country and states associated with the delivery modes.
+        try
+        {
+            ttsBegin;
+
+            // Explode the addresses to a temporary staging table.
+            this.infoTimestamped("@Retail:DeliveryModeExplodeJobExplodeAddresses");
+            this.explodeAddresses();
+
+            // Delta sync the exploded results for addresses.
+            this.infoTimestamped("@Retail:DeliveryModeExplodeJobDeltaSyncAddresses");
+            this.deltaSyncAddresses();
+
+            ttsCommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            // Retry after deadlock in processing addresses.
+            this.warningTimestamped("@Retail:DeliveryModeExplodeJobDeadlockRetryAddresses");
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    // Retry after update conflict in processing addresses.
+                    this.warningTimestamped("@Retail:DeliveryModeExplodeJobUpdateConflictRetryAddresses");
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@RET4160584";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        RetailDlvModeExplodeJob scheduler = new RetailDlvModeExplodeJob();
+
+        if (scheduler.prompt())
+        {
+            scheduler.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>RetailDlvModeExplodeJob</c>
+    /// class can be run in a new session.
+    /// </summary>
+    /// <returns>true if the the class <c>RetailDlvModeExplodeJob</c> can
+    ///  be run in a new session; otherwise, false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>infoTimestamped</Name>
+				<Source><![CDATA[
+    private void infoTimestamped(str _message)
+    {
+        info(this.timestamp(_message));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>warningTimestamped</Name>
+				<Source><![CDATA[
+    private void warningTimestamped(str _message)
+    {
+        warning(this.timestamp(_message));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>timestamp</Name>
+				<Source><![CDATA[
+    private str timestamp(str _message)
+    {
+        return strFmt('%1 %2', DateTimeUtil::toStr(DateTimeUtil::utcNow()), _message);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

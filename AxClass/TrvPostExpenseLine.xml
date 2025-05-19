@@ -1,0 +1,764 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TrvPostExpenseLine</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class TrvPostExpenseLine
+{
+    TrvExpTrans                 trvExpTrans;
+    NumberSequenceCode          voucherSeriesCode;
+    Voucher                     voucherNumber;
+    TrvParameters               trvParameters;
+
+    TrvExpTrans                 trvExpTransNewMileageLine;
+    boolean                     isProjOpsIntegrationEnabled = ProjProjectOperationsIntegrationFeatureHelper::isFeatureEnabled();
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getLedgerVoucher</Name>
+				<Source><![CDATA[
+    private LedgerVoucher getLedgerVoucher(TrvExpTrans _trvExpTrans)
+    {
+        LedgerVoucher           ledgerVoucher;
+        LedgerVoucherObject     ledgerVoucherObject;
+
+        ledgerVoucher = LedgerVoucher::newLedgerPost(DetailSummary::Detail, SysModule::Ledger, voucherSeriesCode);
+
+        ledgerVoucherObject = LedgerVoucherObject::newVoucher(voucherNumber,
+                                                _trvExpTrans.TransDate,
+                                                SysModule::Ledger);
+
+        ledgerVoucher.addVoucher(ledgerVoucherObject);
+
+        return ledgerVoucher;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    void new(TrvExpTrans _trvExpTrans)
+    {
+        trvExpTrans = _trvExpTrans;
+
+        trvParameters = TrvParameters::find();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>post</Name>
+				<Source><![CDATA[
+    //Main posting logic
+    public boolean post()
+    {
+        boolean isPostingSuccessful = true;
+
+        // Handle the special case that the expense line is personal and paid by employee
+        if (trvParameters.PersonalPaidBy == TrvPersonalPaidBy::Employee &&
+            trvExpTrans.ExpType == TrvExpType::Personal)
+        {
+            ttsbegin;
+            this.updateExpenseStatus();
+            ttscommit;
+            return true;
+        }
+
+        isPostingSuccessful = this.validatePost();
+
+        if (isPostingSuccessful)
+        {
+            ttsbegin;
+
+            // Update Mileage Information
+            isPostingSuccessful = isPostingSuccessful && this.processMileageLines();
+
+            // Update Cash Advance
+            if (TrvExpCashAdvanceMappingHelper::isCashAdvanceMappingFeatureEnabled() && TrvExpenseHelper::isTrvApplyCashAdvanceMappingFlightEnabled())
+            {
+                isPostingSuccessful = isPostingSuccessful && this.processCashAdvanceLinesUsingMapping();
+            }
+            else
+            {
+                isPostingSuccessful = isPostingSuccessful && this.processCashAdvanceLines();
+            }
+
+            // Perform budget check again, as the mileage posting might change the expense line amount
+            isPostingSuccessful = isPostingSuccessful && trvExpTrans.validatePost();
+
+            if (isPostingSuccessful)
+            {
+                this.processTaxRecovery();
+            }
+
+            // Post SourceDocumentLine
+            isPostingSuccessful = isPostingSuccessful && this.postSourceDocumentLine();
+
+            // Update status of trvExpTrans to posted
+            isPostingSuccessful = isPostingSuccessful && this.updateExpenseStatus();
+
+            if (isPostingSuccessful)
+                ttscommit;
+            else
+                ttsabort;
+        }
+
+        this.updateExpenseReportPostedDate();
+
+        return isPostingSuccessful;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postSourceDocumentLine</Name>
+				<Source><![CDATA[
+    //Post to General Ledger
+    protected boolean postSourceDocumentLine()
+    {
+        AccountingDistribution accountingDistribution;
+
+        TrvExpTable trvExpTable;
+        TrvExpTrans trvExpTransChild;
+
+        SourceDocumentLineImplementationList sourceDocumentLineImplementationList = SourceDocumentLineImplementationList::construct();
+        boolean result = true;
+
+        #OCCRetryCount
+        NumberSeq numberSeq;
+        try
+        {
+            ttsbegin;
+            numberSeq = NumberSeq::newGetVoucherFromCode(voucherSeriesCode, NumberSeqScopeFactory::createDataAreaScope(), true);
+            voucherNumber = numberSeq.voucher();
+
+            this.postTax();
+
+            this.updateExpenseLineVoucher();
+
+            sourceDocumentLineImplementationList.addEnd(trvExpTrans);
+
+            if (trvExpTrans.LineType == TrvExpLineType::ItemizedHeader)
+            {
+                while select trvExpTransChild
+                    where trvExpTransChild.ParentRecId == trvExpTrans.RecId
+                       && (trvExpTransChild.ApprovalStatus == TrvAppStatus::Approved
+                            || trvExpTransChild.ApprovalStatus == TrvAppStatus::Ready)
+                {
+                    sourceDocumentLineImplementationList.addEnd(trvExpTransChild);
+                }
+            }
+
+            if (trvExpTransNewMileageLine)
+            {
+                sourceDocumentLineImplementationList.addEnd(trvExpTransNewMileageLine);
+            }
+
+            trvExpTable = TrvExpTable::findRecId(trvExpTrans.TrvExpTable);
+
+            this.completeSourceDocument(trvExpTable, sourceDocumentLineImplementationList, SourceDocumentAccountingStatus::Completed);
+
+            TrvPostExpenseHeader::processSubLedger(trvExpTable, voucherNumber, voucherSeriesCode);
+
+            if (trvExpTrans.isIntercompany())
+            {
+                this.processExpenseLinesProjectRevenue();
+
+                // Commit any unsaved changes to the database to avoid update conflicts ahead.
+                trvExpTrans = TrvExpTrans::find(trvExpTrans.RecId, true);
+            }
+
+            TransactionLog::create(TransactionLogType::ExpenseReport, strFmt("%1, %2", trvExpTrans.ExpNumber, trvExpTable.employeeName()));
+
+            // Added an if condtion to change the select condition for itemized header to create an audit trail.
+            if (trvExpTrans.LineType == TrvExpLineType::ItemizedHeader)
+            {
+                while select AccountingLegalEntity from accountingDistribution group by AccountingLegalEntity
+                    exists join trvExpTransChild
+                        where trvExpTransChild.ParentRecId == trvExpTrans.RecId
+                            && trvExpTransChild.SourceDocumentLine == accountingDistribution.SourceDocumentLine
+                            && accountingDistribution.AccountingLegalEntity != CompanyInfo::current()
+                            && (trvExpTransChild.ApprovalStatus == TrvAppStatus::Approved
+                            || trvExpTransChild.ApprovalStatus == TrvAppStatus::Ready)
+                {
+                    changecompany(CompanyInfo::findRecId(accountingDistribution.AccountingLegalEntity).DataArea)
+                    {
+                        TransactionLog::create(TransactionLogType::ExpenseReport, strFmt("%1, %2", trvExpTrans.ExpNumber, trvExpTable.employeeName()));
+                    }
+                }
+            }
+            else
+            {
+                while select AccountingLegalEntity from accountingDistribution group by AccountingLegalEntity
+                    where accountingDistribution.SourceDocumentLine == trvExpTrans.SourceDocumentLine
+                    && accountingDistribution.AccountingLegalEntity != CompanyInfo::current()
+                {
+                    changecompany(CompanyInfo::findRecId(accountingDistribution.AccountingLegalEntity).DataArea)
+                    {
+                        TransactionLog::create(TransactionLogType::ExpenseReport, strFmt("%1, %2", trvExpTrans.ExpNumber, trvExpTable.employeeName()));
+                    }
+                }
+            }
+
+            numberSeq.used();
+
+            ttscommit;
+
+            result = true;
+            info(strFmt("@SYS328581",trvExpTrans.ExpNumber,voucherNumber));
+        }
+        catch (Exception::Warning)
+        {
+            ttsabort;
+
+            if (numberSeq)
+            {
+                numberSeq.abort();
+            }
+
+            if (xSession::currentRetryCount() < #RetryNum)
+            {
+                retry;
+            }
+            else
+            {
+                result = false;
+                throw Exception::Warning;
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>completeSourceDocument</Name>
+				<Source><![CDATA[
+    private void completeSourceDocument(SourceDocumentHeaderImplementation _sourceDocumentHeaderImplementation,
+                                        SourceDocumentLineImplementationList _sourceDocumentLineImplementationList,
+                                        SourceDocumentAccountingStatus _targetAccountingStatus)
+    {
+        const SourceDocumentProcessorCaller nullCaller = null;
+        const boolean updateImplementationFalse = false;
+        const boolean transitionToCompletedStateAccountFullyQualifiedValidationTrue = true;
+
+        SourceDocumentProcessorFacade::submitSourceDocumentImplementation(_sourceDocumentHeaderImplementation,
+                                                                          updateImplementationFalse,
+                                                                          _targetAccountingStatus,
+                                                                          nullCaller,
+                                                                          curUserId(),
+                                                                          transitionToCompletedStateAccountFullyQualifiedValidationTrue,
+                                                                          _sourceDocumentLineImplementationList);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postTax</Name>
+				<Source><![CDATA[
+    private void postTax()
+    {
+        TaxPost                     taxPost;
+        TrvTaxDocumentExpense       trvTaxDocumentExpense;
+        TrvExpTrans                 trvExpTransChild;
+        LedgerVoucher               ledgerVoucher;
+
+        if (trvExpTrans.LineType == TrvExpLineType::ItemizedHeader)
+        {
+            while select trvExpTransChild where trvExpTransChild.ParentRecId == trvExpTrans.RecId
+            {
+                trvTaxDocumentExpense = TrvTaxDocumentExpense::newTrvExpTrans(trvExpTransChild);
+
+                taxPost = TaxPost::newForSourceType(TaxSourceType::Expense, trvTaxDocumentExpense, true);
+
+                ledgerVoucher = this.getLedgerVoucher(trvExpTransChild);
+
+                taxPost.updateAndPost(LedgerPostingController::newForLedgerPostingJournal(ledgerVoucher));
+            }
+        }
+        else if (trvExpTrans.TaxGroup !='' && trvExpTrans.TaxItemGroup != '')
+        {
+            trvTaxDocumentExpense = TrvTaxDocumentExpense::newTrvExpTrans(trvExpTrans);
+
+            ledgerVoucher = this.getLedgerVoucher(trvExpTrans);
+
+            taxPost = TaxPost::newForSourceType(TaxSourceType::Expense, trvTaxDocumentExpense, true);
+            taxPost.updateAndPost(LedgerPostingController::newForLedgerPostingJournal(ledgerVoucher));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCashAdvanceLinesUsingMapping</Name>
+				<Source><![CDATA[
+    protected boolean processCashAdvanceLinesUsingMapping()
+    {
+        TrvCashAdvance trvCashAdvanceLocal;
+        TrvExpCashAdvanceMapping trvExpCashAdvanceMapping;
+
+        while select forupdate trvCashAdvanceLocal
+            join trvExpCashAdvanceMapping
+            where trvCashAdvanceLocal.RecId == trvExpCashAdvanceMapping.CashAdvanceRecId
+               && trvExpCashAdvanceMapping.ExpLineRecId == trvExpTrans.RecId
+        {
+            trvCashAdvanceLocal.deductBalanceMST(trvExpCashAdvanceMapping.AmountMST);
+            trvCashAdvanceLocal.doUpdate();
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCashAdvanceLines</Name>
+				<Source><![CDATA[
+    //update balance of Cash Advance, mapped to trvexptrans
+    protected boolean processCashAdvanceLines()
+    {
+        TrvAccountingDistribution   trvAccountingDistribution;
+        TrvAccountingDistribution   trvTaxAccountingDistribution;
+        SourceDocumentHeader        sourceDocumentHeader;
+        AccountingDistribution      accountingDistribution;
+        AccountingDistribution      taxAccountingDistribution;
+
+        // reduce cash advance balance for amount used in distributions
+        while select CashAdvance, AdvanceAmountMST, RecId, AccountingDistribution
+            from trvAccountingDistribution
+            where trvAccountingDistribution.FullySplit == NoYes::Yes
+        join RecId, SourceDocumentLine from accountingDistribution
+            where accountingDistribution.RecId == trvAccountingDistribution.AccountingDistribution
+                && accountingDistribution.SourceDocumentLine == trvExpTrans.SourceDocumentLine
+        join RecId from sourceDocumentHeader
+            where accountingDistribution.SourceDocumentHeader == sourceDocumentHeader.RecId
+        {
+            // account for child distributions (i.e. taxes)
+            select sum(AdvanceAmountMST) from trvTaxAccountingDistribution
+            where trvTaxAccountingDistribution.FullySplit == NoYes::Yes
+                join RecId, ParentDistribution, SourceDocumentLine from taxAccountingDistribution
+            where taxAccountingDistribution.RecId == trvTaxAccountingDistribution.AccountingDistribution
+                && taxAccountingDistribution.SourceDocumentLine == trvExpTrans.SourceDocumentLine
+                && (taxAccountingDistribution.ParentDistribution == trvAccountingDistribution.AccountingDistribution || taxAccountingDistribution.ParentDistribution == 0)
+                join RecId from sourceDocumentHeader
+                    where accountingDistribution.SourceDocumentHeader == sourceDocumentHeader.RecId;
+
+            this.deductFromCashAdvanceBalance(trvAccountingDistribution, trvTaxAccountingDistribution.AdvanceAmountMST);
+
+            if (trvExpTrans.TaxIncluded == NoYes::Yes)
+            {
+                TrvTaxUncommittedDistributionView trvTaxUncommittedDistributionView;
+                TrvAccountingDistribution trvTaxAccDistribution;
+
+                select AdvanceAmountMST, CashAdvance, AccountingDistribution from trvTaxAccDistribution
+                    where trvTaxAccDistribution.FullySplit == NoYes::Yes
+                join ParentDistribution from trvTaxUncommittedDistributionView
+                    where trvTaxUncommittedDistributionView.ParentDistribution == trvAccountingDistribution.AccountingDistribution
+                join RecId, ParentDistribution from taxAccountingDistribution
+                    where taxAccountingDistribution.RecId == trvTaxAccDistribution.AccountingDistribution
+                        && taxAccountingDistribution.ParentDistribution == trvTaxUncommittedDistributionView.ParentDistribution;
+
+                this.deductFromCashAdvanceBalance(trvTaxAccDistribution, 0);
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deductFromCashAdvanceBalance</Name>
+				<Source><![CDATA[
+    private void deductFromCashAdvanceBalance(TrvAccountingDistribution _trvAccountingDistribution, AmountMST _advanceAmountMST)
+    {
+        ttsbegin;
+        TrvCashAdvance trvCashAdvance = TrvCashAdvance::findRecId(_trvAccountingDistribution.CashAdvance, true);
+        AmountMST oldBalanceMST = trvCashAdvance.BalanceMST;
+        if (trvCashAdvance.RecId && oldBalanceMST > 0)
+        {
+            AmountMST reductionAmount = (_trvAccountingDistribution.AdvanceAmountMST + _advanceAmountMST);
+
+            if (reductionAmount > oldBalanceMST)
+            {
+                trvCashAdvance.BalanceMST = 0.0;
+                trvCashAdvance.Balance = 0.0;
+            }
+            else
+            {
+                trvCashAdvance.BalanceMST -= reductionAmount;
+                AmountCur calculatedBalance = ((trvCashAdvance.Balance / oldBalanceMST) * trvCashAdvance.BalanceMST);
+                trvCashAdvance.Balance = CurrencyExchange::round(calculatedBalance, trvCashAdvance.CurrencyCode);
+            }
+
+            trvCashAdvance.doUpdate();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processMileageLines</Name>
+				<Source><![CDATA[
+    protected boolean processMileageLines()
+    {
+        if (trvExpTrans.ExpType == TrvExpType::Transport)
+        {
+            TrvPost::updateAllMileageLines(tableNum(TrvExpTrans),'', trvExpTrans.RecId);
+
+            select forupdate trvExpTransNewMileageLine
+                    where trvExpTransNewMileageLine.ParentRecId == trvExpTrans.RecId;
+
+            //If new new mileage line is created, trvExpTrans is updated. Re-select trvExpTrans in that case
+            if (trvExpTransNewMileageLine)
+            {
+                trvExpTrans = TrvExpTrans::find(trvExpTrans.RecId, true);
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTaxRecovery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates tax recovery records for the expense transaction.
+    /// </summary>
+    void processTaxRecovery()
+    {
+        TrvExpSubCategory   trvExpSubCategory;
+        TrvExpTrans         trvExpTransChild;
+
+        // persists tax recovery
+        if (TrvParametersTableHelper::isTaxRecoveryEnabled(trvParameters))
+        {
+            if (trvExpTrans.ExpType != TrvExpType::Advance &&
+                trvExpTrans.ExpType != TrvExpType::Personal)
+            {
+                if (trvExpTrans.LineType == TrvExpLineType::ItemizedHeader)
+                {
+                    while select trvExpTransChild where trvExpTransChild.ParentRecId == trvExpTrans.RecId
+                    {
+                        select firstonly RecId from trvExpSubCategory where trvExpSubCategory.RecId == trvExpTransChild.SubCategoryRecId;
+
+                        if (!(trvExpSubCategory.RecId && trvExpSubCategory.excludeFromRecovery()))
+                        {
+                            TrvPost::createTaxRecoveryItem(trvExpTransChild);
+                        }
+                    }
+                }
+                else
+                {
+                    if (trvExpTrans.LineType == TrvExpLineType::ItemizedLine)
+                    {
+                        select firstonly RecId from trvExpSubCategory where trvExpSubCategory.RecId == trvExpTrans.SubCategoryRecId;
+                    }
+
+                    if (!(trvExpSubCategory.RecId && trvExpSubCategory.excludeFromRecovery()))
+                    {
+                        TrvPost::createTaxRecoveryItem(trvExpTrans);
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processExpenseLinesProjectRevenue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process expense lines project revenue
+    /// </summary>
+    private void processExpenseLinesProjectRevenue()
+    {
+        ProjectRevenueHeader                 revenueHeader;
+        Map                                  amountPerCurrency;
+        Amount                               amount;
+        ProjIntercompanyInvoiceOrigExpense   expense;
+        TrvExpTable                          trvExpTable;
+        ProjIntercompanyParameters           interParam;
+
+        ttsbegin;
+
+        trvExpTable = TrvExpTable::find(trvExpTrans.ExpNumber);
+
+        amountPerCurrency = new Map(Types::String, Types::Container);
+        if (trvExpTrans.InterCompanyLE != '' &&
+            trvExpTrans.InterCompanyLE != trvExpTrans.ReferenceDataAreaId &&
+            trvExpTrans.ProjId != '')
+        {
+            select firstOnly  RecId from interParam
+            where interParam.BorrowingLegalEntity == trvExpTrans.InterCompanyLE &&
+                interParam.WIPRevenue == true;
+
+            if (interParam.RecId)
+            {
+                TransDate transDate = TrvExpenseTransHelper::getUpdatedAccountingDate(trvExpTrans.RecId);
+                expense = ProjIntercompanyInvoiceOrigExpense::construct(trvExpTrans);
+
+                if (amountPerCurrency.exists(expense.getCurrencyCode()))
+                {
+                    amount = amountPerCurrency.lookup(expense.getCurrencyCode());
+                }
+                else
+                {
+                    amount = 0;
+                }
+
+                amount += expense.getAmountCur();
+                if (amount != 0)
+                {
+                    amountPerCurrency.insert(expense.getCurrencyCode(), [amount, transDate, trvExpTrans.TableId, trvExpTrans.RecId]);
+                }
+            }
+        }
+
+        revenueHeader = TrvPostExpenseHeader::processProjectRevenue(amountPerCurrency, trvExpTable);
+        if (revenueHeader && !(ProjOpsIntegrationExpenseDisableWIPFlight::instance().isEnabled() && 
+            isProjOpsIntegrationEnabled))
+        {
+            SourceDocumentProcessorFacade::submitSourceDocumentImplementation(revenueHeader, false, SourceDocumentAccountingStatus::Completed);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExpenseLineVoucher</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the expense line with posting details i.e. Voucher, Post account, Post account type
+    /// </summary>
+    /// <returns>true</returns>
+    protected boolean updateExpenseLineVoucher()
+    {
+        TrvExpTrans trvExpTransChild;
+        container                       postAccountDetails;
+        LedgerJournalAcType             accountType;
+        LedgerJournalAC                 accountNumber;
+
+        // Get the expense line posting account & posting account type details
+        postAccountDetails = TrvPostExpenseHeader::getExpenseLinePostAccountDetails(trvExpTrans);
+        accountType = conPeek(postAccountDetails, 1);
+        accountNumber = conPeek(postAccountDetails, 2);
+
+        if (trvExpTrans.LineType == TrvExpLineType::ItemizedHeader)
+        {
+            trvExpTransChild.skipDataMethods(true);
+            update_recordset trvExpTransChild
+            setting
+                Voucher = voucherNumber, PostAccountType = accountType, PostAccount = accountNumber
+            where trvExpTransChild.ParentRecId == trvExpTrans.RecId;
+        }
+
+        if (trvExpTransNewMileageLine)
+        {
+            trvExpTransNewMileageLine.skipDataMethods(true);
+            trvExpTransNewMileageLine.Voucher = voucherNumber;
+            trvExpTransNewMileageLine.PostAccountType = accountType;
+            trvExpTransNewMileageLine.PostAccount = accountNumber;
+            trvExpTransNewMileageLine.doUpdate();
+        }
+
+        trvExpTrans.reread();
+        trvExpTrans.skipDataMethods(true);
+        trvExpTrans.Voucher = voucherNumber;
+        trvExpTrans.PostAccountType = accountType;
+        trvExpTrans.PostAccount = accountNumber;
+        trvExpTrans.doUpdate();
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExpenseStatus</Name>
+				<Source><![CDATA[
+    protected boolean updateExpenseStatus()
+    {
+        TrvExpTrans trvExpTransChild;
+
+        if (trvExpTrans.LineType == TrvExpLineType::ItemizedHeader)
+        {
+            trvExpTransChild.skipDataMethods(true);
+            update_recordset trvExpTransChild
+                setting
+                    ApprovalStatus = TrvAppStatus::Ledger
+                where trvExpTransChild.ParentRecId == trvExpTrans.RecId
+                   && (trvExpTransChild.ApprovalStatus == TrvAppStatus::Approved
+                   || trvExpTransChild.ApprovalStatus == TrvAppStatus::Ready);
+        }
+
+        if (trvExpTransNewMileageLine)
+        {
+            trvExpTransNewMileageLine.skipDataMethods(true);
+            trvExpTransNewMileageLine.ApprovalStatus = TrvAppStatus::Ledger;
+            // parentRecid field is set in tvrPost.updateAllMileageLines for reference used in initOriginSourceDocumentLineItem
+            // clear it after successful posting
+            trvExpTransNewMileageLine.ParentRecId = 0;
+
+            if (isProjOpsIntegrationEnabled) //doUpdate will not trigger Business Event which is needed for integration to work
+            {
+                trvExpTransNewMileageLine.update(false); 
+            }
+            else
+            {
+                trvExpTransNewMileageLine.doUpdate();
+            }
+        }
+
+        trvExpTrans.ApprovalStatus = TrvAppStatus::Ledger;
+
+        if (isProjOpsIntegrationEnabled) //doUpdate will not trigger Business Event which is needed for integration to work
+        {
+            trvExpTrans.skipDataMethods(true);
+            trvExpTrans.update(false); 
+        }
+        else
+        {
+            trvExpTrans.doUpdate(); 
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validatePost</Name>
+				<Source><![CDATA[
+    //Check whether trvExpTrans is valid to post
+    protected boolean validatePost()
+    {
+        TrvPayMethod            trvPayMethod;
+        boolean 		        isValidToPost = true;
+        TrvExpTrans             trvExpTransChild;
+        NumberSequenceReference numberSequenceReference;
+
+        if (!trvExpTrans)
+        {
+            return false;
+        }
+
+        if (trvExpTrans.ApprovalStatus != TrvAppStatus::Ready && trvExpTrans.ApprovalStatus != TrvAppStatus::Approved)
+        {
+            return false;
+        }
+
+        if (TrvRemoveExtraSDLForExpenseReportFlight::instance().isEnabled())
+        {
+            TrvExpTable::checkAndRemoveExtraSDL(TrvExpTable::findRecId(trvExpTrans.TrvExpTable).SourceDocumentHeader);
+        }
+
+        numberSequenceReference = TrvParameters::numRefExpenseVoucher();
+
+        if (numberSequenceReference.RecId == 0)
+        {
+            error("@SYS305186");
+            return false;
+        }
+        voucherSeriesCode = numberSequenceReference.numberSequenceTable().NumberSequence;
+
+        Debug::assert(voucherSeriesCode != '');
+
+        //check paymethod offset account setting
+        if (trvExpTrans.LineType == TrvExpLineType::ItemizedHeader)
+        {
+            while select RecId from trvPayMethod where
+                (trvPayMethod.PostMethod == TrvPostMethod::None ||
+                (trvPayMethod.PostMethod != TrvPostMethod::None &&
+                            trvPayMethod.PostMethod != TrvPostMethod::Employee && trvPayMethod.OffsetLedgerDimension==0))
+                exists join trvExpTransChild
+                where trvExpTransChild.PayMethod == trvPayMethod.PayMethod
+                && trvExpTransChild.ParentRecId == trvExpTrans.RecId
+            {
+                error(strFmt("@Expense:PostExpensePayMethodError",trvPayMethod.PayMethod));
+                isValidToPost = false;
+            }
+        }
+        else
+        {
+            trvPayMethod = TrvPayMethod::find(trvExpTrans.PayMethod);
+
+            if (trvPayMethod.PostMethod == TrvPostMethod::None ||
+                (trvPayMethod.PostMethod != TrvPostMethod::None && trvPayMethod.PostMethod != TrvPostMethod::Employee && trvPayMethod.OffsetLedgerDimension==0))
+            {
+                error(strFmt("@Expense:PostExpensePayMethodError",trvPayMethod.PayMethod));
+                isValidToPost = false;
+            }
+        }
+
+        if (trvExpTrans.ProjId)
+        {
+            ProjTable projTable;
+            ProjectAccountingDistribution projectAccountingDistribution;
+            AccountingDistribution accountingDistribution;
+        
+            RecId sourceDocLine = trvExpTrans.SourceDocumentLine;
+
+            select RecId from accountingDistribution
+                where accountingDistribution.SourceDocumentLine == sourceDocLine;
+
+            select RecId from projectAccountingDistribution
+            where projectAccountingDistribution.AccountingDistribution == accountingDistribution.RecId;
+
+            select firstonly DataAreaId from ProjTable
+                where projTable.ProjId == trvExpTrans.ProjId;
+
+            if (projectAccountingDistribution.RecId == 0 && accountingDistribution.RecId != 0 && projTable.DataAreaId == trvExpTrans.InterCompanyLE && TrvProjDistributionValidationFeature::isEnabled())
+            {
+                error(strFmt("@SYS11217",trvExpTrans.ProjId));
+                return false;
+            }
+        }
+
+        return isValidToPost;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExpenseReportPostedDate</Name>
+				<Source><![CDATA[
+    protected void updateExpenseReportPostedDate()
+    {
+        TrvExpTrans trvExpTransCheckApprovalStatus;
+        ttsbegin;
+        
+        select firstonly trvExpTransCheckApprovalStatus where
+            trvExpTransCheckApprovalStatus.ExpNumber == trvExpTrans.ExpNumber &&
+            trvExpTransCheckApprovalStatus.ApprovalStatus != TrvAppStatus::Ledger;
+
+        if (trvExpTransCheckApprovalStatus == null)
+        {
+            TrvExpTable trvExpTable;
+
+            select forupdate trvExpTable
+                where trvExpTable.ExpNumber == trvExpTrans.ExpNumber;
+            
+            trvExpTable.PostedDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            TrvExpTable.update();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

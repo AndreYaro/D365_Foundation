@@ -1,0 +1,887 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSLoadLineAllocationProcessor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WHSLoadLineAllocationProcessor</c> is responsible for running work allocation logic for load lines during wave processing.
+/// </summary>
+class WHSLoadLineAllocationProcessor
+{
+    protected WHSWorkCreateWave        workCreate;
+    protected WHSParameters            whsParameters;
+    protected InventParameters         inventParameters;
+    protected int					   allocatedLines = 0;
+
+    // Parameters
+    protected WHSWaveId                waveId;
+    protected WHSWorkCreateId          workCreateId;
+    protected WHSWorkTransType         workTransType;
+    protected WHSReleaseToWarehouseId  releaseToWarehouseId;
+    protected boolean                  hasReplenishmentStep;
+    protected WHSWaveExecutionID       waveExecutionId;
+    protected boolean                  mustLockOnAllocationCriteria;
+    private WHSWaveMethodStatusHandler waveMethodStatusHandler;
+    private WHSInstrumentationLogger   logger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createQualityOrders</Name>
+				<Source><![CDATA[
+    protected void createQualityOrders(
+        WHSTmpWorkLine  _tmpWorkLine,
+        Qty             _qtyToCreateWorkFor)
+    {
+        if (inventParameters.UseQualityManagement
+            &&  _tmpWorkLine.WorkTransType == WHSWorkTransType::Sales)
+        {
+            Set qualityOrdersBefore = this.getExistingQualityOrdersForSalesLine(_tmpWorkLine.InventTransId, _tmpWorkLine.OrderNum);
+
+            this.setValueInCache(WHSLoadLineAllocationProcessor::transactionScopeCacheKey(_tmpWorkLine.InventTransId, _tmpWorkLine.DataAreaId), _tmpWorkLine.InventDimId);
+            
+            WHSWorkQualityOrderCreator::construct().createQualityOrderForShippingWork(_tmpWorkLine.WorkTransType, _tmpWorkLine.InventTransId, _qtyToCreateWorkFor);
+
+            this.removeValueInCache(WHSLoadLineAllocationProcessor::transactionScopeCacheKey(_tmpWorkLine.InventTransId, _tmpWorkLine.DataAreaId));
+
+            Set qualityOrdersAfter = this.getExistingQualityOrdersForSalesLine(_tmpWorkLine.InventTransId, _tmpWorkLine.OrderNum);
+
+            if (!qualityOrdersAfter.empty())
+            {
+                this.trackNewQualityOrders(Set::difference(qualityOrdersAfter, qualityOrdersBefore));
+            }
+        }    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allocatedLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the number of load lines that were allocated.
+    /// </summary>
+    /// <returns>Number of load lines that were allocated.</returns>
+	internal int allocatedLoadLines()
+    {
+        return allocatedLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allocateLoadLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initiates <c>WHSTmpWorkLine</c> creation for the allocation process of a load line.
+    /// </summary>
+    /// <param name="_shipmentTable">
+    /// The shipment table related to the current allocation being run.
+    /// </param>
+    /// <param name="_loadLine">
+    /// The load line being allocated.
+    /// </param>
+    /// <param name="_waveTable">
+    /// The wave table currently being processed.
+    /// </param>
+    /// <param name="_workCreateId">
+    /// The work create Id which identifies this run of work creation for the wave.
+    /// </param>
+    private void allocateLoadLine(
+        WHSShipmentTable    _shipmentTable,
+        WHSLoadLine         _loadLine,
+        WHSWaveTable        _waveTable,
+        WHSWorkCreateId     _workCreateId)
+    {
+        WHSTmpWorkLine      tmpWorkLine;
+        boolean             lockAcquired;
+
+        using (var waveLockManager = WHSWaveLockManager::newStandard())
+        using (var appInsightsActivity = WHSLoadLineAllocationAllocateLoadLineApplicationInsightsActivity::newFromParameters(_loadLine.ItemId, _shipmentTable.ShipmentId, _loadLine.LoadId, _loadLine.OrderNum))
+        using (var loadLineAllocationProcessorActivityContext = logger.loadLineAllocationProcessorActivities().loadLineAllocationProcessorAllocateLoadLine())
+        {
+            logger.logRecordInformation(_shipmentTable);
+            logger.logRecordInformation(_loadLine);
+
+            if (mustLockOnAllocationCriteria)
+            {
+                lockAcquired = waveLockManager.tryLockForItemDemandWaveAllocation(_loadLine.ItemId,
+                                                                                _loadLine.InventDimId,
+                                                                                _waveTable.WaveId,
+                                                                                whsParameters.WaveLockWait);
+            }
+
+            if (!mustLockOnAllocationCriteria || lockAcquired)
+            {
+                ttsBegin;
+
+                this.initializeWorkCreateWave(_waveTable, _workCreateId);
+
+                workCreate.validateLoadLine(_loadLine);
+
+                // Proceed with creation of tmpWorkLines
+                var inventTable = InventTable::find(_loadLine.ItemId);
+                
+                tmpWorkLine = this.initializeTmpWorkLine(_shipmentTable, _loadLine, _waveTable);
+                tmpWorkLine.WorkCreateId = _workCreateId;
+                
+                if (this.validateBatchDisposition(inventTable, tmpWorkLine))
+                {
+                    Qty qtyToCreateWorkFor = this.calculateQtyDemandForWork(_loadLine, tmpWorkLine);
+
+                    this.createQualityOrders(tmpWorkLine, qtyToCreateWorkFor);
+                    
+                    if (inventTable.ItemType != ItemType::Service
+                    &&  WHSInventEnabled::exist(inventTable.ItemId))
+                    {
+                        Qty workCreatedQty = this.createTmpWorkLine(tmpWorkLine, inventTable, qtyToCreateWorkFor);
+
+                        WHSWaveUpdatedLoadLine::trackDeltaQuantitiesSkipWorkCreatedAdjustment(waveId, _loadLine.RecId, workCreatedQty);
+                    }
+                    else
+                    {
+                        this.allocateLoadLineForServiceAndNonWhsEnabledItems(_loadLine);
+                    }
+                }
+
+                // If we took a lock during this method we must also release it this method.
+                if (mustLockOnAllocationCriteria)
+                {
+                    waveLockManager.releaseForItemDemandWaveAllocation(_loadLine.ItemId, _loadLine.InventDimId);
+                }
+
+                ttsCommit;
+            }
+            else
+            {
+                throw error(strFmt("@WAX:WaveAllocationLockFailureError", _loadLine.ItemId, _loadLine.InventDimId, InventDim::find(_loadLine.InventDimId).preFix(), whsParameters.WaveLockWait));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allocateLoadLineForServiceAndNonWhsEnabledItems</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute, Replaceable(true)]
+    protected void allocateLoadLineForServiceAndNonWhsEnabledItems(WHSLoadLine _loadLine)
+    {
+        // Service items and non-WHS controlled items do not get processed through work so we automatically update
+        // the load line to be finished processing by setting work created qty and picked qty equal to the load line invent qty.
+        _loadLine.WorkCreatedQty = _loadLine.InventQty;
+        _loadLine.PickedQty      = _loadLine.InventQty;
+        _loadLine.update();
+
+        WHSWaveUpdatedLoadLine::trackDeltaQuantities(waveId, _loadLine.RecId, _loadLine.InventQty, _loadLine.InventQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTmpWorkLine</Name>
+				<Source><![CDATA[
+    private Qty createTmpWorkLine(WHSTmpWorkLine _tmpWorkLine, InventTable _inventTable, WHSInventQty _qtyToCreateWorkFor)
+    {
+        Qty workCreatedQty;
+
+        if (WHSReservationHierarchyElementPolicyProvider::singleton().isFlexibleReservationEnabled(_inventTable.whsReservationHierarchy()))
+        {
+            
+            Qty				orderCommittedQtyTotal;
+            Qty             remainingQtyToCreateWorkFor = _qtyToCreateWorkFor;
+
+            MapEnumerator	enumerator = WHSOrderCommittedReservationFacade::createOrderCommittedReservationMap(_tmpWorkLine.InventTransId, _tmpWorkLine.InventDimId, _inventTable).getEnumerator();
+
+            while (enumerator.moveNext())
+            {
+                if (remainingQtyToCreateWorkFor == 0)
+                {
+                    break;
+                }
+
+                InventQty		orderCommittedQty = enumerator.currentValue();
+
+                WHSTmpWorkLine  tmpWorkLineOrderCommitted;
+
+                buf2Buf(_tmpWorkLine, tmpWorkLineOrderCommitted);
+
+                tmpWorkLineOrderCommitted.OrderCommittedInventDimId = enumerator.currentKey();
+
+                tmpWorkLineOrderCommitted.initOrderCommittedDimensions();
+                
+                if (this.validateBatchDisposition(_inventTable, tmpWorkLineOrderCommitted))
+                {
+                    WHSInventQty processQty = min(remainingQtyToCreateWorkFor, orderCommittedQty);
+
+                    workCreate.parmTmpWorkLine(tmpWorkLineOrderCommitted);
+                    workCreate.createTempLine(tmpWorkLineOrderCommitted, processQty);
+
+                    workCreatedQty += workCreate.parmWorkCreatedQty();
+                    remainingQtyToCreateWorkFor -= processQty;
+                }
+            }
+
+            if (workCreatedQty > 0)
+            {
+                WHSInstrumentationLogger::createLogger('WHSOrderCommittedReserve').logInformation('WHSOrderCommittedReserve. Load line allocation process creates work line with flexible dimension reservation');
+            }
+
+            if (remainingQtyToCreateWorkFor)
+            {
+                workCreate.parmTmpWorkLine(_tmpWorkLine);
+                workCreate.createTempLine(_tmpWorkLine, remainingQtyToCreateWorkFor);
+
+                workCreatedQty += workCreate.parmWorkCreatedQty();
+            }
+        }
+        else
+        {
+            workCreate.parmTmpWorkLine(_tmpWorkLine);
+            workCreate.createTempLine(_tmpWorkLine, _qtyToCreateWorkFor);
+
+            workCreatedQty = workCreate.parmWorkCreatedQty();
+        }
+
+        return workCreatedQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeTmpWorkLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>WHSTmpWorkLine</c> tmpWorkLine.
+    /// </summary>
+    /// <param name = "_shipmentTable">The <c>WHSShipmentTable</c> record related to the current allocation being run.</param>
+    /// <param name = "_loadLine">The <c>WHSLoadLine</c> record being allocated.</param>
+    /// <param name = "_waveTable">The <c>WHSWaveTable</c> record currently being processed.</param>
+    /// <returns>
+    /// The initialized <c>WHSTmpWorkLine</c> record.
+    /// </returns>
+    protected WHSTmpWorkLine initializeTmpWorkLine(WHSShipmentTable    _shipmentTable,
+                                                   WHSLoadLine         _loadLine,
+                                                   WHSWaveTable        _waveTable)
+    {
+        WHSTmpWorkLine tmpWorkLine;
+
+        tmpWorkLine.WorkType                = WHSWorkType::Pick;
+        tmpWorkLine.OriginType              = WHSOriginType::Wave;
+        tmpWorkLine.OriginRefId             = _waveTable.WaveId;
+        tmpWorkLine.WaveAttributeCode       = _waveTable.WaveAttributeCode;
+        tmpWorkLine.WaveId                  = _waveTable.WaveId;
+        tmpWorkLine.InventLocationId        = _waveTable.InventLocationId;
+        tmpWorkLine.RefTableId              = tableNum(WHSLoadLine);
+        tmpWorkLine.RefRecId                = _loadLine.RecId;
+        tmpWorkLine.OrderNum                = _loadLine.OrderNum;
+        tmpWorkLine.InventTransId           = _loadLine.InventTransId;
+        tmpWorkLine.InventDimId             = _loadLine.InventDimId;
+        tmpWorkLine.ItemId                  = _loadLine.ItemId;
+        tmpWorkLine.ShipmentId              = _loadLine.ShipmentId;
+        tmpWorkLine.loadLineRefRecId        = _loadLine.RecId;
+        tmpWorkLine.PackingQty              = _loadLine.PackingQty;
+        tmpWorkLine.LoadId                  = _loadLine.LoadId;
+        tmpWorkLine.CarrierCode             = _shipmentTable.CarrierCode;
+        tmpWorkLine.CarrierServiceCode      = _shipmentTable.CarrierServiceCode;
+        tmpWorkLine.ModeCode                = _shipmentTable.ModeCode;
+        tmpWorkLine.WorkTransType           = _shipmentTable.WorkTransType;
+        tmpWorkLine.CustVendAC              = _loadLine.displayCustAccount();
+        tmpWorkLine.ToWarehouse             = this.getTransferOrderReceiptWarehouse(tmpWorkLine.WorkTransType, _loadLine);
+
+        return tmpWorkLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allocateLoadLinesByAllocationCriteria</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes load lines for allocation based on the given criteria.
+    /// </summary>
+    /// <param name="_itemId">
+    /// The itemId of the load lines to process.
+    /// </param>
+    /// <param name="_inventDimId">
+    /// The inventDimId of the load lines to process.
+    /// </param>
+    /// <param name="_waveTable">
+    /// The wave table that is currently being processed.
+    /// </param>
+    public void allocateLoadLinesByAllocationCriteria(
+        ItemId          _itemId,
+        InventDimId     _inventDimId,
+        WHSWaveTable    _waveTable)
+    {
+        WHSShipmentTable	shipmentTable;
+        WHSLoadLine         loadLine;
+
+        allocatedLines = 0;
+
+        ttsBegin;
+
+        // Loop over load lines that do not have work created for the full amount
+        // Load lines must match the specified allocation criteria
+        // ItemId and InventDimId could be blank if we are only allocating by wave criteria.
+        SysDaSearchObject searchObject = new SysDaSearchObject(WHSLoadLineAllocationSysDaBuilder::buildQueryForAllocationByCriteria(loadLine, shipmentTable, _itemId, _inventDimId, _waveTable));
+        SysDaSearchStatement searchStatement = new SysDaSearchStatement();
+
+        while (searchStatement.findNext(searchObject))
+        {
+            this.allocateLoadLine(shipmentTable, loadLine, _waveTable, workCreateId);
+            ++allocatedLines;
+            WHSWaveMethodStatusHandler::makeOneStepForward(waveMethodStatusHandler);
+        }
+
+        ttsCommit;
+	}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allocateLoadLinesByWave</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes allocation for all load lines on the wave.
+    /// </summary>
+    /// <param name="_waveTable">
+    /// The shipping wave table that is currently being processed for allocation.
+    /// </param>
+    public void allocateLoadLinesByWave(
+        WHSWaveTable    _waveTable)
+    {
+        this.allocateLoadLinesByAllocationCriteria('', '', _waveTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateQtyDemandForWork</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calulates the quantity demanded for work creation.
+    /// </summary>
+    /// <param name="_loadLine">
+    /// The loadLine representing the initial demand.
+    /// </param>
+    /// <param name="_tmpWorkLine">
+    /// The <c>WHSTmpWorkLine</c> being created during allocation.
+    /// </param>
+    /// <returns>
+    /// The quantity in the inventory unit which work should be created for.
+    /// </returns>
+    private InventQty calculateQtyDemandForWork(
+        WHSLoadLine     _loadLine,
+        WHSTmpWorkLine  _tmpWorkLine)
+    {
+        InventQty workQtyDemand, qtyNotPhysicallyReserved;
+
+        [workQtyDemand, qtyNotPhysicallyReserved] = _loadLine.calculateQtyDemandForWorkAndQtyNotPhysRes();
+
+        if (qtyNotPhysicallyReserved)
+        {
+            WHSWorkCreateHistory::createWorkHistoryLineFromTmpWorkLine(workCreate.parmWorkCreateId(), "@WAX4686", true, _tmpWorkLine);
+        }
+
+        return workQtyDemand;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getExistingQualityOrdersForSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a set of quality order Ids that exist for the sales line being processed.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// The inventTransId of the sales line.
+    /// </param>
+    /// <param name="_salesId">
+    /// The salesId of the sales line.
+    /// </param>
+    /// <returns>
+    /// A set of quality order Ids.
+    /// </returns>
+    private Set getExistingQualityOrdersForSalesLine(
+        InventTransId  _inventTransId,
+        SalesId        _salesId)
+    {
+        InventQualityOrderTable qualityOrder;
+        Set                     qoSet= new Set(Types::String);
+
+        while select QualityOrderId from qualityOrder
+            where qualityOrder.ReferenceType    == InventTestReferenceType::Sales
+            &&    qualityOrder.InventRefTransId == _inventTransId
+            &&    qualityOrder.InventRefId == _salesId
+        {
+            qoSet.add(qualityOrder.QualityOrderId);
+        }
+
+        return qoSet;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransferOrderReceiptWarehouse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the receipt warehouse Id of the transfer order.
+    /// </summary>
+    /// <param name="_workTransType">
+    /// The workTransType of the shipment.
+    /// </param>
+    /// <param name="_loadLine">
+    /// The loadLine being processed.
+    /// </param>
+    /// <returns>
+    /// The InventLocationId of the receipt warehouse of the transfer order.
+    /// </returns>
+    /// <remarks>
+    /// The warehouse is also validated before it is returned.
+    /// </remarks>
+    private InventLocationid getTransferOrderReceiptWarehouse(
+        WHSWorkTransType    _workTransType,
+        WHSLoadLine         _loadLine)
+    {
+        InventLocationId    receiptWarehouseId;
+
+        if (_workTransType == WHSWorkTransType::TransferIssue)
+        {
+            InventTransferLine inventTransferLine = _loadLine.getOrderCommonFromLoadLine() as InventTransferLine;
+            receiptWarehouseId                    = inventTransferLine.inventTransferTable().InventLocationIdTo;
+            this.validateTransferOrderReceiptWarehouse(receiptWarehouseId);
+        }
+
+        return receiptWarehouseId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeWorkCreateWave</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the work create wave instance.
+    /// </summary>
+    /// <param name="_waveTable">
+    /// The wave being processed to initialize from.
+    /// </param>
+    /// <param name="_workCreateId">
+    /// The work created Id for this instance of work creation.
+    /// </param>
+    protected void initializeWorkCreateWave(
+        WHSWaveTable    _waveTable,
+        WHSWorkCreateId _workCreateId)
+    {
+        if (workCreate == null)
+        {
+            workCreate = new WHSWorkCreateWaveShipping(_waveTable, _workCreateId);
+            workCreate.parmWorkTransType(workTransType);
+            workCreate.parmReleaseToWarehouseId(releaseToWarehouseId);
+            workCreate.parmHasReplen(hasReplenishmentStep);
+            workCreate.parmWaveExecutionId(waveExecutionId);
+            workCreate.parmParmWaveId(_waveTable.WaveId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    private void new()
+    {
+        whsParameters = WHSParameters::find();
+        inventParameters = InventParameters::find();
+
+        logger = WHSInstrumentationLogger::instance(classStr(WHSWavePendingAllocationProcessor));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmHasReplenishmentStep</Name>
+				<Source><![CDATA[
+    public boolean parmHasReplenishmentStep(boolean _hasReplenishmentStep = hasReplenishmentStep)
+    {
+        hasReplenishmentStep = _hasReplenishmentStep;
+
+        return hasReplenishmentStep;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmMustLockOnAllocationCriteria</Name>
+				<Source><![CDATA[
+    public boolean parmMustLockOnAllocationCriteria(boolean _mustLockOnAllocationCriteria = mustLockOnAllocationCriteria)
+    {
+        mustLockOnAllocationCriteria = _mustLockOnAllocationCriteria;
+
+        return mustLockOnAllocationCriteria;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReleaseToWarehouseId</Name>
+				<Source><![CDATA[
+    public WHSReleaseToWarehouseId parmReleaseToWarehouseId(WHSReleaseToWarehouseId _releaseToWarehouseId = releaseToWarehouseId)
+    {
+        releaseToWarehouseId = _releaseToWarehouseId;
+
+        return releaseToWarehouseId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWaveExecutionId</Name>
+				<Source><![CDATA[
+    public WHSWaveExecutionID parmWaveExecutionId(WHSWaveExecutionID _waveExecutionId = waveExecutionId)
+    {
+        waveExecutionId = _waveExecutionId;
+
+        return waveExecutionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWaveId</Name>
+				<Source><![CDATA[
+    public WHSWaveId parmWaveId(WHSWaveId _waveId = waveId)
+    {
+        waveId = _waveId;
+
+        return waveId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWorkCreateId</Name>
+				<Source><![CDATA[
+    public WHSWorkCreateId parmWorkCreateId(WHSWorkCreateId _workCreateId = workCreateId)
+    {
+        workCreateId = _workCreateId;
+
+        return workCreateId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWorkTransType</Name>
+				<Source><![CDATA[
+    public WHSWorkTransType parmWorkTransType(WHSWorkTransType _workTransType = workTransType)
+    {
+        workTransType = _workTransType;
+
+        return workTransType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>trackNewQualityOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Tracks the newly created quality order from this wave run.
+    /// </summary>
+    /// <param name="_newQualityOrders">
+    /// A set with the newly created quality order Ids.
+    /// </param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void trackNewQualityOrders(Set _newQualityOrders)
+    {
+        WHSWaveCreatedQualityOrder  waveCreatedQualityOrder;
+
+        SetEnumerator se = _newQualityOrders.getEnumerator();
+
+        while (se.moveNext())
+        {
+            // Add Quality order to tracking table
+            waveCreatedQualityOrder.clear();
+            waveCreatedQualityOrder.WaveId = waveId;
+            waveCreatedQualityOrder.InventQualityOrderId = se.current();
+            if (!waveCreatedQualityOrder.validateWrite())
+            {
+                throw error(strFmt("@WAX:WHSCannotInsertRecordInTable", tablePName(WHSWaveCreatedQualityOrder)));
+            }
+            else
+            {
+                waveCreatedQualityOrder.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateBatchDisposition</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the batch disposition code will allow the processing of work.
+    /// </summary>
+    /// <param name="_inventTable">
+    /// The <c>InventTable</c> related to the batch.
+    /// </param>
+    /// <param name="_tmpWorkLine">
+    /// The <c>WHSTmpWorkLine</c> being created during allocation which holds inventDim.
+    /// </param>
+    /// <returns>
+    /// true, if batch does not need to be validated or the batch disposition allows for work processing; otherwise, false.
+    /// </returns>
+    protected boolean validateBatchDisposition(
+        InventTable         _inventTable,
+        WHSTmpWorkLine      _tmpWorkLine)
+    {
+        boolean ret = true;
+
+        if (WHSReservationHierarchyInventDimUtil::isBatchAboveLocation(_inventTable))
+        {
+            ret = this.validateBatchDispositionByInventDimId(_inventTable, _tmpWorkLine, _tmpWorkLine.InventDimId);
+        }
+		else if (_tmpWorkLine.OrderCommittedInventDimId)
+        {
+            ret = this.validateBatchDispositionByInventDimId(_inventTable, _tmpWorkLine, _tmpWorkLine.OrderCommittedInventDimId);
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateBatchDispositionByInventDimId</Name>
+				<Source><![CDATA[
+    private boolean validateBatchDispositionByInventDimId(InventTable _inventTable, WHSTmpWorkLine _tmpWorkLine, InventDimId _inventDimId)
+    {
+        boolean			ret = true;
+		InventBatchId	inventBatchId = InventDim::find(_inventDimId).inventBatchId;
+
+        // Validate that the selected batch does not contain a disposition code making it unavailable for picking.
+		if (!InventBatch::find(inventBatchId, _inventTable.ItemId).validateBatchDispCodeForPicking(_tmpWorkLine.WorkTransType))
+        {
+            WHSWorkCreateHistory::createWorkHistoryLineFromTmpWorkLine(_tmpWorkLine.WorkCreateId, strFmt("@WAX5580", inventBatchId), true, _tmpWorkLine);
+            ret = checkFailed(strFmt("@WAX5580", inventBatchId));
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateTransferOrderReceiptWarehouse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the receipt warehouse of the transfer order has the necessary setup.
+    /// </summary>
+    /// <param name="_receiptWarehouse">
+    /// The InventLocationId of the receipt warehouse.
+    /// </param>
+    /// <exception cref="Exception::Error">
+    /// Throws and error if the receipt warehouse does not have default receipt location set.
+    /// </exception>
+    private void validateTransferOrderReceiptWarehouse(InventLocationId _receiptWarehouse)
+    {
+        InventLocation inventLocation = InventLocation::find(_receiptWarehouse);
+
+        if (inventLocation.WHSEnabled
+            && !inventLocation.wmsLocationIdDefaultReceipt)
+        {
+            error(strFmt("@WAX4668", _receiptWarehouse));
+            throw error("@WAX4673");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static WHSLoadLineAllocationProcessor construct()
+    {
+        return new WHSLoadLineAllocationProcessor();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromPendingAllocationProcessor</Name>
+				<Source><![CDATA[
+    public static WHSLoadLineAllocationProcessor newFromPendingAllocationProcessor(WHSWavePendingAllocationProcessor _pendingAllocationProcessor)
+    {
+        if (_pendingAllocationProcessor == null)
+        {
+            throw error(error::wrongUseOfFunction(funcName()));
+        }
+
+        WHSLoadLineAllocationProcessor loadLineAllocationProcessor = WHSLoadLineAllocationProcessor::construct();
+
+        loadLineAllocationProcessor.parmHasReplenishmentStep(_pendingAllocationProcessor.parmHasReplenishmentStep());
+        loadLineAllocationProcessor.parmReleaseToWarehouseId(_pendingAllocationProcessor.parmReleaseToWarehouseId());
+        loadLineAllocationProcessor.parmWaveExecutionId(_pendingAllocationProcessor.parmWaveExecutionId());
+        loadLineAllocationProcessor.parmWaveId(_pendingAllocationProcessor.parmWaveId());
+        loadLineAllocationProcessor.parmWorkCreateId(_pendingAllocationProcessor.parmWorkCreateId());
+        loadLineAllocationProcessor.parmWorkTransType(_pendingAllocationProcessor.parmWorkTransType());
+        // When coming from a pending allocation processor we do not need to create locks because they are handled externally.
+        loadLineAllocationProcessor.parmMustLockOnAllocationCriteria(false);
+
+        return loadLineAllocationProcessor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromPostEngineAndWorkCreateId</Name>
+				<Source><![CDATA[
+    public static WHSLoadLineAllocationProcessor newFromPostEngineAndWorkCreateId(
+        WHSPostEngine   _postEngine,
+        WHSWorkCreateId _workCreateId)
+    {
+        WHSLoadLineAllocationProcessor loadLineAllocationProcessor = WHSLoadLineAllocationProcessor::construct();
+        loadLineAllocationProcessor.parmWaveId(_postEngine.parmWaveTable().WaveId);
+        loadLineAllocationProcessor.parmWorkTransType(WHSWaveTable::getWorkTransType(_postEngine.parmWaveTable().WaveId));
+        loadLineAllocationProcessor.parmReleaseToWarehouseId(_postEngine.parmReleaseToWarehouseId());
+        loadLineAllocationProcessor.parmHasReplenishmentStep(_postEngine.parmWaveTable().waveTemplate().hasReplenishmentStep());
+        loadLineAllocationProcessor.parmWaveExecutionId(_postEngine.parmWaveExecutionId());
+        loadLineAllocationProcessor.parmWorkCreateId(_workCreateId);
+        // When not coming from the pending allocation processor we need to create SQL locks as we process each load line
+        loadLineAllocationProcessor.parmMustLockOnAllocationCriteria(true);
+
+        return loadLineAllocationProcessor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWaveMethodStatusHandler</Name>
+				<Source><![CDATA[
+    public final WHSWaveMethodStatusHandler parmWaveMethodStatusHandler(WHSWaveMethodStatusHandler _waveMethodStatusHandler = waveMethodStatusHandler)
+    {
+        waveMethodStatusHandler = _waveMethodStatusHandler;
+
+        return waveMethodStatusHandler;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setValueInCache</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set value into transaction scope cache.
+    /// </summary>
+    /// <param name="_transactionScopeCacheKey">
+    ///    The transaction scope cache key value.
+    /// </param>
+    ///  <param name="_cacheValue">
+    ///    The related inventDimId value.
+    /// </param>
+    private void setValueInCache(str _transactionScopeCacheKey, inventDimId _cacheValue)
+    {
+        SysGlobalCache transactionCache = appl.transactionScope().parmTransactionScopeCache();
+        if (!transactionCache.isSet(WHSLoadLineAllocationProcessor::cacheOwner(), _transactionScopeCacheKey))
+        {
+            transactionCache.set(WHSLoadLineAllocationProcessor::cacheOwner(), _transactionScopeCacheKey, _cacheValue);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeValueInCache</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Remove cache value according to transaction scope key
+    /// </summary>
+    /// <param name="_transactionScopeCacheKey">
+    ///    The transaction scope cache key value.
+    /// </param>
+    private void removeValueInCache(str _transactionScopeCacheKey)
+    {
+        SysGlobalCache transactionCache = appl.transactionScope().parmTransactionScopeCache();
+        if (transactionCache.isSet(WHSLoadLineAllocationProcessor::cacheOwner(), _transactionScopeCacheKey))
+        {
+            transactionCache.remove(WHSLoadLineAllocationProcessor::cacheOwner(), _transactionScopeCacheKey);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getValueFromCache</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Get <c>InventDimId</c> value which will be used as query constraints to pick correct transaction and dimension.
+    /// </summary>
+    /// <param name="_transactionScopeCacheKey">
+    ///    The transaction scope cache key string value.
+    /// </param>
+    internal static InventDimId getValueFromCache(str _transactionScopeCacheKey)
+    {
+        SysTransactionScope transactionScope = appl.transactionScope();
+		if (!transactionScope)
+        {
+            return "";
+        }
+		else
+        {
+            SysGlobalCache transactionCache = transactionScope.parmTransactionScopeCache();
+
+            return transactionCache.get(WHSLoadLineAllocationProcessor::cacheOwner(), _transactionScopeCacheKey, "");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transactionScopeCacheKey</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the transaction scope cache key.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// The inventTransId from <c>WHSLoadLine</c> buffer.
+    /// </param>
+    /// <param name="_dataareaId">
+    /// Current lengal entity.
+    /// </param>
+    /// <returns>
+    /// A string value contains the transaction scope cache key.
+    /// </returns>
+    [Hookable(false)]
+    static str transactionScopeCacheKey(InventTransId _inventTransId, DataareaId _dataareaId=curext())
+    {
+        return strFmt("%1#%2", _inventTransId, _dataareaId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cacheOwner</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates cache owner string.
+    /// </summary>
+    /// <returns>
+    /// A string value represents cache owner.
+    /// </returns>
+    [Hookable(false)]
+	internal static str cacheOwner()
+    {
+        return classStr(WHSLoadLineAllocationProcessor);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

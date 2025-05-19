@@ -1,0 +1,394 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventTransArchivingReverse_Restore</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class InventTransArchivingReverse_Restore extends InventTransArchivingReverse implements BatchRetryable
+{
+    private InventInstrumentationLogger logger;
+    private Map itemIdTransDateToTransOriginRecIdMap;
+    private InventTransArchiveSqlStatementHelper sqlStatementHelper;
+    private boolean isSQLStatementHelperFlightEnabled;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static InventTransArchivingReverse_Restore construct()
+    {
+        return new InventTransArchivingReverse_Restore();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void execute()
+    {
+        isSQLStatementHelperFlightEnabled = InventTransArchiveRestoreSQLStatementHelperFlight::instance().isEnabled();
+
+        InventTransArchiveTask inventTransArchiveTask;
+
+        logger = InventInstrumentationLogger::createLogger(classStr(InventTransArchivingReverse_Restore));
+        using (var activityContext = logger.inventTransArchivingReverse_Restore().logMeasure(funcName()))
+        {
+            do 
+            {
+                connection = new UserConnection();
+                connection.ttsbegin();
+
+                inventTransArchiveTask = InventTransArchiveTask::getNextTask(inventTransArchiveTable.SessionId, connection);
+                if (!inventTransArchiveTask.RecId)
+                {
+                    connection.ttsabort();
+                }
+                else
+                {
+                    inventTransArchiveTask.InventTransArchiveState = InventTransArchiveState::Processing;
+                    inventTransArchiveTask.update();
+                    InventTable inventTable = InventTable::find(inventTransArchiveTask.ItemId);
+
+                    logger.inventTransArchivingReverse_Restore().logArchiveTaskReverseStartDetail(activityContext, inventTransArchiveTask, inventTable.RecId);
+
+                    this.restoreArchivedInventTrans(reverseInventTransArchiveTable.SessionId, inventTransArchiveTask.ItemId, inventTransArchiveTask.InventDimId);
+
+                    this.cleanupRestoredInventTransArchive(reverseInventTransArchiveTable.SessionId, inventTransArchiveTask.ItemId, inventTransArchiveTask.InventDimId);
+
+                    if (!itemIdTransDateToTransOriginRecIdMap)
+                    {
+                        itemIdTransDateToTransOriginRecIdMap = new Map(Types::String, Types::Int64);
+                    }
+
+                    this.cleanupConsolidateInventTransForArchivedTransactionV2(
+                        reverseInventTransArchiveTable.EndDateOfClosedPeriod,
+                        inventTransArchiveTask.ItemId);
+                
+                    if (!inventTransArchiveTask.selectForUpdate())
+                    {
+                        inventTransArchiveTask.selectForUpdate(true);
+                    }
+
+                    inventTransArchiveTask.doDelete();
+                    connection.ttscommit();
+                    logger.inventTransArchivingReverse_Restore().logArchiveTaskReverseFinishDetail(activityContext, inventTransArchiveTask, inventTable.RecId);
+                }
+
+                connection.finalize();
+                connection = null;
+
+            } while (inventTransArchiveTask.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>restoreArchivedInventTrans</Name>
+				<Source><![CDATA[
+    private void restoreArchivedInventTrans(SysGuidString _sessionId, ItemId _itemId, InventDimId _inventDimId)
+    {
+        using (var activityContext = logger.inventTransArchivingReverse_Restore().logMeasure(funcName()))
+        {
+            str sqlStatement;
+            if (isSQLStatementHelperFlightEnabled)
+            {
+                if (!sqlStatementHelper)
+                {
+                    sqlStatementHelper = InventTransArchiveSqlStatementHelper::contruct();
+                }
+                sqlStatement = sqlStatementHelper.buildReverseArchivedInventTransactionsStatement(_sessionId, _itemId, _inventDimId);
+            }
+            else
+            {
+                sqlStatement = InventTransArchiveSqlStatementHelper::contruct().buildReverseArchivedInventTransactionsStatement(_sessionId, _itemId, _inventDimId);
+            }
+
+            Statement statement = connection.createStatement();
+            new SqlStatementExecutePermission(sqlStatement).assert();
+            statement.executeUpdateWithParameters(sqlStatement, SqlParams::create());
+            // the permissions needs to be reverted back to original condition.
+            CodeAccessPermission::revertAssert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanupRestoredInventTransArchive</Name>
+				<Source><![CDATA[
+    private void cleanupRestoredInventTransArchive(SysGuidString _sessionId, ItemId _itemId, InventDimId _inventDimId)
+    {
+        using (var activityContext = logger.inventTransArchivingReverse_Restore().logMeasure(funcName()))
+        {
+            InventTransArchive inventTransArchive;
+            inventTransArchive.skipDatabaseLog(true);
+            inventTransArchive.skipEvents(true);
+            inventTransArchive.skipDeleteMethod(true);
+
+            inventTransArchive.setConnection(connection);
+            delete_from inventTransArchive
+                where inventTransArchive.SessionId    == reverseInventTransArchiveTable.SessionId
+                    && inventTransArchive.ItemId      == _itemId
+                    && inventTransArchive.InventDimId == _inventDimId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateConsolidateInventTransForArchivedTransaction</Name>
+				<Source><![CDATA[
+    private boolean validateConsolidateInventTransForArchivedTransaction(TransDate _dateFinancial, ItemId _itemId, InventDimId _inventDimId)
+    {
+        InventTrans       consolidateInventTrans;
+        InventTransOrigin inventTransOriginArchive;
+
+        using (var activityContext = logger.inventTransArchivingReverse_Restore().logMeasure(funcName()))
+        {
+            // Is consolidation inventTrans marked
+            select firstonly RecId from consolidateInventTrans
+            where consolidateInventTrans.DateFinancial == _dateFinancial
+               && consolidateInventTrans.ItemId        == _itemId
+               && consolidateInventTrans.InventDimId   == _inventDimId
+               && consolidateInventTrans.MarkingRefInventTransOrigin
+            exists join inventTransOriginArchive
+            where (inventTransOriginArchive.ReferenceCategory   == InventTransType::InventTransArchive
+                  || inventTransOriginArchive.ReferenceCategory == InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow)
+               && inventTransOriginArchive.RecId                == consolidateInventTrans.inventTransOrigin;
+
+            if (consolidateInventTrans.RecId)
+            {
+                return checkFailed(strFmt("@SCM:ConsolidationTransIsMarked",
+                                _itemId,
+                                _inventDimId,
+                                _dateFinancial));
+            }
+
+            // Is consolidation inventTrans revaluated
+            InventSettlement inventSettlement;
+            select firstonly RecId from consolidateInventTrans
+            where consolidateInventTrans.DateFinancial == _dateFinancial
+               && consolidateInventTrans.ItemId        == _itemId
+               && consolidateInventTrans.InventDimId   == _inventDimId
+            exists join inventTransOriginArchive
+            where (inventTransOriginArchive.ReferenceCategory    == InventTransType::InventTransArchive
+                   || inventTransOriginArchive.ReferenceCategory == InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow)
+               && inventTransOriginArchive.RecId                 == consolidateInventTrans.inventTransOrigin
+            exists join inventSettlement
+            where inventSettlement.TransRecId == consolidateInventTrans.RecId
+               && inventSettlement.Cancelled  == NoYes::No;
+
+            if (consolidateInventTrans.RecId)
+            {
+                return checkFailed(strFmt("@SCM:ConsolidationTransIsRevaluated",
+                                _itemId,
+                                _inventDimId,
+                                _dateFinancial));
+            }
+      
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanupConsolidateInventTransForArchivedTransaction</Name>
+				<Source><![CDATA[
+    private void cleanupConsolidateInventTransForArchivedTransaction(TransDate _dateFinancial, ItemId _itemId, InventDimId _inventDimId)
+    {
+        InventTrans       consolidateInventTrans;
+        InventTransOrigin inventTransOriginArchive;
+
+        TmpRecIdFilter tmpRecIdFilter;
+
+        using (var activityContext = logger.inventTransArchivingReverse_Restore().logMeasure(funcName()))
+        {
+            tmpRecIdFilter.setConnection(connection);
+
+            boolean isWHSItem = WHSInventEnabled::exist(_itemId);
+
+            // Store the Record Id of archive inventTransOrigin that will be deleted later
+            if (isWHSItem)
+            {
+                insert_recordset tmpRecIdFilter (RefRecId)
+                    select RecId from inventTransOriginArchive
+                        where inventTransOriginArchive.ReferenceCategory == InventTransType::InventTransArchive
+                           || inventTransOriginArchive.ReferenceCategory == InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow
+                        exists join consolidateInventTrans
+                        where consolidateInventTrans.inventTransOrigin == inventTransOriginArchive.RecId
+                           && consolidateInventTrans.DateFinancial     == _dateFinancial
+                           && consolidateInventTrans.ItemId            == _itemId
+                           && consolidateInventTrans.InventDimId       == _inventDimId;
+            }
+            else
+            {
+                insert_recordset tmpRecIdFilter (RefRecId)
+                    select RecId from inventTransOriginArchive
+                        where inventTransOriginArchive.ReferenceCategory == InventTransType::InventTransArchive
+                        exists join consolidateInventTrans
+                        where consolidateInventTrans.inventTransOrigin == inventTransOriginArchive.RecId
+                           && consolidateInventTrans.DateFinancial     == _dateFinancial
+                           && consolidateInventTrans.ItemId            == _itemId
+                           && consolidateInventTrans.InventDimId       == _inventDimId;
+            }
+
+            consolidateInventTrans.setConnection(connection);
+            consolidateInventTrans.skipDatabaseLog(true);
+            consolidateInventTrans.skipEvents(true);
+            consolidateInventTrans.skipDeleteMethod(true);
+            consolidateInventTrans.skipDeleteActions(true);
+
+            str mapKey = _itemId + '#' + int642Str(tmpRecIdFilter.RefRecId);
+
+            if (isWHSItem)
+            {
+                delete_from consolidateInventTrans
+                    where consolidateInventTrans.DateFinancial == _dateFinancial
+                       && consolidateInventTrans.ItemId        == _itemId
+                       && consolidateInventTrans.InventDimId   == _inventDimId
+                    exists join inventTransOriginArchive
+                    where inventTransOriginArchive.RecId                 == consolidateInventTrans.inventTransOrigin
+                       && (inventTransOriginArchive.ReferenceCategory    == InventTransType::InventTransArchive
+                        || inventTransOriginArchive.ReferenceCategory    == InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow);
+            }
+            else
+            {
+                delete_from consolidateInventTrans
+                where consolidateInventTrans.DateFinancial == _dateFinancial
+                   && consolidateInventTrans.ItemId        == _itemId
+                   && consolidateInventTrans.InventDimId   == _inventDimId
+                exists join inventTransOriginArchive
+                where inventTransOriginArchive.ReferenceCategory == InventTransType::InventTransArchive
+                   && inventTransOriginArchive.RecId             == consolidateInventTrans.inventTransOrigin;
+            }
+        
+            inventTransOriginArchive.setConnection(connection);
+            inventTransOriginArchive.skipDatabaseLog(true);
+            inventTransOriginArchive.skipEvents(true);
+            inventTransOriginArchive.skipDeleteMethod(true);
+            inventTransOriginArchive.skipDeleteActions(true);
+
+            delete_from inventTransOriginArchive
+                exists join tmpRecIdFilter
+                where inventTransOriginArchive.RecId == tmpRecIdFilter.RefRecId;
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanupConsolidateInventTransForArchivedTransactionV2</Name>
+				<Source><![CDATA[
+    private void cleanupConsolidateInventTransForArchivedTransactionV2(TransDate _dateFinancial, ItemId _itemId)
+    {
+        InventTrans       consolidateInventTrans;
+        InventTransOrigin inventTransOriginArchive;
+
+        TmpRecIdFilter tmpRecIdFilter;
+
+        using (var activityContext = logger.inventTransArchivingReverse_Restore().logMeasure(funcName()))
+        {
+            tmpRecIdFilter.setConnection(connection);
+
+            boolean isWHSItem = WHSInventEnabled::exist(_itemId);
+
+            // Store the Record Id of archive inventTransOrigin that will be deleted later
+            if (isWHSItem)
+            {
+                insert_recordset tmpRecIdFilter (RefRecId)
+                    select RecId from inventTransOriginArchive
+                        where inventTransOriginArchive.ReferenceCategory == InventTransType::InventTransArchive
+                           || inventTransOriginArchive.ReferenceCategory == InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow
+                        exists join consolidateInventTrans
+                        where consolidateInventTrans.inventTransOrigin == inventTransOriginArchive.RecId
+                           && consolidateInventTrans.DateFinancial     == _dateFinancial
+                           && consolidateInventTrans.ItemId            == _itemId;
+            }
+            else
+            {
+                insert_recordset tmpRecIdFilter (RefRecId)
+                    select RecId from inventTransOriginArchive
+                        where inventTransOriginArchive.ReferenceCategory == InventTransType::InventTransArchive
+                        exists join consolidateInventTrans
+                        where consolidateInventTrans.inventTransOrigin == inventTransOriginArchive.RecId
+                           && consolidateInventTrans.DateFinancial     == _dateFinancial
+                           && consolidateInventTrans.ItemId            == _itemId;
+            }
+
+            consolidateInventTrans.setConnection(connection);
+            consolidateInventTrans.skipDatabaseLog(true);
+            consolidateInventTrans.skipEvents(true);
+            consolidateInventTrans.skipDeleteMethod(true);
+            consolidateInventTrans.skipDeleteActions(true);
+
+            str mapKey = _itemId + '#' + date2StrUsr(_dateFinancial);
+            if (!itemIdTransDateToTransOriginRecIdMap.exists(mapKey))
+            {
+                itemIdTransDateToTransOriginRecIdMap.add(mapKey, tmpRecIdFilter.RefRecId);
+
+                if (isWHSItem)
+                {
+                    delete_from consolidateInventTrans
+                    where consolidateInventTrans.DateFinancial == _dateFinancial
+                       && consolidateInventTrans.ItemId        == _itemId
+                    exists join inventTransOriginArchive
+                    where inventTransOriginArchive.RecId                 == consolidateInventTrans.inventTransOrigin
+                       && (inventTransOriginArchive.ReferenceCategory    == InventTransType::InventTransArchive
+                        || inventTransOriginArchive.ReferenceCategory    == InventTransType::WHSInventTransArchiveOnlyAffectsLocationAndBelow);
+                }
+                else
+                {
+                    delete_from consolidateInventTrans
+                    where consolidateInventTrans.DateFinancial == _dateFinancial
+                       && consolidateInventTrans.ItemId        == _itemId
+                    exists join inventTransOriginArchive
+                    where inventTransOriginArchive.ReferenceCategory == InventTransType::InventTransArchive
+                       && inventTransOriginArchive.RecId             == consolidateInventTrans.inventTransOrigin;
+                }
+        
+                inventTransOriginArchive.setConnection(connection);
+                inventTransOriginArchive.skipDatabaseLog(true);
+                inventTransOriginArchive.skipEvents(true);
+                inventTransOriginArchive.skipDeleteMethod(true);
+                inventTransOriginArchive.skipDeleteActions(true);
+
+                delete_from inventTransOriginArchive
+                exists join tmpRecIdFilter
+                where inventTransOriginArchive.RecId == tmpRecIdFilter.RefRecId;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public ClassDescription caption()
+    {
+        return "@SCM:RestoreArchivedTransDescription";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    final boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

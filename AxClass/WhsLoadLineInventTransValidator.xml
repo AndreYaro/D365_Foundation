@@ -1,0 +1,1359 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WhsLoadLineInventTransValidator</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>WHSLoadLineInventTransValidator</c> class is used to validate that inventory transactions and
+/// <c>WHSLoadLine</c> lines do not get out of sync.
+/// </summary>
+/// <remarks>
+/// In certain special cases the <c>WHSLoadLine</c> lines can be updated based on the transactions.
+/// </remarks>
+class WhsLoadLineInventTransValidator implements InventITransConsistencyValidator
+{
+    InventTransOriginId             inventTransOriginId;
+    InventTransId                   inventTransId;
+    WHSLoadLineDataBuilder          whsLoadLineDataBuilder;
+    WHSLoadLineUpdater              whsLoadLineUpdater;
+    boolean                         onlyCheckWork;
+    WHSLoadLineSyncIssueHandler     whsLoadLineSyncIssueHandler;
+    InventDimId                     newLoadLineDimId;
+    boolean                         loadDimReservedMoreQty;
+    WHSLoadLineRefRecId             reserveLoadLineRecId;
+    InventQty                       reservationQty;
+    private UnknownNoYes            isCatchWeightItem;
+
+    Map                             mapMatchedLoadLineOpenQty;
+    Map                             mapLoadLinesOpenQty;
+    Map                             mapLoadLinesOpenWorkQty;
+    Map                             mapUnmatchedInventTransQty;
+    Map                             mapUnmatchedLoadLineQty;
+    Counter                         loadLinesToCheck;
+    Counter                         loadLinesChecked;
+    Counter                         loadLinesToCheckWork;
+    Counter                         loadLinesCheckedWork;
+
+    private WHSInstrumentationLogger    instrumentationLogger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>canSplitLoadLineMultipleTransactions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the load lines and transactions are in a state that allows
+    /// splitting a single line based on transaction/inventory dimension combination quantities.
+    /// </summary>
+    /// <returns>
+    /// True if a single load line is backed by multiple transaction/inventory dimension combinations; otherwise, false.
+    /// </returns>
+    private boolean canSplitLoadLineMultipleTransactions()
+    {
+        WHSLoadLine             loadLine;
+        InventDimId             loadLineInventDimId;
+        MapEnumerator           meUnmatchedLoadLines;
+        boolean                 ret = true;
+
+        // Validate that the unmatched transaction and umatched load line quantities are the same.      
+        meUnmatchedLoadLines = mapUnmatchedLoadLineQty.getEnumerator();
+        meUnmatchedLoadLines.moveNext();
+        loadLineInventDimId = meUnmatchedLoadLines.currentKey();
+
+        if (this.sumMapValues(mapUnmatchedInventTransQty.getEnumerator()) != mapLoadLinesOpenQty.lookup(loadLineInventDimId))
+        {
+            ret = false;
+        }
+
+        if (ret)
+        {
+            // Validate that there is only one unmatched load line.
+            select count(RecId) from loadLine
+                where loadLine.InventTransId == inventTransId
+                    && loadLine.InventDimId  == loadLineInventDimId;
+
+            if (loadLine.RecId > 1)
+            {
+                ret = false;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLoadLineOpenWorkQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks the open work quantity of load lines.
+    /// </summary>
+    /// <param name="_inventTrans">
+    ///    The inventory transaction ID to check open work quantity for.
+    /// </param>
+    /// <returns>
+    ///    true if the check was successful; otherwise, false.
+    /// </returns>
+    protected boolean checkLoadLineOpenWorkQty(InventTrans _inventTrans)
+    {
+        MapEnumerator   me;
+        InventQty       openWorkQty;
+        InventDimId     inventDimId;
+        boolean         result = true;
+
+        using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().loadLineActivities().checkLoadLineOpenWorkQty())
+        {
+            if (!this.isReservationForSpecificLoadLine()
+            &&  loadLinesToCheckWork == 1)
+            {
+                me = mapLoadLinesOpenWorkQty.getEnumerator();
+
+                //there should only be one set of dimensions for the loadlines
+                if (me.moveNext())
+                {
+                    openWorkQty = me.currentValue();
+                    inventDimId = me.currentKey();
+                }
+            }
+            else if (mapLoadLinesOpenWorkQty.exists(_inventTrans.InventDimId))
+            {
+                openWorkQty = mapLoadLinesOpenWorkQty.lookup(_inventTrans.InventDimId);
+            }
+
+            boolean isCWItem = this.isCatchWeightItem();
+
+            if (this.isOpenWorkQtyGreaterThanInventTrans(isCWItem, openWorkQty, _inventTrans))
+            {
+                if (inventDimId)
+                {
+                    InventTrans inventTrans;
+
+                    select sum(Qty), sum(PdsCWQty) from inventTrans
+                        where inventTrans.InventTransOrigin == inventTransOriginId
+                           && inventTrans.inventDimId == inventDimId
+                           && (inventTrans.StatusIssue == StatusIssue::ReservPhysical
+                                || ( !onlyCheckWork
+                                    && (inventTrans.StatusIssue == StatusIssue::ReservOrdered
+                                        || inventTrans.StatusIssue == StatusIssue::OnOrder)));
+
+                    result = !this.isOpenWorkQtyGreaterThanInventTrans(isCWItem, openWorkQty, inventTrans);
+                }
+                else
+                {
+                    result = false;
+                }
+            }
+
+            if (result)
+            {
+                // openWorkQty means we have checked the line and was populated in the map.
+                if (openWorkQty)
+                {
+                    loadLinesCheckedWork++;
+                }
+            }
+            else
+            {
+                this.instrumentationLogger().logInformation('HandleValidationFailure: OpenWork');
+                this.handleValidationFailure("@WAX4661", true);
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isOpenWorkQtyGreaterThanInventTrans</Name>
+				<Source><![CDATA[
+    private boolean isOpenWorkQtyGreaterThanInventTrans(boolean _isCWItem, InventQty _openWorkQty, InventTrans _inventTrans)
+    {
+        return (!_isCWItem  && _openWorkQty > abs(_inventTrans.Qty))
+            || (_isCWItem   && _openWorkQty > abs(_inventTrans.PdsCWQty));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLoadLinesOpenQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Checks the open quantity of load lines.
+    /// </summary>
+    /// <param name="_inventDimId">
+    ///    The inventory dimension ID to check open quantities for.
+    /// </param>
+    /// <param name="_inventTransSumQty">
+    ///    A quantity that is used in the validation.
+    /// </param>
+    /// <param name="_inventDimDiffCounter">
+    ///    A value that is used in the validation.
+    /// </param>
+    /// <returns>
+    ///    true f the check was successful; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    /// If the open load line quantity/dimension combination is greater than the transaction
+    /// quantity/dimension combination, track The unmatched load line quantity and the unmatched
+    /// transaction quantity to see if they match up.  If they do the load line can be updated
+    /// or split based on the transactions.
+    /// </remarks>
+    protected boolean checkLoadLinesOpenQty(
+        InventDimId _inventDimId,
+        InventQty   _inventTransSumQty,
+        Counter     _inventDimDiffCounter)
+    {
+        MapEnumerator   me;
+        InventQty       openQty;
+        InventQty       unmatchedQty = 0;
+        InventDimId     loadLineInventDimId;
+        boolean         result = true;
+
+        if (loadLinesToCheck == 1)
+        {
+            me = mapLoadLinesOpenQty.getEnumerator();
+            // there should only be one set of dimensions for the loadlines
+            if (me.moveNext())
+            {
+                openQty = me.currentValue();
+                loadLineInventDimId = me.currentKey();
+            }
+        }
+        else if (mapLoadLinesOpenQty.exists(_inventDimId))
+        {
+            openQty = mapLoadLinesOpenQty.lookup(_inventDimId);
+            loadLineInventDimId = _inventDimId;
+        }
+
+        // If load line quantity is greater than transaction quantity, store the values
+        // to check if the load line can be updated with new dimension values
+        // or if the load line has a dim matching reserved transactions but has more qty than the transactions.
+        if (abs(_inventTransSumQty)  < openQty
+        &&  (loadLineInventDimId    != _inventDimId
+        ||   (loadDimReservedMoreQty
+        &&    loadLineInventDimId)))
+        {
+            if (mapUnmatchedLoadLineQty.exists(loadLineInventDimId))
+            {
+                unmatchedQty = mapUnmatchedLoadLineQty.lookup(loadLineInventDimId);
+            }
+            else
+            {
+                unmatchedQty = openQty;
+            }
+
+            // If we have over matched the load line
+            if (unmatchedQty < abs(_inventTransSumQty))
+            {
+                mapUnmatchedLoadLineQty.insert(loadLineInventDimId, 0);
+
+                // Only want the qty that would take the unmatched load line qty to 0
+                mapUnmatchedInventTransQty.insert(_inventDimId, unmatchedQty);
+            }
+            else
+            {
+                mapUnmatchedLoadLineQty.insert(loadLineInventDimId, (unmatchedQty - abs(_inventTransSumQty)));
+                mapUnmatchedInventTransQty.insert(_inventDimId, abs(_inventTransSumQty));
+            }
+        }
+        // If load line quantity and transaction quantity are the same,
+        // but with different dims the load line could be updated with new dimensions.
+        // Avoid changing a load line inventDimId if the inventDimId is already associated to work.
+        else if (abs(_inventTransSumQty) == openQty
+             &&  loadLineInventDimId != _inventDimId
+             &&  !mapLoadLinesOpenWorkQty.exists(loadLineInventDimId))
+        {
+            newLoadLineDimId = _inventDimId;
+        }
+        // If there are multiple load lines to check, openQty will only be set if the dimension Id is found in a load line.
+        // Handles scenario when reserving an additional load line with the same dimensions as an already reserved load line.
+        else if ((abs(_inventTransSumQty)   > openQty
+             ||   (abs(_inventTransSumQty) == openQty
+             &&    loadLineInventDimId     == _inventDimId))
+             &&  loadLinesToCheck > 1)
+        {
+            this.removeMatchedLoadLineMap(_inventDimId, _inventTransSumQty);
+        }
+
+        // we have checked the line and was populated in the map.
+        if (result && openQty)
+        {
+            loadLinesChecked++;
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeMatchedLoadLineMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Removes element from matched load line map, and 
+    /// inserts any remaining quantity from the transaction to unmatched transaction map. 
+    /// </summary>
+    private void removeMatchedLoadLineMap(
+        InventDimId _inventDimId,
+        InventQty   _inventTransSumQty)
+    {
+        InventQty duplicateQty;
+
+        if (mapMatchedLoadLineOpenQty.exists(_inventDimId))
+        {
+            duplicateQty = mapMatchedLoadLineOpenQty.lookup(_inventDimId);
+        }
+
+        // Remove load lines that are accounted for from the transactions.
+        // If not fully accounted for from matching load lines, add to unmatched transactions
+        if (abs(_inventTransSumQty) == duplicateQty)
+        {
+            mapMatchedLoadLineOpenQty.remove(_inventDimId);
+        }
+        else if (abs(_inventTransSumQty) > duplicateQty)
+        {
+            mapMatchedLoadLineOpenQty.remove(_inventDimId);
+            mapUnmatchedInventTransQty.insert(_inventDimId, abs(_inventTransSumQty) - duplicateQty);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createNewLoadLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Prepare to split load lines based on transactions.
+    /// </summary>
+    private void createNewLoadLines()
+    {
+        InventDimId inventDimId;
+        MapEnumerator me = mapUnmatchedLoadLineQty.getEnumerator();
+
+        // There should only be one set.
+        if (me.moveNext())
+        {
+            inventDimId = me.currentKey();
+        }
+
+        this.loadLineUpdater().createSplitLoadLines(inventDimId, mapUnmatchedInventTransQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleValidationFailure</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Handles a validation failure by invoking the synchronization issue handler.
+    /// </summary>
+    /// <param name="_message">
+    ///    The message that may be used by the issue handler.
+    /// </param>
+    /// <param name="_canThrowError">
+    ///    A Boolean value that indicates if the issue handler may throw an error.
+    /// </param>
+    /// <returns>
+    ///    The return value given by the issue handler.
+    /// </returns>
+    protected boolean handleValidationFailure(
+        str           _message,
+        boolean       _canThrowError)
+    {
+        return this.whsLoadLineSyncIssueHandler().handleIssue(inventTransId,_message,_canThrowError);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes class instance variables.
+    /// </summary>
+    protected void init()
+    {
+        whsLoadLineDataBuilder.fillOpenQuantitiesPerDimensionMaps(inventTransId, onlyCheckWork);
+
+        mapUnmatchedInventTransQty  = new Map(Types::String,Types::Real);
+        mapUnmatchedLoadLineQty     = new Map(Types::String, Types::Real);
+        mapMatchedLoadLineOpenQty   = new Map(Types::String, Types::Real);
+        mapLoadLinesOpenQty         = whsLoadLineDataBuilder.parmMapLoadLinesOpenQty();
+        mapLoadLinesOpenWorkQty     = whsLoadLineDataBuilder.parmMapLoadLinesOpenWorkQty();
+        loadLinesToCheck            = mapLoadLinesOpenQty.elements();
+        loadLinesToCheckWork        = mapLoadLinesOpenWorkQty.elements();
+        loadLinesChecked            = 0;
+        loadLinesCheckedWork        = 0;
+
+        if (loadLinesToCheck > 1)
+        {
+            mapMatchedLoadLineOpenQty = Map::create(mapLoadLinesOpenQty.pack());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventTransId</Name>
+				<Source><![CDATA[
+    public InventTransId parmInventTransId(InventTransId _inventTransId = inventTransId)
+    {
+        inventTransId = _inventTransId;
+
+        return inventTransId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventTransOriginId</Name>
+				<Source><![CDATA[
+    public InventTransOriginId parmInventTransOriginId(InventTransOriginId _inventTransOriginId = inventTransOriginId)
+    {
+        inventTransOriginId = _inventTransOriginId;
+
+        return inventTransOriginId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReserveLoadLineRecId</Name>
+				<Source><![CDATA[
+    public WHSLoadLineRefRecId parmReserveLoadLineRecId(WHSLoadLineRefRecId _reserveLoadLineRecId = reserveLoadLineRecId)
+    {
+        reserveLoadLineRecId = _reserveLoadLineRecId;
+
+        return reserveLoadLineRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmOnlyCheckWork</Name>
+				<Source><![CDATA[
+    public boolean parmOnlyCheckWork(boolean _onlyCheckWork = onlyCheckWork)
+    {
+        onlyCheckWork = _onlyCheckWork;
+
+        return onlyCheckWork;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReservationQty</Name>
+				<Source><![CDATA[
+    public InventQty parmReservationQty(InventQty _reservationQty = reservationQty)
+    {
+        reservationQty = _reservationQty;
+
+        return reservationQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWhsLoadLineDataBuilder</Name>
+				<Source><![CDATA[
+    public WHSLoadLineDataBuilder parmWhsLoadLineDataBuilder(WHSLoadLineDataBuilder _whsLoadLineDataBuilder = whsLoadLineDataBuilder)
+    {
+        whsLoadLineDataBuilder = _whsLoadLineDataBuilder;
+
+        return whsLoadLineDataBuilder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWhsLoadLineUpdater</Name>
+				<Source><![CDATA[
+    public WHSLoadLineUpdater parmWhsLoadLineUpdater(WHSLoadLineUpdater _whsLoadLineUpdater = whsLoadLineUpdater)
+    {
+        whsLoadLineUpdater = _whsLoadLineUpdater;
+
+        return whsLoadLineUpdater;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLineInventoryDimension</Name>
+				<Source><![CDATA[
+    private void updateLineInventoryDimension(InventDimId _newInventDimId)
+    {
+        this.loadLineUpdater().updateLoadLinesInventoryDimension(_newInventDimId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addQuantityDimensionToMap</Name>
+				<Source><![CDATA[
+    private void addQuantityDimensionToMap(
+        Map         _localMap,
+        InventQty   _inventQty,
+        InventDimId _inventDimId)
+    {
+        InventQty localQty = _inventQty;
+
+        if (_localMap.exists(_inventDimId))
+        {
+            localQty += _localMap.lookup(_inventDimId);
+        }
+
+        _localMap.insert(_inventDimId, localQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateLoadLineDimensionConsistency</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that the inventory transactions and load lines are kept in sync.
+    /// </summary>
+    /// <remarks>
+    /// Exceptions are thrown to prevent the transactions and load lines from getting out of sync.
+    /// </remarks>
+    public void validateLoadLineDimensionConsistency()
+    {
+        InventTrans     inventTrans;
+        Map             mapInventDimIdQty;
+        InventDimId     inventTransInventDimId;
+        InventDimId     loadLinesInventDimId;
+        Counter         inventDimDiffCounter;
+        boolean         loadLineFullyReserved;
+        boolean         result = true;
+
+        using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().loadLineActivities().validateLoadLineDimensionConsistency())
+        {
+            this.init();
+            mapInventDimIdQty = new Map(Types::String,Types::Real);
+
+            //we only have open loadLines for the same dimension so we can try and update these based on transactions
+            if (loadLinesToCheck || loadLinesToCheckWork)
+            {
+                boolean isCWItem = this.isCatchWeightItem();
+
+                while select sum(Qty), sum(PdsCWQty) from inventTrans
+                    group by inventTrans.InventDimId,inventTrans.StatusIssue //handle each dimension at a time since we need to check openQty against that
+                        where inventTrans.InventTransOrigin == inventTransOriginId
+                        &&    ((!onlyCheckWork  // If we are doing full check we need reserved physical, reserved ordered, and on order transactions.
+                        &&      (inventTrans.StatusIssue    == StatusIssue::ReservPhysical
+                        ||       inventTrans.StatusIssue    == StatusIssue::ReservOrdered
+                        ||       inventTrans.StatusIssue    == StatusIssue::OnOrder))
+                        ||     (onlyCheckWork  // If we are only checking work then we only need to check reserved physical.
+                        &&      inventTrans.StatusIssue     == StatusIssue::ReservPhysical))
+                        &&    inventTrans.StatusReceipt     == StatusReceipt::None
+                        &&    (!isCWItem
+                        ||     inventTrans.PdsCWQty         !=  0)
+                {
+                    //check that work is backed by a reservation
+                    if (inventTrans.StatusIssue == StatusIssue::ReservPhysical)
+                    {
+                        result = this.checkLoadLineOpenWorkQty(inventTrans);
+
+                        if (!result)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (!onlyCheckWork)
+                    {
+                        // add quantities per inventory dimension into local map
+                        this.addQuantityDimensionToMap(mapInventDimIdQty, isCWItem ? inventTrans.PdsCWQty : inventTrans.Qty, inventTrans.inventDimId);
+                    }
+                }
+
+                if (result)
+                {
+                    if (!onlyCheckWork)
+                    {
+                        if (loadLinesToCheck == 1)
+                        {
+                            MapEnumerator me = mapLoadLinesOpenQty.getEnumerator();
+
+                            if (me.moveNext())
+                            {
+                                // If reserved transactions matching load line dimensions have enough quantity for load,
+                                // avoid changing the load line
+                                select sum(Qty), sum(PdsCWQty) from inventTrans
+                                    where inventTrans.InventTransOrigin == inventTransOriginId
+                                    &&    inventTrans.inventDimId       == me.currentKey()
+                                    &&    (inventTrans.StatusIssue      == StatusIssue::ReservPhysical
+                                    ||     inventTrans.StatusIssue      == StatusIssue::ReservOrdered);
+
+                                InventHandlingQty handlingQty = isCWItem ? inventTrans.PdsCWQty : inventTrans.Qty;
+
+                                if (abs(handlingQty) >= me.currentValue())
+                                {
+                                    loadLineFullyReserved = true;
+                                }
+                                else if (handlingQty) // Some qty is still reserved and the load line has more qty than the transactions.
+                                {
+                                    loadDimReservedMoreQty = true;
+                                }
+                            }
+                        }
+
+                        if (!loadLineFullyReserved)
+                        {
+                            [inventDimDiffCounter, inventTransInventDimId, result] = this.checkTransactionOpenQuantities(mapInventDimIdQty);
+                        }
+                    }
+                }
+
+                if (!loadLineFullyReserved)
+                {
+                    if (result)
+                    {
+                        // Handles case where we have loadlines without inventtrans for cases where we have more than one load lines per dimensions
+                        if (loadLinesToCheck > loadLinesChecked)
+                        {
+                            // Attempt to sync left over load line and unmatched trans
+                            if (mapMatchedLoadLineOpenQty.elements() == 1
+                            &&  mapUnmatchedInventTransQty.elements())
+                            {
+                                result = this.updateRemainingLoadLine();
+                            }
+                            else
+                            {
+                                this.instrumentationLogger().logInformation('HandleValidationFailure: LoadLinesToCheck');
+                                result = this.handleValidationFailure("@WAX4655",true);
+                            }
+                        }
+                    }
+
+                    if (result)
+                    {
+                        // Handles case where not all loadLines with open work get checked, possiblity because no reserved physical transaction exist.
+                        if (this.haveAllLoadLinesWithWorkBeenChecked())
+                        {
+                            this.instrumentationLogger().logInformation('HandleValidationFailure: AllLoadLineCheck');
+                            result = this.handleValidationFailure("@WAX4661",true);
+                        }
+                    }
+
+                    if (result)
+                    {
+                        if (!onlyCheckWork)
+                        {
+                            if (newLoadLineDimId)
+                            {
+                                inventDimDiffCounter = 1;
+                                inventTransInventDimId = newLoadLineDimId;
+                            }
+
+                            // try to update for single loadline case
+                            if (loadLinesToCheck            == 1
+                                && inventTransInventDimId
+                                && inventDimDiffCounter     == 1)
+                            {
+                                this.updateSingleLoadLineFromMap(inventTransInventDimId);
+                            }
+                            else if (this.isReservationForSpecificLoadLine()
+                                 &&  inventTransInventDimId
+                                 &&  inventDimDiffCounter == 1)
+                            {
+                                this.updateLoadLineInventDimId(inventTransInventDimId);
+                            }
+                            // Check if we have a scenario where we can update a load line backed by more
+                            // than one transaction dimension value.
+                            else if (mapUnmatchedLoadLineQty.elements() > 0)
+                            {
+                                if (this.canSplitLoadLineMultipleTransactions())
+                                {
+                                    this.createNewLoadLines();
+                                }
+                                else if (this.isReservationForSpecificLoadLine())
+                                {
+                                    result = this.updateLoadLineFromUnmatchedTrans();
+                                }
+                                else if (loadLinesToCheck == 1 && mapUnmatchedLoadLineQty.elements() == 1 && this.isReservationRemoved())
+                                {
+                                    result = this.updateSingleUnmatchedLoadLineFromReserve();
+                                }
+                                else
+                                {
+                                    this.instrumentationLogger().logInformation('HandleValidationFailure: UnMatchedQuantity');
+                                    result = this.handleValidationFailure("@WAX4655",true);
+                                }
+                            }
+
+                            this.syncInvalidLoadLineWithoutReservation();
+
+                            this.syncLoadTableInvalidFieldWithReservation(isCWItem);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>haveAllLoadLinesWithWorkBeenChecked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the number of load lines with work have been checked.
+    /// </summary>
+    /// <returns>true if number of load lines to check work for is greater than check load lines; otherwise, false.</returns>
+    protected boolean haveAllLoadLinesWithWorkBeenChecked()
+    { 
+        return loadLinesToCheckWork > loadLinesCheckedWork; 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSingleLoadLineFromMap</Name>
+				<Source><![CDATA[
+    private void updateSingleLoadLineFromMap(InventDimId _inventDimId)
+    {
+        MapEnumerator me = mapLoadLinesOpenQty.getEnumerator();
+        InventDimId   loadLineInventDimId;
+
+        // there should only be one set of dimensions for the loadlines
+        if (me.moveNext())
+        {
+            loadLineInventDimId = me.currentKey();
+        }
+
+        // only update if dimensions are actually changing
+        if (_inventDimId != loadLineInventDimId)
+        {
+            this.updateLineInventoryDimension(_inventDimId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkTransactionOpenQuantities</Name>
+				<Source><![CDATA[
+    private container checkTransactionOpenQuantities(Map _mapInventDimIdQty)
+    {
+        // iterate map, check open quantities
+        MapEnumerator   me = _mapInventDimIdQty.getEnumerator();
+        Counter         inventDimDiffCounter = _mapInventDimIdQty.elements();
+        InventDimId     inventTransInventDimId;
+        boolean         result = true;
+
+        while (result
+            && me.moveNext())
+        {
+            inventTransInventDimId = me.currentKey();
+            result = this.checkLoadLinesOpenQty(inventTransInventDimId, me.currentValue(), inventDimDiffCounter);
+        }
+
+        return [inventDimDiffCounter, inventTransInventDimId, result];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isReservationForSpecificLoadLine</Name>
+				<Source><![CDATA[
+    private boolean isReservationForSpecificLoadLine()
+    {
+        return (reservationQty && reserveLoadLineRecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sumMapValues</Name>
+				<Source><![CDATA[
+    private InventQty sumMapValues(MapEnumerator _me)
+    {
+        InventQty sumMapQty;
+
+        while (_me.moveNext())
+        {
+            sumMapQty += _me.currentValue();
+        }
+
+        return sumMapQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRemainingLoadLine</Name>
+				<Source><![CDATA[
+    private boolean updateRemainingLoadLine()
+    {
+        using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().loadLineActivities().updateRemainingLoadLine())
+        {
+            MapEnumerator meLoadLine = mapMatchedLoadLineOpenQty.getEnumerator();
+            WHSLoadLine   unmatchedLoadLine;
+            InventDimId   currentLoadLineDimId;
+            boolean result = true;
+                            
+            meLoadLine.moveNext();
+            currentLoadLineDimId = meLoadLine.currentKey();
+        
+            if (this.singleLoadLineExists(currentLoadLineDimId))
+            {
+                MapEnumerator meUnmatchedTrans = mapUnmatchedInventTransQty.getEnumerator();
+
+                if (mapUnmatchedInventTransQty.elements() == 1
+                &&  meUnmatchedTrans.moveNext())
+                {
+                    InventDimId newDimId = meUnmatchedTrans.currentKey();
+
+                    ttsbegin;
+
+                    select firstonly forupdate unmatchedLoadLine
+                        where unmatchedLoadLine.InventTransId == inventTransId
+                        &&    unmatchedLoadLine.InventDimId   == currentLoadLineDimId
+                        &&    !(unmatchedLoadLine.PickedQty || unmatchedLoadLine.PickedWeight);
+
+                    if (unmatchedLoadLine.RecId)
+                    {
+                        unmatchedLoadLine.InventDimId = newDimId;
+                        unmatchedLoadLine.update();
+                    }
+
+                    ttscommit;
+                }
+                else if (this.sumMapValues(meUnmatchedTrans) == meLoadLine.currentValue())
+                {
+                    this.loadLineUpdater().createSplitLoadLines(currentLoadLineDimId, mapUnmatchedInventTransQty);
+                }
+                else
+                {
+                    this.instrumentationLogger().logInformation('HandleValidationFailure: SingleLoadLine');
+                    result = this.handleValidationFailure("@WAX4655",true);
+                }
+            }
+            else
+            {
+                this.instrumentationLogger().logInformation('HandleValidationFailure: MultipleLoadLines');
+                result = this.handleValidationFailure("@WAX4655",true);
+            }
+
+            return result;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadLineUpdater</Name>
+				<Source><![CDATA[
+    private WHSLoadLineUpdater loadLineUpdater()
+    {
+        if (!whsLoadLineUpdater)
+        {
+            whsLoadLineUpdater = WHSLoadLineUpdater::newFromTransId(inventTransId);
+        }
+
+        return whsLoadLineUpdater;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>singleLoadLineExists</Name>
+				<Source><![CDATA[
+    private boolean singleLoadLineExists(InventDimId _loadLineDimId)
+    {
+        WHSLoadLine loadLine;
+
+        select count(RecId) from loadLine
+            where loadLine.InventTransId == inventTransId
+            &&    loadLine.InventDimId   == _loadLineDimId;
+
+        return (loadLine.RecId ==1);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateNoOnOrderTrans</Name>
+				<Source><![CDATA[
+    private boolean validateNoOnOrderTrans(InventDimId _inventDimId)
+    {
+        InventTrans localInventTrans;
+
+        select firstonly RecId from localInventTrans
+            where localInventTrans.InventTransOrigin == inventTransOriginId
+            &&    localInventTrans.inventDimId       == _inventDimId
+            &&    localInventTrans.StatusReceipt     == StatusReceipt::None
+            &&    localInventTrans.StatusIssue      == StatusIssue::OnOrder;
+
+       return !localInventTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLoadLineFromUnmatchedTrans</Name>
+				<Source><![CDATA[
+    private boolean updateLoadLineFromUnmatchedTrans()
+    {
+        using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().loadLineActivities().updateLoadLineFromUnmatchedTrans())
+        {
+            ttsbegin;
+
+            WHSLoadLine   currentLoadLine = WHSLoadLine::findbyRecId(reserveLoadLineRecId, true);
+            MapEnumerator me = mapUnmatchedInventTransQty.getEnumerator();
+            InventQty     sumInventTransUnmatchedQty;
+            Map           inventTransUnmatchedQuantities = new Map(Types::String, Types::Real);
+            boolean       ret;
+
+            // Look for an unmatched qty that matches our current load line.
+            while (!ret
+                && reservationQty < 0
+                && me.moveNext())
+            {
+                if (me.currentValue() == currentLoadLine.InventQty)
+                {
+                    if (this.validateNoOnOrderTrans(me.currentKey()))
+                    {
+                        currentLoadLine.InventDimId = me.currentKey();
+                        currentLoadLine.update();
+                        ret = true;
+                    }
+                }
+                else
+                {
+                    sumInventTransUnmatchedQty += me.currentValue();
+                    inventTransUnmatchedQuantities.insert(me.currentKey(), me.currentValue());
+                }
+            }
+
+            // Handles first load release when split across multiple batches
+            if (!ret
+            &&  sumInventTransUnmatchedQty == currentLoadLine.InventQty)
+            {
+                ret = this.splitLoadLineWithMultipleDimensions(currentLoadLine, inventTransUnmatchedQuantities);
+            }
+        
+            ttscommit;
+
+            if (!ret)
+            {
+                this.instrumentationLogger().logInformation('HandleValidationFailure: UnmatchedTrans');
+                ret = this.handleValidationFailure("@WAX4655",true);
+            }
+
+            return ret;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitLoadLineWithMultipleDimensions</Name>
+				<Source><![CDATA[
+    private boolean splitLoadLineWithMultipleDimensions(
+        WHSLoadLine _loadLine,
+        Map         _inventTransUnmatchedQuantities)
+    {
+        MapEnumerator meSum = _inventTransUnmatchedQuantities.getEnumerator();;
+        boolean updateDim;
+        boolean ret;
+
+        while (meSum.moveNext())
+        {
+            updateDim = this.validateNoOnOrderTrans(meSum.currentKey());
+
+            if (!updateDim)
+            {
+                break;
+            }
+        }
+
+        if (updateDim)
+        {
+            this.loadLineUpdater().createSplitLoadLines(_loadLine.InventDimId, _inventTransUnmatchedQuantities, _loadLine.LoadId);
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLoadLineInventDimId</Name>
+				<Source><![CDATA[
+    private void updateLoadLineInventDimId(InventDimId _inventDimId)
+    {
+        ttsbegin;
+
+        WHSLoadLine currentLoadLine = WHSLoadLine::findbyRecId(reserveLoadLineRecId, true);
+
+        currentLoadLine.InventDimId = _inventDimId;
+        currentLoadLine.update();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>whsLoadLineSyncIssueHandler</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the instance of the synchronization issue handler.
+    /// </summary>
+    /// <returns>
+    ///    An instance of the <c>WHSLoadLineSyncIssueHandler</c> class.
+    /// </returns>
+    protected WHSLoadLineSyncIssueHandler whsLoadLineSyncIssueHandler()
+    {
+        if (!whsLoadLineSyncIssueHandler)
+        {
+            whsLoadLineSyncIssueHandler = WHSLoadLineSyncIssueHandler::newStandard();
+        }
+
+        return whsLoadLineSyncIssueHandler;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static WHSLoadLineInventTransValidator construct()
+    {
+        return new WHSLoadLineInventTransValidator();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instantiates a new instance based on the parameters.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// An <c>InventTransId</c> ID.
+    /// </param>
+    /// <param name="_inventTransOriginId">
+    /// An <c>InventTransOriginRecId</c> ID.
+    /// </param>
+    /// <param name="_whsLoadLineDataBuilder">
+    /// An <c>WHSLoadLineDataBuilder</c> instance.
+    /// </param>
+    /// <param name="_whsLoadLineUpdater">
+    /// An <c>WHSLoadLineUpdater</c> instance.
+    /// </param>
+    /// <returns>
+    /// An instance of the <c>WHSLoadLineInventTransValidator</c> class.
+    /// </returns>
+    public static WHSLoadLineInventTransValidator newFromParameters(
+        InventTransId           _inventTransId,
+        InventTransOriginId     _inventTransOriginId,
+        WHSLoadLineDataBuilder  _whsLoadLineDataBuilder,
+        WHSLoadLineUpdater      _whsLoadLineUpdater)
+    {
+        WHSLoadLineInventTransValidator whsLoadLineInventTransValidator;
+
+        whsLoadLineInventTransValidator = WHSLoadLineInventTransValidator::construct();
+        whsLoadLineInventTransValidator.parmInventTransId(_inventTransId);
+        whsLoadLineInventTransValidator.parmInventTransOriginId(_inventTransOriginId);
+        whsLoadLineInventTransValidator.parmWhsLoadLineDataBuilder(_whsLoadLineDataBuilder);
+        whsLoadLineInventTransValidator.parmWhsLoadLineUpdater(_whsLoadLineUpdater);
+
+        return whsLoadLineInventTransValidator;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateConsistency</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates that inventory transactions are consistent with load lines.
+    /// </summary>
+    public void validateConsistency()
+    {
+        this.validateLoadLineDimensionConsistency();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLoadLineInventTransConsistencyOnInventoryUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates an instance of the class <c>WhsLoadLineInventTransValidator</c> and validates the load line and 
+    /// invent trans are in sync.
+    /// </summary>
+    /// <param name = "_inventUpd_Reservation">
+    /// An instance of the reservation that is being processed.
+    /// </param>
+    /// <param name = "_result">
+    /// The <c>EventHandlerResult</c>.
+    /// </param>
+    [SubscribesTo(classStr(InventUpd_Reservation), delegateStr(InventUpd_Reservation, reservationCompleted))]
+    public static void checkLoadLineInventTransConsistencyOnInventoryUpdate(
+        InventUpd_Reservation _inventUpd_Reservation, 
+        EventHandlerResult    _result)
+    {
+        InventMovement movement = _inventUpd_Reservation.movement();
+        
+        if (WhsLoadLineInventTransValidator::mustValidateInventTransConsistencyOnInventoryUpdate(movement))
+        {
+            // Reservation changes that do not modify catch weight qty do not affect load lines.
+            if (movement.pdsCWItem() && _inventUpd_Reservation.parmPdsCWInventQty() == 0)
+            {
+                return;
+            }
+
+            InventITransConsistencyValidator validator = movement.parmConsistencyValidator();
+            WhsLoadLineInventTransValidator  whsValidator;
+            
+            if (validator)
+            {
+                whsValidator = validator as WhsLoadLineInventTransValidator;
+            }
+
+            if (!whsValidator)
+            {
+                whsValidator = WhsLoadLineInventTransValidator::construct();
+            }
+
+            whsValidator.initFromMovement(movement);
+            whsValidator.parmWhsLoadLineDataBuilder(WHSLoadLineDataBuilder::construct());
+            whsValidator.parmReservationQty(_inventUpd_Reservation.parmReservation());
+
+            whsValidator.validateConsistency();
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustValidateInventTransConsistencyOnInventoryUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if inventory consistency must be validated on an inventory update.
+    /// </summary>
+    /// <param name = "_movement">
+    /// An instance of the inventory movement.
+    /// </param>
+    /// <returns>
+    /// true if consistency must be validated; otherwise, false.
+    /// </returns>
+    protected static boolean mustValidateInventTransConsistencyOnInventoryUpdate(InventMovement _movement)
+    {
+        return (_movement.isItemWHSEnabled() && _movement.canHaveOutboundLoadLine());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromMovement</Name>
+				<Source><![CDATA[
+    public void initFromMovement(InventMovement _movement)
+    {
+        this.parmInventTransId(_movement.transId());
+        this.parmInventTransOriginId(_movement.inventTransOriginId());
+        this.parmWhsLoadLineUpdater(WHSLoadLineUpdater::newFromTransId(inventTransId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isReservationRemoved</Name>
+				<Source><![CDATA[
+    private boolean isReservationRemoved()
+    {
+        return  reservationQty < 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>syncInvalidLoadLineWithoutReservation</Name>
+				<Source><![CDATA[
+    private void syncInvalidLoadLineWithoutReservation()
+    {       
+        if (reservationQty > 0)
+        {
+            InventTrans inventTrans;
+            select sum(Qty) from inventTrans
+                     where inventTrans.InventTransOrigin == inventTransOriginId
+                         &&    (inventTrans.StatusIssue  == StatusIssue::ReservPhysical
+                         ||     inventTrans.StatusIssue  == StatusIssue::ReservOrdered);
+            if (!inventTrans.Qty)
+            {
+                ttsbegin;
+                WHSLoadLine whsLoadLine;
+                while select forupdate whsLoadLine
+                         where whsLoadLine.InventTransId == inventTransId
+                             && whsLoadLine.Invalid      == NoYes::Yes
+                {
+                    whsLoadLine.Invalid = NoYes::No;
+                    WHSLoadLineSyncInvalid::update(whsLoadLine);
+                    whsLoadLine.doUpdate();
+                }
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSingleUnmatchedLoadLineFromReserve</Name>
+				<Source><![CDATA[
+    private boolean updateSingleUnmatchedLoadLineFromReserve()
+    {
+        boolean ret;
+         
+        using (SysInstrumentationActivityContext activityContext = this.instrumentationLogger().loadLineActivities().updateSingleUnmatchedLoadLineFromReserve())
+        {
+            MapEnumerator meUnmatchedLoadLineQty = mapUnmatchedInventTransQty.getEnumerator();
+            meUnmatchedLoadLineQty.moveNext();
+            MapEnumerator meLoadLinesOpenQty = mapLoadLinesOpenQty.getEnumerator();
+            meLoadLinesOpenQty.moveNext();
+         
+            ttsbegin;
+            WHSLoadLine currentLoadLine;
+            select firstonly forupdate currentLoadLine
+                     where currentLoadLine.InventTransId == inventTransId
+                         && currentLoadLine.Qty          == abs(meUnmatchedLoadLineQty.currentValue())
+                         && currentLoadLine.InventDimId  == meLoadLinesOpenQty.currentKey();
+         
+            if (currentLoadLine && this.validateNoOnOrderTrans(meUnmatchedLoadLineQty.currentKey()))
+            {
+                currentLoadLine.InventDimId = meUnmatchedLoadLineQty.currentKey();
+                currentLoadLine.update();
+                ret = true;
+            }
+            ttscommit;
+         
+            if (!ret)
+            {
+                if (this.showWarningForInsufficientReservationForLoad())
+                {
+                    select firstonly LoadId from currentLoadLine
+                        where currentLoadLine.InventTransId == inventTransId;
+
+                    warning(strFmt("@WAX:WHSLoadInsufficientReservationWarning", currentLoadLine.LoadId));
+                }
+
+                this.instrumentationLogger().logInformation('HandleValidationFailure: LoadLineNotUpdated');
+                ret = this.handleValidationFailure("@WAX4655",true);
+            }
+        }
+         
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showWarningForInsufficientReservationForLoad</Name>
+				<Source><![CDATA[
+    protected boolean showWarningForInsufficientReservationForLoad() 
+    { 
+        return true; 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCatchWeightItem</Name>
+				<Source><![CDATA[
+    private boolean isCatchWeightItem()
+    {
+        if (isCatchWeightItem == UnknownNoYes::Unknown)
+        {
+            isCatchWeightItem = PdsGlobal::pdsIsCWItem(InventTransOrigin::findByInventTransId(inventTransId).ItemId) ? UnknownNoYes::Yes : UnknownNoYes::No;
+        }
+
+        return isCatchWeightItem == UnknownNoYes::Yes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>syncLoadTableInvalidFieldWithReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Synchronizes the load table to be valid when the following conditions are met,
+    ///  (1). A single loadline exists for the salesline.
+    ///  (2). The quantity on the loadline match the entire inventtrans qty which is reserved.
+    /// </summary>
+    /// <param name = "_isCWItem">
+    /// A Boolean value that indicates if it is a CW item.
+    /// </param>
+    private void syncLoadTableInvalidFieldWithReservation(boolean _isCWItem)
+    {
+        WHSLoadTable    whsLoadTable;
+        WHSLoadLine     whsLoadLine;
+        InventTrans     inventTrans;
+        
+        if (loadLinesToCheck == 1)
+        {
+            select sum(InventQty) from whsLoadLine
+            where whsLoadLine.InventTransId == inventTransId
+               && whsLoadLine.Invalid == NoYes::No;
+    
+            select sum(Qty), sum(PdsCWQty) from inventTrans
+            where inventTrans.InventTransOrigin == inventTransOriginId
+                &&    (inventTrans.StatusIssue  == StatusIssue::ReservPhysical
+                ||     inventTrans.StatusIssue  == StatusIssue::ReservOrdered);
+
+            if ((!_isCWItem && abs(whsLoadLine.InventQty) == abs(inventTrans.Qty))
+            ||  (_isCWItem  && abs(whsLoadLine.InventQty) == abs(inventTrans.PdsCWQty)))
+            {
+                select firstOnly LoadId, Invalid from whsLoadLine
+                where whsLoadLine.InventTransId == inventTransId
+                   && whsLoadLine.Invalid == NoYes::No;
+                
+                whsLoadTable = WHSLoadTable::find(whsLoadLine.LoadId, true);
+        
+                if (whsLoadTable.Invalid != whsLoadLine.Invalid)
+                {
+                    whsLoadTable.Invalid = NoYes::No;
+                    whsLoadTable.update();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>instrumentationLogger</Name>
+				<Source><![CDATA[
+    private WHSInstrumentationLogger instrumentationLogger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = WHSInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

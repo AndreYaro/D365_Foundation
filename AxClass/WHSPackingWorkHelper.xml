@@ -1,0 +1,635 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSPackingWorkHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+internal class WHSPackingWorkHelper
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createPackingWorkForWorkLine</Name>
+				<Source><![CDATA[
+    internal static void createPackingWorkForWorkLine(WHSWorkId _workId, 
+        LineNum _lineNum, 
+        WHSLicensePlateId _targetLP,
+        boolean _withReopen = false)
+    {
+
+        ttsbegin;
+
+        WHSWorkTable origWorkTable = WHSWorkTable::find(_workId, true);
+
+        if (!_workId 
+            || origWorkTable.WorkTransType != WHSWorkTransType::Packing
+            || !_targetLP)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }     
+   
+        WHSWorkStatus origWorkTableStatus = origWorkTable.WorkStatus;
+        if (_withReopen && origWorkTable.WorkStatus != WHSWorkStatus::Open)
+        {
+            WHSWorkLine workLine;
+
+            origWorkTable.WorkStatus = WHSWorkStatus::Open;
+            origWorkTable.update();
+
+            workLine.skipDataMethods(true);
+            workLine.skipEvents(true);
+            workLine.skipBusinessEvents(true);
+            workLine.skipDatabaseLog(true);            
+
+            update_recordset workLine
+                setting WorkStatus = WHSWorkStatus::Open,
+                        QtyRemain = workLine.QtyWork,
+                        InventQtyRemain = workLine.InventQtyWork
+                where workLine.WorkId == origWorkTable.WorkId
+                    && workLine.WorkStatus == WhsWorkStatus::Closed;
+        }
+
+        WHSLicensePlateId origLP = origWorkTable.TargetLicensePlateId;
+
+        WHSWorkLine origWorkLine = WHSWorkLine::find(_workId, _lineNum);
+        WhsSplitWork splitWork = WhsSplitWork::newStandard(_workId,
+                                                           _lineNum,
+                                                           origWorkLine.InventQtyWork,
+                                                           false,
+                                                           origWorkTable.WorkCreatedBy);
+        WHSWorkTable newWorkTable;
+
+        using(var context = WHSPackingWorkAllowInProcessContext::construct())
+        {
+            newWorkTable = WHSWorkTable::find(splitWork.splitWork(), true);   
+        }
+
+        newWorkTable.TargetLicensePlateId = _targetLP;
+        newWorkTable.WorkStatus = WHSWorkStatus::Open;
+        newWorkTable.update();
+
+        origWorkTable = WHSWorkTable::find(_workId, true);
+        origWorkTable.TargetLicensePlateId = origLP;
+
+        if (_withReopen)
+        {            
+            origWorkTable.WorkStatus = origWorkTableStatus;            
+
+            WHSWorkLine workLine;
+            
+            workLine.skipDataMethods(true);
+            workLine.skipEvents(true);
+            workLine.skipBusinessEvents(true);
+            workLine.skipDatabaseLog(true);
+
+            if (origWorkTableStatus != WHSWorkStatus::Open)
+            {
+                update_recordset workLine
+                    setting WorkStatus = origWorkTableStatus,
+                            QtyRemain = 0,
+                            InventQtyRemain = 0
+                    where workLine.WorkId == origWorkTable.WorkId
+                       && workLine.WorkStatus == WhsWorkStatus::Open;
+            }
+
+            if (WHSPackingWorkRemainingQtyUpdateOnPackingFlight::instance().isEnabled())
+            {
+                // Remaining quantity on packing work lines should be zero as items are still packed after container reopening.
+                update_recordset workLine
+                    setting QtyRemain = 0,
+                            InventQtyRemain = 0
+                    where workLine.WorkId == newWorkTable.WorkId;
+            }
+        }
+        
+        origWorkTable.update();
+
+        WHSPackingWorkHelper::updatePutLineQty(_workId);
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addWorkLineToWork</Name>
+				<Source><![CDATA[
+    internal static void addWorkLineToWork(WHSWorkId _targetWorkId, WHSWorkId _combineWorkId, LineNum _combineLineNum, boolean _withReopen = false)
+    {
+        boolean shouldUpdateQtyRemainOnReopen = !WHSPackingWorkRemainingQtyUpdateOnPackingFlight::instance().isEnabled();
+
+        LineNum targetLineNum = WHSWorkLine::lastPickLine(_targetWorkId).LineNum + 1;
+
+        WHSWorkLine::renumberWorkLines(_targetWorkId, targetLineNum, 1);
+                
+        WHSWorkTable targetWorkTable = WHSWorkTable::find(_targetWorkId, true);
+
+        WHSWorkTable combineWorkTable = WHSWorkTable::find(_combineWorkId);
+
+        if (targetWorkTable.OrderNum
+                    && combineWorkTable.OrderNum != targetWorkTable.OrderNum)
+        {
+            targetWorkTable.OrderNum = '';
+        }
+
+        if (targetWorkTable.LoadId
+                    && combineWorkTable.LoadId != targetWorkTable.LoadId)
+        {
+            targetWorkTable.LoadId = '';
+        }
+
+        targetWorkTable.update();
+
+        WHSWorkLine combineWorkLine = WHSWorkLine::find(combineWorkTable.WorkId, _combineLineNum, true);
+
+        // Move the current WITs to the new pick workline.
+        WHSWorkInventTrans::moveToNewWorkLine(combineWorkLine.WorkId, combineWorkLine.LineNum, targetWorkTable.WorkId, targetLineNum);
+
+        // Move the pick workLine to be on the target work header as a new initial pick
+        if (_withReopen)
+        {
+            combineWorkLine.WorkStatus         = WHSWorkStatus::Open;
+
+            if (shouldUpdateQtyRemainOnReopen)
+            {
+                combineWorkLine.QtyRemain          = combineWorkLine.QtyWork;
+                combineWorkLine.InventQtyRemain    = combineWorkLine.InventQtyWork;
+            }
+        }
+
+        combineWorkLine.WorkId  = targetWorkTable.WorkId;
+        combineWorkLine.LineNum = targetLineNum;
+
+        
+        using (var updatePackingWorkLine = WHSWorkLineUpdateContext::newAllowingReopen(true))
+        {
+            combineWorkLine.update();
+        }
+  
+
+        InventUnitId inventUnitId = InventTableModule::find(combineWorkLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
+        WHSWorkLine targetWorkLine;
+
+        // Loop over all the non-initial pick worklines and update.
+        while select forupdate targetWorkLine
+                    order by LineNum
+                    where targetWorkLine.WorkId  == targetWorkTable.WorkId
+                    &&    targetWorkLine.LineNum >  targetLineNum
+        {
+            // Compare combined workLine fields to see if they need to be cleared out
+            if (targetWorkLine.ItemId != combineWorkLine.ItemId)
+            {
+                targetWorkLine.ItemId = '';
+            }
+
+            if (targetWorkLine.InventDimId != combineWorkLine.InventDimId)
+            {
+                targetWorkLine.InventDimId = '';
+            }
+
+            if (targetWorkLine.LoadId != combineWorkLine.LoadId)
+            {
+                targetWorkLine.LoadId = '';
+            }
+
+            if (targetWorkLine.LoadLineRefRecId != combineWorkLine.LoadLineRefRecId)
+            {
+                targetWorkline.LoadLineRefRecId = 0;
+            }
+
+            if (targetWorkLine.InventTransId != combineWorkLine.InventTransId)
+            {
+                targetWorkLine.InventTransId = '';
+            }
+
+            if (targetWorkLine.InventTransOriginIdSupply!= combineWorkLine.InventTransOriginIdSupply)
+            {
+                targetWorkLine.InventTransOriginIdSupply = 0;
+            }
+
+            // Increase quantity buckets on workLine
+            if (EcoResProductUnitConverter::canBeConvertedGivenUnitSymbolsForReleasedProduct(combineWorkLine.ItemId,
+                                                                                                        combineWorkLine.InventDimId,
+                                                                                                        inventUnitId,
+                                                                                                        targetWorkLine.UnitId))
+            {
+                Qty workQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(combineWorkLine.ItemId,
+                                                                                                            combineWorkLine.InventDimId,
+                                                                                                            combineWorkLine.InventQtyWork,
+                                                                                                            inventUnitId,
+                                                                                                            targetWorkLine.UnitId,
+                                                                                                            NoYes::No,
+                                                                                                            NoYes::No);
+                if (_withReopen && shouldUpdateQtyRemainOnReopen)
+                {
+                    targetWorkLine.QtyRemain += workQty;
+                }
+
+                targetWorkLine.QtyWork   += workQty;
+            }
+            else
+            {
+                targetWorkLine.UnitId     = '';
+
+                if (_withReopen && shouldUpdateQtyRemainOnReopen)
+                {
+                    targetWorkLine.QtyRemain += combineWorkLine.QtyRemain;
+                }
+
+                targetWorkLine.QtyWork   += combineWorkLine.QtyWork;
+            }
+
+            if (_withReopen && shouldUpdateQtyRemainOnReopen)
+            {
+                targetWorkLine.InventQtyRemain  += combineWorkLine.InventQtyRemain;
+            }
+
+            targetWorkLine.InventQtyWork    += combineWorkLine.InventQtyWork;
+
+            targetWorkLine.update();
+        }
+
+        //Update put line on combined Work
+        WHSPackingWorkHelper::updatePutLineQty(combineWorkTable.WorkId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePutLineQty</Name>
+				<Source><![CDATA[
+    internal static void updatePutLineQty(WHSWorkId _workId)
+    {
+        WHSWorkLine putWorkLine, workLine;
+        WHSWorkTable workTable = WHSWorkTable::find(_workId, true);
+
+        select forupdate firstonly putWorkLine
+            where putWorkLine.WorkId == _workId
+            && putWorkLine.WorkType == WHSWorkType::Put;
+
+        select sum(InventQtyWork), sum(InventQtyRemain), sum(QtyRemain), sum(QtyWork) from workLine
+            where workLine.WorkId == workTable.WorkId
+            && workLine.WorkType == WHSWorkType::Pick;
+
+        if (workLine.QtyWork)
+        {
+            putWorkLine.InventQtyWork   = workLine.InventQtyWork;
+            putWorkLine.InventQtyRemain = workLine.InventQtyRemain;
+            putWorkLine.QtyRemain       = workLine.QtyRemain;
+            putWorkLine.QtyWork         = workLine.QtyWork;
+
+            putWorkLine.update();
+        }
+        else
+        {
+            workTable.delete();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPackingWorkLineFromWorkLine</Name>
+				<Source><![CDATA[
+    internal static void createPackingWorkLineFromWorkLine(WHSWorkLine _initialWorkLine, WHSWorkTable _initialWorkTable, WHSWorkId _newWorkId, WMSLocationId _locationId)
+    {
+
+        if(_initialWorkLine.hasDimTracking())
+        {
+            WHSDimTracking dimTracking;
+
+            while select dimTracking
+                    where dimTracking.WorkId == _initialWorkLine.WorkId
+                        && dimTracking.LineNum == _initialWorkLine.LineNum
+            {
+                WHSPackingWorkHelper::initPackingLine(_initialWorkLine, _initialWorkTable, _newWorkId, _locationId, dimTracking.InventDimId, dimTracking.Qty);
+            }
+
+            delete_from dimTracking
+                    where dimTracking.WorkId == _initialWorkLine.WorkId
+                        && dimTracking.LineNum == _initialWorkLine.LineNum;
+        }
+        else
+        {
+            WHSPackingWorkHelper::initPackingLine(_initialWorkLine, _initialWorkTable, _newWorkId, _locationId, _initialWorkLine.InventDimId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initPackingLine</Name>
+				<Source><![CDATA[
+    internal static void initPackingLine(WHSWorkLine _initialWorkLine, 
+                                         WHSWorkTable _initialWorkTable,
+                                         WHSWorkId _newWorkId, 
+                                         WMSLocationId _locationId, 
+                                         InventDimId _inventDimId, 
+                                         InventHandlingQty _inventQtyWork = 0)
+    {
+        WHSWorkLine     newWorkLine;      
+        InventDim       updateInventDimForWork;
+
+        newWorkLine.clear();
+        newWorkLine.initValue();
+
+        buf2Buf(_initialWorkLine, newWorkLine);
+
+        newWorkLine.WorkId = _newWorkId;
+        newWorkLine.LineNum = WHSWorkLine::lastLineNum(_newWorkId) + 1;
+        newWorkLine.WorkStatus = WHSWorkStatus::Open;
+        newWorkLine.WMSLocationId = _locationId;
+        newWorkLine.AllocatedWMSLocationId = '';
+        newWorkLine.ZoneId = '';
+        newWorkLine.OrigPackingWorkTargetLicensePlateId = _initialWorkTable.TargetLicensePlateId;
+        
+        if (_inventQtyWork)
+        {
+            //recalculating qties
+            newWorkLine.InventQtyWork = _inventQtyWork;
+            newWorkLine.QtyWork = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(_initialWorkLine.ItemId,
+                                                                                                                _inventDimId,
+                                                                                                                _inventQtyWork,
+                                                                                                                InventTableModule::find(_initialWorkLine.ItemId, ModuleInventPurchSales::Invent).UnitId,
+                                                                                                                _initialWorkLine.UnitId,
+                                                                                                                NoYes::No,
+                                                                                                                NoYes::No);
+        }
+
+        newWorkLine.InventQtyRemain = newWorkLine.InventQtyWork;
+        newWorkLine.QtyRemain = newWorkLine.QtyWork;
+
+        updateInventDimForWork = InventDim::find(_inventDimId);
+        updateInventDimForWork.LicensePlateId = WHSWorkTable::find(_newWorkId).TargetLicensePlateId;
+        updateInventDimForWork.wmsLocationId = _locationId;
+                    
+        newWorkLine.InventDimId = InventDim::findOrCreate(updateInventDimForWork).inventDimId;
+
+        newWorkLine.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>connectedPackingWorkLineExists</Name>
+				<Source><![CDATA[
+    internal static boolean connectedPackingWorkLineExists(WHSWorkLine _workLine, WHSWorkTable _workTable = null)
+    {
+        if (!_workTable)
+        {
+            _workTable = WHSWorkTable::find(_workLine.WorkId);
+        }
+
+        if (!_workTable || !(_workTable.isWorkTransTypeOutbound()))
+        {
+            return false;
+        }
+
+        WHSWorkLine workLinePacking;
+        WHSWorkTable workTablePacking;
+
+        select firstonly RecId from workLinePacking 
+            where workLinePacking.inventTransId == _workLine.inventTransId
+            exists join workTablePacking 
+            where workTablePacking.WorkId == workLinePacking.WorkId 
+               && workTablePacking.WorkTransType == WHSWorkTransType::Packing;
+
+        return (workLinePacking.RecId != 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>connectedPackingWorkExists</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static boolean connectedPackingWorkExists(WHSWorkId _workId)
+    {
+        WHSWorkTable workTable = WHSWorkTable::find(_workId);
+
+        if (!workTable || !(workTable.isWorkTransTypeOutbound()))
+        {
+            return false;
+        }
+
+        return (select firstonly WHSWorkTable
+                    where WHSWorkTable.OrderNum == workTable.OrderNum   
+                    && WHSWorkTable.InventLocationId == workTable.InventLocationId
+                    && WHSWorkTable.TargetLicensePlateId == workTable.TargetLicensePlateId
+                    && WHSWorkTable.WorkTransType == WHSWorkTransType::Packing).RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>connectedPackingWorkToLoadLineExists</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static boolean connectedPackingWorkToLoadLineExists(WHSLoadLineRefRecId _loadLineRefRecId)
+    {
+        WHSWorkTable workTable;
+        WHSWorkLine workLine;
+
+        boolean ret;
+
+        if (!_loadLineRefRecId)
+        {
+            return ret;
+        }
+
+        select firstonly RecId from workTable
+            where workTable.WorkTransType == WHSWorkTransType::Packing
+            exists join workLine
+            where workLine.LoadLineRefRecId	== _loadLineRefRecId
+                &&  workTable.WorkId        == workLine.WorkId;
+
+        return workTable.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findSalesWorkByTargetLicensePlate</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static WHSWorkTable findSalesWorkByTargetLicensePlate(WHSLicensePlateId _targetLicensePlateId, boolean _forUpdate = false)
+    {
+        WHSWorkTable workTable;
+
+        workTable.selectForUpdate(_forUpdate);
+
+        if (_targetLicensePlateId)
+        {
+            select firstonly workTable
+                where workTable.TargetLicensePlateId == _targetLicensePlateId
+                    && workTable.WorkTransType == WHSWorkTransType::Sales;
+        }
+
+        return workTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOutboundWorkByTargetLicensePlate</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    internal static WHSWorkTable findOutboundWorkByTargetLicensePlate(WHSLicensePlateId _targetLicensePlateId, boolean _forUpdate = false)
+    {
+        WHSWorkTable workTable;
+
+        workTable.selectForUpdate(_forUpdate);
+
+        if (_targetLicensePlateId)
+        {
+            container workTransTypes = WhsWorkTransactionType::workTransTypesSupportingConnectedPackingWork();
+
+            select firstonly workTable
+                order by WorkClosedUTCDateTime desc //in the unlikely case the lp was on more than one work we take the one that was closed most recently
+                where workTable.TargetLicensePlateId == _targetLicensePlateId
+                    && workTable.WorkTransType in workTransTypes;
+        }
+
+        return workTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePackingWorkLineQtyRemainOnContainerLineChange</Name>
+				<Source><![CDATA[
+    internal static void updatePackingWorkLineQtyRemainOnContainerLineChange(WHSContainerLine _containerLine, InventQty _handlingQty)
+    {
+        if (appl.ttsLevel() == 0)
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        WHSInstrumentationLogger logger = WHSInstrumentationLogger::createLogger(classStr(WHSPackingWorkHelper));
+        WHSUpdatePackingWorkLineQtyRemainInstrumentationActivities activities = logger.updatePackingWorkLineQtyRemain();
+
+        using (var updatePackingWorkLineQtyRemainActivityContext = activities.updatePackingWorkLineQtyRemain(_containerLine.RecId))
+        {
+            Set updatedWorks = new Set(Types::String);
+        
+            InventUnitId inventUnitId = InventTableModule::find(_containerLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
+
+            WHSWorkTable packingWork;
+            WHSWorkLine packingWorkLine;
+                
+            boolean isPackingMore = _handlingQty >= 0;
+            InventQty runningQty = abs(_handlingQty);
+            Counter processedPackingWorkLinesCount = 0;
+
+            while select forupdate packingWorkLine
+                where packingWorkLine.LoadLineRefRecId == _containerLine.LoadLine
+                    && packingWorkLine.inventDimId == _containerLine.InventDimId
+                    && ((isPackingMore && packingWorkLine.InventQtyRemain > 0)
+                    || (!isPackingMore && packingWorkLine.InventQtyRemain < packingWorkLine.InventQtyWork))
+            exists join packingWork
+                where packingWork.WorkTransType == WHSWorkTransType::Packing
+                    && packingWork.WorkStatus == WHSWorkStatus::Open
+                    && packingWork.WorkId == packingWorkLine.WorkId
+            {
+                if (runningQty <= 0)
+                {
+                    break;
+                }
+
+                InventQty workLineInventQtyToAdjust; 
+
+                if (isPackingMore)
+                {
+                    workLineInventQtyToAdjust = min(runningQty, packingWorkLine.InventQtyRemain);
+                }
+                else
+                {
+                    workLineInventQtyToAdjust = min(runningQty, packingWorkLine.InventQtyWork - packingWorkLine.InventQtyRemain);
+                }
+                        
+                Qty workLineQtyToAdjust = 0;
+
+                if (EcoResProductUnitConverter::canBeConvertedGivenUnitSymbolsForReleasedProduct(packingWorkLine.ItemId, packingWorkLine.InventDimId, inventUnitId, packingWorkLine.UnitId))
+                {
+                    workLineQtyToAdjust = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(packingWorkLine.ItemId,
+                                                                                                                packingWorkLine.InventDimId,
+                                                                                                                workLineInventQtyToAdjust,
+                                                                                                                inventUnitId,
+                                                                                                                packingWorkLine.UnitId,
+                                                                                                                NoYes::No,
+                                                                                                                NoYes::No);
+                }
+
+                if (isPackingMore)
+                {
+                    packingWorkLine.QtyRemain -= workLineQtyToAdjust;
+                    packingWorkLine.InventQtyRemain -= workLineInventQtyToAdjust;
+                }
+                else
+                {
+                    packingWorkLine.QtyRemain += workLineQtyToAdjust;
+                    packingWorkLine.InventQtyRemain += workLineInventQtyToAdjust;
+                }
+
+                packingWorkLine.update();
+
+                runningQty -= workLineInventQtyToAdjust;
+
+                if (!updatedWorks.in(packingWorkLine.WorkId))
+                {
+                    updatedWorks.add(packingWorkLine.WorkId);
+                }
+
+                processedPackingWorkLinesCount++;
+            }
+
+            SetEnumerator updatedWorksEnumerator = updatedWorks.getEnumerator();
+
+            while (updatedWorksEnumerator.moveNext())
+            {
+                WHSPackingWorkHelper::updatePutLineQty(updatedWorksEnumerator.current());
+            }
+
+            activities.parmProcessedPackingWorkLinesCount(updatePackingWorkLineQtyRemainActivityContext, processedPackingWorkLinesCount);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>existsUnpackedQtyForItemOnPackLocation</Name>
+				<Source><![CDATA[
+    internal static boolean existsUnpackedQtyForItemOnPackLocation(WHSShipmentId _shipmentId, 
+                                                                    ItemId _itemId, 
+                                                                    InventLocationId _warehouseId, 
+                                                                    WMSLocationId _packingLocationId, 
+                                                                    InventDim _inventDimCriteria)
+    {
+        WHSWorkLine packingWorkLine;
+        WHSWorkTable packingWork;
+        WHSLoadLine loadLine;
+        InventDim inventDim;
+        InventDimParm inventDimParm;
+        inventDimParm.initFromInventDim(_inventDimCriteria);
+
+        select firstonly RecId from packingWorkLine
+            where packingWorkLine.ItemId == _itemId
+                && packingWorkLine.WMSLocationId == _packingLocationId
+                && packingWorkLine.InventQtyRemain > 0
+        exists join packingWork
+            where packingWork.WorkId == packingWorkLine.WorkId
+                && packingWork.InventLocationId == _warehouseId
+        exists join loadLine 
+            where loadLine.RecId == packingWorkLine.LoadLineRefRecId
+                && loadLine.ShipmentId ==_shipmentId
+        #InventDimExistsJoin(packingWorkLine.inventDimId, inventDim, _inventDimCriteria, inventDimParm);
+
+        return packingWorkLine.RecId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

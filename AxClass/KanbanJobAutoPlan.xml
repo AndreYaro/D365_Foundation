@@ -1,0 +1,1790 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>KanbanJobAutoPlan</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>KanbanJobAutoPlan</c> class plans kanban jobs.
+/// </summary>
+public class KanbanJobAutoPlan
+{
+    #TimeConstants
+    #define.maxPlanAttempts(500)
+
+    KanbanRule      kanbanRule;
+    KanbanJob       kanbanJob;
+    Kanban          kanban;
+    LegalEntity     legalEntity;
+    TransDateTime   todaysDateTime; //UTC
+
+    boolean         silent;
+    ParmId          parmId;
+
+    int             totalCount;
+    int             successCount;
+    int             failCount;
+
+    Map             mapKanbanJobsPlanStatus;    //[kanbanId,sequence] -> [status,kanbanJob,kanban,date]
+
+    Map             mapDueDateSequenceJobs;
+    Map             mapKanbanJobSetProductionFlowModel;
+    Map             mapKanbanJobWrkCtrResourceGroup;
+    Map             mapInitialLeanWorkScheduleCapacity;
+    Map             mapMinSchedDateTime;
+
+    boolean         onlyUnplanned;
+
+    private KanbanInstrumentationLogger instrumentationLogger;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addToPlanningSequence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Inserts a job into a sequence of jobs to be planned.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    ///    A <c>KanbanJob</c> record to insert into the planning sequence.
+    /// </param>
+    /// <param name="_kanban">
+    ///    The kanban that owns the job; optional.
+    /// </param>
+    /// <remarks>
+    ///    When planning kanban jobs the sequence is: 1. The due date (ascending) 2. The job sequence
+    ///    (ascending) 3. The work cell (all jobs on a work cell at a given date and sequence)
+    /// </remarks>
+    /// <exception cref="M:Exception::Error">
+    ///    No work cell capacity is defined.
+    /// </exception>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void addToPlanningSequence(
+        KanbanJob _kanbanJob,
+        Kanban    _kanban = _kanbanJob.kanban())
+    {
+        WrkCtrResourceGroup                 wrkCtrResourceGroup /*<SYS>
+                                                                = this.wrkCtrResourceGroup(_kanbanJob)
+                                                                </SYS>*/
+                                                                ;
+        TransDate                           dueDate             /*<SYS>
+                                                                = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(_kanbanJob.DueDateTime,DateTimeUtil::getCompanyTimeZone()))
+                                                                </SYS>*/
+                                                                ;   //company TZ
+        boolean                             doAddKanbanJob      = true;
+        Map                                 mapSequenceCellJobs;
+        Map                                 mapCellKanbanJobs;
+        RecordSortedList                    rslKanbanJobs;
+
+        if (_kanbanJob.Status == LeanKanbanJobStatus::Planned)
+        {
+            // Un-plan the job to remove existing scheduling reservations
+            _kanbanJob.status().runReset(LeanKanbanJobStatus::NotPlanned);
+
+            // Reread after unplanning
+            _kanbanJob = KanbanJob::find(_kanbanJob.RecId);
+            _kanban = _kanbanJob.kanban();
+        }
+
+        wrkCtrResourceGroup = this.wrkCtrResourceGroup(_kanbanJob);
+        dueDate             = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(_kanbanJob.DueDateTime,DateTimeUtil::getCompanyTimeZone()));
+
+        if (wrkCtrResourceGroup)
+        {
+            //register job as 'pending'
+            this.registerKanbanJobPlanStatus(KanbanJobPlanStatus::Pending,_kanbanJob,_kanban);
+
+            //all jobs in planning order
+            //map(due Date -> map(Sequence -> map(Cell -> recordSortedList(kanbanJobs))))
+            if (mapDueDateSequenceJobs.exists(dueDate))
+            {
+                mapSequenceCellJobs = mapDueDateSequenceJobs.lookup(dueDate);
+            }
+            else
+            {
+                mapSequenceCellJobs = new Map(Types::Real,Types::Class);
+            }
+
+            if (mapSequenceCellJobs.exists(_kanbanJob.Sequence))
+            {
+                mapCellKanbanJobs = mapSequenceCellJobs.lookup(_kanbanJob.Sequence);
+            }
+            else
+            {
+                mapCellKanbanJobs = new Map(Types::Int64,Types::Class);
+            }
+
+            if (mapCellKanbanJobs.exists(wrkCtrResourceGroup.RecId))
+            {
+                rslKanbanJobs = mapCellKanbanJobs.lookup(wrkCtrResourceGroup.RecId);
+            }
+            else
+            {
+                rslKanbanJobs = this.createRslKanbanJobs();
+            }
+
+            //cache the productionflow model for the set of jobs on the same due date on the same cell
+            if (!mapKanbanJobSetProductionFlowModel.exists(rslKanbanJobs))
+            {
+                LeanWorkCellCapacity leanWorkCellCapacity = LeanWorkCellCapacity::findActiveForWorkCell(wrkCtrResourceGroup.RecId,dueDate);
+
+                if (!leanWorkCellCapacity)
+                {
+                    warning(strFmt("@SYS301789",wrkCtrResourceGroup.WrkCtrId,dueDate));
+                    doAddKanbanJob = false;
+                    this.registerKanbanJobPlanStatus(KanbanJobPlanStatus::Failed,_kanbanJob,_kanban);
+                }
+                else
+                {
+                    LeanProductionFlowModel leanProductionFlowModel = LeanProductionFlowModel::find(leanWorkCellCapacity.ProductionFlowModel);
+                    mapKanbanJobSetProductionFlowModel.insert(rslKanbanJobs,leanProductionFlowModel);
+                }
+            }
+
+            if (doAddKanbanJob)
+            {
+                rslKanbanJobs.ins(_kanbanJob);
+                mapCellKanbanJobs.insert(wrkCtrResourceGroup.RecId,rslKanbanJobs);
+                mapSequenceCellJobs.insert(_kanbanJob.Sequence,mapCellKanbanJobs);
+                mapDueDateSequenceJobs.insert(dueDate,mapSequenceCellJobs);
+            }
+        }
+        else
+        {
+            //register job as 'failed'
+            this.registerKanbanJobPlanStatus(KanbanJobPlanStatus::Failed,_kanbanJob,_kanban);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allowPlanIndividualJobs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines whether jobs that must all be planned in the same period can be split across the
+    ///    multiple periods, if there is not enough capacity in one slot.
+    /// </summary>
+    /// <param name="_leanProductionFlowModel">
+    ///    A <c>LeanProductionFlowModel</c> record.
+    /// </param>
+    /// <returns>
+    ///    true if the jobs can be split among periods; otherwise, false.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected boolean allowPlanIndividualJobs(LeanProductionFlowModel _leanProductionFlowModel)
+    {
+        return    this.capacityShortageReaction(_leanProductionFlowModel) != LeanCapacityShortageReactions::Cancel
+               || !this.shouldPlanAsSlot(_leanProductionFlowModel);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>capacityShortageReaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the capacity shortage reaction.
+    /// </summary>
+    /// <param name="_leanProductionFlowModel">
+    /// The production flow model to determine the reaction from.
+    /// </param>
+    /// <returns>
+    /// The capacity shortage reaction.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected LeanCapacityShortageReaction capacityShortageReaction(LeanProductionFlowModel _leanProductionFlowModel)
+    {
+        return _leanProductionFlowModel.CapacityShortageReaction;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>countKanbanJobsInStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Counts the number of kanban jobs in a specific status for the current rule.
+    /// </summary>
+    /// <param name="_status">
+    /// The kanban job status to look for.
+    /// </param>
+    /// <returns>
+    /// The number of kanban jobs in the specified status.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected int64 countKanbanJobsInStatus(LeanKanbanJobStatus _status)
+    {
+        Kanban              kanbanLocal;
+        KanbanJob           kanbanJobLocal;
+
+        select count(RecId) from kanbanLocal
+            where kanbanLocal.KanbanRule == kanbanRule.RecId
+            exists join kanbanJobLocal
+                where kanbanJobLocal.Kanban == kanbanLocal.RecId
+                   && kanbanJobLocal.Type   == LeanKanbanJobType::Process
+                   && kanbanJobLocal.Status == _status;
+
+        return kanbanLocal.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRslKanbanJobs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a <c>RecordSortedList</c> object for the <c>KanbanJob</c> table.
+    /// </summary>
+    /// <returns>
+    /// A new <c>RecordSortedList</c> object.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected RecordSortedList createRslKanbanJobs()
+    {
+        RecordSortedList rslKanbanJobs = new RecordSortedList(tableNum(KanbanJob));
+        rslKanbanJobs.sortOrder(fieldNum(KanbanJob,DueDateTime),fieldNum(KanbanJob,RecId));
+
+        return rslKanbanJobs;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endDatePlanningTimeFence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the end date of the planning time fence for a given <c>LeanWorkCellScheduleCapacity</c> object.
+    /// </summary>
+    /// <param name="_leanWorkCellScheduleCapacity">
+    /// A <c>LeanWorkCellScheduleCapacity</c> object.
+    /// </param>
+    /// <returns>
+    /// The end date of the planning time fence in the company timezone.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected TransDate endDatePlanningTimeFence(LeanWorkCellScheduleCapacity _leanWorkCellScheduleCapacity)
+    {
+        TransDate               transDate;
+        LeanProductionFlowModel leanProductionFlowModel = _leanWorkCellScheduleCapacity.leanProductionFlowModel();
+
+        if (leanProductionFlowModel.PlanningTimeFence > 1)
+        {
+            transDate = new WorkCalendarSched().schedDate(SchedDirection::Forward,
+                                                            DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(todaysDateTime,DateTimeUtil::getCompanyTimeZone())),
+                                                            leanProductionFlowModel.PlanningTimeFence-1,   //count incl. today
+                                                            NoYes::Yes,
+                                                            _leanWorkCellScheduleCapacity.calendarId());
+        }
+        else    // 1, as PlanningTimeFence cannot be negative or 0
+        {
+            transDate = dateMax();
+        }
+
+        return transDate;   //company TZ
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>estimatedCapacityConsumptionSeconds</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the estimated capacity consumption for one or more kanban jobs.
+    /// </summary>
+    /// <param name="_leanWorkCellScheduleCapacity">
+    ///    A <c>LeanWorkCellScheduleCapacity</c> object to use to calculate the estimated consumption.
+    /// </param>
+    /// <param name="_kanbanJob">
+    ///    The kanban job to estimate; optional.
+    /// </param>
+    /// <param name="_rslKanbanJobs">
+    ///    A <c>RecordSortedList</c> list of kanban jobs to estimate; optional.
+    /// </param>
+    /// <returns>
+    ///    The estimated capacity consumption, in seconds.
+    /// </returns>
+    /// <remarks>
+    ///    Passes either a single kanban job or a set of kanban jobs, but not both at the same time.
+    /// </remarks>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected Seconds estimatedCapacityConsumptionSeconds(
+        LeanWorkCellScheduleCapacity _leanWorkCellScheduleCapacity,
+        KanbanJob                    _kanbanJob     = null,
+        RecordSortedList             _rslKanbanJobs = null)
+    {
+        Seconds         estimatedConsumptionSeconds;
+        KanbanJob       kanbanJobLocal;
+
+        if (_rslKanbanJobs)
+        {
+            boolean rslNext = _rslKanbanJobs.first(kanbanJobLocal);
+            while (   rslNext
+                   && kanbanJobLocal)
+            {
+                estimatedConsumptionSeconds += _leanWorkCellScheduleCapacity.estimatedCapacityConsumptionSeconds(kanbanJobLocal);
+                rslNext                      = _rslKanbanJobs.next(kanbanJobLocal);
+            }
+        }
+        else
+        {
+            if (_kanbanJob)
+            {
+                estimatedConsumptionSeconds  = _leanWorkCellScheduleCapacity.estimatedCapacityConsumptionSeconds(_kanbanJob);
+            }
+        }
+
+        return estimatedConsumptionSeconds;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>estimatedCapacityConsumptionThroughput</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the estimated throughput capacity consumption for one or more kanban jobs.
+    /// </summary>
+    /// <param name="_leanWorkCellScheduleCapacity">
+    ///    A <c>LeanWorkCellScheduleCapacity</c> object to use to calculate the estimated consumption.
+    /// </param>
+    /// <param name="_kanbanJob">
+    ///    The kanban job to estimate; optional.
+    /// </param>
+    /// <param name="_rslKanbanJobs">
+    ///    A <c>RecordSortedList</c> list of kanban jobs to estimate; optional.
+    /// </param>
+    /// <returns>
+    ///    The estimated throughput capacity consumption.
+    /// </returns>
+    /// <remarks>
+    ///    Passes either a single kanban job or a set of kanban jobs, but not both at the same time.
+    /// </remarks>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected InventQty estimatedCapacityConsumptionThroughput(
+        LeanWorkCellScheduleCapacity _leanWorkCellScheduleCapacity,
+        KanbanJob                    _kanbanJob     = null,
+        RecordSortedList             _rslKanbanJobs = null)
+    {
+        InventQty       estimatedConsumptionThroughput;
+        KanbanJob       kanbanJobLocal;
+
+        if (_rslKanbanJobs)
+        {
+            boolean rslNext = _rslKanbanJobs.first(kanbanJobLocal);
+            while (   rslNext
+                   && kanbanJobLocal)
+            {
+                estimatedConsumptionThroughput += _leanWorkCellScheduleCapacity.estimatedCapacityConsumptionThroughput(kanbanJobLocal);
+                rslNext                         = _rslKanbanJobs.next(kanbanJobLocal);
+            }
+        }
+        else
+        {
+            if (_kanbanJob)
+            {
+                estimatedConsumptionThroughput  = _leanWorkCellScheduleCapacity.estimatedCapacityConsumptionThroughput(_kanbanJob);
+            }
+        }
+
+        return estimatedConsumptionThroughput;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>failCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the number of jobs that failed planning.
+    /// </summary>
+    /// <returns>
+    /// The number of jobs that failed planning.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public int failCount()
+    {
+        return failCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalizePlanKanbanJobs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Finalizes the planning process.
+    /// </summary>
+    /// <exception cref="M:Exception::Error">
+    ///    Encountered an unknown <c>KanbanJobPlanStatus</c> enumeration value.
+    /// </exception>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void finalizePlanKanbanJobs()
+    {
+        KanbanJob           kanbanJobLocal;
+        Kanban              kanbanLocal;
+        KanbanJobPlanStatus kanbanJobPlanStatus;
+        TransDate           transDate;
+        MapEnumerator       me = mapKanbanJobsPlanStatus.getEnumerator();
+
+        totalCount = mapKanbanJobsPlanStatus.elements();
+
+        while (me.moveNext())
+        {
+            [kanbanJobPlanStatus,kanbanJobLocal,kanbanLocal,transDate] = me.currentValue();
+
+            switch (kanbanJobPlanStatus)
+            {
+                //all jobs that are left 'pending' must now be considered as 'failed'
+                case KanbanJobPlanStatus::Pending:
+                    this.registerKanbanJobPlanStatus(KanbanJobPlanStatus::Failed,kanbanJobLocal,kanbanLocal,transDate);
+                    failCount++;
+                    break;
+                case KanbanJobPlanStatus::Failed:
+                    failCount++;
+                    break;
+                case KanbanJobPlanStatus::Planned:
+                    successCount++;
+                    break;
+                default:
+                    throw error(Error::wrongUseOfFunction(funcName()));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findPlannedPeriodEPECycle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds a planned period for a job or set of jobs according to the EPE cycle and capacity shortage reaction setting.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    /// The <c>KanbanJob</c> record to find a planning period for; optional.
+    /// </param>
+    /// <param name="_rslKanbanJobs">
+    /// A <c>RecordSortedList</c> of kanban jobs to find a planning period for; optional.
+    /// </param>
+    /// <returns>
+    /// The planning period date in the company timezone if one was found; otherwise an empty date.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected KanbanJobSchedulePlannedPeriod findPlannedPeriodEPECycle(
+        KanbanJob           _kanbanJob     = null,
+        RecordSortedList    _rslKanbanJobs = null)
+    {
+        KanbanJob                       kanbanJobLocal;
+        LeanWorkCellScheduleCapacity    nextLeanWorkCellScheduleCapacity;
+        KanbanJobSchedulePlannedPeriod  kanbanJobSchedulePlannedPeriod;
+        SchedDirection                  schedDirection   = this.schedDirection();
+        boolean                         cancelSearch     = false;
+        boolean                         foundPeriod;
+        int                             numPlanAttempts;
+
+        if (_rslKanbanJobs)
+        {
+            //first job in list
+            _rslKanbanJobs.first(kanbanJobLocal);
+        }
+        else
+        {
+            kanbanJobLocal = _kanbanJob;
+        }
+
+        if (kanbanJobLocal)
+        {
+            //cell
+            WrkCtrResourceGroup wrkCtrResourceGroup = this.wrkCtrResourceGroup(kanbanJobLocal);
+
+            //set date
+            TransDateTime initialTransDateTime = this.initialTransDateTime(kanbanJobLocal);
+
+            LeanWorkCellScheduleCapacity leanWorkCellScheduleCapacity = LeanWorkCellScheduleCapacity::newStandard(wrkCtrResourceGroup,initialTransDateTime);
+            TransDate endDatePlanningTimeFence = this.endDatePlanningTimeFence(leanWorkCellScheduleCapacity);     //company TZ
+
+            leanWorkCellScheduleCapacity = this.initialLeanWorkScheduleCapacity(kanbanJobLocal);
+            initialTransDateTime = leanWorkCellScheduleCapacity.capacityFromDateTime();
+            TransDateTime transDateTime = leanWorkCellScheduleCapacity.capacityFromDateTime();
+            LeanProductionFlowModel leanProductionFlowModel = leanWorkCellScheduleCapacity.leanProductionFlowModel();
+            int interval = leanProductionFlowModel.PlanningPeriodType == LeanPlanningPeriodTypes::Day ? 1 : #daysPerWeek;
+            TransDateTime minSchedDateTime = this.minSchedDateTime(kanbanJobLocal);
+
+            //find a period with sufficient capacity
+            while (   !kanbanJobSchedulePlannedPeriod
+                   && leanWorkCellScheduleCapacity.capacityFromDate() <= endDatePlanningTimeFence
+                   && numPlanAttempts <= #maxPlanAttempts
+                   && !cancelSearch)
+            {
+                switch (leanProductionFlowModel.ModelType)
+                {
+                    case LeanProdFlowModelTypes::Hours:
+                        Seconds estimatedConsumptionSeconds = this.estimatedCapacityConsumptionSeconds(leanWorkCellScheduleCapacity,kanbanJobLocal,_rslKanbanJobs);
+                        foundPeriod = estimatedConsumptionSeconds <= leanWorkCellScheduleCapacity.freeCapacitySeconds();
+                        break;
+                    case LeanProdFlowModelTypes::Throughput:
+                        InventQty estimatedConsumptionThroughput = this.estimatedCapacityConsumptionThroughput(leanWorkCellScheduleCapacity,kanbanJobLocal,_rslKanbanJobs);
+                        foundPeriod = estimatedConsumptionThroughput <= leanWorkCellScheduleCapacity.freeCapacityThroughput();
+                        break;
+                }
+
+                numPlanAttempts++;
+
+                if (foundPeriod)
+                {
+                    kanbanJobSchedulePlannedPeriod = leanWorkCellScheduleCapacity.capacityFromDate();
+                }
+                else
+                {
+                    switch (this.capacityShortageReaction(leanProductionFlowModel))
+                    {
+                        case LeanCapacityShortageReactions::Distribute:
+                        case LeanCapacityShortageReactions::Slot:
+                            //go backwards until minimum period is reached, then move forwards from initial period
+                            interval = leanProductionFlowModel.PlanningPeriodType == LeanPlanningPeriodTypes::Day ? 1 : #daysPerWeek;
+                            do
+                            {
+                                if (   transDateTime  >  minSchedDateTime
+                                    && schedDirection == SchedDirection::Backward)
+                                {
+                                    //backwards
+                                    transDateTime = max(minSchedDateTime,DateTimeUtil::addDays(transDateTime,-interval));
+                                }
+                                else
+                                {
+                                    schedDirection = SchedDirection::Forward;
+                                    if (transDateTime >= initialTransDateTime)
+                                    {
+                                        //moving forward
+                                        transDateTime = DateTimeUtil::addDays(transDateTime,interval);
+                                    }
+                                    else
+                                    {
+                                        //switching to forward
+                                        transDateTime   = DateTimeUtil::addDays(initialTransDateTime,interval);
+                                    }
+                                }
+                                //new instances for next period
+                                nextLeanWorkCellScheduleCapacity = LeanWorkCellScheduleCapacity::newStandard(wrkCtrResourceGroup,transDateTime);
+                            }
+                            while (nextLeanWorkCellScheduleCapacity.capacityFromDate() == leanWorkCellScheduleCapacity.capacityFromDate());
+
+                            leanWorkCellScheduleCapacity   = nextLeanWorkCellScheduleCapacity;
+                            leanProductionFlowModel        = leanWorkCellScheduleCapacity.leanProductionFlowModel();
+                            transDateTime                  = leanWorkCellScheduleCapacity.capacityFromDateTime();
+                            break;
+                        case LeanCapacityShortageReactions::AddToRequestedDay:
+                            //overload period
+                            foundPeriod                    = true;
+                            kanbanJobSchedulePlannedPeriod = leanWorkCellScheduleCapacity.capacityFromDate();
+                            break;
+                        case LeanCapacityShortageReactions::Cancel:
+                            warning(strFmt("@SYS301790",kanbanJobLocal.kanbanId(),kanbanJobLocal.PlanActivityName,leanWorkCellScheduleCapacity.capacityFromDate()));
+                            cancelSearch                   = true;
+                    }
+                }
+            }
+
+            //if no planned period was found after the maximum number of attempts or exceeding the time fence, show an error.
+            //Do not show an error when the search was for a list of jobs. The jobs in the set will be retried individually.
+            if (   !kanbanJobSchedulePlannedPeriod
+                && !_rslKanbanJobs)
+            {
+                if (   endDatePlanningTimeFence != dateMax()
+                    && leanWorkCellScheduleCapacity.capacityFromDate() >= endDatePlanningTimeFence)
+                {
+                    warning(strFmt("@SYS311837",endDatePlanningTimeFence));
+                }
+                warning(strFmt("@SYS301791",kanbanJobLocal.kanbanId(),kanbanJobLocal.PlanActivityName,numPlanAttempts));
+            }
+        }
+
+        return kanbanJobSchedulePlannedPeriod;      //company TZ
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findPlannedPeriodFIFO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Finds a planning period for a given <c>KanbanJob</c> record.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    ///    The <c>KanbanJob</c> to plan.
+    /// </param>
+    /// <returns>
+    ///    A planning period date in the company timezone if one was found; otherwise an empty date.
+    /// </returns>
+    /// <exception cref="M:Exception::Warning">
+    ///    No planning period could be found after a maximum number of attempts.
+    /// </exception>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected KanbanJobSchedulePlannedPeriod findPlannedPeriodFIFO(KanbanJob _kanbanJob)
+    {
+        WrkCtrResourceGroup             wrkCtrResourceGroup = this.wrkCtrResourceGroup(_kanbanJob);
+        boolean                         foundPeriod;
+        KanbanJobSchedulePlannedPeriod  kanbanJobSchedulePlannedPeriod;
+        int                             numPlanAttempts;
+        int                             numInsufficientAverageQtyPeriods;
+
+        //set initial date
+        LeanWorkCellScheduleCapacity leanWorkCellScheduleCapacity = this.initialLeanWorkScheduleCapacity(_kanbanJob);
+        TransDateTime transDateTime = leanWorkCellScheduleCapacity.capacityFromDateTime();
+
+        //find a period with sufficient capacity (forward direction only)
+        while (   !kanbanJobSchedulePlannedPeriod
+               && numPlanAttempts <= #maxPlanAttempts
+               && leanWorkCellScheduleCapacity.leanProductionFlowModel())
+        {
+            switch (leanWorkCellScheduleCapacity.modelType())
+            {
+                case LeanProdFlowModelTypes::Hours:
+                    Seconds estimatedConsumptionSeconds = leanWorkCellScheduleCapacity.estimatedCapacityConsumptionSeconds(_kanbanJob);
+                    foundPeriod = estimatedConsumptionSeconds <= leanWorkCellScheduleCapacity.freeCapacitySeconds();
+                    break;
+                case LeanProdFlowModelTypes::Throughput:
+                    InventQty estimatedConsumptionThroughput = leanWorkCellScheduleCapacity.estimatedCapacityConsumptionThroughput(_kanbanJob);
+                    foundPeriod = estimatedConsumptionThroughput <= leanWorkCellScheduleCapacity.freeCapacityThroughput();
+
+                    // count the days with insufficient averageQty for the job's estimated consumption
+                    if (  !foundPeriod
+                        && estimatedConsumptionThroughput > leanWorkCellScheduleCapacity.leanWorkCellCapacity().AverageThroughputQuantity)
+                    {
+                        numInsufficientAverageQtyPeriods++;
+                    }
+                    break;
+            }
+
+            numPlanAttempts++;
+
+            if (foundPeriod)
+            {
+                kanbanJobSchedulePlannedPeriod = leanWorkCellScheduleCapacity.capacityFromDate();
+            }
+            else
+            {
+                transDateTime = DateTimeUtil::addDays(transDateTime,
+                                              leanWorkCellScheduleCapacity.planningPeriodType() == LeanPlanningPeriodTypes::Day
+                                              ? 1
+                                              : #daysPerWeek);
+
+                // try to create a schedule capacity object. in case so far there hasn't
+                // been a day with sufficient enough AverageThroughputQty, then we're doing the
+                // creation in silent mode - i.e. we won't throw an exception in case of validation error
+                leanWorkCellScheduleCapacity = LeanWorkCellScheduleCapacity::newStandard(wrkCtrResourceGroup,
+                                                                                         transDateTime,
+                                                                                         numInsufficientAverageQtyPeriods == numPlanAttempts);
+
+                transDateTime                = leanWorkCellScheduleCapacity.capacityFromDateTime();
+            }
+        }
+
+        if (!kanbanJobSchedulePlannedPeriod)
+        {
+            warning(strFmt("@SYS301791",_kanbanJob.kanbanId(),_kanbanJob.PlanActivityName,#maxPlanAttempts));
+            if (numPlanAttempts == numInsufficientAverageQtyPeriods)
+            {
+                throw error(strFmt("@SYS326864", wrkCtrResourceGroup.WrkCtrId));
+            }
+        }
+
+        return kanbanJobSchedulePlannedPeriod;      //company TZ
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the class variables.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void init()
+    {
+        successCount                       = 0;
+        failCount                          = 0;
+        totalCount                         = 0;
+        todaysDateTime                     = DateTimeUtil::getSystemDateTime(); //UTC
+        mapDueDateSequenceJobs             = new Map(Types::Date,Types::Class);
+        mapKanbanJobSetProductionFlowModel = new Map(Types::Class,Types::Record);
+        mapKanbanJobWrkCtrResourceGroup    = new Map(Types::Int64,Types::Record);
+        mapKanbanJobsPlanStatus            = new Map(Types::Container,Types::Container);
+        legalEntity                        = CompanyInfo::current();
+        onlyUnplanned                      = true;
+        this.resetCacheMaps();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialLeanWorkScheduleCapacity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines the initial <c>LeanWorkCellScheduleCapacity</c> object to use to try to plan a kanban
+    ///    job.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    ///    A <c>KanbanJob</c> record.
+    /// </param>
+    /// <returns>
+    ///    A <c>LeanWorkCellScheduleCapacity</c> object.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected LeanWorkCellScheduleCapacity initialLeanWorkScheduleCapacity(KanbanJob _kanbanJob)
+    {
+        LeanWorkCellScheduleCapacity    leanWorkCellScheduleCapacity;
+        Timezone                        companyTimeZone = DateTimeUtil::getCompanyTimeZone();
+
+        if (mapInitialLeanWorkScheduleCapacity.exists(_kanbanJob.RecId))
+        {
+            leanWorkCellScheduleCapacity = mapInitialLeanWorkScheduleCapacity.lookup(_kanbanJob.RecId);
+        }
+        else
+        {
+            WrkCtrResourceGroup wrkCtrResourceGroup          = this.wrkCtrResourceGroup(_kanbanJob);
+            TransDateTime       minimumDateTimePeriodDayUTC  = this.minSchedDateTime(_kanbanJob);
+            TransDateTime       minimumDateTimePeriodWeekUTC = DateTimeUtil::newDateTime(LeanSchedulePlanningPeriod::mondayOfWeek(DateTimeUtil::date(minimumDateTimePeriodDayUTC)),0,companyTimeZone);
+            TransDateTime       initialTransDateTimeUTC      = max(minimumDateTimePeriodDayUTC, this.initialTransDateTime(_kanbanJob));
+            TransDate           initialTransDateTZ           = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(initialTransDateTimeUTC,companyTimeZone));
+            leanWorkCellScheduleCapacity = LeanWorkCellScheduleCapacity::newStandard(wrkCtrResourceGroup,initialTransDateTimeUTC);
+
+            //if the capacity period starts in the future, move to previous period
+            //for example if a due date falls on a weekend, go backwards to a working day.
+            TransDate checkTransDateTZ = initialTransDateTZ;
+            while (leanWorkCellScheduleCapacity.capacityFromDate() > checkTransDateTZ)
+            {
+                //save values to fall back to if next period is not valid.
+                TransDate prevTransDateTZ = initialTransDateTZ;
+                TransDateTime prevTransDateTimeUTC = initialTransDateTimeUTC;
+                LeanWorkCellScheduleCapacity prevLeanWorkCellScheduleCapacity = leanWorkCellScheduleCapacity;
+
+                //next period (backwards)
+                initialTransDateTZ--;
+                initialTransDateTimeUTC      = DateTimeUtil::newDateTime(initialTransDateTZ,0,companyTimeZone);
+                leanWorkCellScheduleCapacity = LeanWorkCellScheduleCapacity::newStandard(wrkCtrResourceGroup,initialTransDateTimeUTC);
+
+                if (   (leanWorkCellScheduleCapacity.capacityFromDateTime() <  minimumDateTimePeriodDayUTC
+                    &&  leanWorkCellScheduleCapacity.planningPeriodType()   == LeanPlanningPeriodTypes::Day)
+                    || (leanWorkCellScheduleCapacity.capacityFromDateTime() <  minimumDateTimePeriodWeekUTC
+                    &&  leanWorkCellScheduleCapacity.planningPeriodType()   == LeanPlanningPeriodTypes::Week))
+                {
+                    initialTransDateTZ           = prevTransDateTZ;
+                    initialTransDateTimeUTC      = prevTransDateTimeUTC;
+                    leanWorkCellScheduleCapacity = prevLeanWorkCellScheduleCapacity;
+                    break;
+                }
+            }
+
+            LeanProductionFlowModel leanProductionFlowModel = leanWorkCellScheduleCapacity.leanProductionFlowModel();
+
+            //go backwards for EPE
+            if (   leanProductionFlowModel.PlanningTimeFence > 1
+                && leanProductionFlowModel.epeCycle != 0)
+            {
+                TransDate minimumDatePeriodDayTZ = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(minimumDateTimePeriodDayUTC,companyTimeZone));
+                TransDate minimumDatePeriodWeekTZ = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(minimumDateTimePeriodWeekUTC,companyTimeZone));
+
+                initialTransDateTZ      = new WorkCalendarSched().schedDate(SchedDirection::Backward,
+                                                                            DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(initialTransDateTimeUTC,
+                                                                            companyTimeZone)),
+                                                                            leanProductionFlowModel.epeCycle,
+                                                                            NoYes::Yes,
+                                                                            leanWorkCellScheduleCapacity.calendarId());
+
+                switch (leanProductionFlowModel.PlanningPeriodType)
+                {
+                    case LeanPlanningPeriodTypes::Day:
+                        initialTransDateTZ = max(initialTransDateTZ,minimumDatePeriodDayTZ);
+                        break;
+                    case LeanPlanningPeriodTypes::Week:
+                        initialTransDateTZ = max(initialTransDateTZ,minimumDatePeriodWeekTZ);
+                        break;
+                }
+
+                initialTransDateTimeUTC      = DateTimeUtil::newDateTime(initialTransDateTZ,0,companyTimeZone);
+                leanWorkCellScheduleCapacity = LeanWorkCellScheduleCapacity::newStandard(wrkCtrResourceGroup,initialTransDateTimeUTC);
+            }
+
+            //add to cache
+            mapInitialLeanWorkScheduleCapacity.insert(_kanbanJob.RecId,leanWorkCellScheduleCapacity);
+        }
+
+        //period may start in the past
+        return leanWorkCellScheduleCapacity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialTransDateTime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the initial transaction datetime based on the kanban job.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    /// The kanban job.
+    /// </param>
+    /// <returns>
+    /// The initial transaction datetime
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public TransDateTime initialTransDateTime(KanbanJob _kanbanJob)
+    {
+        return max(todaysDateTime,_kanbanJob.DueDateTime);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isInPlanningTimeFence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines whether a kanban job falls into the planning time fence.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    ///    A <c>KanbanJob</c> record.
+    /// </param>
+    /// <returns>
+    ///    true if the job falls into the planning time fence; otherwise, false.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected boolean isInPlanningTimeFence(KanbanJob _kanbanJob)
+    {
+        LeanWorkCellScheduleCapacity    leanWorkCellScheduleCapacity = this.initialLeanWorkScheduleCapacity(_kanbanJob);
+
+        return    leanWorkCellScheduleCapacity
+               && leanWorkCellScheduleCapacity.capacityFromDate() <= this.endDatePlanningTimeFence(leanWorkCellScheduleCapacity);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mapKanbanJobsPlanStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the planning status of jobs that are handled by the current instance of the
+    ///    <c>KanbanJobAutoPlan</c> class.
+    /// </summary>
+    /// <returns>
+    ///    A packed map that has a key of a container with the kanban ID and the <c>Sequence</c> property of
+    ///    the kanban job and the status, kanban job, kanban, and date values.
+    /// </returns>
+    /// <remarks>
+    ///    This method is called to retrieve planning results after the <c>run</c> method is executed.
+    /// </remarks>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public container mapKanbanJobsPlanStatus()
+    {
+        return mapKanbanJobsPlanStatus.pack();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>maxJobsPerSlot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines the maximum number of the kanban jobs that can be in one slot.
+    /// </summary>
+    /// <param name="_leanProductionFlowModel">
+    ///    A <c>LeanProductionFlowModel</c> record to use to determine the maximum.
+    /// </param>
+    /// <returns>
+    ///    The maximum number of kanban jobs in a slot.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected int maxJobsPerSlot(LeanProductionFlowModel _leanProductionFlowModel)
+    {
+        int result = maxInt();
+
+        if (   this.capacityShortageReaction(_leanProductionFlowModel) != LeanCapacityShortageReactions::Cancel
+            && this.shouldPlanAsSlot(_leanProductionFlowModel)
+            && kanbanRule.RecId)
+        {
+            int triggerLevel = kanbanRule.TriggerLevel;
+            if (triggerLevel != 0)
+            {
+                result = triggerLevel;
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>minSchedDateTime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the minimum dateTime a job is allowed to start.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    /// The kanban job to get the dateTime for.
+    /// </param>
+    /// <returns>
+    /// The minimum dateTime a job is allowed to start.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected TransDateTime minSchedDateTime(KanbanJob _kanbanJob)
+    {
+        TransDateTime fromDateTime;
+
+        if (mapMinSchedDateTime.exists(_kanbanJob.RecId))
+        {
+            fromDateTime = mapMinSchedDateTime.lookup(_kanbanJob.RecId);
+        }
+        else
+        {
+            fromDateTime = KanbanDateCalculation::newKanbanJob(_kanbanJob).jobMinDateTimeForward(_kanbanJob);
+            fromDateTime = max(fromDateTime, todaysDateTime);
+
+            mapMinSchedDateTime.insert(_kanbanJob.RecId, fromDateTime);
+        }
+
+        return fromDateTime;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfKanbansToPlan</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the number of kanbans that must be auto planned.
+    /// </summary>
+    /// <returns>
+    /// The number of kanbans to plan.
+    /// </returns>
+    /// <remarks>
+    /// For fixed kanbans with a trigger level > 1, the number of kanbans is limited (i.e. not all kanbans are planned).
+    /// If a kanban is planned, all unplanned process jobs for that kanban are planned.
+    /// </remarks>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected int numberOfKanbansToPlan()
+    {
+        int                 kanbansToPlan = maxInt();
+
+        // for manufacturing kanbans, find the trigger level and calculate the number of kanbans that need to be planned
+        if (   kanbanRule.RecId
+            && kanbanRule.KanbanType == LeanKanbanType::Manufacturing)
+        {
+            int triggerLevel = kanbanRule.TriggerLevel;
+
+            //for trigger level 1, all available jobs will be planned (maxInt)
+            if (triggerLevel > 1)
+            {
+                int64 numJobsNotPlanned = this.countKanbanJobsInStatus(LeanKanbanJobStatus::NotPlanned);
+                if (numJobsNotPlanned >= triggerLevel)
+                {
+                    kanbansToPlan = any2int(numJobsNotPlanned - (numJobsNotPlanned mod triggerLevel));
+                }
+                else
+                {
+                    kanbansToPlan = 0;
+                }
+            }
+            else
+            {
+                if (triggerLevel == 0)
+                {
+                    kanbansToPlan = 0;
+                }
+            }
+
+            // Scheduled and event kanbans have to apply the maximum planned orders
+            if (   kanbansToPlan
+                && (kanbanRule.ReplenishmentStrategy == LeanReplenishmentStrategy::Scheduled
+                ||  kanbanRule.ReplenishmentStrategy == LeanReplenishmentStrategy::Event))
+            {
+                KanbanRuleVariable kanbanRuleVariable = KanbanRuleVariable::findParentRecId(kanbanRule.RecId);
+
+                if (kanbanRuleVariable.MaximumPlannedOrders > 0)
+                {
+                    // Obtain how many kanban jobs are planned already
+                    int64 numJobsPlanned = this.countKanbanJobsInStatus(LeanKanbanJobStatus::Planned);
+
+                    // Plan only the remaining ones until reaching the maximum
+                    int freePlanningSlots = any2int(kanbanRuleVariable.MaximumPlannedOrders - numJobsPlanned);
+                    kanbansToPlan = min(kanbansToPlan, freePlanningSlots);
+                }
+            }
+        }
+
+        return kanbansToPlan;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmKanban</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public Kanban parmKanban(Kanban _kanban = kanban)
+    {
+        kanban = _kanban;
+        return kanban;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmKanbanJob</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public KanbanJob parmKanbanJob(KanbanJob _kanbanJob = kanbanJob)
+    {
+        kanbanJob = _kanbanJob;
+        return kanbanJob;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmKanbanRule</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public KanbanRule parmKanbanRule(KanbanRule _kanbanRule = kanbanRule)
+    {
+        kanbanRule = _kanbanRule;
+        return kanbanRule;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSilent</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public boolean parmSilent(boolean _silent = silent)
+    {
+        silent = _silent;
+        return silent;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planKanbanJobInPeriod</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Executes the planning of a <c>KanbanJob</c> record in a given period and on a given work cell.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    ///    The <c>KanbanJob</c> record to plan.
+    /// </param>
+    /// <param name="_plannedPeriod">
+    ///    A company time zone date that represents the period in which to plan the job.
+    /// </param>
+    /// <returns>
+    ///    true if the job was successfully planned; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    0 may be passed as the record ID for the work center if a resource is not required.
+    /// </remarks>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected boolean planKanbanJobInPeriod(
+        KanbanJob                      _kanbanJob,
+        KanbanJobSchedulePlannedPeriod _plannedPeriod)  //company TZ
+    {
+        WrkCtrResourceGroup     wrkCtrResourceGroup = this.wrkCtrResourceGroup(_kanbanJob);
+
+        KanbanJobStatus kanbanJobStatus = KanbanJobStatus::newKanbanJob(_kanbanJob,true);
+        KanbanJobStatusUpdate kanbanJobStatusUpdate = KanbanJobStatusUpdate::makeParameters(kanbanJobStatus,LeanKanbanJobStatus::Planned,parmId ? false : true,false);
+
+        //initialize record
+        kanbanJobStatusUpdate.ParmId              = parmId ? parmId : kanbanJobStatusUpdate.ParmId;
+        kanbanJobStatusUpdate.LineNum             = KanbanJobStatusUpdate::lastLineNum(kanbanJobStatusUpdate.ParmId) + 1;
+        kanbanJobStatusUpdate.TransactionDateTime = DateTimeUtil::newDateTime(_plannedPeriod,0,DateTimeUtil::getCompanyTimeZone()); //UTC
+        kanbanJobStatusUpdate.PlanAfterLineNum    = KanbanJobSchedule::lastSequence(wrkCtrResourceGroup.RecId,_plannedPeriod)+1;
+        kanbanJobStatusUpdate.PlanAfterType       = LeanPlanJobReferenceTypes::LineNumber;
+        ttsbegin;
+        kanbanJobStatusUpdate.insert();
+        boolean result = kanbanJobStatus.runStatusUpdate(kanbanJobStatusUpdate);
+        ttscommit;
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planKanbanJobs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Iterates over the jobs to plan and initiates the planning process.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void planKanbanJobs()
+    {
+        MapEnumerator                   meDueDateSequenceJobs = mapDueDateSequenceJobs.getEnumerator();
+        LeanProductionFlowModel         leanProductionFlowModel;
+
+        // Reset the cached maps to ensure that the expected dates of previous jobs will be taken into account as the jobs gets planned
+        this.resetCacheMaps();
+
+        //due date in ascending order
+        while (meDueDateSequenceJobs.moveNext())
+        {
+            Map mapSequenceCellJobs = meDueDateSequenceJobs.currentValue();
+            MapEnumerator meSequenceCellJobs = mapSequenceCellJobs.getEnumerator();
+
+            //job sequence in ascending order
+            while (meSequenceCellJobs.moveNext())
+            {
+                Map mapCellKanbanJobs = meSequenceCellJobs.currentValue();
+                MapEnumerator meCellKanbanJobs = mapCellKanbanJobs.getEnumerator();
+
+                //all cells (with same sequence number)
+                while (meCellKanbanJobs.moveNext())
+                {
+                    //the list holds all jobs that must be planned with given due date and sequence at the current cell
+                    RecordSortedList rslKanbanJobs = meCellKanbanJobs.currentValue();
+                    leanProductionFlowModel.clear();
+                    if (mapKanbanJobSetProductionFlowModel.exists(rslKanbanJobs))
+                    {
+                        leanProductionFlowModel = mapKanbanJobSetProductionFlowModel.lookup(rslKanbanJobs);
+                    }
+
+                    if (leanProductionFlowModel)
+                    {
+                        //may need to slice, if the number of jobs is higher than trigger level.
+                        List list = this.splitRslKanbanJobs(rslKanbanJobs,leanProductionFlowModel);
+                        ListEnumerator le = list.getEnumerator();
+
+                        while (le.moveNext())
+                        {
+                            RecordSortedList rslKanbanJobsSlot = le.current();
+                            this.planKanbanJobSlot(rslKanbanJobsSlot,leanProductionFlowModel);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>planKanbanJobSlot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Starts the planning for a given slot.
+    /// </summary>
+    /// <param name="_rslKanbanJobs">
+    ///    A <c>RecordSortedList</c> table of <c>KanbanJob</c> records.
+    /// </param>
+    /// <param name="_leanProductionFlowModel">
+    ///    A <c>LeanProductionFlowModel</c> record.
+    /// </param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void planKanbanJobSlot(
+        RecordSortedList        _rslKanbanJobs,
+        LeanProductionFlowModel _leanProductionFlowModel)
+    {
+        #OCCRetryCount
+        
+        KanbanJobSchedulePlannedPeriod  kanbanJobSchedulePlannedPeriod;
+        KanbanJob                       kanbanJobLocal;
+
+        boolean foundSlot = false;
+        if (this.shouldPlanAsSlot(_leanProductionFlowModel))
+        {
+            kanbanJobSchedulePlannedPeriod = this.findPlannedPeriodEPECycle(null,_rslKanbanJobs);
+            foundSlot                      = kanbanJobSchedulePlannedPeriod != dateNull();
+        }
+
+        if (   foundSlot
+            || this.allowPlanIndividualJobs(_leanProductionFlowModel))
+        {
+            //iterate jobs
+            boolean rslNext = _rslKanbanJobs.first(kanbanJobLocal);
+            while (   rslNext
+                    && kanbanJobLocal)
+            {
+                try
+                {
+                    ttsbegin;
+                    
+                    //planned period stays the same, if a slot was found, otherwise it needs to be determined for every job.
+                    if (!foundSlot)
+                    {
+                        switch (_leanProductionFlowModel.PlanningTimeFence)
+                        {
+                            case 1:
+                                //find FIFO
+                                kanbanJobSchedulePlannedPeriod = this.findPlannedPeriodFIFO(kanbanJobLocal);            //company TZ
+                                break;
+                            default:
+                                //distribute as necessary
+                                kanbanJobSchedulePlannedPeriod = this.findPlannedPeriodEPECycle(kanbanJobLocal,null);   //company TZ
+                                break;
+                        }
+                    }
+
+                    if (kanbanJobSchedulePlannedPeriod)
+                    {
+                        if (this.planKanbanJobInPeriod(kanbanJobLocal,kanbanJobSchedulePlannedPeriod))
+                        {
+                            this.registerKanbanJobPlanStatus(KanbanJobPlanStatus::Planned,
+                                                             kanbanJobLocal,
+                                                             kanbanJobLocal.kanban(),
+                                                             kanbanJobSchedulePlannedPeriod);
+                        }
+                    }
+
+                    ttscommit;
+                }
+                catch (Exception::Deadlock)
+                {
+                    retry;
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    else
+                    {
+                        throw Exception::UpdateConflict;
+                    }
+                }
+                catch (Exception::DuplicateKeyException)
+                {
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::DuplicateKeyExceptionNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    else
+                    {
+                        throw Exception::DuplicateKeyException;
+                    }
+                }
+
+                rslNext = _rslKanbanJobs.next(kanbanJobLocal);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerKanbanJobPlanStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Registers a kanban job plan status.
+    /// </summary>
+    /// <param name="_kanbanJobPlanStatus">
+    ///    A <c>KanbanJobPlanStatus</c> enumeration value.
+    /// </param>
+    /// <param name="_kanbanJob">
+    ///    The kanban job.
+    /// </param>
+    /// <param name="_kanban">
+    ///    The kanban that owns the job; optional.
+    /// </param>
+    /// <param name="_date">
+    ///    A date associated with the status, such as the planning period for successfully planned jobs;
+    ///    optional.
+    /// </param>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void registerKanbanJobPlanStatus(
+        KanbanJobPlanStatus _kanbanJobPlanStatus,
+        KanbanJob           _kanbanJob,
+        Kanban              _kanban = _kanbanJob.kanban(),
+        TransDate           _date   = dateNull())
+    {
+        mapKanbanJobsPlanStatus.insert([_kanban.KanbanId,_kanbanJob.Sequence],[_kanbanJobPlanStatus,_kanbanJob,_kanban,_date]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetCacheMaps</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reset the cached maps to ensure that the expected dates of previous jobs will be taken into account as the jobs gets planned.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void resetCacheMaps()
+    {
+        mapInitialLeanWorkScheduleCapacity = new Map(Types::Int64,Types::Class);
+        mapMinSchedDateTime = new Map(Types::Int64, Types::UtcDateTime);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logger</Name>
+				<Source><![CDATA[
+    private KanbanInstrumentationLogger logger()
+    {
+        if (!instrumentationLogger)
+        {
+            instrumentationLogger = KanbanInstrumentationLogger::createLogger(classId2Name(classIdGet(this)));
+        }
+
+        return instrumentationLogger;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Executes the kanban job auto planning.
+    /// </summary>
+    /// <exception cref="M:Exception::UpdateConflictNotRecovered">
+    ///    A standard update conflict occurred.
+    /// </exception>
+    /// <exception cref="M:Exception::UpdateConflict">
+    ///    Standard update conflict resolution.
+    /// </exception>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public void run()
+    {
+        this.init();
+
+        if (this.validate())
+        {
+            using (var a = this.logger().kanbanJobActivities().scheduleKanbanJob())
+            {
+                this.runAutoPlan();
+            }
+        }
+
+        if (!silent)
+        {
+            if (successCount)
+            {
+                info(strFmt("@SYS301792",successCount));
+            }
+            if (failCount)
+            {
+                warning(strFmt("@SYS301793",failCount));
+            }
+            if (   !successCount
+                && !failCount)
+            {
+                info("@SYS310029");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runAutoPlan</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Auto-plans the <c>KanbanJob</c> records in the created status for the specified kanban.
+    /// </summary>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected void runAutoPlan()
+    {
+        Kanban              kanbanLocal;
+        KanbanJob           kanbanJobLocal;
+
+        // for fixed kanbans, find the trigger level and calculate the number of kanbans that need to be planned
+        int kanbansToPlan = this.numberOfKanbansToPlan();
+
+        if (kanbansToPlan > 0)
+        {
+            Set setPlannedKanbans = new Set(Types::Int64);
+
+            //add jobs to planning sequence
+            while select kanbanJobLocal
+
+                where (kanbanJobLocal.Status  == LeanKanbanJobStatus::NotPlanned || !onlyUnplanned)
+                   && kanbanJobLocal.Type    == LeanKanbanJobType::Process
+                   && (kanbanJobLocal.Kanban == kanban.RecId    || !kanban.RecId)
+                   && (kanbanJobLocal.RecId  == kanbanJob.RecId || !kanbanJob.RecId)
+                join kanbanLocal
+                    order by kanbanLocal.DueDateTime, kanbanJobLocal.Kanban, kanbanJobLocal.Sequence
+                    where kanbanLocal.RecId       == kanbanJobLocal.Kanban
+                       && kanbanLocal.LegalEntity == legalEntity
+                       && kanbanLocal.Type        == LeanKanbanType::Manufacturing
+                       && (kanbanLocal.KanbanRule == kanbanRule.RecId || !kanbanRule.RecId)
+            {
+                if (   kanbanJobLocal.status().isStatusUpdateAllowed(LeanKanbanJobStatus::Planned,true)
+                    && this.isInPlanningTimeFence(kanbanJobLocal))
+                {
+                    //stop planning when the expected number of kanbans (not jobs) has been planned
+                    if (   setPlannedKanbans.elements() >= kanbansToPlan
+                        && !setPlannedKanbans.in(kanbanLocal.RecId))
+                    {
+                        break;
+                    }
+                    setPlannedKanbans.add(kanbanLocal.RecId);
+
+                    //store in maps
+                    this.addToPlanningSequence(kanbanJobLocal,kanbanLocal);
+                }
+            }
+
+            //plan in sequence
+            try
+            {
+                this.planKanbanJobs();
+            }
+            finally
+            {
+                //finalize
+                this.finalizePlanKanbanJobs();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>schedDirection</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines the default scheduling direction.
+    /// </summary>
+    /// <returns>
+    /// The scheduling direction.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected SchedDirection schedDirection()
+    {
+        return SchedDirection::Backward;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldPlanAsSlot</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines if jobs that belong to a specified production flow model must all be planned in the same
+    ///    period.
+    /// </summary>
+    /// <param name="_leanProductionFlowModel">
+    ///    A <c>LeanProductionFlowModel</c> record.
+    /// </param>
+    /// <returns>
+    ///    true if the jobs should be slotted; otherwise, false.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected boolean shouldPlanAsSlot(LeanProductionFlowModel _leanProductionFlowModel)
+    {
+        return    _leanProductionFlowModel.RecId
+               && _leanProductionFlowModel.PlanningTimeFence > 1
+               && (this.capacityShortageReaction(_leanProductionFlowModel) == LeanCapacityShortageReactions::Slot
+               ||  this.capacityShortageReaction(_leanProductionFlowModel) == LeanCapacityShortageReactions::Cancel);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitRslKanbanJobs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Splits a <c>RecordSortedList</c> list of kanban jobs into pieces that are compliant with the
+    ///    trigger level of the rule.
+    /// </summary>
+    /// <param name="_rslKanbanJobs">
+    ///    The <c>RecordSortedList</c> list to slice.
+    /// </param>
+    /// <param name="_leanProductionFlowModel">
+    ///    A <c>LeanProductionFlowModel</c> record.
+    /// </param>
+    /// <returns>
+    ///    a <c>List</c> object that contains one or more <c>RecordSortedList</c> list elements.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected List splitRslKanbanJobs(
+        RecordSortedList        _rslKanbanJobs,
+        LeanProductionFlowModel _leanProductionFlowModel)
+    {
+        int                 maxKanbanJobsPerSlot = this.maxJobsPerSlot(_leanProductionFlowModel);
+        List                list                 = new List(Types::Class);
+        KanbanJob           kanbanJobLocal;
+
+        if (_rslKanbanJobs)
+        {
+            if (_rslKanbanJobs.len() <= maxKanbanJobsPerSlot)
+            {
+                list.addEnd(_rslKanbanJobs);
+            }
+            else
+            {
+                RecordSortedList rslKanbanJobs = this.createRslKanbanJobs();
+
+                boolean rslNext = _rslKanbanJobs.first(kanbanJobLocal);
+                while (   rslNext
+                       && kanbanJobLocal)
+                {
+                    //insert into slice
+                    rslKanbanJobs.ins(kanbanJobLocal);
+
+                    //append to result list and open new slice when max. size is reached
+                    if (rslKanbanJobs.len() >= maxKanbanJobsPerSlot)
+                    {
+                        list.addEnd(rslKanbanJobs);
+                        rslKanbanJobs = this.createRslKanbanJobs();
+                    }
+                    rslNext = _rslKanbanJobs.next(kanbanJobLocal);
+                }
+
+                //append remainder to list
+                if (rslKanbanJobs.len())
+                {
+                    list.addEnd(rslKanbanJobs);
+                }
+            }
+        }
+
+        return list;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates input parameters.
+    /// </summary>
+    /// <returns>
+    ///    true if the validation succeeds; otherwise, false.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected boolean validate()
+    {
+        boolean result = true;
+
+        if (   kanbanRule
+            && kanbanRule.LegalEntity != legalEntity)
+        {
+            result = checkFailed(strFmt("@SYS332730",kanbanRule.RuleId));
+        }
+
+        if (   result
+            && kanban)
+        {
+            result = kanban.checkValid(kanban.RecId);
+        }
+
+        if (   result
+            && kanbanJob)
+        {
+            result = kanbanJob.checkValid(kanbanJob.RecId);
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>wrkCtrResourceGroup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Retrieves the work cell for a given kanban job.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    ///    A <c>KanbanJob</c> record.
+    /// </param>
+    /// <returns>
+    ///    A <c>WrkCtrResourceGroup</c> record.
+    /// </returns>
+    /// <remarks>
+    ///    The results are cached in a class internal map.
+    /// </remarks>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    protected WrkCtrResourceGroup wrkCtrResourceGroup(KanbanJob _kanbanJob)
+    {
+        WrkCtrResourceGroup     wrkCtrResourceGroup;
+
+        if (mapKanbanJobWrkCtrResourceGroup.exists(_kanbanJob.RecId))
+        {
+            wrkCtrResourceGroup = mapKanbanJobWrkCtrResourceGroup.lookup(_kanbanJob.RecId);
+        }
+        else
+        {
+            wrkCtrResourceGroup = _kanbanJob.wrkCtrResourceGroup();
+            mapKanbanJobWrkCtrResourceGroup.insert(_kanbanJob.RecId,wrkCtrResourceGroup);
+        }
+
+        return wrkCtrResourceGroup;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    private static KanbanJobAutoPlan construct()
+    {
+        return new KanbanJobAutoPlan();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static ClassDescription description()
+    {
+        return "@SYS135411";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        KanbanJobAutoPlan   kanbanJobAutoPlan;
+
+        if (_args.record())
+        {
+            switch (_args.dataset())
+            {
+                case tableNum(KanbanRule):
+                    kanbanJobAutoPlan = KanbanJobAutoPlan::newKanbanRule(_args.record());
+                    break;
+                case tableNum(KanbanJob):
+                    kanbanJobAutoPlan = KanbanJobAutoPlan::newKanbanJob(_args.record());
+                    break;
+                case tableNum(Kanban):
+                    kanbanJobAutoPlan = KanbanJobAutoPlan::newKanban(_args.record());
+                    break;
+            }
+        }
+
+        if (kanbanJobAutoPlan)
+        {
+            kanbanJobAutoPlan.run();
+        }
+        else
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newKanban</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of the <c>KanbanJobAutoPlan</c> class by using the specified parameter.
+    /// </summary>
+    /// <param name="_kanban">
+    ///    A buffer of the <c>Kanban</c> table.
+    /// </param>
+    /// <param name="_silent">
+    ///    A Boolean value that indicates whether planning results must be shown in the Infolog; optional.
+    /// </param>
+    /// <returns>
+    ///    A <c>KanbanJobAutoPlan</c> object.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static KanbanJobAutoPlan newKanban(
+        Kanban  _kanban,
+        boolean _silent = false)
+    {
+        KanbanJobAutoPlan kanbanJobAutoPlan = KanbanJobAutoPlan::construct();
+
+        kanbanJobAutoPlan.parmKanban(_kanban);
+        kanbanJobAutoPlan.parmSilent(_silent);
+        return kanbanJobAutoPlan;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newKanbanJob</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of the <c>KanbanJobAutoPlan</c> class by using the specified parameter.
+    /// </summary>
+    /// <param name="_kanbanJob">
+    ///    A buffer of the <c>KanbanJob</c> table.
+    /// </param>
+    /// <param name="_silent">
+    ///    A Boolean value that indicates whether planning results must be shown in the Infolog; optional.
+    /// </param>
+    /// <returns>
+    ///    A <c>KanbanJobAutoPlan</c> object.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static KanbanJobAutoPlan newKanbanJob(
+        KanbanJob _kanbanJob,
+        boolean   _silent = false)
+    {
+        KanbanJobAutoPlan kanbanJobAutoPlan = KanbanJobAutoPlan::construct();
+
+        kanbanJobAutoPlan.parmKanbanJob(_kanbanJob);
+        kanbanJobAutoPlan.parmSilent(_silent);
+        return kanbanJobAutoPlan;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newKanbanRule</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of the <c>KanbanJobAutoPlan</c> object by using the specified parameter.
+    /// </summary>
+    /// <param name="_kanbanRule">
+    ///    A buffer of the <c>KanbanRule</c> table.
+    /// </param>
+    /// <param name="_silent">
+    ///    A Boolean value that indicates whether planning results must be shown in the Infolog; optional.
+    /// </param>
+    /// <returns>
+    ///    A <c>KanbanJobAutoPlan</c> object.
+    /// </returns>
+    [Microsoft.Dynamics.BusinessPlatform.SharedTypes.InternalUseOnlyAttribute]
+    public static KanbanJobAutoPlan  newKanbanRule(
+        KanbanRule _kanbanRule,
+        boolean    _silent = false)
+    {
+        KanbanJobAutoPlan kanbanJobAutoPlan = KanbanJobAutoPlan::construct();
+
+        kanbanJobAutoPlan.parmKanbanRule(_kanbanRule);
+        kanbanJobAutoPlan.parmSilent(_silent);
+        return kanbanJobAutoPlan;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

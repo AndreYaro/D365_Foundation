@@ -1,0 +1,839 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BankExchAdj_RU</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This is the main class for bank foreign currency revaluation on bank transactions.
+/// </summary>
+class BankExchAdj_RU extends RunBaseBatch implements BatchRetryable
+{
+    #isoCountryRegionCodes
+
+    ToDate          toDate;
+    CurrencyCode    fromCur;
+    CurrencyCode    toCur;
+
+    DialogField     dialogAccountNum;
+    DialogField     dialogToDate;
+    DialogField     dialogFromCur;
+    DialogField     dialogToCur;
+
+    QueryRun        queryRun;
+    Counter         progressCounter;
+
+    private const int CurrentVersion = 1;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>calcAndPost</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the exchange rate adjustment for bank account.
+    /// </summary>
+    /// <param name="_accountId">
+    /// The bank account number for which exch rate adjustment is calculated.
+    /// </param>
+    public void calcAndPost(CompanyBankAccountId _accountId)
+    {
+        LedgerDimensionDefaultAccount defaultAccount = BankAccountTable::findLedgerDimension(_accountId);
+        Map                           dateAndVoucherMap = new Map(Types::Date, Types::String);
+        BankAccountTrans              bankAccountTransLocal;
+        KeySum                        totalKeySum = KeySum::construct(1,2);
+        AmountMST                     totalExchAdj;
+        AmountMSTSecondary            totalReportingExchAdj;
+        Currency                      currency;
+        CurrencyCode                  reportingCurrency = CompanyInfoHelper::secondaryCurrency_RU();
+        CurrencyCode                  standardCurrency = CompanyInfoHelper::standardCurrency();
+
+        setPrefix(strFmt("@GLS112025", _accountId));
+
+        try
+        {
+            ttsbegin;
+
+            NumberSeq numberSeq = NumberSeq::newGetVoucher(BankParameters::numRefBankExchAdjVoucher_RU());
+
+            Voucher voucher = numberSeq.voucher();
+
+            TransactionTxt transactionTxt = TransactionTxt::construct();
+            transactionTxt.setDate(toDate);
+            transactionTxt.setType(LedgerTransTxt::BankExchAdj_RU);
+            transactionTxt.setVoucher(voucher);
+            TransTxt transTxt = transactionTxt.txt();
+
+            LedgerVoucher ledgerVoucher = LedgerVoucher::newLedgerPost(DetailSummary::Summary,
+                                                         SysModule::Bank,
+                                                         numberSeq.parmVoucherSequenceCode(),
+                                                         TransactionLogType::PlBankExchAdj,
+                                                         transTxt);
+
+            ledgerVoucher.addVoucher(LedgerVoucherObject::newVoucher(voucher,
+                                                                     toDate,
+                                                                     SysModule::Bank,
+                                                                     LedgerTransType::ExchAdjustment));
+
+            ledgerVoucher.findLedgerVoucherObject().lastTransTxt(transTxt);
+
+            dateAndVoucherMap.insert(toDate, voucher);
+
+            while select CurrencyCode from currency
+                where currency.CurrencyCode >= fromCur &&
+                      currency.CurrencyCode <= toCur
+            {
+                voucher = dateAndVoucherMap.lookup(toDate);
+                [totalExchAdj, totalReportingExchAdj] = this.calcAndPostCurrency(_accountId, toDate, currency.CurrencyCode, ledgerVoucher, voucher, defaultAccount);
+                totalKeySum.updateNow(toDate, [totalExchAdj, totalReportingExchAdj]);
+
+                while select bankAccountTransLocal
+                    group by TransDate
+                    where bankAccountTransLocal.AccountId       == _accountId            &&
+                          bankAccountTransLocal.CurrencyCode    == currency.CurrencyCode &&
+                          bankAccountTransLocal.TransDate       >  toDate                &&
+                          bankAccountTransLocal.LedgerTransType == LedgerTransType::ExchAdjustment
+                {
+                    if (!dateAndVoucherMap.exists(bankAccountTransLocal.TransDate))
+                    {
+                        voucher = numberSeq.voucher();
+
+                        ledgerVoucher.addVoucher(LedgerVoucherObject::newVoucher(voucher,
+                                                                                 bankAccountTransLocal.TransDate,
+                                                                                 SysModule::Bank,
+                                                                                 LedgerTransType::ExchAdjustment));
+                    }
+                    else
+                    {
+                        voucher = dateAndVoucherMap.lookup(bankAccountTransLocal.TransDate);
+                    }
+
+                    [totalExchAdj, totalReportingExchAdj] = this.calcAndPostCurrency(_accountId, bankAccountTransLocal.TransDate, currency.CurrencyCode, ledgerVoucher, voucher, defaultAccount);
+                    totalKeySum.updateNow(bankAccountTransLocal.TransDate, [totalExchAdj, totalReportingExchAdj]);
+                }
+            }
+
+            ledgerVoucher.end();
+
+            TransactionLog::create(this.transactionLogType(), this.transactionLogTxt());
+
+            for (int idx = 1; idx <= totalKeySum.numOfTrans(); idx++)
+            {
+                [totalExchAdj, totalReportingExchAdj] = totalKeySum.index2Data(idx);
+
+                if (reportingCurrency)
+                {
+                    info(strFmt("@GLS220602",
+                        totalKeySum.index2Key(idx),
+                        totalExchAdj,
+                        standardCurrency,
+                        totalReportingExchAdj,
+                        reportingCurrency));
+                }
+                else
+                {
+                    info(strFmt("@GLS104487", totalKeySum.index2Key(idx), totalExchAdj, standardCurrency));
+                }
+            }
+
+            ttscommit;
+        }
+
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+
+        catch
+        {
+            ttsabort;
+
+            if (this.isInBatch())
+            {
+                throw Exception::Error;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCurrencyExchangeHelper</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates <c>CurrencyExchangeHelper</c> object for a specified currency exchange date.
+    /// </summary>
+    /// <param name = "_toDate">
+    /// The on date up to which the transaction need to be included for calculating exchAdj amount.
+    /// </param>
+    /// <returns>
+    /// An instance of the <c>CurrencyExchangeHelper</c> class.
+    /// </returns>
+    protected CurrencyExchangeHelper createCurrencyExchangeHelper(TransDate _toDate)
+    {
+        return CurrencyExchangeHelper::newExchangeDate(Ledger::current(), _toDate);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcExchAdjAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the accounting currency amount from the specified transaction currency amount.
+    /// </summary>
+    /// <param name = "_toDate">
+    /// The on date up to which the transaction need to be included for calculating exchAdj amount.
+    /// </param>
+    /// <param name = "_currencyCode">
+    /// The currency for which exchAdj amount needs to be calculated.
+    /// </param>
+    /// <param name = "_balanceAmountCur">
+    /// The amount in transaction currency.
+    /// </param>
+    /// <param name = "_balanceAmountMST">
+    /// Amount in master currency.
+    /// </param>
+    /// <param name = "_balanceExchAdjAmount">
+    /// Adjusting amount in master currency.
+    /// </param>
+    /// <returns>
+    /// An accounting currency amount that has been calculated from the transaction currency amount with the appropriate rounding applied.
+    /// </returns>
+    protected AmountMST calcExchAdjAmount (AmountCur _balanceAmountCur, CurrencyCode _currencyCode, TransDate _toDate, AmountMST _balanceAmountMST, AmountMST _balanceExchAdjAmount)
+    {
+        return CurrencyExchangeHelper::mstAmount(_balanceAmountCur, _currencyCode, _toDate) - _balanceAmountMST - _balanceExchAdjAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRussianCountryContextEnabled</Name>
+				<Source><![CDATA[
+    private boolean isRussianCountryContextEnabled()
+    {
+        return SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSetProfitIdsForExchAdjDimensionNeeded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether profit IDs should be set for exchange adjustment dimension.
+    /// </summary>
+    /// <returns>
+    /// True if profit IDs should be set for exchange adjustment dimension; otherwise false.
+    /// </returns>
+    protected boolean isSetProfitIdsForExchAdjDimensionNeeded()
+    {
+        return this.isRussianCountryContextEnabled();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isExchAdjDimensionToBeRemoved</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether is it needed to remove exchange adjustment <c>rTax25ExchAdjDimension</c> dimension.
+    /// </summary>
+    /// <returns>
+    /// True if <c>rTax25ExchAdjDimension</c> should be removed from exchange adjustment; otherwise false.
+    /// </returns>
+    protected boolean isExchAdjDimensionToBeRemoved()
+    {
+        return this.isRussianCountryContextEnabled();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcAndPostCurrency</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the totalExchAdjAmount, totalreportingExchAdjAmount on bank account for a specified currency and voucher.
+    /// </summary>
+    /// <param name = "_accountId">
+    /// The bank account for which the exchAdj amount needs to be calculated.
+    /// </param>
+    /// <param name = "_toDate">
+    /// The on date up to which the transaction need to be included for calculating exchAdj amount.
+    /// </param>
+    /// <param name = "_currencyCode">
+    /// The currency for which exchAdj amount needs to be calculated.
+    /// </param>
+    /// <param name = "_ledgerVoucher">
+    /// The ledger voucher for which exchAdj amount needs to be calculated.
+    /// </param>
+    /// <param name = "_voucher">
+    /// The voucher for which exchAdj amount needs to be calculated.
+    /// </param>
+    /// <param name = "_defaultAccount">
+    /// The default account for which exchAdj amount needs to be calculated.
+    /// </param>
+    /// <returns>
+    /// The totalExchAdjAmount, totalreportingExchAdjAmount.
+    /// </returns>
+    public container calcAndPostCurrency(CompanyBankAccountId          _accountId,
+                                         TransDate                     _toDate,
+                                         CurrencyCode                  _currencyCode,
+                                         LedgerVoucher                 _ledgerVoucher,
+                                         Voucher                       _voucher,
+                                         LedgerDimensionDefaultAccount _defaultAccount)
+    {
+        const int ConPos1 = 1;
+        AmountCur                   balanceAmountCur;
+        AmountMST                   balanceAmountMST, balanceExchAdjAmount;
+        AmountMST                   totalExchAdjAmount;
+        AmountMSTSecondary          balanceReportingAmount, balanceReportingExchAdjAmount, totalreportingExchAdjAmount;
+
+        LedgerBondClient_RU         ledgerBondClient         = _ledgerVoucher.findLedgerVoucherObject(_voucher, _toDate).ledgerBondClient_RU();
+        RecId                       currentLedger            = Ledger::current();
+        CurrencyExchangeHelper      currencyExchangeHelper   = this.createCurrencyExchangeHelper(_toDate);
+        DimensionDefault            defaultDimension;
+        RTax25ExchAdjDimension      exchAdjDimension         = new RTax25ExchAdjDimension();
+
+        exchAdjDimension.setLedgerDimensions(
+            CurrencyLedgerGainLossAccount::ledgerDimension(currentLedger, _currencyCode, CurrencyGainLossAccountType::UnrealizedGain),
+            CurrencyLedgerGainLossAccount::ledgerDimension(currentLedger, _currencyCode, CurrencyGainLossAccountType::UnrealizedLoss));
+
+        if (this.isSetProfitIdsForExchAdjDimensionNeeded())
+        {
+            LedgerCurrencyParameters_RU ledgerCurrencyParameters = LedgerCurrencyParameters_RU::findParameters(currentLedger, _currencyCode);
+
+            exchAdjDimension.setProfitIds(ledgerCurrencyParameters.rTax25ProfitTableProfit, ledgerCurrencyParameters.rTax25ProfitTableLoss);
+        }
+
+        KeySum balanceKeySum = this.calcBalance(_accountId, _toDate, _currencyCode);
+
+        for (int idx = 1; idx <= balanceKeySum.numOfTrans(); idx++)
+        {
+            [balanceAmountMST, balanceAmountCur, balanceReportingAmount, balanceExchAdjAmount, balanceReportingExchAdjAmount] = balanceKeySum.index2Data(idx);
+
+            AmountMST exchAdjAmount = this.calcExchAdjAmount(balanceAmountCur, _currencyCode, _toDate, balanceAmountMST, balanceExchAdjAmount);
+            AmountMSTSecondary reportingExchAdjAmount = currencyExchangeHelper.calculateTransactionCurrencyToReportingCurrency(_currencyCode, balanceAmountCur) - balanceReportingAmount - balanceReportingExchAdjAmount;
+
+            if (exchAdjAmount || reportingExchAdjAmount)
+            {
+                defaultDimension = conPeek(balanceKeySum.index2Key(idx), ConPos1);
+                exchAdjDimension.parmExchAdjType(exchAdjAmount > 0 ? RTax25ExchAdjType::Gain : RTax25ExchAdjType::Loss);
+                defaultDimension = exchAdjDimension.getDefaultDimension(defaultDimension);
+
+                BankAccountTrans bankAccountTrans = this.initBankAccountTrans(_accountId,
+                                                             _currencyCode,
+                                                             exchAdjAmount,
+                                                             reportingExchAdjAmount,
+                                                             defaultDimension,
+                                                             _ledgerVoucher.findLedgerVoucherObject(_voucher, _toDate),
+                                                             _toDate);
+
+                bankAccountTrans.insert();
+            }
+
+            if (exchAdjAmount)
+            {
+                if (ledgerBondClient)
+                {
+                    ledgerBondClient.addNewLogObject();
+                }
+
+                _ledgerVoucher.addTrans(LedgerVoucherTransObject::newBasicMST_RU(_ledgerVoucher.findLedgerVoucherObject(_voucher, _toDate),
+                                                                                 exchAdjDimension.getPostingType(),
+                                                                                 LedgerDimensionFacade::serviceCreateLedgerDimension(_defaultAccount, defaultDimension),
+                                                                                 _currencyCode,
+                                                                                 exchAdjAmount));
+
+                _ledgerVoucher.addTrans(LedgerVoucherTransObject::newBasicMST_RU(_ledgerVoucher.findLedgerVoucherObject(_voucher, _toDate),
+                                                                                 exchAdjDimension.getPostingType(),
+                                                                                 LedgerDimensionFacade::serviceCreateLedgerDimension(exchAdjDimension.getLedgerDimension(), defaultDimension),
+                                                                                 _currencyCode,
+                                                                                 - exchAdjAmount));
+
+                if (ledgerBondClient)
+                {
+                    ledgerBondClient.bondLastVRef2CurrentLog();
+                    ledgerBondClient.removeCurrentLogObject();
+                }
+
+                totalExchAdjAmount += exchAdjAmount;
+            }
+
+            if (reportingExchAdjAmount)
+            {
+                defaultDimension = conPeek(balanceKeySum.index2Key(idx), ConPos1);
+                exchAdjDimension.parmExchAdjType(reportingExchAdjAmount > 0 ? RTax25ExchAdjType::Gain : RTax25ExchAdjType::Loss);
+                defaultDimension = exchAdjDimension.getDefaultDimension(defaultDimension);
+
+                if (ledgerBondClient)
+                {
+                    ledgerBondClient.addNewLogObject();
+                }
+
+                _ledgerVoucher.addTrans(LedgerVoucherTransObject::newBasicSecondary_RU(_ledgerVoucher.findLedgerVoucherObject(_voucher, _toDate),
+                                                                                        exchAdjDimension.getPostingType(),
+                                                                                        LedgerDimensionFacade::serviceCreateLedgerDimension(_defaultAccount, defaultDimension),
+                                                                                        _currencyCode,
+                                                                                        reportingExchAdjAmount));
+
+                _ledgerVoucher.addTrans(LedgerVoucherTransObject::newBasicSecondary_RU(_ledgerVoucher.findLedgerVoucherObject(_voucher, _toDate),
+                                                                                        exchAdjDimension.getPostingType(),
+                                                                                        LedgerDimensionFacade::serviceCreateLedgerDimension(exchAdjDimension.getLedgerDimension(), defaultDimension),
+                                                                                        _currencyCode,
+                                                                                        - reportingExchAdjAmount));
+
+                if (ledgerBondClient)
+                {
+                    ledgerBondClient.bondLastVRef2CurrentLog();
+                    ledgerBondClient.removeCurrentLogObject();
+                }
+
+                totalreportingExchAdjAmount += reportingExchAdjAmount;
+            }
+        }
+
+        return [totalExchAdjAmount, totalreportingExchAdjAmount];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcBalance</Name>
+				<Source><![CDATA[
+    protected KeySum calcBalance(CompanyBankAccountId _accountId, TransDate _toDate, CurrencyCode _currencyCode)
+    {
+        BankAccountTrans                  bankAccountTrans;
+        DimensionDefault                  defaultDimension;
+        RTax25ExchAdjDimension            rTax25ExchAdjDimension = new RTax25ExchAdjDimension();
+        const int NumOfKeys = 1;
+        const int NumData = 5;
+        KeySum                            balanceKeySum = KeySum::construct(NumOfKeys, NumData);
+        DimensionAttributeValueSetStorage dimAttrValueSetStorage;
+        boolean                           removeDimensionAttribute;
+
+        if (this.isExchAdjDimensionToBeRemoved())
+        {
+            removeDimensionAttribute = true;
+        }
+
+        // bank transactions
+        while select * from bankAccountTrans
+            where bankAccountTrans.AccountId              == _accountId    &&
+                  bankAccountTrans.TransDate              <= _toDate       &&
+                  bankAccountTrans.BankTransCurrencyCode == _currencyCode
+        {
+            defaultDimension = bankAccountTrans.DefaultDimension;
+
+            if (removeDimensionAttribute && rTax25ExchAdjDimension.getDimAttr())
+            {
+                dimAttrValueSetStorage = DimensionAttributeValueSetStorage::find(defaultDimension);
+                dimAttrValueSetStorage.removeDimensionAttribute(rTax25ExchAdjDimension.getDimAttr().RecId);
+                defaultDimension       = dimAttrValueSetStorage.save();
+            }
+
+            if (bankAccountTrans.LedgerTransType == LedgerTransType::ExchAdjustment)
+            {
+                balanceKeySum.updateNow([defaultDimension], [0, 0, 0, bankAccountTrans.AmountMST, bankAccountTrans.ReportingCurrencyAmount_RU]);
+            }
+            else
+            {
+                balanceKeySum.updateNow([defaultDimension],
+                    [bankAccountTrans.AmountMST - bankAccountTrans.AccountingCurrencyAmountCorrect_RU,
+                    bankAccountTrans.BankTransAmountCur,
+                    bankAccountTrans.ReportingCurrencyAmount_RU - bankAccountTrans.ReportingCurrencyAmountCorrect_RU, 0, 0]);
+            }
+        }
+
+        // bank transaction corrections
+        while select * from bankAccountTrans
+            where bankAccountTrans.AccountId              == _accountId    &&
+                  bankAccountTrans.TransDate              <= _toDate       &&
+                  bankAccountTrans.CurrencyCode           == _currencyCode &&
+                  bankAccountTrans.AmountCorrect          != 0
+        {
+            defaultDimension = bankAccountTrans.DefaultDimension;
+
+            if (removeDimensionAttribute && rTax25ExchAdjDimension.getDimAttr())
+            {
+                dimAttrValueSetStorage = DimensionAttributeValueSetStorage::find(defaultDimension);
+                dimAttrValueSetStorage.removeDimensionAttribute(rTax25ExchAdjDimension.getDimAttr().RecId);
+                defaultDimension       = dimAttrValueSetStorage.save();
+            }
+
+            balanceKeySum.updateNow([defaultDimension],
+                [bankAccountTrans.AccountingCurrencyAmountCorrect_RU,
+                bankAccountTrans.AmountCorrect,
+                bankAccountTrans.ReportingCurrencyAmountCorrect_RU, 0, 0]);
+        }
+
+        return balanceKeySum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        const int ColumnCount = 2;
+        DialogRunbase dialog = super();
+        DialogGroup   dialogGroup = dialog.addGroup("@GLS116844");
+
+        dialogGroup.widthMode(FormWidth::ColumnWidth);
+        dialogToDate  = dialog.addFieldValue(extendedTypeStr(ToDate), toDate, "@GLS116844");
+
+        dialogGroup = dialog.addGroup("@SYS8815");
+        dialogGroup.columns(ColumnCount);
+        dialogGroup.widthMode(FormWidth::ColumnWidth);
+        dialogFromCur = dialog.addFieldValue(extendedTypeStr(CurrencyCode), fromCur, "@GLS104436");
+        dialogToCur   = dialog.addFieldValue(extendedTypeStr(CurrencyCode), toCur, "@GLS104437");
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        boolean ret = super();
+
+        if (ret)
+        {
+            toDate  = dialogToDate.value();
+            fromCur = dialogFromCur.value();
+            toCur   = dialogToCur.value();
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initBankAccountTrans</Name>
+				<Source><![CDATA[
+    protected BankAccountTrans initBankAccountTrans(CompanyBankAccountId       _accountId,
+                                                    CurrencyCode               _currencyCode,
+                                                    AmountMSTExchAdjustment    _exchAdjAmount,
+                                                    AmountMSTSecondary         _reportingExchAdjAmount,
+                                                    DimensionDefault           _defaultDimension,
+                                                    LedgerVoucherObject        _ledgerVoucherObject,
+                                                    TransDate                  _toDate)
+    {
+        BankAccountTrans  bankAccountTrans;
+        BankAccountTable  bankAccountTable = BankAccountTable::find(_accountId);
+
+        bankAccountTrans.TransDate             = _toDate;
+        bankAccountTrans.AccountId             = _accountId;
+
+        bankAccountTrans.Voucher               = _ledgerVoucherObject.parmVoucher();
+        bankAccountTrans.Txt                   = _ledgerVoucherObject.lastTransTxt();
+        bankAccountTrans.DefaultDimension      = _defaultDimension;
+
+        bankAccountTrans.LedgerTransType       = LedgerTransType::ExchAdjustment;
+        bankAccountTrans.Reconciled            = NoYes::Yes;
+
+        bankAccountTrans.CurrencyCode          = bankAccountTable.CurrencyCode;
+        bankAccountTrans.BankTransCurrencyCode = _currencyCode;
+
+        bankAccountTrans.AmountMST                  = _exchAdjAmount;
+        bankAccountTrans.ReportingCurrencyAmount_RU = _reportingExchAdjAmount;
+        bankAccountTrans.AmountCur                  = 0.0;
+        bankAccountTrans.BankTransAmountCur         = 0.0;
+
+        return bankAccountTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    public void initParmDefault()
+    {
+        Query query = new Query("@SYS24408");
+        QueryBuildDataSource qbds  = query.addDataSource(tableNum(BankAccountTable));
+        qbds.addRange(fieldNum(BankAccountTable, AccountID));
+
+        queryRun = new QueryRun(query);
+
+        fromCur  = (select firstonly CurrencyCode from currency
+                          order by CurrencyCode asc).CurrencyCode;
+        toCur    = (select firstonly CurrencyCode from currency
+                          order by CurrencyCode desc).CurrencyCode;
+        toDate   = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [CurrentVersion, toDate, fromCur, toCur, queryRun.pack()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmFromCur</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the value of the  parameter fromCur.
+    /// </summary>
+    /// <param name="_fromDate">
+    /// The new value of the parameter fromCur.
+    /// </param>
+    /// <returns>
+    /// The current value of parameter fromCur.
+    /// </returns>
+    public CurrencyCode parmFromCur(CurrencyCode _fromCur = fromCur)
+    {
+        fromCur = _fromCur;
+        return fromCur;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmToCur</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the value of the  parameter toCur.
+    /// </summary>
+    /// <param name="_fromDate">
+    /// The new value of the parameter toCur.
+    /// </param>
+    /// <returns>
+    /// The current value of parameter toCur.
+    /// </returns>
+    public CurrencyCode parmToCur(CurrencyCode _toCur = toCur)
+    {
+        toCur = _toCur;
+        return toCur;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmToDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the value of the  parameter toDate.
+    /// </summary>
+    /// <param name="_fromDate">
+    /// The new value of the parameter toDate.
+    /// </param>
+    /// <returns>
+    /// The current value of parameter toDate.
+    /// </returns>
+    public ToDate parmToDate(ToDate _toDate = toDate)
+    {
+        toDate = _toDate;
+        return toDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRun</Name>
+				<Source><![CDATA[
+    public QueryRun queryRun()
+    {
+        return queryRun;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        GlobalizationInstrumentationHelper::featureRun(this.isRussianCountryContextEnabled() ? GlobalizationConstants::FeatureReferenceRU00031 : GlobalizationConstants::FeatureReferenceEEU00022, funcName());
+        
+        while (queryRun.next())
+        {
+            BankAccountTable bankAccountTable = queryRun.get(tableNum(BankAccountTable));
+            if (BankAccountTable::checkIsActive(bankAccountTable.AccountID, toDate))
+            {
+                this.calcAndPost(bankAccountTable.AccountID);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runsImpersonated</Name>
+				<Source><![CDATA[
+    public boolean runsImpersonated()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQueryValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether a Select button is to be added to the dialog box.
+    /// If you change the return value to true, the button will be added.
+    /// </summary>
+    /// <returns>
+    /// Always returns true.
+    /// </returns>
+    /// <remarks>
+    /// If you click this button, it will show the query form.
+    /// Therefore,the queryRun method has to return a valid queryRun.
+    /// </remarks>
+    public boolean showQueryValues()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transactionLogTxt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method returns the transaction log text.
+    /// </summary>
+    /// <returns>
+    /// Transaction log text
+    /// </returns>
+    public TransTxt transactionLogTxt()
+    {
+        return "@SYS55328";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transactionLogType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method returns the transaction log type.
+    /// </summary>
+    /// <returns>
+    /// Transaction log type.
+    /// </returns>
+    public TransactionLogType transactionLogType()
+    {
+        return TransactionLogType::PlBankExchAdj;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Integer     version = conPeek(_packedClass, 1);
+        container   packedQuery;
+
+        switch (version)
+        {
+            case CurrentVersion:
+                [version, toDate, fromCur, toCur, packedQuery] = _packedClass;
+                if (packedQuery)
+                {
+                    queryRun = new QueryRun(packedQuery);
+                }
+                break;
+            default :
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    public boolean validate(Object _calledFrom = null)
+    {
+        boolean ret = super(_calledFrom);
+
+        if (! toDate)
+        {
+            ret = ret && checkFailed("@SYS24455");
+        }
+
+        ret = Currency::checkExist(fromCur) && ret;
+        ret = Currency::checkExist(toCur)   && ret;
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the description of the foreign currency revaluation.
+    /// </summary>
+    /// <returns>
+    /// Foreign currency revaluation description.
+    /// </returns>
+    public static ClassDescription description()
+    {
+        return "@SYS55328";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        BankExchAdj_RU exchAdj = new BankExchAdj_RU();
+
+        setPrefix("@SYS24408");
+
+        if (exchAdj.prompt())
+        {
+            exchAdj.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		<Method><Name>isRetryable</Name><Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    public final boolean isRetryable()
+    {
+        return true;
+    }
+]]></Source></Method></Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BankReconciliationReversalDocumentMatchRuleProcessor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>BankReconciliationReversalDocumentMatchRuleProcessor</c> class is responsible for processing reversed bank documents.
+/// Only the matching of two bank transactions with opposite amount is supported.
+/// </summary>
+[BankReconciliationMatchActionType(BankReconciliationMatchActionType::TransactionReversal)]
+internal final class BankReconciliationReversalDocumentMatchRuleProcessor extends BankReconciliationMatchRuleProcessor
+{
+    private List searchedOrigDocumentIdList;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>preprocess</Name>
+				<Source><![CDATA[
+    internal protected void preprocess()
+    {
+        return;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    internal void run(SysInstrumentationProgressLogger _progressLogger)
+    {
+        int64 totalDurationMs;
+        int64 performMatchActionDurationMs;
+        System.Diagnostics.Stopwatch totalConsumeStopWatch = System.Diagnostics.Stopwatch::StartNew();
+        System.Diagnostics.Stopwatch performMatchActionStopWatch = System.Diagnostics.Stopwatch::StartNew();
+
+        QueryRun documentQueryRun = this.buildDocumentQueryRun();
+
+        if (documentQueryRun)
+        {
+            int64 unmatchedDocuments = this.getUnmatchedDocumentCount();
+            int64 documentsProcessed;
+            boolean matchingSkippedForManualMatching = false;
+
+            SysInstrumentationProgressStage stage = _progressLogger.createStage(BankInstrumentationConstants::AdvancedBankReconciliationMatchRule, unmatchedDocuments);
+
+            using (SysInstrumentationActivityContext activityContext = _progressLogger.activityContextWithProgressMonitor(stage))
+            {
+                activityContext.addCustomProperty(BankInstrumentationConstants::AdvancedBankReconciliationMatchRuleRecId, int642Str(matchRule.RecId));
+                activityContext.addCustomProperty(BankInstrumentationConstants::AdvancedBankReconciliationMatchRuleMatchActionType, enum2Str(matchRule.MatchActionType));
+                activityContext.addCustomProperty(BankInstrumentationConstants::AdvancedBankReconciliationMatchRuleMatchingType, enum2Str(matchRule.MatchingType));
+                activityContext.addCustomProperty(BankInstrumentationConstants::AdvancedBankReconciliationMatchRuleProcessedRecords, int642Str(unmatchedDocuments));
+
+                while (documentQueryRun.next())
+                {
+                    BankReconciliationDocumentOpenTmp tmpDocumentLocal = documentQueryRun.get(tableNum(BankReconciliationDocumentOpenTmp));
+
+                    if (tmpDocumentLocal)
+                    {
+                        this.getSearchedOrigDocumentIdList(tmpDocumentLocal);
+
+                        if (this.canPerformMatchAction())
+                        {
+                            ListEnumerator enumerator = searchedOrigDocumentIdList.getEnumerator();
+                            enumerator.moveNext();
+
+                            RecId documentId = enumerator.current();
+
+                            BankReconciliationDocumentOpenTmp origDocument;
+                            origDocument.linkPhysicalTableInstance(reconciliationDocumentTmp);
+
+                            select firstOnly origDocument
+                                where origDocument.RecId == documentId;
+
+                            if (origDocument)
+                            {
+                                performMatchActionStopWatch.Restart();
+
+                                ttsbegin;
+
+                                BankReconciliationMatchingMatchProcessor matchingMatchProcessor = BankReconciliationMatchingMatchProcessor::construct(reconciliation, true, matchRule.RecId);
+
+                                BankReconciliationMatchingEntry reversalDocumentMatchingEntry = BankReconciliationMatchingEntry::construct(
+                                    BankReconciliationMatchingEntryType::BankDocument,
+                                    origDocument.BankDocumentTableView);
+                                BankReconciliationMatchingEntry origDocumentMatchingEntry = BankReconciliationMatchingEntry::construct(
+                                    BankReconciliationMatchingEntryType::BankDocument,
+                                    tmpDocumentLocal.BankDocumentTableView);
+
+                                matchingMatchProcessor.addEntry(reversalDocumentMatchingEntry);
+                                matchingMatchProcessor.addEntry(origDocumentMatchingEntry);
+
+                                matchingMatchProcessor.processMatch();
+
+                                this.updateDocumentMatchStatus(tmpDocumentLocal);
+                                this.updateDocumentMatchStatus(origDocument);
+
+                                documentsProcessed = documentsProcessed + 2;
+
+                                _progressLogger.trackProgress(documentsProcessed);
+
+                                ttscommit;
+
+                                performMatchActionDurationMs += performMatchActionStopWatch.ElapsedMilliseconds;
+                            }
+                        }
+                        else if (matchRule.RequireManualMatching && searchedOrigDocumentIdList.elements() > 1)
+                        {
+                            matchingSkippedForManualMatching = true;
+                            break;
+                        }
+                    }
+                }
+
+                totalDurationMs = totalConsumeStopWatch.ElapsedMilliseconds;
+                activityContext.addCustomProperty(BankInstrumentationConstants::AdvancedBankReconciliationMatchRuleMatchedRecords, int642Str(documentsProcessed));
+                activityContext.addCustomProperty(BankInstrumentationConstants::AdvancedBankReconciliationMatchRuleTotalDurationMs, int642Str(totalDurationMs));
+                activityContext.addCustomProperty(BankInstrumentationConstants::AdvancedBankReconciliationMatchRuleMatchDurationMs, int642Str(totalDurationMs - performMatchActionDurationMs));
+                activityContext.addCustomProperty(BankInstrumentationConstants::AdvancedBankReconciliationMatchRulePerformActionDurationMs, int642Str(performMatchActionDurationMs));
+            }
+
+            if (matchingSkippedForManualMatching)
+            {
+                Info(strFmt("@Bank:BankReconciliationClearReverseTransactionMatchingSkippedInfo", matchRule.RuleId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDocumentMatchStatus</Name>
+				<Source><![CDATA[
+    private void updateDocumentMatchStatus(BankReconciliationDocumentOpenTmp documentToUpdate)
+    {
+        documentToUpdate.selectForUpdate(true);
+        documentToUpdate.IsMatched = NoYes::Yes;
+        documentToUpdate.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performMatchAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates payment for the matched statement line, creates matching entries, and updates record status.
+    /// </summary>
+    /// <param name="_openStatementForMatch">
+    /// The matched <c>BankReconciliationStatementOpenTmp</c> record.
+    /// </param>
+    /// <param name="_bankStatementsToUpdate">
+    /// The <c>BankStmtTmp</c> is responsible for recording the related bank statement header and will be used to update the header status latter.
+    /// </param>
+    internal protected void performMatchAction(Common _openStatementForMatch, BankStmtTmp _bankStatementsToUpdate)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getUnmatchedDocumentCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Counts the number of unmatched document lines.
+    /// </summary>
+    /// <returns>
+    /// The number of unmatched document lines.
+    /// </returns>
+    internal protected int64 getUnmatchedDocumentCount()
+    {
+        select count(RecId) from reconciliationDocumentTmp
+            where reconciliationDocumentTmp.IsMatched == NoYes::No;
+
+        return reconciliationDocumentTmp.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getUnmatchedStatementCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Counts the number of unmatched statement lines.
+    /// </summary>
+    /// <returns>
+    /// The number of unmatched statement lines.
+    /// </returns>
+    internal protected int64 getUnmatchedStatementCount()
+    {
+        select count(RecId) from reconciliationStatementTmp
+            where reconciliationStatementTmp.IsMatched == NoYes::No;
+
+        return reconciliationStatementTmp.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildStatementQueryRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds the query run for searching unmatched statement lines.
+    /// </summary>
+    /// <returns>
+    /// The query run for searching unmatched statement lines.
+    /// </returns>
+    internal protected QueryRun buildStatementQueryRun()
+    {
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildDocumentQueryRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds the query run for searching unmatched document lines.
+    /// </summary>
+    /// <returns>
+    /// The query run for searching unmatched document lines.
+    /// </returns>
+    internal protected QueryRun buildDocumentQueryRun()
+    {
+        QueryRun qrDocument;
+        BankReconciliationMatchingRuleQuery matchingRuleQuery = BankReconciliationMatchingRuleQuery::construct(matchRule.RecId);
+
+        qrDocument = matchingRuleQuery.getQueryRunForSearching(
+            BankReconciliationMatchRuleLineType::Document,
+                reconciliationDocumentTmp);
+
+        return qrDocument;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSearchedOrigDocumentIdList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the list of searched original document line temporary buffer Id for the given reversal document line.
+    /// </summary>
+    /// <param name = "_tmpDocument">Given <c>BankReconciliationDocumentOpenTmp</c> buffer for reversal document line.</param>
+    private void getSearchedOrigDocumentIdList(BankReconciliationDocumentOpenTmp _tmpDocument)
+    {
+        searchedOrigDocumentIdList = new List(Types::Int64);
+
+        BankReconciliationMatchingRuleQuery matchingRuleQuery = BankReconciliationMatchingRuleQuery::construct(matchRule.RecId);
+        matchingRuleQuery.parmComparedDocumentTmpBuffer(_tmpDocument);
+
+        if (matchRule
+            && matchRule.getMatchActionType() == BankReconciliationMatchActionType::TransactionReversal
+            && _tmpDocument)
+        {
+            QueryRun qrOrigDocument = matchingRuleQuery.getQueryRunForSearching(
+                BankReconciliationMatchRuleLineType::OrigDocument,
+                reconciliationDocumentTmp);
+
+            if (qrOrigDocument)
+            {
+                while (qrOrigDocument.next())
+                {
+                    BankReconciliationDocumentOpenTmp tmpDocumentLocal = qrOrigDocument.get(tableNum(BankReconciliationDocumentOpenTmp));
+
+                    if (tmpDocumentLocal)
+                    {
+                        searchedOrigDocumentIdList.addEnd(tmpDocumentLocal.RecId);
+                        if (searchedOrigDocumentIdList.elements() >= 2)
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCurrentStatement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the current <c>BankReconciliationStatementOpenTmp</c> record of the given query run..
+    /// </summary>
+    /// <param name="_statementQueryRun">
+    /// The query run for searching unmatched statement lines.
+    /// </param>
+    /// <returns>
+    /// The current <c>BankReconciliationStatementOpenTmp</c> record of the given query run.
+    /// </returns>
+    internal protected Common getCurrentStatement(QueryRun _statementQueryRun)
+    {
+        return null;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canPerformMatchAction</Name>
+				<Source><![CDATA[
+    internal protected boolean canPerformMatchAction()
+    {
+        if (matchRule.RequireManualMatching)
+        {
+            return searchedOrigDocumentIdList.elements() == 1;
+        }
+        return searchedOrigDocumentIdList.elements() >= 1;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSearchedDocumentIdList</Name>
+				<Source><![CDATA[
+    internal protected void getSearchedDocumentIdList(Common _tmpStatement)
+    {
+        return;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

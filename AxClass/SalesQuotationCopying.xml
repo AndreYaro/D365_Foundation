@@ -1,0 +1,730 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>SalesQuotationCopying</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The class is responsible for copying sales quotation data
+/// </summary>
+[SalesPurchCopyFactory(SalesPurchCopy::CopyAllHeader, tableStr(SalesQuotationTable))]
+[SalesPurchCopyFactory(SalesPurchCopy::CopyAllLines, tableStr(SalesQuotationTable))]
+public class SalesQuotationCopying
+{
+    SalesQuotationTable     salesQuotationTable;
+    SalesParameters         salesParameters;
+
+    TmpFrmVirtual           tmpFrmVirtualLines;
+    TmpFrmVirtual           tmpFrmVirtualHeader;
+
+    Qty                     qtyFactor;
+
+    NoYes                   recalculateAmount;
+    NoYes                   copyMarkup;
+    NoYes                   copyPrecisely;
+    NoYes                   deleteLines;
+    NoYes                   startingLineNum;
+
+    LineNum                 lineNum;
+
+    boolean                 convertCurrency;
+    TradeCurencyConversion  tradeCurencyConversion;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Indicates whether the line is valid to use.
+    /// </summary>
+    /// <param name="_salesQuotationLine">
+    ///    The sales quotation line to be validated.
+    /// </param>
+    /// <returns>
+    ///    true if the line is valid; otherwise, false.
+    /// </returns>
+    protected boolean checkLine(SalesQuotationLine _salesQuotationLine)
+    {
+        //Validate category used in the line exists and is active
+        if (_salesQuotationLine.SalesCategory)
+        {
+            EcoResCategory ecoResCategory = EcoResCategory::find(_salesQuotationLine.SalesCategory);
+
+            if (ecoResCategory)
+            {
+                //Category is not active
+                if (!ecoResCategory.IsActive)
+                {
+                    throw error(strfmt("@SYS309006", ecoResCategory.Name));
+                }
+            }
+            else
+            {
+                //Category does not exist
+                throw error("@SYS309007");
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustCopySalesQuotation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Defines if sales quotation must be copied.
+    /// </summary>
+    /// <returns>true if the sales quotation must be copied; otherwise, false.</returns>
+    protected boolean mustCopySalesQuotation()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesQuotationAfterCopying</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the sales quotation header.
+    /// </summary>
+    /// <param name = "_salesQuotationTable">An instance of the <c>SalesQuotationTable</c> that is being copied.</param>
+    /// <remarks>Is called in case all instances of <c>SalesQuotationLine</c> is considered to be valid after copying.</remarks>
+    protected void updateSalesQuotationAfterCopying(SalesQuotationTable _salesQuotationTable)
+    {
+        if (recalculateAmount
+            && RetailPricingKillSwitch::skipOrderCalculationInBulkCreationV2()
+            && RetailPricingEngine::useRetailPricingEngineForSalesQuatation(salesQuotationTable.QuotationId))
+        {
+            // Recalculate for the whole order after bulk creation, as pricing calculation line by line is skipped.
+            RetailSalesQuotationTable retailQuotationTable = salesQuotationTable.retailSalesQuotationTable();
+            RetailSalesQuotationCalculator::setPricesDiscountsOnOrderOnServer(salesQuotationTable.QuotationId, retailQuotationTable.TotalManualDiscountPercentage);
+        }
+
+        // Force credit limit check to execute and update salesQuotationTable.Estimated if eligible.
+        salesQuotationTable.Touched = NoYes::Yes;
+
+        if (salesQuotationTable.validateWrite())
+        {
+            salesQuotationTable.update();
+        }
+        else
+        {
+            salesQuotationTable.reread();
+            throw error("@SYS18722");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSalesQuotationLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes sales quotation lines, if specified by a corresponding property on an instance of <c>SalesQuotationCopyingContract</c>.
+    /// </summary>
+    protected void deleteSalesQuotationLines()
+    {
+        if (deleteLines)
+        {
+            this.deleteLines();
+            deleteLines=NoYes::No;
+            salesQuotationTable.reread();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copies sales quotation header and its lines.
+    /// </summary>
+    public void copy()
+    {
+        if (!this.mustCopySalesQuotation())
+        {
+            return;
+        }
+
+        if (FeatureStateProvider::IsFeatureEnabled(KittingFeature::instance()))
+        {
+            if (!this.kittingCanCopy())
+            {
+                return;
+            }
+        }
+
+        ttsbegin;
+
+        this.deleteSalesQuotationLines();
+
+        this.copyHeader();
+
+        boolean isCopyValid = true;
+
+        while select tmpFrmVirtualLines order by LineNum
+        {
+            isCopyValid = this.copySalesQuotationLine();
+
+            if (!isCopyValid)
+            {
+                break;
+            }
+        }
+
+        salesQuotationTable.CovStatus = 0;
+
+        if (isCopyValid)
+        {
+            this.updateSalesQuotationAfterCopying(salesQuotationTable);
+
+            ttscommit;
+        }
+        else
+        {
+            ttsabort;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copySalesQuotationLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs copying of the sales quotation line from <c>tmpFrmVirtualLines</c>.
+    /// </summary>
+    /// <returns>true if sales quotation line is valid to be copied; otherwise, false.</returns>
+    protected boolean copySalesQuotationLine()
+    {
+        SalesQuotationLine salesQuotationLine;
+
+        if (startingLineNum)
+        {
+            salesQuotationLine.LineNum = lineNum;
+            lineNum += 0.01;
+        }
+            
+        salesQuotationLine.initFromSalesQuotationTable(salesQuotationTable);
+        if (RetailPricingKillSwitch::skipOrderCalculationInBulkCreationV2() && RetailPricingEngine::useRetailPricingEngineForSalesQuatation(salesQuotationTable.QuotationId))
+        {
+            salesQuotationLine.SkipPriceDiscCalc = NoYes::Yes;
+        }
+
+        boolean isCopyValid = this.checkLine(salesQuotationLine);
+
+        if (!isCopyValid)
+        {
+            return isCopyValid;
+        }
+
+        NoYes                                  searchPrice = recalculateAmount;
+        SalesQuotationLineForeignTradeCategory salesQuotationLineForeignTradeCategory;
+        SalesQuotationLineCopyFromSource       salesQuotationCopyFromSource = SalesQuotationLineCopyFromSource::newFromSalesQuotationCopyingParameters(
+            tmpFrmVirtualLines,
+            salesQuotationLine,
+            salesQuotationLineForeignTradeCategory,
+            this);
+
+        this.copyLine(salesQuotationLine, salesQuotationCopyFromSource);
+
+        return isCopyValid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyLine</Name>
+				<Source><![CDATA[
+    internal protected void copyLine(SalesQuotationLine _target, SalesQuotationLineCopyFromSource _source)
+    {
+        _source.copyLine();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyHeader</Name>
+				<Source><![CDATA[
+    void copyHeader()
+    {
+        ttsbegin;
+
+        while select forupdate tmpFrmVirtualHeader
+        {
+            Common fromTrans = this.initSalesQuotationTableFromTmpFrmVirtualHeader();
+
+            if (copyMarkup)
+            {
+                Markup::delete(salesQuotationTable);
+            }
+
+            if (convertCurrency)
+            {
+                salesQuotationTable.convertCurrencyCode(salesQuotationTable.CurrencyCode, tradeCurencyConversion);
+            }
+
+            if (salesQuotationTable.validateWrite())
+            {
+                this.setPriceDiscHeaderChangePolicy(tmpFrmVirtualHeader.TableNum, salesQuotationTable);
+                salesQuotationTable.update();
+            }
+            else
+            {
+                salesQuotationTable.reread();
+                throw error("@SYS18722");
+            }
+            tmpFrmVirtualHeader.delete();
+
+            if (copyMarkup)
+            {
+                Markup::copy(NoYes::No,fromTrans,salesQuotationTable);
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSalesQuotationTableFromTmpFrmVirtualHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>SalesQuotationTable</c> record from the record referenced by the tmpFrmVirtualHeader record.
+    /// </summary>
+    /// <returns>
+    /// The record referenced by the tmpFrmVirtualHeader record.
+    /// </returns>
+    protected common initSalesQuotationTableFromTmpFrmVirtualHeader()
+    {
+        Common fromTrans;
+
+        switch (tmpFrmVirtualHeader.TableNum)
+        {
+            case tablenum(SalesQuotationTable):
+                fromTrans = SalesQuotationTable::findRec(tmpFrmVirtualHeader.RecordNo);
+                salesQuotationTable.initFromSalesQuotationTable(fromTrans);
+                break;
+            case tablenum(CustQuotationConfirmJour):
+                fromTrans = CustQuotationConfirmJour::findRecId(tmpFrmVirtualHeader.RecordNo);
+                salesQuotationTable.initFromCustQuotationConfirmJour(fromTrans);
+                break;
+            case tablenum(CustQuotationJour):
+                fromTrans = CustQuotationJour::findRecId(tmpFrmVirtualHeader.RecordNo);
+                salesQuotationTable.initFromCustQuotationJour(fromTrans);
+                break;
+        }
+
+        return fromTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteLines</Name>
+				<Source><![CDATA[
+    void deleteLines()
+    {
+        SalesQuotationLine   salesQuotationLine;
+
+        while select forupdate salesQuotationLine where salesQuotationLine.QuotationId == salesQuotationTable.QuotationId
+        {
+            if (salesQuotationLine.validateDelete())
+            {
+                salesQuotationLine.delete();
+            }
+            else
+            {
+                // Copying has been interrupted.
+                throw error("@SYS18722");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParameters</Name>
+				<Source><![CDATA[
+    [SysObsolete("This method has been made obsolete, please use initializeParametersFromContract method.", false, 31\03\2019)]
+    void initParameters(SalesQuotationTable     _salesQuotationTable,
+                        TmpFrmVirtual           _tmpFrmVirtualLines,
+                        TmpFrmVirtual           _tmpFrmVirtualHeader,
+                        Qty                     _qtyFactor           = 1,
+                        NoYes                   _recalculateAmount   = NoYes::No,
+                        NoYes                   _copyMarkup          = NoYes::No,
+                        NoYes                   _copyPrecisely       = NoYes::No,
+                        NoYes                   _deleteLines         = NoYes::No,
+                        boolean                _convertCurrency = false,
+                        TradeCurencyConversion _tradeCurencyConversion = TradeCurencyConversion::ExchRate
+                        )
+    {
+        SalesQuotationCopyingContract contract = SalesQuotationCopyingContract::construct();
+
+        contract.parmCallingTableQuotationId(_salesQuotationTable.QuotationId);
+        contract.parmTmpFrmVirtualLines(_tmpFrmVirtualLines);
+        contract.parmTmpFrmVirtualHeader(_tmpFrmVirtualHeader);
+        contract.parmQtyFactor(_qtyFactor);
+        contract.parmRecalculateAmount(_recalculateAmount);
+        contract.parmCopyMarkup(_copyMarkup);
+        contract.parmCopyPrecisely(_copyPrecisely);
+        contract.parmDeleteLines(_deleteLines);
+        contract.parmConvertCurrency(_convertCurrency);
+        contract.parmTradeCurencyConversion(_tradeCurencyConversion);
+
+        this.initializeParametersFromContract(contract);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        salesParameters = SalesParameters::find();
+        startingLineNum = NoYes::No;
+        lineNum         = 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCopyPrecisely</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Provides access to the parameter, which defines if copying has to be made precisely.
+    /// </summary>
+    /// <returns>true if copying has to be made precisely; otherwise, false.</returns>
+    public boolean parmCopyPrecisely()
+    {
+        return copyPrecisely;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCopyMarkup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Provides access to the parameter, which defines if sales quotation line markup has to be copied.
+    /// </summary>
+    /// <returns>true if sales quotation line markup has to be copied; otherwise, false.</returns>
+    public boolean parmCopyMarkup()
+    {
+        return copyMarkup;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecalculateAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Provides access to the parameter, which defines if amount has to be recalculated during copying.
+    /// </summary>
+    /// <returns>true if amount has to be recalculated; otherwise, false.</returns>
+    public boolean parmRecalculateAmount()
+    {
+        return recalculateAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldCopyQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Identifies if quantity should be copied based on quantity factor parameter.
+    /// </summary>
+    /// <returns>true if quantity factor has been provided; otherwise, false.</returns>
+    public boolean shouldCopyQty()
+    {
+        return qtyFactor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmQuantityFactor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sales quotation line quantity factor to be used for quantity recalculation.
+    /// </summary>
+    /// <returns>Quantity factor.</returns>
+    public Qty parmQuantityFactor()
+    {
+        return qtyFactor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmConvertCurrency</Name>
+				<Source><![CDATA[
+    public boolean parmConvertCurrency(boolean _convertCurrency = convertCurrency)
+    {
+        convertCurrency = _convertCurrency;
+        return convertCurrency;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTradeCurrencyConversion</Name>
+				<Source><![CDATA[
+    public TradeCurencyConversion parmTradeCurrencyConversion(TradeCurencyConversion _tradeCurrencyConversion = tradeCurencyConversion)
+    {
+        tradeCurencyConversion = _tradeCurrencyConversion;
+        return tradeCurencyConversion;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>promptConvertCurrencyCode</Name>
+				<Source><![CDATA[
+    void promptConvertCurrencyCode()
+    {
+        SalesQuotationTable      salesQuotationTableNew;
+        while select tmpFrmVirtualHeader
+        {
+            switch (tmpFrmVirtualHeader.TableNum)
+            {
+                case tablenum(SalesQuotationTable)           :
+                        Common fromTrans = SalesQuotationTable::findRec(tmpFrmVirtualHeader.RecordNo);
+                        salesQuotationTableNew.initFromSalesQuotationTable(fromTrans);
+                        break;
+                case tablenum(CustQuotationConfirmJour)      :
+                        fromTrans = CustQuotationConfirmJour::findRecId(tmpFrmVirtualHeader.RecordNo);
+                        salesQuotationTableNew.initFromCustQuotationConfirmJour(fromTrans);
+                        break;
+                case tablenum(CustQuotationJour)    :
+                        fromTrans = CustQuotationJour::findRecId(tmpFrmVirtualHeader.RecordNo);
+                        salesQuotationTableNew.initFromCustQuotationJour(fromTrans);
+                        break;
+            }
+
+            if (salesQuotationTable.CurrencyCode == salesQuotationTableNew.CurrencyCode)
+                return; // same currency code
+
+            if (!deleteLines && SalesQuotationLine::exist(salesQuotationTable.QuotationId))
+            {
+                [convertCurrency, tradeCurencyConversion] = SalesQuotationTable::promptConvertCurrencyCode(salesQuotationTable);
+                return; // Now we have prompted - no need to prompt again.
+            }
+
+            if (!copyMarkup && MarkupTrans::exist(salesQuotationTable.TableId, salesQuotationTable.RecId))
+            {
+                [convertCurrency, tradeCurencyConversion] = SalesQuotationTable::promptConvertCurrencyCode(salesQuotationTable);
+                return;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPriceDiscHeaderChangePolicy</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Sets price discount policies for the header of the new sales quotation orders.
+    /// </summary>
+    /// <param name="_tmpFrmVirtualId">
+    ///    The ID of the original table.
+    /// </param>
+    /// <param name="_salesQuotationTable">
+    ///    A <c>SalesQuotationTable</c> table buffer.
+    /// </param>
+    void setPriceDiscHeaderChangePolicy(RefTableId _tmpFrmVirtualId, SalesQuotationTable _salesQuotationTable)
+    {
+        switch (_tmpFrmVirtualId)
+        {
+            case tablenum(SalesTable)           :
+            case tablenum(CustInvoiceJour)      :
+            case tablenum(CustPackingSlipJour)  :
+            case tablenum(CustConfirmJour)      :
+                _salesQuotationTable.setPriceDiscChangePolicy(PriceDiscSystemSource::CopyFromSalesOrder);
+                break;
+
+            case tablenum(SalesQuotationTable)    :
+                _salesQuotationTable.setPriceDiscChangePolicy(PriceDiscSystemSource::SalesQuotation);
+                break;
+
+            case tablenum(ProjInvoiceJour)    :
+                _salesQuotationTable.setPriceDiscChangePolicy(PriceDiscSystemSource::Project);
+                break;
+
+            default : break;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    static SalesQuotationCopying construct(SalesPurchCopy _salesPurchCopy)
+    {
+        SalesPurchCopyFactoryAttribute attr = new SalesPurchCopyFactoryAttribute(_salesPurchCopy, tableStr(SalesQuotationTable));
+        SalesQuotationCopying salesQuotationCopying = SysExtensionAppClassFactory::getClassFromSysAttribute(classStr(SalesQuotationCopying), attr) as SalesQuotationCopying;
+
+        if (classIdGet(salesQuotationCopying) == classNum(SalesQuotationCopying)
+            && _salesPurchCopy != SalesPurchCopy::CopyAllHeader
+            && _salesPurchCopy != SalesPurchCopy::CopyAllLines)
+        {
+            throw error(strfmt("@SYS19306",funcname()));
+        }
+
+        return salesQuotationCopying;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyServer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs Sales Quotation copying server-side.
+    /// </summary>
+    /// <param name="_sqCopyingContract">
+    /// <c>SalesQuotationCopyingContract</c> contract.
+    /// </param>
+    public static void copyServer(SalesQuotationCopyingContract _sqCopyingContract)
+    {
+        SalesQuotationCopying salesQuotationCopying = SalesQuotationCopying::construct(_sqCopyingContract.parmSalesPurchCopy());
+
+        salesQuotationCopying.initializeParametersFromContract(_sqCopyingContract);
+
+        salesQuotationCopying.copy();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>promptConvertCurrencyCodeOnClient</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if there are lines requiring currency conversion on destination record and prompts user about conversion details.
+    /// </summary>
+    /// <param name="_tmpFrmVirtualHeader">
+    /// The table with order headers to copy from.
+    /// </param>
+    /// <param name="_salesQuotationTable">
+    /// The destination record to copy to.
+    /// </param>
+    /// <param name="_deleteLines">
+    /// A <c>Boolean</c> value determining whether existing order lines should be deleted.
+    /// </param>
+    /// <param name="_copyMarkup">
+    /// A <c>Boolean</c> value determining whether markup should be copied.
+    /// </param>
+    /// <returns>
+    /// User response to the dialog, in a container with a <c>Boolean</c> value determining
+    /// if currency should be converted and <c>TradeCurencyConversion</c> enum value about
+    /// currency conversion type.
+    /// </returns>
+    public static container promptConvertCurrencyCodeOnClient(
+        TmpFrmVirtual _tmpFrmVirtualHeader,
+        SalesQuotationTable _salesQuotationTable,
+        boolean _deleteLines,
+        boolean _copyMarkup
+    )
+    {
+        SalesQuotationCopying salesQuotationCopying = SalesQuotationCopying::construct(SalesPurchCopy::CopyAllLines);
+
+        SalesQuotationCopyingContract salesQuotationCopyingContract = salesQuotationCopying.createContract(_salesQuotationTable, _tmpFrmVirtualHeader, _copyMarkup, _deleteLines);
+        salesQuotationCopying.initializeParametersFromContract(salesQuotationCopyingContract);
+        salesQuotationCopying.promptConvertCurrencyCode();
+
+        return [salesQuotationCopying.parmConvertCurrency(), salesQuotationCopying.parmTradeCurrencyConversion()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeParametersFromContract</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the parameters based on <c>SalesQuotationCopyingContract</c>.
+    /// </summary>
+    /// <param name = "_salesQuotationCopyingContract">An instance of <c>SalesQuotationCopyingContract</c> class.</param>
+    protected void initializeParametersFromContract(SalesQuotationCopyingContract _salesQuotationCopyingContract)
+    {
+        salesQuotationTable     = SalesQuotationTable::find(_salesQuotationCopyingContract.parmCallingTableQuotationId(), true);
+        tmpFrmVirtualLines      = _salesQuotationCopyingContract.parmTmpFrmVirtualLines();
+        tmpFrmVirtualHeader     = _salesQuotationCopyingContract.parmTmpFrmVirtualHeader();
+        qtyFactor               = _salesQuotationCopyingContract.parmQtyFactor();
+        recalculateAmount       = _salesQuotationCopyingContract.parmRecalculateAmount();
+        copyMarkup              = _salesQuotationCopyingContract.parmCopyMarkup();
+        copyPrecisely           = _salesQuotationCopyingContract.parmCopyPrecisely();
+        deleteLines             = _salesQuotationCopyingContract.parmDeleteLines();
+        convertCurrency         = _salesQuotationCopyingContract.parmConvertCurrency();
+        tradeCurencyConversion  = _salesQuotationCopyingContract.parmTradeCurencyConversion();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createContract</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the <c>SalesQuotationCopyingContract</c> object.
+    /// </summary>
+    /// <param name = "_salesQuotationTable">A sales quotation table buffer.</param>
+    /// <param name = "_tmpFrmVirtualHeader">The table with order headers.</param>
+    /// <param name = "_copyMarkup">Copy markup flag to create sales quotation copying contract with <c>parmCopyMarkup</c>.</param>
+    /// <param name = "_deleteLines">Delete lines flag to create sales quotation copying contract with <c>parmDeleteLines</c>.</param>
+    /// <returns>
+    /// An instance of <c>SalesQuotationCopyingContract</c> class.
+    /// </returns>
+    protected SalesQuotationCopyingContract createContract(
+        SalesQuotationTable     _salesQuotationTable,
+        TmpFrmVirtual           _tmpFrmVirtualHeader,
+        NoYes                   _copyMarkup,
+        NoYes                   _deleteLines)
+    {
+        SalesQuotationCopyingContract contract = SalesQuotationCopyingContract::construct();
+
+        contract.parmCallingTableQuotationId(_salesQuotationTable.QuotationId);
+        contract.parmTmpFrmVirtualHeader(_tmpFrmVirtualHeader);
+        contract.parmQtyFactor(1);
+        contract.parmCopyMarkup(_copyMarkup);
+        contract.parmDeleteLines(_deleteLines);
+
+        return contract;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>kittingCanCopy_delegate</Name>
+				<Source><![CDATA[
+    delegate void kittingCanCopy_delegate(TmpFrmVirtual _tmpFrmVirtualLines, EventHandlerResult _eventHandlerResult)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>kittingCanCopy</Name>
+				<Source><![CDATA[
+    public boolean kittingCanCopy()
+    {
+        EventHandlerResult resultValue = new EventHandlerResult();
+        this.kittingCanCopy_delegate(tmpFrmVirtualLines, resultValue);
+        return !resultValue.hasResult() || resultValue.booleanResult();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

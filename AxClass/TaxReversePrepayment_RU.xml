@@ -1,0 +1,538 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>TaxReversePrepayment_RU</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class TaxReversePrepayment_RU extends Tax
+{
+    CustVendTrans       custVendTrans;
+    AmountMST           settleAmountMst;
+    AmountCur           settleAmountCur;
+    AmountMSTSecondary  settleAmountReporting;
+    Set                 taxTransRecIDs;
+    boolean             isUseTax;
+    // <GEECZ>
+    CustVendTrans       offsetTrans;
+
+    private LedgerDimensionAccount vatPrePaymentLedgerDimension;
+    private container totalTaxAmountsWithoutUseTaxContainer;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>parmVatPrePaymentLedgerDimension</Name>
+				<Source><![CDATA[
+    public LedgerDimensionAccount parmVatPrePaymentLedgerDimension(LedgerDimensionAccount _vatPrePaymentLedgerDimension = vatPrePaymentLedgerDimension)
+    {
+        vatPrePaymentLedgerDimension = _vatPrePaymentLedgerDimension;
+        return vatPrePaymentLedgerDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcPennyDiff</Name>
+				<Source><![CDATA[
+    private container calcPennyDiff(TaxTrans _taxTransReverse, LedgerDimensionAccount _ledgerDimension,  LedgerDimensionAccount _offsetLedgerDimension)
+    {
+        TaxTrans                        taxTrans;
+        TaxTrans_RU                     taxTrans_RU;
+        CustVendTransPostingLog_RU      postingLog;
+        TaxAmount                       pennyDiffCur, pennyDiffMst;
+        TaxTransLedgerDimensions_RU     taxTransLedgerDimensions;
+        TaxAmount                       taxAmount;
+        TaxAmount                       taxUnroundAmount_RU;
+        TaxAmount                       sourceTaxAmountCur;
+        TaxAmount                       taxUnroundAmountCur_RU;
+        TaxTrans_RU                     taxTransReverse_RU;
+
+        taxTransReverse_RU = _taxTransReverse.taxTrans_RU();
+
+        while select sum(TaxAmount),
+                     sum(SourceTaxAmountCur)
+            from taxTrans
+            where taxTrans.TaxCode              == _taxTransReverse.TaxCode             &&
+                  taxTrans.TaxGroup             == _taxTransReverse.TaxGroup            &&
+                  taxTrans.TaxItemGroup         == _taxTransReverse.TaxItemGroup        &&
+
+                  taxTrans.CurrencyCode         == _taxTransReverse.CurrencyCode        &&
+                  taxTrans.SourceTableId        == _taxTransReverse.SourceTableId       &&
+                  taxTrans.SourceRecId          == _taxTransReverse.SourceRecId
+            join CustVendTransPostingLog_RU, sum(TaxUnroundAmount_RU), sum(TaxUnroundAmountCur_RU) from taxTrans_RU
+                    where taxTrans_RU.TaxTrans == taxTrans.RecId &&
+                 (taxTrans_RU.TaxUnroundAmount_RU || taxTrans_RU.TaxUnroundAmountCur_RU)
+            join LedgerDimension, OffsetLedgerDimension from taxTransLedgerDimensions
+                    where taxTransLedgerDimensions.TaxTrans                 == taxTrans.RecId    &&
+                          (! _ledgerDimension        || taxTransLedgerDimensions.LedgerDimension          == _ledgerDimension)   &&
+                          (! _offsetLedgerDimension  || taxTransLedgerDimensions.OffsetLedgerDimension    == _offsetLedgerDimension)
+        exists join postingLog
+            where postingLog.RefTableId     == custVendTrans.TableId    &&
+                  postingLog.TransRecId     == custVendTrans.RecId      &&
+                  postingLog.TransDate      == taxTrans.TransDate       &&
+                  postingLog.Voucher        == taxTrans.Voucher         &&
+                  postingLog.RecId          == taxTrans_RU.CustVendTransPostingLog_RU &&
+                 !postingLog.Reversed                                   &&
+                  postingLog.PostingLogType == CustVendTransPostingLogType_RU::PrepaymentStornoVAT
+        {
+            // no offset ledger dimension, filtering for 0 will not work
+            // (no "is null" in Ax)
+            if (_ledgerDimension         == taxTransLedgerDimensions.LedgerDimension &&
+                _offsetLedgerDimension   == taxTransLedgerDimensions.OffsetLedgerDimension)
+            {
+                taxAmount               += taxTrans.TaxAmount;
+                taxUnroundAmount_RU     += taxTrans_RU.TaxUnroundAmount_RU;
+                sourceTaxAmountCur      += taxTrans.SourceTaxAmountCur;
+                taxUnroundAmountCur_RU  += taxTrans_RU.TaxUnroundAmountCur_RU;
+            }
+        }
+        pennyDiffCur = CurrencyExchangeHelper::amount(taxUnroundAmountCur_RU + taxTransReverse_RU.TaxUnroundAmountCur_RU, _taxTransReverse.SourceCurrencyCode) - sourceTaxAmountCur - _taxTransReverse.SourceTaxAmountCur;
+
+        pennyDiffMst = CurrencyExchangeHelper::amount(taxUnroundAmount_RU + taxTransReverse_RU.TaxUnroundAmount_RU, CompanyInfoHelper::standardCurrency()) - taxAmount - _taxTransReverse.TaxAmount;
+
+        return [ pennyDiffCur, pennyDiffMst ];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcPostAndInsertTaxes</Name>
+				<Source><![CDATA[
+    public container calcPostAndInsertTaxes(
+        LedgerPostingController _ledgerPostingController,
+        TaxOrigin               _taxOrigin      = TaxOrigin::TaxReversed,
+        ExchRate                _exchRateSecond = 0)
+    {
+        TaxTrans                      taxTrans;
+        TaxTrans                      taxTransReverse;
+        TaxTrans_W                    taxTransReverse_W;
+        TaxTrans_RU                   taxTransReverse_RU;
+        TaxAmount                     sourceTaxAmountCur, taxAmountMST, taxAmountReporting;
+        TaxAmount                     taxInCostPrice, taxInCostPriceMST, taxInCostPriceRep;
+        TaxAmount                     taxUnroundAmountCur, taxUnroundAmountMST;
+        TaxAmount                     pennyDiffCur, pennyDiffMST;
+        TaxBase                       baseAmountCur, baseAmountMst;
+        CustVendCalcSettledAmounts_RU custVendCalcSettledAmounts;
+        Map                           taxAmountsMst;
+        Map                           sourceTaxAmountsCur;
+        Map                           taxAmountsReporting;
+        Map                           taxUnroundAmountsMst;
+        Map                           taxUnroundAmountsCur;
+        MapIterator                   iterator;
+        BookStructSmallVATAmounts_RU  bookStructSmallVATAmounts;
+        TaxCode                       taxCode;
+        TaxGroup                      taxGroup;
+        TaxItemGroup                  taxItemGroup;
+        InventTransId                 inventTransId;
+        LedgerDimensionAccount        ledgerDimension, offsetLedgerDimension;
+        TaxModuleTypeId               source;
+        TaxAmount                     totalTaxAmountMST, totalTaxAmountCur, totalTaxAmountReporting;
+        TaxAmount                     totalTaxAmountMSTWithoutUseTax, totalTaxAmountCurWithoutUseTax, totalTaxAmountReportingWithoutUseTax;
+        boolean                       useSourceRecId;
+        DimensionDefault              defaultDimension;
+        CurrencyExchangeHelper        currencyExchangeHelper;
+
+        TaxTransLedgerDimensions_RU   taxTransLedgerDimensions;
+
+        const SysFlightName           RUTaxCalculationReportingCurrencyTotals = 'RUTaxCalculationReportingCurrencyTotals';
+
+        // <GEECZ>
+        TaxAmount                     taxAmountMSTOrig;
+        AmountMST                     amountDiffMST;
+        boolean                       isCZOffsetTransEnabled = SysCountryRegionCode::isLegalEntityInCountryRegion([#IsoCZ]) && offsetTrans.RecId;
+        // </GEECZ>
+
+        if (TaxReversePrepaymentWithUseTaxAndOtherTaxFlight::instance().isEnabled())
+        {
+            totalTaxAmountsWithoutUseTaxContainer = conNull();
+        }
+
+        CurrencyCode                  standardCurrency = CompanyInfoHelper::standardCurrency();
+
+        TaxCurrencyConversionRoutineHandler handler = TaxCurrencyConversionRoutineHandler::instance();
+
+        taxDate         = _ledgerPostingController.getJournal().lastTransDate();
+        useSourceRecId  = CustVendTransData::construct(custVendTrans).isPrepaymentConverted_W();
+
+        custVendCalcSettledAmounts = CustVendCalcSettledAmounts_RU::construct(custVendTrans, useSourceRecId, true, null, true);
+        custVendCalcSettledAmounts.calcSettledAmounts();
+        custVendCalcSettledAmounts.calcNewSettlement(settleAmountMst, settleAmountCur, settleAmountReporting);
+
+        taxAmountsMst       = custVendCalcSettledAmounts.mapLastSettledAmountsMST();
+        sourceTaxAmountsCur = custVendCalcSettledAmounts.mapLastSettledAmountsCur();
+        taxAmountsReporting = custVendCalcSettledAmounts.mapLastSettledAmountsReporting();
+
+        voucher = _ledgerPostingController.getReference().parmReferenceNumber();
+        taxTransRecIDs = new Set(typeName2Type(extendedTypeStr(RecId)));
+
+        taxUnroundAmountsMst = custVendCalcSettledAmounts.mapUnroundSettledAmountsMST();
+        taxUnroundAmountsCur = custVendCalcSettledAmounts.mapUnroundSettledAmountsCur();
+
+        ttsbegin;
+
+        iterator = new MapIterator(taxAmountsMst);
+        while (iterator.more())
+        {
+            [taxGroup, taxItemGroup, taxCode, defaultDimension, inventTransId, ledgerDimension, offsetLedgerDimension, source] = iterator.key();
+
+            // Query the posted tax trans that tax direction is sales tax payment. Then create TaxReversePayment by this record.
+            if (custVendTrans.TableId == tablenum(CustTrans) || custVendTrans.TableId == tableNum(VendTrans))
+            {
+                select firstonly taxTrans order by RecId desc
+                    where taxTrans.Voucher == custVendTrans.Voucher
+                        && taxTrans.TransDate == custVendTrans.TransDate
+                        && taxTrans.TaxOrigin == TaxOrigin::Tax
+                        && taxTrans.TaxCode == taxCode
+                        && taxTrans.TaxGroup == taxGroup
+                        && taxTrans.TaxItemGroup == taxItemGroup
+                        && taxTrans.Source == source
+                        && (!useSourceRecId || taxTrans.SourceRecId == custVendTrans.RecId)
+                        && taxTrans.ExchRateDiffOrigRecId == 0;
+            }
+            else
+            {
+                select firstonly taxTrans order by RecId desc
+                    where taxTrans.Voucher == custVendTrans.Voucher
+                        && taxTrans.TransDate == custVendTrans.TransDate
+                        && taxTrans.TaxOrigin == TaxOrigin::Tax
+                        && taxTrans.TaxCode == taxCode
+                        && taxTrans.TaxGroup == taxGroup
+                        && taxTrans.TaxItemGroup == taxItemGroup
+                        && taxTrans.Source == source
+                        && (!useSourceRecId || taxTrans.SourceRecId == custVendTrans.RecId);
+            }
+
+            if (taxTrans.RecId)
+            {
+                triangulation = taxTrans.euroTriangulation;
+
+                bookStructSmallVATAmounts   = BookStructSmallVATAmounts_RU::create(iterator.value());
+                taxAmountMST                = -bookStructSmallVATAmounts.taxAmountVAT();
+                baseAmountMst               = -bookStructSmallVATAmounts.amountLiableToVAT();
+                taxInCostPriceMST           = -bookStructSmallVATAmounts.taxInCostPrice();
+
+                bookStructSmallVATAmounts   = BookStructSmallVATAmounts_RU::create(sourceTaxAmountsCur.lookup(iterator.key()));
+                sourceTaxAmountCur          = -bookStructSmallVATAmounts.taxAmountVAT();
+                baseAmountCur               = -bookStructSmallVATAmounts.amountLiableToVAT();
+                taxInCostPrice              = -bookStructSmallVATAmounts.taxInCostPrice();
+
+                bookStructSmallVATAmounts   = BookStructSmallVATAmounts_RU::create(taxUnroundAmountsCur.lookup(iterator.key()));
+                taxUnroundAmountCur         = -bookStructSmallVATAmounts.taxAmountVAT();
+
+                bookStructSmallVATAmounts   = BookStructSmallVATAmounts_RU::create(taxUnroundAmountsMst.lookup(iterator.key()));
+                taxUnroundAmountMST         = -bookStructSmallVATAmounts.taxAmountVAT();
+
+                bookStructSmallVATAmounts   = BookStructSmallVATAmounts_RU::create(taxAmountsReporting.lookup(iterator.key()));
+                taxAmountReporting          = -bookStructSmallVATAmounts.taxAmountVAT();
+                taxInCostPriceRep           = -bookStructSmallVATAmounts.taxInCostPrice();
+
+                // <GEECZ>
+                if (isCZOffsetTransEnabled)
+                {
+                    taxAmountMSTOrig = taxAmountMST;
+                    taxAmountMST     = CurrencyExchangeHelper::mstAmount(sourceTaxAmountCur, sourceCurrencyCode, dateNull(), UnknownNoYes::Unknown, offsetTrans.ExchRate);
+                    baseAmountMst    = CurrencyExchangeHelper::mstAmount(baseAmountCur, sourceCurrencyCode, dateNull(), UnknownNoYes::Unknown, offsetTrans.ExchRate);
+                    taxInCostPriceMST = CurrencyExchangeHelper::mstAmount(taxInCostPrice, sourceCurrencyCode, dateNull(), UnknownNoYes::Unknown, offsetTrans.ExchRate);
+                }
+                // </GEECZ>
+
+                if (sourceTaxAmountCur || taxAmountMST || baseAmountCur || baseAmountMst || taxUnroundAmountCur || taxUnroundAmountMST)
+                {
+                    taxTransReverse.clear();
+
+                    taxTransReverse.data(taxTrans);
+                    taxTransReverse_W  = taxTransReverse.taxTrans_W();
+                    taxTransReverse_RU = taxTransReverse.taxTrans_RU();
+
+                    taxTransReverse.TaxCode                  = taxTrans.TaxCode;
+                    taxTransReverse.TaxGroup                 = taxTrans.TaxGroup;
+                    taxTransReverse.TaxItemGroup             = taxTrans.TaxItemGroup;
+                    taxTransReverse.Source                   = TaxModuleType::Voucher;
+                    taxTransReverse.Voucher                  = voucher;
+                    taxTransReverse.TransDate                = taxDate;
+                    //<GEEU>
+                    taxTransReverse_W.VatDueDate_W           = max(taxDate, taxTrans.taxTrans_W().VatDueDate_W);
+                    //</GEEU>
+                    taxTransReverse.TaxDirection             = taxTrans.TaxDirection;
+                    taxTransReverse.CurrencyCode             = taxTrans.CurrencyCode;
+                    taxTransReverse.SourceCurrencyCode       = sourceCurrencyCode;
+                    taxTransReverse.TaxAutogenerated         = NoYes::Yes;
+                    taxTransReverse.euroTriangulation        = taxTrans.euroTriangulation;
+                    taxTransReverse.TaxAmount                = taxAmountMST;
+                    taxTransReverse_RU.TaxUnroundAmount_RU   = taxUnroundAmountMST;
+                    taxTransReverse.TaxBaseAmount            = baseAmountMst;
+
+                    taxTransReverse.TaxInCostPrice           = taxInCostPrice;
+                    taxTransReverse.TaxInCostPriceMST        = taxInCostPriceMST;
+                    taxTransReverse.TaxInCostPriceRep        = taxInCostPriceRep;
+
+                    // <GEECZ>
+                    if (isCZOffsetTransEnabled)
+                    {
+                        taxTransReverse.TaxBaseAmountCur = CurrencyExchangeHelper::curAmount(baseAmountMst, taxTrans.CurrencyCode, taxDate);
+                        taxTransReverse.TaxAmountCur     = CurrencyExchangeHelper::curAmount(taxAmountMST, taxTrans.CurrencyCode, taxDate);
+                        taxTransReverse.TaxInCostPriceCur = CurrencyExchangeHelper::curAmount(taxInCostPriceMST, taxTrans.CurrencyCode, taxDate);
+                    }
+                    else
+                    {
+                        // </GEECZ>
+                        // special case: tax currency equal to standard curency
+                        // in this case we can omit recalculation and thus get rid of penny diff
+                        if (taxTransReverse.CurrencyCode == standardCurrency)
+                        {
+                            taxTransReverse.TaxBaseAmountCur = baseAmountMST;
+                            taxTransReverse.TaxAmountCur     = taxAmountMST;
+                            taxTransReverse.TaxInCostPriceCur = taxInCostPriceMST;
+                        }
+                        else
+                        {
+                            taxTransReverse.TaxBaseAmountCur = CurrencyExchangeHelper::curAmount2CurAmount(baseAmountCur, sourceCurrencyCode, taxTrans.CurrencyCode, taxDate);
+                            taxTransReverse.TaxAmountCur     = CurrencyExchangeHelper::curAmount2CurAmount(sourceTaxAmountCur, sourceCurrencyCode, taxTrans.CurrencyCode, taxDate);
+                            taxTransReverse.TaxInCostPriceCur = CurrencyExchangeHelper::curAmount2CurAmount(taxInCostPrice, sourceCurrencyCode, taxTrans.CurrencyCode, taxDate);
+                        }
+                        // <GEECZ>
+                    }
+                    // </GEECZ>
+                    taxTransReverse_RU.TaxUnroundAmountCur_RU       = taxUnroundAmountCur;
+                    taxTransReverse.SourceTaxAmountCur              = sourceTaxAmountCur;
+                    taxTransReverse.SourceBaseAmountCur             = baseAmountCur;
+                    taxTransReverse.SourceBaseAmountCurRegulated    = baseAmountCur;
+                    taxTransReverse.ExemptTax                       = NoYes::No;
+                    taxTransReverse.TaxOrigin                       = _taxOrigin;
+                    taxTransReverse.JournalNum                      = taxTrans.JournalNum;
+                    taxTransReverse.SourceTableId                   = taxTrans.SourceTableId;
+                    taxTransReverse.SourceRecId                     = taxTrans.SourceRecId;
+
+                    taxTransReverse.TaxBaseAmountRep = handler.transCurrencyToReportingCurrency(sourceCurrencyCode, taxTransReverse.SourceBaseAmountCur,
+                                                                                                reportingCurrencyExchRate, taxDate);
+                    taxTransReverse.TaxAmountRep = handler.transCurrencyToReportingCurrency(sourceCurrencyCode, taxTransReverse.SourceTaxAmountCur,
+                                                                                                reportingCurrencyExchRate, taxDate);
+
+                    taxTransReverse.packTaxTrans_W(taxTransReverse_W);
+                    taxTransReverse.packTaxTrans_RU(taxTransReverse_RU);
+
+                    // <GEECZ>
+                    if (!isCZOffsetTransEnabled)
+                    {
+                        // </GEECZ>
+                        [pennyDiffCur, pennyDiffMST] = this.calcPennyDiff(taxTransReverse, ledgerDimension, offsetLedgerDimension);
+
+                        sourceTaxAmountCur += pennyDiffCur;
+                        taxAmountMST += pennyDiffMST;
+
+                        taxTransReverse.SourceTaxAmountCur        = sourceTaxAmountCur;
+                        // <GEECZ>
+                    }
+                    // </GEECZ>
+
+                    taxTransReverse.SourceBaseAmountCur          -= pennyDiffCur;
+                    taxTransReverse.SourceBaseAmountCurRegulated -= pennyDiffCur;
+                    taxTransReverse.TaxBaseAmount                -= pennyDiffMST;
+
+                    taxTransReverse.SourceRegulateAmountCur = sourceTaxAmountCur;
+                    taxTransReverse.TaxInCostPriceRegulated = taxInCostPrice;
+                    taxTransReverse.TaxAmount               = taxAmountMST;
+
+                    TaxTransGlobalInitializer initializerBySourceTable = TaxTransGlobalInitializer::construct(taxTransReverse);
+                    initializerBySourceTable.parmTaxTransSource(taxTrans);
+                    initializerBySourceTable.initTaxTransFromSourceTaxTrans();
+
+                    taxTransReverse.insert();
+
+                    if (_taxOrigin != TaxOrigin::Tax)
+                    {
+                        taxTransRecIDs.add(taxTransReverse.RecId);
+                    }
+
+                    if (taxTransReverse.TaxDirection == TaxDirection::UseTax)
+                    {
+                        this.parmUseTax(true);
+                    }
+
+                    sourceTaxAmountCur = taxTransReverse.SourceRegulateAmountCur;
+
+                    totalTaxAmountCur += sourceTaxAmountCur;
+                    totalTaxAmountMST += taxAmountMST;
+                    totalTaxAmountReporting += taxAmountReporting;
+
+                    if (TaxReversePrepaymentWithUseTaxAndOtherTaxFlight::instance().isEnabled())
+                    {
+                        totalTaxAmountCurWithoutUseTax = (taxTransReverse.TaxDirection == TaxDirection::UseTax) ?
+                            totalTaxAmountCurWithoutUseTax : totalTaxAmountCurWithoutUseTax + sourceTaxAmountCur;
+                        totalTaxAmountMSTWithoutUseTax = (taxTransReverse.TaxDirection == TaxDirection::UseTax) ?
+                            totalTaxAmountMSTWithoutUseTax : totalTaxAmountMSTWithoutUseTax + taxAmountMST;
+                        totalTaxAmountReportingWithoutUseTax = (taxTransReverse.TaxDirection == TaxDirection::UseTax) ?
+                            totalTaxAmountReportingWithoutUseTax : totalTaxAmountReportingWithoutUseTax + taxAmountReporting;
+                    }
+
+                    currencyExchangeHelper = this.getCurrencyExchangeHelper(
+                        sourceTaxAmountCur,
+                        taxTransReverse.TaxAmount,
+                        taxAmountReporting,
+                        _ledgerPostingController.getReference().parmTransDate(),
+                        _exchRateSecond);
+
+                    this.post(
+                        _ledgerPostingController,
+                        taxTransReverse,
+                        sourceTaxAmountCur,
+                        taxInCostPrice,
+                        currencyExchangeHelper,
+                        ledgerDimension,
+                        TaxTransGeneralJournalAccountEntry::getLedgerDimensionForTaxTrans(taxTrans.RecId, TaxTransRelationshipType::TransactionLineAccount),
+                        TaxTransGeneralJournalAccountEntry::getLedgerDimensionForTaxTrans(taxTrans.RecId, TaxTransRelationshipType::UseTaxPayable),
+                        LedgerDetailLevel::AsDefault,
+                        null,
+                        offsetLedgerDimension);
+                    // <GEECZ>
+                    if (isCZOffsetTransEnabled)
+                    {
+                        amountDiffMST += (abs(taxAmountMSTOrig) - abs(taxAmountMST));
+                    }
+                    // </GEECZ>
+
+                    if (taxInCostPrice && TaxPrepaymentHandlingPostTaxInCostPriceFlight::instance().isEnabled())
+                    {
+                        if (vatPrePaymentLedgerDimension)
+                        {
+                            currencyExchangeHelper = this.getCurrencyExchangeHelper(
+                                taxTransReverse.TaxInCostPrice,
+                                taxTransReverse.TaxInCostPriceMST,
+                                taxTransReverse.TaxInCostPriceRep,
+                                _ledgerPostingController.getReference().parmTransDate(),
+                                _exchRateSecond);
+
+                            this.postCharge(_ledgerPostingController, taxTransReverse, taxInCostPrice, currencyExchangeHelper, vatPrePaymentLedgerDimension);
+                        }
+                        else
+                        {
+                            warning(strFmt("@TaxCoreTax:PostingProfilesNotSetupAccount", "@SYS24760", "@SYS68656"));
+                        }
+                    }
+                }
+            }
+            iterator.next();
+        }
+
+        ttscommit;
+
+        if (TaxReversePrepaymentWithUseTaxAndOtherTaxFlight::instance().isEnabled())
+        {
+            this.parmTotalTaxAmountsWithoutUseTaxContainer([totalTaxAmountCurWithoutUseTax, totalTaxAmountMSTWithoutUseTax, totalTaxAmountReportingWithoutUseTax]);
+        }
+
+        return [ totalTaxAmountCur, totalTaxAmountMST, totalTaxAmountReporting
+            // <GEECZ>
+            , amountDiffMST
+            // </GEECZ>
+            ];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromSettlement</Name>
+				<Source><![CDATA[
+    public void initFromSettlement(
+        CustVendTrans       _custVendTrans,
+        AmountMST           _settleAmountMst,
+        AmountCur           _settleAmountCur,
+        AmountMSTSecondary  _settleAmountReporting
+        , CustVendTrans     _offsetTrans = null
+        )
+    {
+        custVendTrans           = _custVendTrans;
+        settleAmountMst         = _settleAmountMst;
+        settleAmountCur         = _settleAmountCur;
+        settleAmountReporting   = _settleAmountReporting;
+        sourceCurrencyCode      = custVendTrans.CurrencyCode;
+        // <GEECZ>
+        offsetTrans             = _offsetTrans;
+        // </GEECZ>
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taxTransRecIDs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set of RecIDs of tax transactions to be linked with posting log
+    /// </summary>
+    /// <returns>Set of <c>recID</c>s</returns>
+    public Set taxTransRecIDs()
+    {
+        return taxTransRecIDs;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmUseTax</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Gets or sets the reversing posted tax transaction is use tax or not.
+    /// </summary>
+    /// <param name="_isUseTax">
+    /// The boolean to set.
+    /// </param>
+    /// <returns>
+    /// The posted tax transaction is use tax or not.
+    /// </returns>
+    public boolean parmUseTax(boolean _isUseTax = isUseTax)
+    {
+        isUseTax = _isUseTax;
+        return isUseTax;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTotalTaxAmountsWithoutUseTaxContainer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets or sets the total tax amount in transaction/accounting/reporting currency without use tax.
+    /// </summary>
+    /// <param name = "_totalTaxAmountsWithoutUseTaxContainer">Container of total tax amounts without use tax.</param>
+    /// <returns>Container of total tax amounts without use tax.</returns>
+    internal container parmTotalTaxAmountsWithoutUseTaxContainer(container _totalTaxAmountsWithoutUseTaxContainer = totalTaxAmountsWithoutUseTaxContainer)
+    {
+        totalTaxAmountsWithoutUseTaxContainer = _totalTaxAmountsWithoutUseTaxContainer;
+        return totalTaxAmountsWithoutUseTaxContainer;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCurrencyExchangeHelper</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instantiates an object of the class <c>CurrencyExchangeHelper</c>.
+    /// </summary>
+    /// <param name = "_amountCur">Amount in transaction currency.</param>
+    /// <param name = "_amountMST">Amount in accounting currency.</param>
+    /// <param name = "_amountReporting">Amount in reporting currency.</param>
+    /// <param name = "_exchangeDate">Exchange date.</param>
+    /// <param name = "_exchRateSecond">Exchange rate for reporting currency.</param>
+    /// <returns>The object of the class <c>CurrencyExchangeHelper</c>.</returns>
+    protected CurrencyExchangeHelper getCurrencyExchangeHelper(
+        AmountCur _amountCur,
+        AmountMST _amountMST,
+        AmountMSTSecondary _amountReporting,
+        TransDate _exchangeDate,
+        ExchRate  _exchRateSecond)
+    {
+        CurrencyExchangeHelper currencyExchangeHelperLoc = CurrencyExchangeHelper::newLedger(Ledger::current());
+        //Anti-rounding exchange rate:
+        currencyExchangeHelperLoc.parmExchangeRate1(CurrencyExchange::calculateExchangeRate(_amountCur, _amountMST));
+        currencyExchangeHelperLoc.parmReportingExchangeRate1(_exchRateSecond ? _exchRateSecond : CurrencyExchange::calculateExchangeRate(_amountCur, _amountReporting));
+        currencyExchangeHelperLoc.parmExchangeDate(_exchangeDate);
+        
+        return currencyExchangeHelperLoc;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,1119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>BusinessDocumentSubmissionService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.AX.Metadata.MetaModel;
+using Newtonsoft.Json.Linq;
+using System.IO;
+using System.Text;
+using System.Collections;
+using System.Diagnostics;
+
+/// <summary>
+///    The <c>BusinessDocumentSubmissionService</c> class provides the service operation for
+///    submitting business documents to the external service.
+/// </summary>
+public class BusinessDocumentSubmissionService
+{
+    private Map realInvoiceDataSourceMap = new Map(Types::Integer, Types::Class);
+    private const int64 TicksInOneSecond = 10000000;
+    private const str BaseClassNamespace = 'Dynamics.AX.Application';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>updateState</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The method updates the state of a business document.
+    /// </summary>
+    /// <param name = "_dataContract">
+    ///    A <c>BusinessDocumentSubmissionContract</c> object specifying the business documents records
+    ///    that should be submitted.
+    /// </param>
+    private void updateState(BusinessDocumentSubmissionContract _dataContract)
+    {
+        #OCCRetryCount
+
+        Query query = new Query(SysOperationHelper::base64Decode(_dataContract.parmQuery()));
+
+        for (int dsNo = 1; dsNo <= query.dataSourceCount(); dsNo++)
+        {
+            if (query.dataSourceNo(dsNo).table() == tableNum(BusinessDocumentSubmission))
+            {
+                findOrCreateRange_W(
+                    query.dataSourceNo(dsNo),
+                    fieldNum(BusinessDocumentSubmission, State),
+                    con2Str(
+                    [BusinessDocumentState::Scheduled,
+                    BusinessDocumentState::Executing,
+                    BusinessDocumentState::Pending]));
+            }
+        }
+
+        QueryRun queryRun = new QueryRun(query);
+
+        SysOperationProgress progress = this.showProgress("@BusinessDocumentSubmissionService:UpdateBusDocState");
+
+        try
+        {
+            if (ERForInvoicingRouteSwitch::shouldUseV2())
+            {
+                this.updatePendingResponseV2();
+            }
+            else
+            {
+                this.updatePendingResponse();
+            }
+            
+            while (queryRun.next())
+            {
+                BusinessDocumentTypes businessDocumentTypes;
+
+                while select TableName from businessDocumentTypes
+                    group by businessDocumentTypes.TableName
+                    where businessDocumentTypes.ERModelMappingContext
+                        && (businessDocumentTypes.LegalEntityId == curExt() || !businessDocumentTypes.LegalEntityId)
+                {
+                    RefTableId tableId = businessDocumentTypes.tableId();
+
+                    if (queryRun.changed(tableId))
+                    {
+                        Common document = queryRun.get(tableId);
+
+                        if (document)
+                        {
+                            this.updateDocumentInfo(document);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            queryRun.reset();
+            retry;
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::DuplicateKeyExceptionNotRecovered;
+                }
+                else
+                {
+                    queryRun.reset();
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::DuplicateKeyException;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    queryRun.reset();
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+
+        progress.kill();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDocumentSubmissions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The method updates the state of a business document.
+    /// </summary>
+    internal void updateDocumentSubmissions()
+    {
+        SysOperationProgress progress = this.showProgress("@BusinessDocumentSubmissionService:UpdateBusDocState");
+
+        if (ERForInvoicingRouteSwitch::shouldUseV2())
+        {
+            this.updatePendingResponseV2();
+        }
+        else
+        {
+            this.updatePendingResponse();
+        }
+
+        BusinessDocumentSubmission businessDocumentSubmission;
+        while select businessDocumentSubmission
+            where businessDocumentSubmission.State == BusinessDocumentState::Scheduled
+                  || businessDocumentSubmission.State == BusinessDocumentState::Executing
+                  || businessDocumentSubmission.State == BusinessDocumentState::Pending
+        {
+            this.updateDocumentInfo(businessDocumentSubmission.getDocument());
+        }
+                      
+        progress.kill();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePendingResponse</Name>
+				<Source><![CDATA[
+    private void updatePendingResponse()
+    {
+        BusinessDocumentSubmission businessDocumentSubmission;
+        select firstonly TimestampTicks from businessDocumentSubmission
+            order by TimestampTicks
+            where businessDocumentSubmission.State == BusinessDocumentState::PendingResponse;
+
+        if (businessDocumentSubmission)
+        {
+            System.DateTime currentTimestamp = (System.DateTime::UtcNow);
+            int64 currentTicks = currentTimestamp.Ticks - TicksInOneSecond; //Being conservative and capturing time stamp from 1 second ago.
+            int64 ticks = businessDocumentSubmission.TimestampTicks;
+            str timestampStr = BusinessDocumentSubmissionFunctions::getTimestampUtcFromTicks(ticks);
+
+            JObject documents = BusinessDocumentServiceController::requestResumed(timestampStr);
+            JArray elements = documents.SelectToken(BusinessDocumentServiceController::PayloadToken);
+            
+            if (elements &&
+                elements.Count > 0 &&
+                !BusinessDocumentSubmissionFunctions::hasException(documents))
+            {
+                for (int idx = 0; idx < elements.Count; idx++)
+                {
+                    JObject document = elements.get_Item(idx);
+                    BusinessDocumentInfo documentInfo = BusinessDocumentInfo::newFromJSON(document);
+
+                    ttsbegin;
+
+                    businessDocumentSubmission = BusinessDocumentSubmission::findByUID(str2Guid(documentInfo.getId()), true);
+                    if (businessDocumentSubmission && businessDocumentSubmission.State == BusinessDocumentState::PendingResponse)
+                    {
+                        businessDocumentSubmission.State = symbol2Enum(enumNum(BusinessDocumentState), documentInfo.getState());
+                        businessDocumentSubmission.setTimestampTicks(System.DateTime::UtcNow);
+                        businessDocumentSubmission.update();
+                    }
+            
+                    ttscommit;
+                }
+
+                // Updating timestamp ticks on all the submissions with 'PendingResponse' status to indicate
+                // we tried checking in the backend to fetch latest updates on the documents at this time.
+                BusinessDocumentSubmission businessDocumentPendingResponse;
+                update_recordset businessDocumentPendingResponse
+                    setting TimestampTicks = currentTicks
+                        where businessDocumentPendingResponse.State == BusinessDocumentState::PendingResponse;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePendingResponseV2</Name>
+				<Source><![CDATA[
+    private void updatePendingResponseV2()
+    {
+        BusinessDocumentSubmission businessDocumentSubmission;
+        select firstonly TimestampTicks from businessDocumentSubmission
+            order by TimestampTicks
+            where businessDocumentSubmission.State == BusinessDocumentState::PendingResponse;
+
+        if (businessDocumentSubmission)
+        {
+            System.DateTime currentTimestamp = (System.DateTime::UtcNow);
+            int64 currentTicks = currentTimestamp.Ticks - TicksInOneSecond; //Being conservative and capturing time stamp from 1 second ago.
+            int64 ticks = businessDocumentSubmission.TimestampTicks;
+            utcdatetime timestamp = BusinessDocumentSubmissionFunctions::getUtcsDatetimeFromTicks(ticks);
+
+            BusinessDocument businessDocument;
+
+            while select businessDocument
+                order by businessDocument.ResumedDateTime
+                    where businessDocument.WasPaused == NoYes::Yes
+                    && businessDocument.State != BusinessDocumentState::PendingResponse
+                    && businessDocument.ResumedDateTime > timestamp
+            {
+                ttsbegin;
+
+                businessDocumentSubmission = BusinessDocumentSubmission::findByUID(businessDocument.UID, true);
+                if (businessDocumentSubmission && businessDocumentSubmission.State == BusinessDocumentState::PendingResponse)
+                {
+                    businessDocumentSubmission.State = businessDocument.State;
+                    businessDocumentSubmission.setTimestampTicks(System.DateTime::UtcNow);
+                    businessDocumentSubmission.update();
+                }
+
+                ttscommit;
+            }
+
+            if (BusinessDocumentPendingResponseUpdateTimestampFlight::instance().isEnabled())
+            {
+                // Updating timestamp ticks on all the submissions with 'PendingResponse' status to indicate
+                // we tried checking in the backend to fetch latest updates on the documents at this time.
+                BusinessDocumentSubmission businessDocumentPendingResponse;
+                update_recordset businessDocumentPendingResponse
+                    setting TimestampTicks = currentTicks
+                        where businessDocumentPendingResponse.State == BusinessDocumentState::PendingResponse;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNewBatchSubmissionId</Name>
+				<Source><![CDATA[
+    private str getNewBatchSubmissionId(RefTableId documentTableId)
+    {
+        Num submissionId;
+        BusinessDocumentTypes documentType = BusinessDocumentTypes::find(tableId2Name(documentTableId));
+
+        if (documentType.BatchSubmissionNumberSeq)
+        {
+            var numberSeq = NumberSeq::newGetNumFromId(documentType.BatchSubmissionNumberSeq);
+            if (numberSeq)
+            {
+                submissionId = numberSeq.num();
+            }
+        }
+        
+        if (!submissionId)
+        {
+            throw Error("@BusinessDocumentSubmissionService:BatchSubmissionIdIsNotSet");
+        }
+
+        return submissionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBatchSubmissionsPerBatchSize</Name>
+				<Source><![CDATA[
+    private Map createBatchSubmissionsPerBatchSize(Query _query)
+    {
+        BusinessDocumentTypes businessDocumentTypes;
+        Map submissionHeaders = new Map(Types::String, Types::String);
+        PositiveNumber runningBatchSize;
+        BusinessDocumentBatchSubmissionId runningSubmissionId;
+
+        while select TableName from businessDocumentTypes
+            group by businessDocumentTypes.TableName
+                where businessDocumentTypes.BatchSubmission
+                    && businessDocumentTypes.ERModelMappingContext
+                    && (businessDocumentTypes.LegalEntityId == curExt() || !businessDocumentTypes.LegalEntityId)
+        {
+            RefTableId tableId = businessDocumentTypes.tableId();
+            BusinessDocumentTypes businessDocumentTypesLocal = BusinessDocumentTypes::find(businessDocumentTypes.TableName);
+
+            runningBatchSize = 0;
+            QueryRun queryRun = new QueryRun(_query);
+
+            while (queryRun.next())
+            {
+                if (queryRun.changed(tableId))
+                {
+                    Common document = queryRun.get(tableId);
+
+                    if (document && BusinessDocumentValidator::validate(document, businessDocumentTypes))
+                    {
+                        BusinessDocumentBatchSubmission header;
+
+                        if (runningBatchSize == 0)
+                        {
+                            runningSubmissionId = this.getNewBatchSubmissionId(tableId);
+                            submissionHeaders.insert(runningSubmissionId, businessDocumentTypes.TableName);
+                            header = BusinessDocumentBatchSubmission::createRecord(runningSubmissionId, businessDocumentTypes.TableName);
+                        }
+                        else
+                        {
+                            header = BusinessDocumentBatchSubmission::findById(runningSubmissionId);
+                        }
+
+                        BusinessDocumentBatchSubmissionItem::createRecord(header.RecId, document);
+                        runningBatchSize++;
+
+                        if (runningBatchSize == businessDocumentTypesLocal.BatchSize)
+                        {
+                            runningBatchSize = 0;
+                        }
+                    }
+                }
+            }
+        }
+
+        return submissionHeaders;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Submits the business documents records specified by the
+    ///    provided <c>BusinessDocumentSubmissionContract</c> contract.
+    /// </summary>
+    /// <param name="_dataContract">
+    ///    A <c>BusinessDocumentSubmissionContract</c> object specifying the business documents records
+    ///    that should be submitted.
+    /// </param>
+    public void submit(BusinessDocumentSubmissionContract _dataContract)
+    {
+        Query query = new Query(SysOperationHelper::base64Decode(_dataContract.parmQuery()));
+
+        if (query.dataSourceCount() == 0)
+        {
+            warning("@BusinessDocumentSubmissionService:NoDocTypesIsSetupForSubmission");
+            return;
+        }
+
+        BusinessDocumentTypes businessDocumentTypes;
+
+        while select TableName from businessDocumentTypes
+            group by businessDocumentTypes.TableName
+            where (businessDocumentTypes.LegalEntityId == curExt() || !businessDocumentTypes.LegalEntityId)
+        {
+            // The same table can be added into the query, so store the real data source in advance.
+            realInvoiceDataSourceMap.insert(businessDocumentTypes.tableId(), query.dataSourceTable(businessDocumentTypes.tableId()));
+        }
+
+        if (_dataContract.parmBatchSubmission())
+        {
+            this.submitByBatch(_dataContract, query);
+        }
+        else
+        {
+            this.submitByDocument(_dataContract, query);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitByBatch</Name>
+				<Source><![CDATA[
+    private void submitByBatch(BusinessDocumentSubmissionContract _dataContract, Query _query)
+    {
+        Map batchSubmissions;
+        this.adjustQueryForBatchSubmit(_dataContract, _query);
+
+        batchSubmissions = this.createBatchSubmissionsPerBatchSize(_query);
+        
+        if (batchSubmissions.elements())
+        {
+            MapEnumerator enum = batchSubmissions.getEnumerator();
+            while(enum.moveNext())
+            {
+                TableName tableName;
+                BusinessDocumentBatchSubmissionId batchSubmissionId;
+
+                tableName = enum.currentValue();
+                batchSubmissionId = enum.currentKey();
+
+                this.submitBatch(batchSubmissionId, tableName);
+            }
+        }
+
+        info(strFmt("@BusinessDocumentSubmissionService:NoDocumentsSubmitted", batchSubmissions.elements()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitByDocument</Name>
+				<Source><![CDATA[
+    private void submitByDocument(BusinessDocumentSubmissionContract _dataContract, Query _query)
+    {
+        #OCCRetryCount
+
+        this.adjustQueryForDocumentSubmit(_dataContract, _query);
+        QueryRun queryRun = new QueryRun(_query);
+
+        SysOperationProgress progress = this.showProgress("@BusinessDocumentSubmissionService:SubmitBusDocuments");
+        int documentCounter;
+
+        try
+        {
+            while (queryRun.next())
+            {
+                BusinessDocumentTypes businessDocumentTypes;
+
+                while select TableName from businessDocumentTypes
+                    group by businessDocumentTypes.TableName
+                        where businessDocumentTypes.ERModelMappingContext
+                            && (businessDocumentTypes.LegalEntityId == curExt() || !businessDocumentTypes.LegalEntityId)
+                {
+                    QueryBuildDataSource qbds = realInvoiceDataSourceMap.lookup(businessDocumentTypes.tableId());
+                    if (queryRun.changedNo(qbds.id()))
+                    {
+                        Common document = queryRun.getNo(qbds.id());
+
+                        if (document && BusinessDocumentValidator::validate(document, businessDocumentTypes))
+                        {
+                            if (_dataContract.parmResubmit() == NoYes::Yes && _dataContract.parmResubmitFromFailedAction() == NoYes::Yes)
+                            {
+                                this.resubmitDocumentFromFailedAction(document);
+                            }
+                            else
+                            {
+                                this.submitDocument(document);
+                            }
+
+                            documentCounter++;
+                        }
+                    }
+                }
+            }
+
+            info(strFmt("@BusinessDocumentSubmissionService:NoDocumentsSubmitted", documentCounter));
+        }
+        catch (Exception::Deadlock)
+        {
+            queryRun.reset();
+            retry;
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::DuplicateKeyExceptionNotRecovered;
+                }
+                else
+                {
+                    queryRun.reset();
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::DuplicateKeyException;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    queryRun.reset();
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+
+        progress.kill();
+
+        if (documentCounter == 0)
+        {
+            this.updateState(_dataContract);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showProgress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates and displays a progress bar.
+    /// </summary>
+    /// <param name = "_caption">Progress caption.</param>
+    /// <returns>
+    ///    A <c>SysOperationProgress</c> progress bar object.
+    /// </returns>
+    protected SysOperationProgress showProgress(str _caption)
+    {
+        #AviFiles
+
+        SysOperationProgress progress = new SysOperationProgress(0);
+
+        progress.setCaption(_caption);
+        progress.update(true);
+
+        return progress;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resubmitDocumentFromFailedAction</Name>
+				<Source><![CDATA[
+    private void resubmitDocumentFromFailedAction(Common _document)
+    {
+        BusinessDocumentServiceController controller = BusinessDocumentServiceController::newDocument(_document);
+        controller.parmResubmitType(BusinessDocumentResubmitType::ResubmitFromFailedAction);
+        controller.run();
+
+        this.updateSubmittedDocument(_document, controller);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitDocument</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Submits the document to the submission service.
+    /// </summary>
+    /// <param name = "_document">
+    /// The document header record.
+    /// </param>
+    protected void submitDocument(Common _document)
+    {
+        BusinessDocumentServiceController controller = BusinessDocumentServiceController::newDocument(_document);
+        controller.run();
+
+        this.updateSubmittedDocument(_document, controller);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Submits the batch to the submission service.
+    /// </summary>
+    /// <param name = "_batchSubmissionId">The batch submission id.</param>
+    /// <param name = "_tableName">The table name.</param>
+    protected void submitBatch(BusinessDocumentBatchSubmissionId _batchSubmissionId, TableName _tableName)
+    {
+        BusinessDocumentBatchSubmissionController batchSubmissionController = BusinessDocumentBatchSubmissionController::newBatchSubmission(_batchSubmissionId, _tableName);
+        batchSubmissionController.run();
+
+        this.updateSubmittedDocument(batchSubmissionController.getBatchSubmission(), batchSubmissionController);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSubmittedDocument</Name>
+				<Source><![CDATA[
+    private void updateSubmittedDocument(Common _document, BusinessDocumentServiceController _controller)
+    {
+        ttsbegin;
+                    
+        BusinessDocumentSubmission submission = BusinessDocumentSubmission::find(_document.TableId, _document.RecId, true);
+        if (submission)
+        {
+            BusinessDocumentInfo documentInfo = BusinessDocumentInfo::newFromJSON(_controller.getSubmitResponse());
+            if (submission.KeyData == conNull())
+            {
+                submission.initKeysFromDocInfo(documentInfo);
+            }
+
+            if (submission.DocDetailsData == conNull() && FeatureStateProvider::isFeatureEnabled(BusinessDocumentExtendedDocumentIdentificationInSubmissionLogFeature::instance()))
+            {
+                submission.initDetailsFromDocInfo(documentInfo);
+            }
+            
+            submission.update();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDocumentInfo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the document info from the submission service.
+    /// </summary>
+    /// <param name = "_document">
+    /// The document header record.
+    /// </param>
+    protected void updateDocumentInfo(Common _document)
+    {
+        BusinessDocumentSubmissionService::updateDocumentStatusWithTelemetry(_document);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDocumentStatusWithTelemetry</Name>
+				<Source><![CDATA[
+    internal static void updateDocumentStatusWithTelemetry(Common _document, BusinessDocumentInfo _documentInfo = null)
+    {
+        boolean isSuccess;
+
+        ERForInvoicingActivities activities = ERForInvoicingActivities::newFromCategory(classStr(BusinessDocumentSubmissionService));
+        using (var activityContext = activities.updateDocumentInfo())
+        {
+            try
+            {
+                if (ERForInvoicingRouteSwitch::shouldUseV2())
+                {
+                    BusinessDocumentSubmissionService::updateDocumentStatusV2(_document);
+                }
+                else
+                {
+                    BusinessDocumentSubmissionService::updateDocumentStatus(_document);
+                }
+                
+                isSuccess = true;
+            }
+            catch (Exception::CLRError)
+            {
+                str message = SRSProxy::getLastClrExceptionMessage();
+                activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyError, message);
+                error(message);
+            }
+            finally
+            {
+                activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyIsSuccess, any2Str(isSuccess));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDocumentStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the document status from the submission service.
+    /// </summary>
+    /// <param name = "_document">The document header record.</param>
+    /// <param name = "_documentInfo">The document info provider.</param>
+    public static void updateDocumentStatus(Common _document, BusinessDocumentInfo _documentInfo = null)
+    {
+        BusinessDocumentExecutionTmp execution;
+        BusinessDocumentExecutionActionTmp executionActions;
+        BusinessDocumentOutgoingVariablesTmp outgoingVariables;
+        BusinessDocumentState documentState;
+        BusinessDocumentServiceController controller;
+        BusinessDocumentInfo documentInfo;
+
+        void initDocInfo()
+        {
+            if (!documentInfo)
+            {
+                return;
+            }
+
+            documentState = symbol2Enum(
+                enumNum(BusinessDocumentState),
+                documentInfo.getState());
+            
+            execution.setTmpData(documentInfo.getExecutions());
+            executionActions.setTmpData(documentInfo.getExecutionActions());
+            outgoingVariables.setTmpData(documentInfo.getOutgoingVariables());
+
+            select firstonly ID, ExternalId from execution
+                order by Timestamp desc;
+        }
+
+        BusinessDocumentSubmission submission;
+        boolean isDocumentInfoPassed = _documentInfo != null;
+        int stage = isDocumentInfoPassed ? _documentInfo.parmSubmission().Stage : 0;
+
+        while select submission
+        where submission.RefTableId == _document.TableId
+            && submission.RefRecId == _document.RecId
+            && (!isDocumentInfoPassed
+                || submission.Stage == stage)
+            && (submission.State == BusinessDocumentState::Scheduled
+                || submission.State == BusinessDocumentState::Executing
+                || submission.State == BusinessDocumentState::Pending)
+        {
+            ERForInvoicingActivities activities = ERForInvoicingActivities::newFromCategory(classStr(BusinessDocumentSubmissionService));
+            using (var activityContext = activities.updateDocumentStatus())
+            {
+                controller = BusinessDocumentServiceController::newSubmission(submission);
+                documentInfo =
+                _documentInfo ?
+                _documentInfo :
+                controller.lookupDocumentInfo();
+        
+                initDocInfo();
+
+                if (!documentInfo)
+                {
+                    continue;
+                }
+            
+                ttsbegin;
+
+                submission.selectForUpdate(true);
+                submission.State = documentState;
+                submission.ErrorMsg = '';
+                submission.ExistExternal = execution.ExternalId != conNull();
+                submission.setTimestampTicks(System.DateTime::UtcNow);
+                submission.update();
+
+                ttscommit;
+
+                activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyBusinessDocumentUid, guid2Str(submission.UID));
+                activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyBusinessDocumentState, enum2Str(documentState));
+
+                if (documentState == BusinessDocumentState::Scheduled ||
+                documentState == BusinessDocumentState::Executing)
+                {
+                    continue;
+                }
+
+                BusinessDocumentTypes documentTypes = BusinessDocumentTypes::find(tableId2Name(_document.TableId));
+                BusinessDocumentReturnState returnState;
+            
+                while select returnState
+                where returnState.BusinessDocumentTypes == documentTypes.RecId
+                    && returnState.DocumentState == documentState
+                {
+                    str value;
+                    boolean success;
+                    str event;
+                    Stopwatch stopwatch;
+
+                    try
+                    {
+                        var variableNotFound = false;
+                        if (returnState.ReturnTypeName)
+                        {
+                            event = strFmt(ERForInvoicingInstrumentationConstants::ImportData, returnState.ReturnTypeName);
+                            stopwatch = Stopwatch::StartNew();
+
+                            BusinessDocumentTelemetry::startEvent(event, funcName());
+                            activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyReturnTypeName, returnState.ReturnTypeName);
+                            activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyExecutionId, guid2Str(execution.ID));
+
+                            try
+                            {
+                                value = BusinessDocumentSubmissionFunctions::getOutgoingVariableValue(
+                                returnState.ReturnTypeName,
+                                outgoingVariables,
+                                execution,
+                                executionActions,
+                                documentInfo.getId());
+                            }
+                            catch
+                            {
+                                variableNotFound = true;
+                                activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyVariableNotFound, 'true');
+                            }
+                        }
+                    
+                        if (returnState.ERModelMappingTable && !variableNotFound)
+                        {
+                            using (var stream = new MemoryStream(Encoding::UTF8.GetBytes(value)))
+                            {
+                                returnState.runERImport(_document, stream);
+                            }
+
+                            success = true;
+                        }
+                    }
+                    finally
+                    {
+                        if (event && stopwatch)
+                        {
+                            stopwatch.Stop();
+                            BusinessDocumentTelemetry::finishEvent(
+                            event,
+                            funcName(),
+                            success,
+                            stopwatch.ElapsedMilliseconds);
+                        }
+                    }
+                }
+
+                submission.reread();
+                if (documentState == BusinessDocumentState::Pending)
+                {
+                    if (submission.ErrorMsg == '')
+                    {
+                        documentState = BusinessDocumentState::Completed;
+                    }
+                
+                    switch(documentState)
+                    {
+                        case BusinessDocumentState::Completed :
+                            controller.completeDocument();
+                            break;
+                        case BusinessDocumentState::Failed :
+                            controller.failDocument();
+                            break;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDocumentStatusV2</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the document status from the submission service.
+    /// </summary>
+    /// <param name = "_document">The document header record.</param>
+    /// <param name = "_stage">The document stage.</param>
+    public static void updateDocumentStatusV2(Common _document, int _stage = 0)
+    {
+        BusinessDocument businessDocument;
+        BusinessDocumentState documentState;
+        BusinessDocumentServiceController controller;
+        BusinessDocumentSubmission submission;
+
+        while select submission
+            where submission.RefTableId == _document.TableId
+               && submission.RefRecId == _document.RecId
+               && (_stage == 0
+                  || submission.Stage == _stage)
+               && (submission.State == BusinessDocumentState::Scheduled
+                  || submission.State == BusinessDocumentState::Executing
+                  || submission.State == BusinessDocumentState::Pending)
+        {
+            ERForInvoicingActivities activities = ERForInvoicingActivities::newFromCategory(classStr(BusinessDocumentSubmissionService));
+            using (var activityContext = activities.updateDocumentStatusV2())
+            {
+                businessDocument = BusinessDocument::findByUID(submission.UID);
+
+                if (!businessDocument)
+                {
+                    continue;
+                }
+
+                activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyBusinessDocumentUid, guid2str(submission.UID));
+                activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyBusinessDocumentState, enum2Str(businessDocument.State));
+
+                documentState = businessDocument.State;
+
+                ttsbegin;
+
+                submission.selectForUpdate(true);
+                submission.State = documentState;
+                submission.ErrorMsg = '';
+                submission.ExistExternal = NoYes::No;
+                submission.setTimestampTicks(System.DateTime::UtcNow);
+                submission.update();
+
+                ttscommit;
+
+                if (documentState == BusinessDocumentState::Scheduled ||
+                    documentState == BusinessDocumentState::Executing)
+                {
+                    continue;
+                }
+
+                BusinessDocumentTypes documentTypes = BusinessDocumentTypes::find(tableId2Name(_document.TableId));
+                BusinessDocumentReturnState returnState;
+            
+                while select returnState
+                    where returnState.BusinessDocumentTypes == documentTypes.RecId
+                        && returnState.DocumentState == documentState
+                {
+                    str value;
+                    boolean success;
+                    str event;
+                    Stopwatch stopwatch;
+
+                    try
+                    {
+                        var variableNotFound = false;
+                        if (returnState.ReturnTypeName)
+                        {
+                            event = strFmt(ERForInvoicingInstrumentationConstants::ImportData, returnState.ReturnTypeName);
+                            stopwatch = Stopwatch::StartNew();
+
+                            BusinessDocumentTelemetry::startEvent(event, funcName());
+                            activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyReturnTypeName, returnState.ReturnTypeName);
+
+                            try
+                            {
+                                value = BusinessDocumentSubmissionFunctions::getOutgoingVariableValueByBusinessDocument(
+                                    businessDocument,
+                                    returnState.ReturnTypeName);
+                            }
+                            catch
+                            {
+                                variableNotFound = true;
+                                activityContext.addCustomProperty(ERForInvoicingInstrumentationConstants::CustomPropertyVariableNotFound, 'true');
+                            }
+                        }
+                    
+                        if (returnState.ERModelMappingTable && !variableNotFound)
+                        {
+                            using (var stream = new MemoryStream(Encoding::UTF8.GetBytes(value)))
+                            {
+                                returnState.runERImport(_document, stream);
+                            }
+
+                            success = true;
+                        }
+                    }
+                    finally
+                    {
+                        if (event && stopwatch)
+                        {
+                            stopwatch.Stop();
+                            BusinessDocumentTelemetry::finishEvent(
+                                event,
+                                funcName(),
+                                success,
+                                stopwatch.ElapsedMilliseconds);
+                        }
+                    }
+                }
+
+                submission.reread();
+                if (documentState == BusinessDocumentState::Pending)
+                {
+                    if (submission.ErrorMsg == '')
+                    {
+                        documentState = BusinessDocumentState::Completed;
+                    }
+                
+                    controller = BusinessDocumentServiceController::newSubmission(submission);
+
+                    switch(documentState)
+                    {
+                        case BusinessDocumentState::Completed :
+                            controller.completeDocument();
+                            break;
+                        case BusinessDocumentState::Failed :
+                            controller.failDocument();
+                            break;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustQueryForDocumentSubmit</Name>
+				<Source><![CDATA[
+    private void adjustQueryForDocumentSubmit(BusinessDocumentSubmissionContract _dataContract, Query _query)
+    {
+        BusinessDocumentTypes businessDocumentTypes;
+
+        while select TableName from businessDocumentTypes
+            group by businessDocumentTypes.TableName
+            where businessDocumentTypes.ERModelMappingContext
+                && (businessDocumentTypes.LegalEntityId == curExt() || !businessDocumentTypes.LegalEntityId)
+        {
+            TableId tableId = businessDocumentTypes.tableId();
+            QueryBuildDataSource qbds = realInvoiceDataSourceMap.lookup(businessDocumentTypes.tableId());
+            ERForInvoicingActivities activities = ERForInvoicingActivities::newFromCategory(classStr(BusinessDocumentSubmissionService));
+
+            if (BusinessDocumentTypes::find(businessDocumentTypes.TableName).BatchSubmission)
+            {
+                qbds.enabled(false);
+                continue;
+            }
+            
+            var metadataCollection = new SysPluginMetadataCollection();
+            var businessDocumentFilterImplementations = SysPluginFactory::Instances(
+                BaseClassNamespace,
+                classStr(IBusinessDocumentSubmissionFilter),
+                metadataCollection
+            );
+
+            for (int counter = 1; counter <= businessDocumentFilterImplementations.lastIndex(); counter++)
+            {
+                IBusinessDocumentSubmissionFilter businessDocumentFilter = businessDocumentFilterImplementations.value(counter);
+
+                if (businessDocumentFilter != null)
+                {
+                    businessDocumentFilter.filterBusinessDocumentsBeforeSubmission(qbds, tableId, _dataContract);
+                }
+                else
+                {
+                    activities.logError(
+                        strFmt(ERForInvoicingInstrumentationConstants::BusinessDocumentFilterImplNotFound,
+                        classStr(IBusinessDocumentSubmissionFilter)
+                    ));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustQueryForBatchSubmit</Name>
+				<Source><![CDATA[
+    private void adjustQueryForBatchSubmit(BusinessDocumentSubmissionContract _dataContract, Query _query)
+    {
+        BusinessDocumentTypes businessDocumentTypes;
+
+        while select TableName from businessDocumentTypes
+            group by businessDocumentTypes.TableName
+                where (businessDocumentTypes.LegalEntityId == curExt() || !businessDocumentTypes.LegalEntityId)
+        {
+            TableId tableId = businessDocumentTypes.tableId();
+            QueryBuildDataSource qbds = _query.dataSourceTable(tableId);            
+            ERForInvoicingActivities activities = ERForInvoicingActivities::newFromCategory(classStr(BusinessDocumentSubmissionService));
+
+            if (qbds && (BusinessDocumentTypes::find(businessDocumentTypes.TableName).BatchSubmission))
+            {
+                var metadataCollection = new SysPluginMetadataCollection();
+                var businessDocumentFilterImplementations = SysPluginFactory::Instances(
+                    BaseClassNamespace, 
+                    classStr(IBusinessDocumentBatchSubmissionFilter),
+                    metadataCollection
+            );
+            
+                for (int counter = 1; counter <= businessDocumentFilterImplementations.lastIndex(); counter++)
+                {
+                    IBusinessDocumentBatchSubmissionFilter businessDocumentFilter = businessDocumentFilterImplementations.value(counter);
+
+                    if (businessDocumentFilter != null)
+                    {
+                        businessDocumentFilter.filterBusinessDocumentsBeforeBatchSubmission(qbds, tableId, _dataContract);
+                    }
+                    else
+                    {
+                        activities.logError(
+                            strFmt(ERForInvoicingInstrumentationConstants::BusinessDocumentFilterImplNotFound,
+                            classStr(IBusinessDocumentBatchSubmissionFilter)
+                        ));
+                    }
+                }
+            }
+            else if (qbds)
+            {
+                qbds.enabled(false);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

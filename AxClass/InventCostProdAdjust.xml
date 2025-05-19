@@ -1,0 +1,816 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>InventCostProdAdjust</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>InventCostProdAdjust</c> class handles the adjusting of a production order.
+/// </summary>
+/// <remarks>
+/// The base input for this class is an instance of the <c>InventCostProdDataMap</c> class.
+/// </remarks>
+class InventCostProdAdjust
+{
+    // Global Variables (will be initialize in new method)
+    boolean                     isCostBreakdownActivated;
+    boolean                     recalc;
+    Map                         indirectCostPerInventTransId;
+
+    // Caller parameters
+    LedgerVoucher               ledgerVoucher;
+    Voucher                     voucher;
+    TransDate                   transDate;
+    InventTransAdjustDataMap    inventTransAdjustDataMap;
+    RefRecId                    inventClosingRecid;
+
+    // Variables per InventTransId
+    InventTransOrigin           inventTransOrigin;
+    InventTrans                 inventTrans;
+    InventTransId               inventTransId;
+    InventCostProdIndirect      inventCostProdIndirect;
+    CostAmount                  totalCostAmount;
+    CostAmount                  totalIndirectCostAmount;
+
+    // Which type needs to be adjusted
+    ProdTransRefType            prodTransRefType;
+
+    // Reference to the production flow
+    LeanCostingFacade           leanCostingFacade;
+    PlanName                    planName;
+    RefRecId                    productionFlowReferenceRecId;
+
+    // Optional only if prodtable still exists
+    ProdTable                   prodTable;
+    boolean                     deferRecalc;
+    // <GEERU>
+    InventTransCurrency_RU      inventTransCurrency;
+    // </GEERU>
+    Set                         recalculateProductions;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>adjust</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Handles the adjustment of a single production order.
+    /// </summary>
+    /// <param name="_inventTransId">
+    ///    The <c>inventTransId</c> that belongs to a production order that should be updated.
+    /// </param>
+    /// <param name="_keyAdjustmentMap">
+    ///    The storage structure that holds the adjustments.
+    /// </param>
+    /// <remarks>
+    ///    The <c>keyAdjustmentMap</c> holds all the items for which adjustments occurred. Based on this,
+    ///    first the indirect cost will be calculated. Then the material consumption, costing records will be
+    ///    created.
+    /// </remarks>
+    protected void adjust(InventTransId  _inventTransId,
+                          Map            _keyAdjustmentMap)
+    {
+        MapEnumerator                   keyAdjustmentMapEnumerator;
+        CostAmount                      curCostAmount;
+        str                             key;
+        ItemId                          itemId;
+        RecId                           itemPriceRecId;
+        Map                             itemCostGroupRollupListMap;
+        InventItemCostGroupRollupList   curCostGroupRollupList;
+
+        // Initialize variables
+        this.initFromInventTransId(_inventTransId);
+
+        if (prodTransRefType != ProdTransRefType::InventTransId)
+        {
+            keyAdjustmentMapEnumerator = _keyAdjustmentMap.getEnumerator();
+            while (keyAdjustmentMapEnumerator.moveNext())
+            {
+                curCostGroupRollupList = keyAdjustmentMapEnumerator.currentValue();
+                key                    = keyAdjustmentMapEnumerator.currentKey();
+
+                [itemId, itemPriceRecId] = InventTransAdjustDataMap::string2key(key);
+
+                curCostAmount = curCostGroupRollupList.parmCostAmount();
+
+                curCostGroupRollupList.reverseSign();
+
+                if (prodTransRefType == ProdTransRefType::Production)
+                {
+                    if (inventTrans)
+                    {
+                        // Add the indirect cost to the prodJournalIndirectCost
+                        inventCostProdIndirect.calcInvent(InventCostProdIndirectData_Invent::newConsumptionFromInventTrans(inventTrans,
+                                                                                                                           0,
+                                                                                                                           itemId,
+                                                                                                                           0,
+                                                                                                                           -1 * curCostAmount,
+                                                                                                                           true,
+                                                                                                                           curCostGroupRollupList));
+                    }
+                    else if (prodTable)
+                    {
+                            inventCostProdIndirect.calcInvent(InventCostProdIndirectData_Invent::newConsumptionFromProdTable(prodTable,
+                                                                                                                             0,
+                                                                                                                             itemId,
+                                                                                                                             0,
+                                                                                                                             -1 * curCostAmount,
+                                                                                                                             true,
+                                                                                                                             curCostGroupRollupList));
+                    }
+                }
+                else
+                {
+                    itemCostGroupRollupListMap = new Map(Types::String, Types::Class);
+                    itemCostGroupRollupListMap.insert(itemId, curCostGroupRollupList);
+                    inventCostProdIndirect.calcInvent(InventCostProdIndirectData_Invent::newConsumptionFromLeanProductionFlow(planName,
+                                                                                                                              leanCostingFacade.getDefaultDimensions(productionFlowReferenceRecId),
+                                                                                                                              inventTrans.inventDim().InventSiteId,
+                                                                                                                              NoYes::Yes,
+                                                                                                                              itemCostGroupRollupListMap));
+                }
+                // Build the sum of the overall adjustments
+                totalCostAmount -= curCostAmount;
+            }
+        }
+
+        // Now create the indirect cost records
+        this.insertIndirectCost();
+
+        // create the material consumptions
+        if (totalCostAmount  != 0 &&
+            prodTransRefType == ProdTransRefType::Production)
+        {
+            this.insertMaterialConsumption();
+        }
+
+        // For ended production orders, create the product costing record
+        if (((inventTrans.RecId && inventTrans.isUpdatedFinancial())
+            || prodTable.ProdStatus                        == ProdStatus::Completed)
+            && inventTrans.PackingSlipReturned             == NoYes::No
+            && prodTransRefType                            == ProdTransRefType::Production
+            && (totalCostAmount + totalIndirectCostAmount) != 0)
+        {
+            this.insertCosting();
+        }
+
+        // After creating all the indirect cost records, recalc the prodCalcTrans records
+        if (recalc == true)
+        {
+            if (prodTable)
+            {
+                recalculateProductions.add(prodTable.ProdId);            
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromInventTransId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes all variables so that a new <c>inventTransId</c> value can be processed.
+    /// </summary>
+    /// <param name="_inventTransId">
+    /// The <c>inventTransID</c> value that is processed.
+    /// </param>
+    protected void initFromInventTransId(InventTransId    _inventTransId)
+    {
+        // Reset all the variables to start a new calculation for a
+        // production order
+        inventTransId     = _inventTransId;
+        inventTransOrigin = InventTransOrigin::findByInventTransId(inventTransId);
+        inventTrans       = InventTrans::findByInventTransOrigin(inventTransOrigin.RecId);
+
+        if (inventTransOrigin.ReferenceCategory == InventTransType::Production)
+        {
+            prodTransRefType = ProdTransRefType::Production;
+
+            // Try to find prodtable record if it still exists
+            prodTable = InventTransOriginProdTable::prodTable(inventTransOrigin.RecId);
+        }
+        else if (inventTransOrigin.ReferenceCategory == InventTransType::PmfProdCoBy)
+        {
+            PmfProdCoBy prodCoBy = InventTransOriginPmfProdCoBy::prodCoBy(inventTransOrigin.RecId);
+            prodTable = prodCoBy.prodTable();
+        }
+        else
+        {
+            if (inventTransOrigin.ReferenceCategory == InventTransType::KanbanJobPickingList ||
+                inventTransOrigin.ReferenceCategory == InventTransType::KanbanEmptied ||
+                inventTransOrigin.ReferenceCategory == InventTransType::KanbanJobWIP ||
+                inventTransOrigin.ReferenceCategory == InventTransType::KanbanJobProcess)
+            {
+                prodTransRefType = ProdTransRefType::ProductionFlow;
+
+                // Retrieve the production flow
+                leanCostingFacade = LeanCostingFacade::construct();
+                productionFlowReferenceRecId = leanCostingFacade.getProductionFlowFromInventTrans(inventTransOrigin.RecId);
+                planName = LeanProductionFlowReference::find(productionFlowReferenceRecId).planReference().PlanName;
+
+                // Check if the production flow has been costed already
+                if (! LeanCosting::checkOpen(transDate, false))
+                {
+                    throw error(strfmt("@SYS309843", planName, date2StrUsr(transDate, DateFlags::FormatAll)));
+                }
+            }
+            else
+            {
+                // For scrap we end up in the situation, that the inventTrans is gone
+                // additional the prodTable could have been deleted, so both input sources are non existing any more
+                prodTransRefType = ProdTransRefType::InventTransId;
+            }
+        }
+
+        // Initialize class that will generate the indirect cost records
+        inventCostProdIndirect = InventCostProdIndirect::newFromInventCostProdAdjust(this);
+
+        totalCostAmount         = 0;
+        totalIndirectCostAmount = 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProdTableJour</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a <c>ProdTableJour</c> record.
+    /// </summary>
+    /// <returns>
+    ///    A <c>ProdTableJour</c> record.
+    /// </returns>
+
+    protected ProdTableJour initProdTableJour()
+    {
+        ProdTableJour       prodTableJour;
+        
+        if (inventTrans)
+        {
+            prodTableJour.initFromInventTrans(inventTrans);
+        }
+        else
+        {            
+            prodTableJour.initFromInventTransOrigin(inventTransOrigin);
+            prodTableJour.OpenProdOrder = prodTable.ProdStatus == ProdStatus::Completed ? NoYes::No : NoYes::Yes;
+        }
+
+        prodTableJour.TransDate      = transDate;
+        prodTableJour.Voucher        = voucher;
+
+        return prodTableJour;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertCosting</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Inserts a costing record into the <c>ProdTableJour</c> table.
+    /// </summary>
+    /// <remarks>
+    ///    This will only be done for ended production orders.
+    /// </remarks>
+
+    protected void insertCosting()
+    {
+        ProdTableJour   prodTableJour;
+
+        // Try to find the costing record to avoid multiple record creation
+        select forupdate firstonly prodTableJour
+            where prodTableJour.InventTransId == inventTransOrigin.InventTransId
+               && prodTableJour.Voucher       == voucher
+               && prodTableJour.TransDate     == transDate
+               && prodTableJour.JournalType   == ProdJourType::HistoricalCost;
+
+        if (!prodTableJour.RecId)
+        {
+            prodTableJour = this.initProdTableJour();
+
+            prodTableJour.JournalType     = ProdJourType::HistoricalCost;
+        }
+
+        prodTableJour.AmountFinancial += (totalCostAmount + totalIndirectCostAmount);
+
+        prodTableJour.write();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertIndirectCost</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Triggers the finalization of the indirect cost calculation.
+    /// </summary>
+    /// <remarks>
+    ///    The total indirect amount will be stored so that it can be passed on to the inventory closing.
+    /// </remarks>
+
+    protected void insertIndirectCost()
+    {
+        CostAmount      prevIndirectCost;
+
+        // Insert the indirect cost records
+        inventCostProdIndirect.finalizeCalc(prodTransRefType == ProdTransRefType::Production ? true : false);
+
+        totalIndirectCostAmount = inventCostProdIndirect.getIndirectCostTotal(inventTransOrigin.InventTransId);
+
+        if (indirectCostPerInventTransId.exists(inventTransId))
+        {
+            prevIndirectCost = indirectCostPerInventTransId.lookup(inventTransId);
+        }
+
+        // This is done to be able to pass back the adjustments
+        // that needs to be done additional to the inventTrans record of the finished good
+        // Currently only used from inventory closing
+        indirectCostPerInventTransId.insert(inventTransId, prevIndirectCost + totalIndirectCostAmount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertMaterialConsumption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Inserts a material consumption record into the <c>ProdTableJour</c> table.
+    /// </summary>
+
+    protected void insertMaterialConsumption()
+    {
+        ProdTableJour   prodTableJour;
+
+        // Try to find the costing record to avoid multiple record creation
+        select forupdate firstonly prodTableJour
+            where prodTableJour.InventTransId == inventTransOrigin.InventTransId
+               && prodTableJour.Voucher       == voucher
+               && prodTableJour.TransDate     == transDate
+               && prodTableJour.JournalType   == ProdJourType::Release;
+
+        if (!prodTableJour.RecId)
+        {
+            prodTableJour = this.initProdTableJour();
+
+            prodTableJour.JournalType     = ProdJourType::Release;
+        }
+
+        prodTableJour.AmountPhysical  += totalCostAmount;
+
+        prodTableJour.write();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        isCostBreakdownActivated      = InventParameters::isCostBreakdownActivated();
+        indirectCostPerInventTransId  = new Map(Types::String, Types::Real);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDeferRecalc</Name>
+				<Source><![CDATA[
+    public boolean parmDeferRecalc(boolean _deferRecalc = deferRecalc)
+    {
+        deferRecalc = _deferRecalc;
+
+        return deferRecalc;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmIndirectCostPerInventTransId</Name>
+				<Source><![CDATA[
+    public Map parmIndirectCostPerInventTransId(Map _indirectCostPerInventTransId = indirectCostPerInventTransId)
+    {
+        indirectCostPerInventTransId = _indirectCostPerInventTransId;
+
+        return indirectCostPerInventTransId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventTransAdjustDataMap</Name>
+				<Source><![CDATA[
+    public InventTransAdjustDataMap parmInventTransAdjustDataMap(InventTransAdjustDataMap _inventTransAdjustDataMap = inventTransAdjustDataMap)
+    {
+        inventTransAdjustDataMap = _inventTransAdjustDataMap;
+        return inventTransAdjustDataMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventTransCurrency_RU</Name>
+				<Source><![CDATA[
+    public InventTransCurrency_RU parmInventTransCurrency_RU(InventTransCurrency_RU _inventTransCurrency = inventTransCurrency)
+    {
+        inventTransCurrency = _inventTransCurrency;
+        return inventTransCurrency;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmLedgerVoucher</Name>
+				<Source><![CDATA[
+    public LedgerVoucher parmLedgerVoucher(LedgerVoucher _ledgerVoucher = ledgerVoucher)
+    {
+        ledgerVoucher = _ledgerVoucher;
+
+        return ledgerVoucher;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmRecalc</Name>
+				<Source><![CDATA[
+    public boolean parmRecalc(boolean _recalc = recalc)
+    {
+        recalc = _recalc;
+
+        return recalc;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTransDate</Name>
+				<Source><![CDATA[
+    public TransDate parmTransDate(TransDate _transDate = transDate)
+    {
+        transDate = _transDate;
+
+        return transDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmVoucher</Name>
+				<Source><![CDATA[
+    public Voucher parmVoucher(Voucher _voucher = voucher)
+    {
+        voucher = _voucher;
+
+        return voucher;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventClosingRecid</Name>
+				<Source><![CDATA[
+    public RefRecId parmInventClosingRecid(RefRecId _inventClosingRecid = inventClosingRecid)
+    {
+        inventClosingRecid = _inventClosingRecid;
+        return inventClosingRecid;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Iterates over a given <c>InventCostProdDataMap</c> class instance.
+    /// </summary>
+    /// <remarks>
+    ///    For each <c>ProdTable</c> record, the <c>adjustProdOrder</c> method will be called.
+    /// </remarks>
+
+    public void run()
+    {
+        MapEnumerator           dataMapEnumerator;
+        Map                     keyAdjustmentMap;
+        InventTransId           curInventTransId;
+
+        // <GEERU>
+        if (inventTransCurrency != InventTransCurrency_RU::PrimaryCur)
+        {
+            return;
+        }
+        // </GEERU>
+
+        ttsbegin;
+        recalculateProductions = new Set(Types::String);
+        dataMapEnumerator = inventTransAdjustDataMap.getEnumerator();
+
+        while (dataMapEnumerator.moveNext())
+        {
+            // For each production order get the inventTransIdCostAmount map
+            keyAdjustmentMap = dataMapEnumerator.currentValue();
+            curInventTransId = dataMapEnumerator.currentKey();
+
+            // Recalc the single production order
+            this.adjust(curInventTransId, keyAdjustmentMap);
+        }
+
+        SetEnumerator recalculateProductionsEnumerator = recalculateProductions.getEnumerator();
+        while (recalculateProductionsEnumerator.moveNext())
+        {
+            if (deferRecalc)
+            {
+                ProdTableRecalcQueue::add(recalculateProductionsEnumerator.current(), inventClosingRecid);
+            }
+            else
+            {
+                InventCostProdRecalc::recalcProductionOrder(ProdTable::find(recalculateProductionsEnumerator.current()));
+            }
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustFromInventClosing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Adjusts production orders.
+    /// </summary>
+    /// <param name="_inventTransAdjustDataMap">
+    ///    The <c>InventTransAdjustDataMap</c> class holding the adjustments.
+    /// </param>
+    /// <param name="_inventClosing">
+    ///    The inventory closing during which this adjustments have been produced.
+    /// </param>
+    /// <param name="_deferRecalc">
+    ///    Indicates if recalc must run async if true or synch when false.
+    /// </param>
+    /// <returns>
+    ///    A map that holds the total indirect cost that must be processed more.
+    /// </returns>
+
+    public static Map adjustFromInventClosing(InventTransAdjustDataMap        _inventTransAdjustDataMap,
+                                              InventClosing                   _inventClosing,
+                                              boolean                         _deferRecalc = false)
+    {
+        InventCostProdAdjust    inventCostProdAdjust;
+
+        // Get instance
+        inventCostProdAdjust = InventCostProdAdjust::newFromInventClosing(_inventTransAdjustDataMap,
+                                                                          _inventClosing);
+        inventCostProdAdjust.parmDeferRecalc(_deferRecalc);
+        // Recalc the single production order
+        inventCostProdAdjust.run();
+
+        return inventCostProdAdjust.parmIndirectCostPerInventTransId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustFromInventCostRevaluate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Adjusts production orders.
+    /// </summary>
+    /// <param name="_inventTransAdjustDataMap">
+    ///    The <c>InventTransAdjustDataMap</c> class that holds the adjustments.
+    /// </param>
+    /// <param name="_ledgerVoucher">
+    ///    The ledger voucher to which the postings should be added.
+    /// </param>
+    /// <param name="_recalc">
+    ///    A Boolean value that indicates whether the production order should be recalculated.
+    /// </param>
+    /// <param name="_inventTransCurrency">
+    /// The transaction currency: primary (default) or secondary - used for Dual Warehousing
+    /// </param>
+    /// <param name="_deferRecalc">
+    ///    A Boolean value that indicates whether the production order recalculation should be deferred.
+    /// </param>
+    /// <remarks>
+    ///    When the revaluation is triggered during a production ending, the recalculation of the
+    ///    <c>ProdCalcTrans</c> records can be spared, because it occurs anyway in the other process.
+    /// </remarks>
+    public static void adjustFromInventCostRevaluate(InventTransAdjustDataMap _inventTransAdjustDataMap,
+                                                     LedgerVoucher            _ledgerVoucher,
+                                                     boolean                  _recalc,
+                                                     InventTransCurrency_RU   _inventTransCurrency = InventTransCurrency_RU::PrimaryCur,
+                                                     boolean                  _deferRecalc = false)
+
+    {
+        // Get instance
+        InventCostProdAdjust inventCostProdAdjust = InventCostProdAdjust::newFromLedgerVoucher(_inventTransAdjustDataMap,
+                                                                                               _recalc,
+                                                                                               _ledgerVoucher);
+        // <GEERU>
+        inventCostProdAdjust.parmInventTransCurrency_RU(_inventTransCurrency);
+        // </GEERU>
+
+        inventCostProdAdjust.parmDeferRecalc(_deferRecalc);
+
+        // Recalc the single production order
+        inventCostProdAdjust.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>adjustFromStdCostConvert</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Changes production orders using static interface from the standard cost conversion.
+    /// </summary>
+    /// <param name="_inventTransAdjustDataMap">
+    ///    The <c>InventTransAdjustDataMap</c> class that hold the adjustments.
+    /// </param>
+    /// <param name="_voucher">
+    ///    The Voucher used to do the posting of the adjustments.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction used to do the posting of the adjustments.
+    /// </param>
+    /// <param name="_inventTransCurrency">
+    /// Enumeration for dual warehousing functionality
+    /// </param>
+
+    public static void adjustFromStdCostConvert(InventTransAdjustDataMap _inventTransAdjustDataMap,
+                                                Voucher                  _voucher,
+                                                TransDate                _transDate,
+                                                InventTransCurrency_RU   _inventTransCurrency = InventTransCurrency_RU::PrimaryCur)
+    {
+        InventCostProdAdjust    inventCostProdAdjust;
+
+        if (!_voucher || !_transDate)
+        {
+            throw error("@SYS25407");
+        }
+
+        // Get instance
+        inventCostProdAdjust = InventCostProdAdjust::newFromParameter(_inventTransAdjustDataMap,
+                                                                      true);
+
+        // Set parameters
+        inventCostProdAdjust.parmVoucher               (_voucher);
+        inventCostProdAdjust.parmTransDate             (_transDate);
+        // <GEERU>
+        inventCostProdAdjust.parmInventTransCurrency_RU(_inventTransCurrency);
+        // </GEERU>
+
+        // Recalc the single production order
+        inventCostProdAdjust.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static InventCostProdAdjust construct()
+    {
+        return new InventCostProdAdjust();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromInventClosing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of this class based on an inventory closing record.
+    /// </summary>
+    /// <param name="_inventTransAdjustDataMap">
+    ///    The <c>InventTransAdjustDataMap</c> class holding the adjustments.
+    /// </param>
+    /// <param name="_inventClosing">
+    ///    The inventory closing during which this adjustments have been produced.
+    /// </param>
+    /// <returns>
+    ///    An initialized instance of the class.
+    /// </returns>
+    /// <exception cref="M:Exception::Error">
+    ///    No <c>InventClosing</c> record is passed in.
+    /// </exception>
+
+    public static InventCostProdAdjust newFromInventClosing(InventTransAdjustDataMap        _inventTransAdjustDataMap,
+                                                            InventClosing                   _inventClosing)
+    {
+        InventCostProdAdjust    inventCostProdAdjust;
+
+        // A ledgerVoucher needs to be passed
+        if (! _inventClosing)
+        {
+            throw error("@SYS25407");
+        }
+
+        // Create instance
+        inventCostProdAdjust = InventCostProdAdjust::newFromParameter(_inventTransAdjustDataMap, true);
+
+        // Set parameters
+        inventCostProdAdjust.parmVoucher(_inventClosing.Voucher);
+        inventCostProdAdjust.parmTransDate(_inventClosing.TransDate);
+        inventCostProdAdjust.parmInventClosingRecid(_inventClosing.Recid);
+        // <GEERU>
+        inventCostProdAdjust.parmInventTransCurrency_RU(_inventClosing.InventTransCurrency_RU);
+        // </GEERU>
+
+        return inventCostProdAdjust;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromLedgerVoucher</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of this class based on a ledger voucher.
+    /// </summary>
+    /// <param name="_inventTransAdjustDataMap">
+    ///    The <c>InventTransAdjustDataMap</c> class that holds the adjustments.
+    /// </param>
+    /// <param name="_recalc">
+    ///    A Boolean value that indicates whether the production order should be recalculated.
+    /// </param>
+    /// <param name="_ledgerVoucher">
+    ///    The ledger voucher to which the postings should be added.
+    /// </param>
+    /// <returns>
+    ///    An initialized instance of the class.
+    /// </returns>
+    /// <exception cref="M:Exception::Error">
+    ///    No <c>ledgerVoucher</c> is passed.
+    /// </exception>
+
+    public static InventCostProdAdjust newFromLedgerVoucher(InventTransAdjustDataMap        _inventTransAdjustDataMap,
+                                                            boolean                         _recalc,
+                                                            LedgerVoucher                   _ledgerVoucher)
+    {
+        InventCostProdAdjust    inventCostProdAdjust;
+
+        // A ledgerVoucher needs to be passed
+        if (! _ledgerVoucher)
+        {
+            throw error("@SYS25407");
+        }
+
+        // Create instance
+        inventCostProdAdjust = InventCostProdAdjust::newFromParameter(_inventTransAdjustDataMap, _recalc);
+
+        // Set parameters
+        inventCostProdAdjust.parmLedgerVoucher(_ledgerVoucher);
+        inventCostProdAdjust.parmVoucher(_ledgerVoucher.lastVoucher());
+        inventCostProdAdjust.parmTransDate(_ledgerVoucher.lastTransDate());
+
+        return inventCostProdAdjust;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromParameter</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes a new instance of this class based on an <c>inventCostProdAdjustDataMap</c>.
+    /// </summary>
+    /// <param name="_inventTransAdjustDataMap">
+    ///    The <c>InventTransAdjustDataMap</c> class that holds the adjustments.
+    /// </param>
+    /// <param name="_recalc">
+    ///    A Boolean value that indicates whether the production order should be recalculated.
+    /// </param>
+    /// <returns>
+    ///    An initialized instance of the class.
+    /// </returns>
+    /// <exception cref="M:Exception::Error">
+    ///    No <c>inventCostProdAdjustDataMap</c> is passed in.
+    /// </exception>
+
+    protected static InventCostProdAdjust newFromParameter(InventTransAdjustDataMap        _inventTransAdjustDataMap,
+                                                           boolean                         _recalc)
+    {
+        InventCostProdAdjust    inventCostProdAdjust;
+
+        // A ledgerVoucher needs to be passed
+        if (! _inventTransAdjustDataMap)
+        {
+            throw error("@SYS25407");
+        }
+
+        // Create instance
+        inventCostProdAdjust = InventCostProdAdjust::construct();
+
+        // Set parameters
+        inventCostProdAdjust.parmInventTransAdjustDataMap(_inventTransAdjustDataMap);
+        inventCostProdAdjust.parmRecalc(_recalc);
+
+        return inventCostProdAdjust;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,610 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailOperationProcessorCancelCustomerOrder</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// This class implements the asynchronous cancellation operation functionality.
+/// </summary>
+internal class RetailOperationProcessorCancelCustomerOrder extends RetailDocumentOperationProcessorBase
+{
+    //The maximum number to retry DB modification if update conflict or deadlock are reported
+    private const int DbModificationMaxRetries = 3;
+    private const int DbRetryDelayMultiplier = 10;
+    private const int DbRetryInitialDelay = 50;
+
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+
+    // Indicates whether the retries number has been increased in RetailOrderOperationStatus table as part of current processing
+    private boolean shouldIncreaseRetriesNumber = true;
+
+    private RetailOrderOperationInputDocument inputDocument;
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(RetailDocumentOperationProcessorParameters _parameters)
+    {
+        super(_parameters);
+
+        this.isRetriable = false; // the operation is not retriable unless we report a retriable error
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static RetailOperationProcessorCancelCustomerOrder construct(RetailDocumentOperationProcessorParameters _parameters)
+    {
+        return new RetailOperationProcessorCancelCustomerOrder(_parameters);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the request document and save result, should be implement in subclasses.
+    /// </summary>
+    /// <returns>A container object to indicate result documents.</returns>
+    /// <exception cref="Exception::Error">The input document is invalid or failed to be processed.</exception>
+    protected container processInternal()
+    {
+        container result;
+        str custOrderInfoXmlStr = conPeek(this.requestContainer, 1);
+        inputDocument = RetailOrderOperationInputDocument::construct(custOrderInfoXmlStr);
+
+        if (inputDocument.getTargetOrderId() != '')
+        {
+            // This is to process cancellation requests for the specified sales order id.
+            result = this.processSalesOrderCancellation();
+        }
+        else
+        {
+            // This is to process cancellation requests for 'AsyncOrderCancellation' transactions which target another transaction.
+            result = this.processTransactionCancellation();
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTransactionCancellation</Name>
+				<Source><![CDATA[
+    private container processTransactionCancellation()
+    {
+        // we are not catching exception here because the underlying methods handle the exceptions and set the operation state as needed
+        this.prepareInputDocumentForTransactionCancellation();
+
+        this.updateCancellationTransactionPreCancellation();
+
+        container result = this.callCancelCustomerOrderRTSMethod();
+
+        boolean isSuccess = conPeek(result, RetailDocumentOperationProcessorBase::IsSuccessIndex);
+
+        if (isSuccess)
+        {
+            this.updateCancellationTransactionPostCancellation();
+            this.updateOperationStatusToSuccessful();
+        }
+        else
+        {
+            str message = conPeek(result, RetailDocumentOperationProcessorBase::ErrorMessageIndex);
+            this.throwProcessingError(RetailOrderOperationProcessingResult::ProcessingError, true, strFmt("@RetailAsyncOrderOperations:AsyncCancellationProcessorReturnedError",message));
+        }
+
+        return [conPeek(result, RetailDocumentOperationProcessorBase::ResponseDocumentIndex)];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSalesOrderCancellation</Name>
+				<Source><![CDATA[
+    private container processSalesOrderCancellation()
+    {
+        container result = this.callCancelCustomerOrderRTSMethod();
+
+        boolean isSuccess = conPeek(result, RetailDocumentOperationProcessorBase::IsSuccessIndex);
+
+        if (isSuccess)
+        {
+            this.updateOperationStatusToSuccessful();
+        }
+        else
+        {
+            str message = conPeek(result, RetailDocumentOperationProcessorBase::ErrorMessageIndex);
+            this.throwProcessingError(RetailOrderOperationProcessingResult::ProcessingError, true, strFmt("@RetailAsyncOrderOperations:AsyncCancellationProcessorReturnedError",message));
+        }
+
+        return [conPeek(result, RetailDocumentOperationProcessorBase::ResponseDocumentIndex)];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>callCancelCustomerOrderRTSMethod</Name>
+				<Source><![CDATA[
+    private container callCancelCustomerOrderRTSMethod()
+    {
+        container result;
+        System.Exception ex;
+        try
+        {
+            result = RetailTransactionService::cancelCustomerOrder(inputDocument.getDocumentSource());
+        }
+        catch (ex)
+        {
+            this.throwProcessingError(RetailOrderOperationProcessingResult::ProcessingError,
+                true,
+                this.getProcessingErrorMessage(RetailOrderOperationProcessingResult::ProcessingError),
+                ex);
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>prepareInputDocumentForTransactionCancellation</Name>
+				<Source><![CDATA[
+    private void prepareInputDocumentForTransactionCancellation()
+    {
+        RetailOrderOperationProcessingResult errorResult = RetailOrderOperationProcessingResult::None;
+        str missigDependencyReference;
+        System.Exception ex;
+        
+        try
+        {
+            RetailTransactionTable cancellationTransaction, targetTransaction;
+            str orderId;
+
+            select firstonly RecId, SalesOrderId from targetTransaction where
+                    targetTransaction.transactionId == inputDocument.getTargetTransactionId()
+                    && targetTransaction.Store == inputDocument.getTargetStoreId()
+                    && targetTransaction.Terminal == inputDocument.getTargetTerminalId()
+                    && targetTransaction.Channel == inputDocument.getTargetChannelId();
+        
+            if (targetTransaction.RecId && targetTransaction.salesOrderId)
+            {
+                orderId = targetTransaction.SalesOrderId;
+            }
+            else
+            {
+                // If we cannot find the transaction table we check RetailTransactionOrderStatus table
+                // which is created earlier.
+                RetailTransactionOrderStatus orderStatus;
+
+                select firstonly RecId, SalesId, Status from orderStatus where
+                    orderStatus.transactionId == inputDocument.getTargetTransactionId()
+                    && orderStatus.Store == inputDocument.getTargetStoreId()
+                    && orderStatus.Terminal == inputDocument.getTargetTerminalId()
+                    && orderStatus.Channel == inputDocument.getTargetChannelId();
+
+                if (orderStatus
+                    && orderStatus.SalesId
+                    && (orderStatus.Status == RetailTransactionOrderStatusType::PendingSynchronization
+                    || orderStatus.Status == RetailTransactionOrderStatusType::Succeeded))
+                {
+                    orderId = orderStatus.SalesId;
+                }
+            }
+
+            if (orderId)
+            {
+                inputDocument.setTargetOrderId(orderId);
+            }
+            else
+            {
+                errorResult = (!targetTransaction) ?
+                    RetailOrderOperationProcessingResult::TargetTransactionDoesNotExist
+                    : RetailOrderOperationProcessingResult::TargetOrderDoesNotExist;
+
+                missigDependencyReference = inputDocument.getTargetTransactionId();
+            }
+ 
+            if (!errorResult)
+            {
+                // we have to to make sure that cancellation transaction is uploaded to HQ because we have to update
+                // it with cancelled transaction id
+                select firstonly RecId from cancellationTransaction where
+                cancellationTransaction.transactionId == inputDocument.getTransactionId()
+                && cancellationTransaction.Store == inputDocument.getStoreId()
+                && cancellationTransaction.Terminal == inputDocument.getTerminalId()
+                && cancellationTransaction.Channel == inputDocument.getChannelId()
+                && cancellationTransaction.type == RetailTransactionType::AsyncOrderCancellation;
+
+                if (!cancellationTransaction.RecId)
+                {
+                    errorResult = RetailOrderOperationProcessingResult::OperationTransactionDoesNotExist;
+                    missigDependencyReference = inputDocument.getTransactionId();
+                }
+            }
+        }
+        catch (ex)
+        {
+            this.throwProcessingError(RetailOrderOperationProcessingResult::PreProcessingError,
+                true,
+                this.getProcessingErrorMessage(RetailOrderOperationProcessingResult::PreProcessingError),
+                ex);
+        }
+
+        if (errorResult)
+        {
+            eventSource.EventWriteOrderOperationMissingDependency(funcName(),
+                this.retailDocumentOperation.RetailDocumentOperationId,
+                enum2Str(errorResult),
+                missigDependencyReference);
+
+            this.throwProcessingError(errorResult, true, this.getProcessingErrorMessage(errorResult));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCancellationTransactionPreCancellation</Name>
+				<Source><![CDATA[
+    void updateCancellationTransactionPreCancellation()
+    {
+        System.Exception ex;
+        try
+        {
+            RetailTransactionSalesTrans transactionSalesTrans;
+            RetailTransactionTable transactionTable;
+
+            if (inputDocument.getTransactionId() == '')
+            {
+                //if transaction id is not specified nothing to update
+                return;
+            }
+
+            ttsbegin;
+
+            update_recordset transactionSalesTrans
+            setting CancelledTransactionId = inputDocument.getTargetTransactionId(),
+                ReturnStore = inputDocument.getTargetStoreId(),
+                ReturnTerminalId = inputDocument.getTargetTerminalId()
+            where   transactionSalesTrans.Store == inputDocument.getStoreId()
+                    &&    transactionSalesTrans.Channel == inputDocument.getChannelId()
+                    &&    transactionSalesTrans.TerminalId == inputDocument.getTerminalId()
+                    &&    transactionSalesTrans.TransactionId == inputDocument.getTransactionId()
+                    &&    transactionSalesTrans.CancelledTransactionId == "";
+
+
+            // We are currently processing one order cancellation per transaction so we set the order id field in the transaction record.
+            update_recordset transactionTable
+            setting SalesOrderId = inputDocument.getTargetOrderId()
+            where   transactionTable.Store == inputDocument.getStoreId()
+                    &&    transactionTable.Channel       == inputDocument.getChannelId()
+                    &&    transactionTable.Terminal    == inputDocument.getTerminalId()
+                    &&    transactionTable.TransactionId == inputDocument.getTransactionId()
+                    &&    transactionTable.SalesOrderId == "";
+
+            ttscommit;
+        }
+        catch (ex)
+        {
+            this.throwProcessingError(RetailOrderOperationProcessingResult::PreProcessingError, true, this.getProcessingErrorMessage(RetailOrderOperationProcessingResult::PreProcessingError), ex);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCancellationTransactionPostCancellation</Name>
+				<Source><![CDATA[
+    void updateCancellationTransactionPostCancellation()
+    {
+        System.Exception ex;
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockEx;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictEx;
+        int dbRetryDelay = DbRetryInitialDelay;
+        try
+        {
+            RetailTransactionSalesTrans transactionSalesTrans;
+            RetailTransactionTable transactionTable;
+
+            ttsbegin;
+
+            update_recordset transactionTable
+                setting EntryStatus = RetailEntryStatus::Posted
+            where   transactionTable.Store == inputDocument.getStoreId()
+                    &&    transactionTable.Channel       == inputDocument.getChannelId()
+                    &&    transactionTable.Terminal    == inputDocument.getTerminalId()
+                    &&    transactionTable.TransactionId == inputDocument.getTransactionId();
+
+            update_recordset transactionSalesTrans
+            setting TransactionStatus = RetailEntryStatus::Posted
+            where   transactionSalesTrans.Store == inputDocument.getStoreId()
+                    &&    transactionSalesTrans.Channel == inputDocument.getChannelId()
+                    &&    transactionSalesTrans.TerminalId == inputDocument.getTerminalId()
+                    &&    transactionSalesTrans.TransactionId == inputDocument.getTransactionId()
+                    &&    transactionSalesTrans.TransactionStatus == RetailEntryStatus::None;
+            
+            ttscommit;
+        }
+        catch (deadLockEx)
+        {
+            if (xSession::currentRetryCount() >= DbModificationMaxRetries )
+            {
+                this.logDbError(funcName(), 0, ex);
+                throw deadLockEx;
+            }
+            else
+            {
+                sleep(dbRetryDelay);
+                dbRetryDelay *= DbRetryDelayMultiplier;
+                retry;
+            }
+        }
+        catch (updateConflictEx)
+        {
+            if (appl.ttsLevel() != 0)
+            {
+                this.logDbError(funcName(), 0, updateConflictEx);
+                throw updateConflictEx;
+            }
+            else if (xSession::currentRetryCount() >= DbModificationMaxRetries)
+            {
+                this.logDbError(funcName(), 0, updateConflictEx);
+                throw Exception::UpdateConflictNotRecovered;
+            }
+            else
+            {
+                sleep(dbRetryDelay);
+                dbRetryDelay *= DbRetryDelayMultiplier;
+                retry;
+            }
+        }
+        catch (ex)
+        {
+            // we are not reporting this error as retriable since the order already cancelled successfully
+            this.throwProcessingError(RetailOrderOperationProcessingResult::PostProcessingError, false, this.getProcessingErrorMessage(RetailOrderOperationProcessingResult::PostProcessingError), ex);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>throwProcessingError</Name>
+				<Source><![CDATA[
+    private void throwProcessingError(RetailOrderOperationProcessingResult _processingResult, boolean _isRetriable = false, RetailDocumentOperationErrorMessage _errorMessage = null, System.Exception _exception = null)
+    {
+        this.updateOperationStatus(
+            _processingResult,
+            (_isRetriable) ? RetailDocumentOperationStatus::RetriableError : RetailDocumentOperationStatus::Failed,
+            _errorMessage);
+
+        if (_exception == null)
+        {
+            this.throwsException(_isRetriable, _errorMessage);
+        }
+        else
+        {
+            this.isRetriable = _isRetriable;
+            throw _exception;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOperationStatusToSuccessful</Name>
+				<Source><![CDATA[
+    private void updateOperationStatusToSuccessful()
+    {
+        RetailOrderOperationProcessingResult processingResult = this.getSuccessfulProcessingResultByOrderState();
+        RetailDocumentOperationErrorMessage msg =
+            (processingResult == RetailOrderOperationProcessingResult::Success) ? '' : this.getProcessingErrorMessage(processingResult);
+        this.updateOperationStatus(processingResult, RetailDocumentOperationStatus::Succeeded, msg);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOperationStatus</Name>
+				<Source><![CDATA[
+    private void updateOperationStatus(RetailOrderOperationProcessingResult _processingResult,
+        RetailDocumentOperationStatus _documentOperationStatus,
+        RetailDocumentOperationErrorMessage _errorMessage = null)
+    {
+        System.Exception ex;
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockEx;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictEx;
+        RetailOrderOperationStatus operationStatusRecord;
+        int dbRetryDelay = DbRetryInitialDelay;
+
+        eventSource.EventWriteOrderOperationUpdatingStatus(
+            funcName(),
+            this.retailDocumentOperation.RetailDocumentOperationId,
+            enum2Str(_documentOperationStatus),
+            enum2Str(_processingResult));
+
+        try
+        {
+            if (!inputDocument)
+            {
+                throw error("@RetailAsyncOrderOperations:ErrorOperationInputDocumentIsInvalid");
+            }
+
+            operationStatusRecord = this.getPreparedOperationStatusRecord(_processingResult, _documentOperationStatus, _errorMessage);
+
+            ttsbegin;
+
+            operationStatusRecord.write();
+
+            ttscommit;
+        }
+        catch (deadLockEx)
+        {
+            if (xSession::currentRetryCount() >= DbModificationMaxRetries )
+            {
+                this.logDbError(funcName(), operationStatusRecord.RecId, ex);
+                throw deadLockEx;
+            }
+            else
+            {
+                sleep(dbRetryDelay);
+                dbRetryDelay *= DbRetryDelayMultiplier;
+                retry;
+            }
+        }
+        catch (updateConflictEx)
+        {
+            if (appl.ttsLevel() != 0)
+            {
+                this.logDbError(funcName(), operationStatusRecord.RecId, updateConflictEx);
+                throw updateConflictEx;
+            }
+            else if (xSession::currentRetryCount() >= DbModificationMaxRetries)
+            {
+                this.logDbError(funcName(), operationStatusRecord.RecId, updateConflictEx);
+                throw Exception::UpdateConflictNotRecovered;
+            }
+            else
+            {
+                sleep(dbRetryDelay);
+                dbRetryDelay *= DbRetryDelayMultiplier;
+                retry;
+            }
+        }
+        catch (ex)
+        {
+            this.logDbError(funcName(), operationStatusRecord.RecId, ex);
+            throw ex;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSuccessfulProcessingResultByOrderState</Name>
+				<Source><![CDATA[
+    private RetailOrderOperationProcessingResult getSuccessfulProcessingResultByOrderState()
+    {
+        SalesTable salesTable;
+
+        select SalesStatus from salesTable where salesTable.SalesId == inputDocument.getTargetOrderId();
+
+        if (salesTable.SalesStatus == SalesStatus::Canceled)
+        {
+            return RetailOrderOperationProcessingResult::Success;
+        }
+        else
+        {
+            return RetailOrderOperationProcessingResult::OperationProcessedOrderNotFullyCancelled;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPreparedOperationStatusRecord</Name>
+				<Source><![CDATA[
+    private RetailOrderOperationStatus getPreparedOperationStatusRecord(RetailOrderOperationProcessingResult _processingResult,
+        RetailDocumentOperationStatus _documentOperationStatus,
+        RetailDocumentOperationErrorMessage _errorMessage = null)
+    {
+        RetailOrderOperationStatus operationStatusRecord = RetailOrderOperationStatus::findByOperationId(this.retailDocumentOperation.RetailDocumentOperationId, true);
+
+        if (!operationStatusRecord.RecId)
+        {
+            operationStatusRecord.initValue();
+            operationStatusRecord.RetailDocumentOperationId = this.retailDocumentOperation.RetailDocumentOperationId;
+            operationStatusRecord.OperationRequestTime = this.retailDocumentOperation.CommittedDateTime;
+            operationStatusRecord.OperationType = RetailOrderOperationType::Cancel;
+            operationStatusRecord.ChannelId = inputDocument.getChannelId();
+            operationStatusRecord.TransactionId = inputDocument.getTransactionId();
+            operationStatusRecord.StoreId = inputDocument.getStoreId();
+            operationStatusRecord.TerminalId = inputDocument.getTerminalId();
+            operationStatusRecord.TroubleshootingStatus = RetailOrderOperationTroubleshootingStatus::None;
+            operationStatusRecord.TargetTransactionId = inputDocument.getTargetTransactionId();
+            operationStatusRecord.TargetStoreId = inputDocument.getTargetStoreId();
+            operationStatusRecord.TargetTerminalId = inputDocument.getTargetTerminalId();
+            operationStatusRecord.TargetChannelId = inputDocument.getTargetChannelId();
+            this.shouldIncreaseRetriesNumber = false;
+        }
+
+        operationStatusRecord.OperationProcessingResult = _processingResult;
+        operationStatusRecord.RetailDocumentOperationStatus = _documentOperationStatus;
+        operationStatusRecord.RetailDocumentOperationErrorMessage = _errorMessage;
+        operationStatusRecord.OperationProcessingTime = DateTimeUtil::utcNow();
+        operationStatusRecord.TargetSalesId = inputDocument.getTargetOrderId();
+        if (this.shouldIncreaseRetriesNumber)
+        {
+            operationStatusRecord.RetailDocumentOperationRetries += 1;
+            this.shouldIncreaseRetriesNumber = false;
+        }
+
+        return operationStatusRecord;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logDbError</Name>
+				<Source><![CDATA[
+    private void logDbError(str function, RefRecId _recId, System.Exception _exception)
+    {
+        eventSource.EventWriteOrderOperationDatabaseError(function,
+            this.retailDocumentOperation.RetailDocumentOperationId,
+            _recId,
+            (_exception != null) ? _exception.Message : 'Exception object is null',
+            (_exception != null) ? _exception.GetType().ToString() : '',
+            xSession::currentRetryCount(),
+            (_exception != null && _exception.StackTrace != null) ? _exception.StackTrace : '');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProcessingErrorMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This function return user facing message describing the processing error.
+    /// </summary>
+    /// <param name = "errorResult">Processing error code.</param>
+    /// <returns>Corresponsing error message or empty string if no message was found.</returns>
+    private str getProcessingErrorMessage(RetailOrderOperationProcessingResult errorResult)
+    {
+        switch (errorResult)
+        {
+            case RetailOrderOperationProcessingResult::OperationProcessedOrderNotFullyCancelled:
+                return "@RetailAsyncOrderOperations:AsyncCancellationErrorOrderPartiallyCancelled";
+
+            case RetailOrderOperationProcessingResult::OperationTransactionDoesNotExist:
+                return "@RetailAsyncOrderOperations:AsyncCancellationErrorMissingCancellationTransaction";
+
+            case RetailOrderOperationProcessingResult::TargetOrderDoesNotExist:
+                return "@RetailAsyncOrderOperations:AsyncCancellationErrorMissingTargetOrder";
+                
+            case RetailOrderOperationProcessingResult::TargetTransactionDoesNotExist:
+                return "@RetailAsyncOrderOperations:AsyncCancellationErrorMissingOrderCreationTransaction";
+
+            case RetailOrderOperationProcessingResult::PreProcessingError:
+            case RetailOrderOperationProcessingResult::ProcessingError:
+                return "@RetailAsyncOrderOperations:AsyncCancellationProcessingError";
+
+            case RetailOrderOperationProcessingResult::PostProcessingError:
+                return "@RetailAsyncOrderOperations:AsyncCancellationPostProcessingError";
+        }
+        return '';
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

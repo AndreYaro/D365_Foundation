@@ -1,0 +1,2325 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>CustWriteOff</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>CustWriteOff</c> class creates the write-off journal for customer transactions
+/// when transaction posting profiles are used.
+/// </summary>
+class CustWriteOff extends RunBase
+{
+    ReasonCode writeOffReasonCodeByUser;
+    ReasonComment writeOffReasonCommentByUser;
+
+    CompanyId defaultCompanyForWriteOffReason;
+    CustWriteOffFinancialReasonsSetup defaultFinancialReasonCodeSetup;
+
+    TransDate writeOffDate;
+
+    TmpCustVendTransOpen tmpTrans;
+    TmpTaxWorkTrans tmpTaxTrans;
+
+    boolean taxErrorDisplayedForJournal;
+
+    CustParameters custParameters;
+    CompanyId dataSourceCompany;
+
+    Map custTransOpenMap;
+    Map custTransMap;
+
+    #DEFINE.CurrentVersion(1)
+    #LOCALMACRO.CurrentList
+        writeOffReasonCodeByUser,
+        writeOffReasonCommentByUser,
+        writeOffDate
+    #ENDMACRO
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addActivites</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates activities for the write-off journals.
+    /// </summary>
+    /// <param name="_companyId">
+    ///    The company where the activities will be created.
+    /// </param>
+    /// <param name="_custAccount">
+    ///    The customer account number that is used on the activities.
+    /// </param>
+    /// <param name="_journalNum">
+    ///    The ledger journal number that is used on the activities.
+    /// </param>
+    /// <remarks>
+    ///    A closed event will record that the write-off journal was created.
+    /// </remarks>
+    protected void addActivites(CompanyId _companyId, CustAccount _custAccount, LedgerJournalId _journalNum)
+    {
+        smmActivities event;
+        CustTable custTable;
+
+        changecompany(_companyId)
+        {
+            custTable = CustTable::find(_custAccount);
+
+            // add event for customer
+            event.initValue(smmActivityCategory::Event);
+            event.setActivityNum();
+            event.Closed = NoYes::Yes;
+            event.modifiedField(fieldNum(smmActivities, Closed));
+            event.Purpose = "@SYS136674";
+            event.UserMemo = strFmt("@SYS134957", _journalNum, curext());
+            event.insertParentLink(smmActivityParentType::Customer, custTable.RecId, true);
+            event.insertParentLink(smmActivityParentType::Collections, custTable.RecId);
+            event.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcSalesTaxOnOpenTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Calculates the amount of sales tax for associated records in the set parameter.
+    /// </summary>
+    /// <param name="_transOpenToSettle">
+    ///    A set object that contains the <c>CustTransOpen</c> records for which to calculate the sales tax
+    ///    amount.
+    /// </param>
+    /// <returns>
+    ///    The sales tax amount for the associated records.
+    /// </returns>
+    protected AmountCur calcSalesTaxOnOpenTrans(Set _transOpenToSettle)
+    {
+        AmountCur totalTax;
+        Percent writeOffPercent;
+        CustTransOpen custTransOpen;
+        CustTrans custTrans;
+        TaxTrans taxTrans;
+        AccountingDistribution accountingDistribution;
+        SubledgerJournalAccountEntryDistribution accountEntryDistribution;
+        SubledgerJournalAccountEntry accountEntry;
+        SetEnumerator enumerator;
+        RefRecId transOpenRecId;
+        boolean conditionalTaxAllowed;
+
+        TaxTransGeneralJournalAccountEntry taxTransGeneralJournalAccountEntryTax;
+        DimensionAttributeValueCombination dimensionAttributeValueCombination;
+        GeneralJournalAccountEntry generalJournalAccountEntryTax;
+
+        // clear the temporary tax trans table
+        delete_from tmpTaxTrans;
+
+        // Determine if need to adjust tax on openTrans
+        if (!CustParameters::find().CollectionsWriteOffSeparateSalesTax)
+        {
+            return 0;
+        }
+
+        conditionalTaxAllowed = TaxParameters::find().ConditionalTax;
+
+        enumerator = _transOpenToSettle.getEnumerator();
+        while (enumerator.moveNext())
+        {
+            transOpenRecId = enumerator.current();
+
+            custTransOpen = CustTransOpen::find(transOpenRecId);
+            Debug::assert(custTransOpen.RecId);
+
+            custTrans = CustTrans::find(custTransOpen.RefRecId);
+            Debug::assert(custTrans.RecId);
+
+            writeOffPercent = 0;
+
+            if (custTrans.AmountCur != 0)
+            {
+                writeOffPercent = custTransOpen.AmountCur / custTrans.AmountCur;
+            }
+
+            // process the tax data associated with the current CustTrans based upon whether or not distribution data exists
+            if (custTrans.AccountingEvent != 0)
+            {
+                // This select statement will sum distributed tax amounts for all TaxTrans records associated with the current CustTrans
+                // grouped by basic tax information plus the LedgerDimension of the associated SubledgerJournalAccountEntry records.
+                QueryRun queryRun = new QueryRun(this.buildTaxDistributionSumAmountQuery(custTrans));
+
+                while (queryRun.next())
+                {
+                    accountingDistribution = queryRun.get(tableNum(AccountingDistribution));
+                    taxTrans = queryRun.get(tableNum(TaxTrans));
+                    accountEntry = queryRun.get(tableNum(SubledgerJournalAccountEntry));
+
+                    totalTax += this.generateSummarizedTmpTaxTrans(taxTrans, custTrans, accountingDistribution.TransactionCurrencyAmount, accountEntry.LedgerDimension, writeOffPercent, conditionalTaxAllowed);
+                }
+
+                totalTax += this.populateSalesTaxLinesWithZeroAmt(custTrans, writeOffPercent, conditionalTaxAllowed);
+            }
+            else
+            {
+                // use TaxTrans records directly to determine Tax distributions
+
+                // check if multiple CustTrans or VendTrans with same voucher number,
+                // in this case will not calculate tax
+                if (this.checkForDuplicateVouchers(custTrans.Voucher, custTrans.TransDate, custTrans.RecId))
+                {
+                    if (!taxErrorDisplayedForJournal)
+                    {
+                        warning("@SYS134955");
+                        taxErrorDisplayedForJournal = true;
+                    }
+                }
+                else
+                {
+                    while select TaxCode, TaxDirection, SourceCurrencyCode, SourceRegulateAmountCur, ExchRateDiffOrigRecId from taxTrans
+                        order by taxTrans.TaxCode, taxTrans.TaxDirection, taxTrans.SourceCurrencyCode
+                        where taxTrans.Voucher == custTrans.Voucher &&
+                              taxTrans.TransDate == custTrans.TransDate &&
+                              taxTrans.ExemptTax == NoYes::No &&
+                              taxTrans.TaxOrigin == TaxOrigin::Tax
+                        outer join RecId from taxTransGeneralJournalAccountEntryTax
+                        where taxTrans.RecId == taxTransGeneralJournalAccountEntryTax.TaxTrans &&
+                              taxTransGeneralJournalAccountEntryTax.TaxTransRelationship == TaxTransRelationshipType::Tax
+                        outer join RecId, LedgerDimension from generalJournalAccountEntryTax
+                        where generalJournalAccountEntryTax.RecId == taxTransGeneralJournalAccountEntryTax.GeneralJournalAccountEntry
+                        join MainAccount, RecId from dimensionAttributeValueCombination
+                        where ((dimensionAttributeValueCombination.RecId == generalJournalAccountEntryTax.LedgerDimension && taxTransGeneralJournalAccountEntryTax.GeneralJournalAccountEntry) ||
+                              (dimensionAttributeValueCombination.RecId == taxTransGeneralJournalAccountEntryTax.LedgerDimension && !taxTransGeneralJournalAccountEntryTax.GeneralJournalAccountEntry))
+                    {
+                        totalTax += this.generateSummarizedTmpTaxTrans(taxTrans, custTrans, taxTrans.SourceRegulateAmountCur, dimensionAttributeValueCombination.RecId, writeOffPercent, conditionalTaxAllowed);
+                    }
+
+                    totalTax += this.populateSalesTaxLinesWithZeroAmt(custTrans, writeOffPercent, conditionalTaxAllowed);
+                }
+            }
+        }
+
+        return totalTax;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildTaxDistributionSumAmountQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the Tax Distribution sum amount query.
+    /// </summary>
+    /// <param name = "_custTrans">
+    /// The <c>CustTrans</c> buffer.
+    /// </param>
+    /// <returns>
+    /// The Tax Distribution sum amount query.
+    /// </returns>
+    [Wrappable(true)]
+    protected final Query buildTaxDistributionSumAmountQuery(CustTrans _custTrans)
+    {
+        Query query = new Query();
+
+        QueryBuildDataSource qbdsAccountingDistribution = query.addDataSource(tableNum(AccountingDistribution));
+
+        qbdsAccountingDistribution.addRange(fieldNum(AccountingDistribution, AccountingEvent)).value(queryValue(_custTrans.AccountingEvent));
+        qbdsAccountingDistribution.addRange(fieldNum(AccountingDistribution, ReferenceRole)).value(SysQuery::valueNot(enum2int(AccountingDistributionReferenceRole::Reversing)));
+     
+        qbdsAccountingDistribution.fields().clearFieldList();
+        qbdsAccountingDistribution.addSelectionField(fieldNum(AccountingDistribution, TransactionCurrencyAmount), SelectionField::Sum);
+
+        QueryBuildDataSource qbdsTaxTrans = qbdsAccountingDistribution.addDataSource(tableNum(TaxTrans));
+        qbdsTaxTrans.addLink(fieldNum(AccountingDistribution, SourceDocumentLine), fieldNum(TaxTrans, SourceDocumentLine));
+        qbdsTaxTrans.joinMode(JoinMode::InnerJoin);
+
+        qbdsTaxTrans.addRange(fieldNum(TaxTrans, ExemptTax)).value(queryValue(enum2int(NoYes::No)));
+        qbdsTaxTrans.addRange(fieldNum(TaxTrans, TaxOrigin)).value(queryValue(enum2int(TaxOrigin::Tax)));
+
+        qbdsTaxTrans.addGroupByField(fieldNum(TaxTrans, TaxCode));
+        qbdsTaxTrans.addGroupByField(fieldNum(TaxTrans, TaxDirection));
+        qbdsTaxTrans.addGroupByField(fieldNum(TaxTrans, SourceCurrencyCode));
+        qbdsTaxTrans.addGroupByField(fieldNum(TaxTrans, ExchRateDiffOrigRecId));
+
+        qbdsTaxTrans.fields().clearFieldList();
+        qbdsTaxTrans.addSelectionField(fieldNum(TaxTrans, TaxCode));
+        qbdsTaxTrans.addSelectionField(fieldNum(TaxTrans, TaxDirection));
+        qbdsTaxTrans.addSelectionField(fieldNum(TaxTrans, SourceCurrencyCode));
+        qbdsTaxTrans.addSelectionField(fieldNum(TaxTrans, ExchRateDiffOrigRecId));
+
+        QueryBuildDataSource qbdsSubledgerJournalAccountEntryDistribution = qbdsTaxTrans.addDataSource(tableNum(SubledgerJournalAccountEntryDistribution));
+        qbdsSubledgerJournalAccountEntryDistribution.addLink(fieldNum(AccountingDistribution, RecId), fieldNum(SubledgerJournalAccountEntryDistribution, AccountingDistribution), qbdsAccountingDistribution.name());
+        qbdsSubledgerJournalAccountEntryDistribution.joinMode(JoinMode::InnerJoin);
+
+        qbdsSubledgerJournalAccountEntryDistribution.fields().clearFieldList();
+        qbdsSubledgerJournalAccountEntryDistribution.addSelectionField(fieldNum(SubledgerJournalAccountEntryDistribution, AccountingDistribution));
+        qbdsSubledgerJournalAccountEntryDistribution.addSelectionField(fieldNum(SubledgerJournalAccountEntryDistribution, SubledgerJournalAccountEntry));
+
+        QueryBuildDataSource qbdsSubledgerJournalAccountEntry = qbdsSubledgerJournalAccountEntryDistribution.addDataSource(tableNum(SubledgerJournalAccountEntry));
+        qbdsSubledgerJournalAccountEntry.addLink(fieldNum(SubledgerJournalAccountEntryDistribution, SubledgerJournalAccountEntry), fieldNum(SubledgerJournalAccountEntry, RecId));
+        qbdsTaxTrans.joinMode(JoinMode::InnerJoin);
+
+        qbdsSubledgerJournalAccountEntry.addRange(fieldNum(SubledgerJournalAccountEntry, PostingType)).value(queryValue(enum2int(LedgerPostingType::Tax)));
+        
+        qbdsSubledgerJournalAccountEntry.addGroupByField(fieldNum(SubledgerJournalAccountEntry, LedgerDimension));
+        
+        qbdsSubledgerJournalAccountEntry.fields().clearFieldList();
+        qbdsSubledgerJournalAccountEntry.addSelectionField(fieldNum(SubledgerJournalAccountEntry, PostingType));
+        qbdsSubledgerJournalAccountEntry.addSelectionField(fieldNum(SubledgerJournalAccountEntry, RecId));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateSalesTaxLinesWithZeroAmt</Name>
+				<Source><![CDATA[
+    private AmountCur populateSalesTaxLinesWithZeroAmt(CustTrans _custTrans, Percent _writeOffPercent, boolean _conditionalTaxAllowed)
+    {
+        TaxTrans taxTrans;
+        AmountCur totalTax;
+
+        //Populate the TmpTaxTrans with Zero value Tax trans records
+        while select TaxCode, TaxDirection, SourceCurrencyCode, SourceRegulateAmountCur, ExchRateDiffOrigRecId from taxTrans
+                    order by taxTrans.TaxCode, taxTrans.TaxDirection, taxTrans.SourceCurrencyCode
+                    where taxTrans.Voucher == _custTrans.Voucher &&
+                            taxTrans.TransDate == _custTrans.TransDate &&
+                            taxTrans.ExemptTax == NoYes::No &&
+                            taxTrans.TaxOrigin == TaxOrigin::Tax &&
+                            taxTrans.SourceRegulateAmountCur == 0.0
+        {
+            if (this.shouldSkipTaxTransOfExchangeRateDiff(taxTrans))
+            {
+                continue;
+            }
+
+            LedgerDimensionAccount defaultAccount = TaxLedgerAccountGroup::accountLedgerDimension(taxTrans.TaxCode, taxTrans.TaxDirection);
+            totalTax += this.generateSummarizedTmpTaxTrans(taxTrans, _custTrans, taxTrans.SourceRegulateAmountCur, defaultAccount, _writeOffPercent, _conditionalTaxAllowed);
+        }
+
+        return totalTax;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkForDuplicateVouchers</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines whether additional <c>CustTrans</c> or <c>VendTrans</c> records exist for the voucher
+    ///    and transaction date.
+    /// </summary>
+    /// <param name="_voucher">
+    ///    The voucher to find.
+    /// </param>
+    /// <param name="_transDate">
+    ///    The transaction date to find.
+    /// </param>
+    /// <param name="_existingCustTransRecId">
+    ///    The record ID of the <c>CustTrans</c> record that exists.
+    /// </param>
+    /// <returns>
+    ///    true if additional records exist for the voucher and transaction date; otherwise, false.
+    /// </returns>
+    protected boolean checkForDuplicateVouchers(Voucher _voucher, TransDate _transDate, recId _existingCustTransRecId)
+    {
+        // check for duplicate customer transaction
+        boolean found = (select firstonly RecId from custTrans
+                            where custTrans.Voucher == _voucher
+                               && custTrans.TransDate == _transDate
+                               && custTrans.RecId != _existingCustTransRecId).RecId;
+
+        if (!found)
+        {
+            // check for duplicate vendor transaction
+            found = VendTrans::findVoucherDate(_voucher, _transDate).RecId;
+        }
+
+        return found;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeLedgerJournalEngine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a <c>LedgerJournalEngine</c> object of <c>LedgerJournalEngine_Daily</c> type
+    /// and initializes it with <c>LedgerJournalTable</c> record.
+    /// </summary>
+    /// <param name="_ledgerJournalTable">
+    /// The <c>LedgerJournalTable</c> record created for write-off.
+    /// </param>
+    /// <returns>
+    /// The <c>LedgerJournalEngine</c> object.
+    /// </returns>
+    protected LedgerJournalEngine initializeLedgerJournalEngine(LedgerJournalTable _ledgerJournalTable)
+    {
+        LedgerJournalEngine ledgerJournalEngine = LedgerJournalEngine_Daily::construct();
+        ledgerJournalEngine.ledgerJournalTable(_ledgerJournalTable);
+        ledgerJournalEngine.newJournalActive(_ledgerJournalTable);
+
+        return ledgerJournalEngine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeTransactionAmountsAndMap</Name>
+				<Source><![CDATA[
+    protected void initializeTransactionAmountsAndMap()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initWriteOffPostingDefinitionAccounts</Name>
+				<Source><![CDATA[
+    protected boolean initWriteOffPostingDefinitionAccounts()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>displayMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Displays confirmation message to the user.
+    /// </summary>
+    /// <param name="_ledgerJournalTable">
+    /// The <c>LedgerJournalTable</c> record created for write-off.
+    /// </param>
+    /// <param name="_companyId">
+    /// The company for which write-off was created.
+    /// </param>
+    protected void displayMessage(LedgerJournalTable _ledgerJournalTable, CompanyId _companyId)
+    {
+        info(strFmt("@SYS134956", _ledgerJournalTable.JournalNum, _companyId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWriteOff</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the write-off journal.
+    /// </summary>
+    /// <param name="_companyId">
+    /// The company in which the write-off journal will be created.
+    /// </param>
+    /// <param name="_accountNum">
+    /// The customer account number for the write-off journal.
+    /// </param>
+    protected void createWriteOff(CompanyId _companyId, CustAccount _accountNum)
+    {
+        TmpCustVendTransOpen localTmpTrans;
+        LedgerJournalTable ledgerJournalTable;
+        LedgerJournalTrans ledgerJournalTrans;
+        LedgerJournalEngine ledgerJournalEngine;
+        Set transOpenToSettle;
+        boolean firstRecord = true;
+
+        taxErrorDisplayedForJournal = false;
+
+        while select tmpTrans
+            order by CurrencyCode, DefaultDimension
+            where tmpTrans.Company == _companyId
+               && tmpTrans.AccountNum == _accountNum
+        {
+            if (firstRecord)
+            {
+                firstRecord = false;
+
+                ledgerJournalTable = this.createWriteOffJournalHeader(_companyId, _accountNum);
+
+                //Record activity for write-off journal creation
+                this.addActivites(_companyId, _accountNum, ledgerJournalTable.JournalNum);
+
+                ledgerJournalTrans.clear();
+                ledgerJournalEngine = this.initializeLedgerJournalEngine(ledgerJournalTable);
+
+                // set values on localTmpTrans
+                localTmpTrans.clear();
+                localTmpTrans.data(tmpTrans);
+                localTmpTrans.AmountCur = 0;
+                localTmpTrans.AmountMST = 0;
+
+                transOpenToSettle = new Set(Types::Int64);
+            }
+
+            if (localTmpTrans.CurrencyCode != tmpTrans.CurrencyCode
+                || !DimensionDefaultFacade::areEqual(localTmpTrans.DefaultDimension, tmpTrans.DefaultDimension))
+            {
+                if (localTmpTrans.AmountCur != 0)
+                {
+                    ledgerJournalTrans = this.createWriteOffJournalLines(localTmpTrans, ledgerJournalEngine, transOpenToSettle, ledgerJournalTrans);
+                    this.initializeTransactionAmountsAndMap();
+                }
+
+                ledgerJournalTrans.clear();
+                localTmpTrans.clear();
+                localTmpTrans.data(tmpTrans);
+                localTmpTrans.AmountCur = 0;
+                localTmpTrans.AmountMST = 0;
+
+                transOpenToSettle = new Set(Types::Int64);
+            }
+
+            CustTransOpen custTransOpen = CustTransOpen::find(tmpTrans.TmpRecId);
+
+            // check if amount is marked before adding to total
+            if (custTransOpen.RecId && this.initWriteOffPostingDefinitionAccounts() && !this.isTransOpenMarked(custTransOpen, '', false))
+            {
+                localTmpTrans.AmountCur += tmpTrans.AmountCur;
+                localTmpTrans.AmountMST += tmpTrans.AmountMST;
+                transOpenToSettle.add(tmpTrans.TmpRecId);
+            }
+
+            if (CustDisputeHistoryAutomation::doesDisputeExist(custTransOpen.RefRecId))
+            {
+                CustDisputeHistoryAutomationPayment::updateCollectionsStatus(
+                    custTransOpen.RefRecId,
+                    CustDisputeHistoryAutomationAction::WriteOff,
+                    writeOffReasonCodeByUser,
+                    writeOffReasonCommentByUser);
+            }
+        }
+
+        // create last journal line
+        if (localTmpTrans.AmountCur != 0)
+        {
+            ledgerJournalTrans = this.createWriteOffJournalLines(localTmpTrans, ledgerJournalEngine, transOpenToSettle, ledgerJournalTrans);
+        }
+
+        this.displayMessage(ledgerJournalTable, _companyId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWriteOffJournalHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates the <c>LedgerJournalTable</c> record for the write-off journal.
+    /// </summary>
+    /// <param name="_companyId">
+    ///    The company where the write-off journal will be created.
+    /// </param>
+    /// <param name="_custAccountNum">
+    ///    The customer account number for the write-off journal.
+    /// </param>
+    /// <returns>
+    ///    The <c>LedgerJournalTable</c> record that was created.
+    /// </returns>
+    protected LedgerJournalTable createWriteOffJournalHeader(CompanyId _companyId, CustVendAC _custAccountNum)
+    {
+        LedgerJournalTable journalHeader;
+
+        changecompany(_companyId)
+        {
+            journalHeader.JournalName = CustParameters::find().CollectionsWriteOffLedgerJournalName;
+            journalHeader.Name = strFmt("@SYS133612", _custAccountNum, CustTable::find(tmpTrans.AccountNum).name());
+            journalHeader.defaultRow();
+
+            if (journalHeader.validateWrite())
+            {
+                journalHeader.insert();
+            }
+        }
+
+        return journalHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustomerAccTypeJournalLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates the <c>LedgerJournalTrans</c> record of customer account type for the write-off journal.
+    /// </summary>
+    /// <param name="_localTmpTrans">
+    ///    A <c>TmpCustVendTransOpen</c> record.
+    /// </param>
+    /// <param name="_ledgerJournalEngine">
+    ///    A <c>LedgerJournalEngine_Daily</c> object.
+    /// </param>
+    /// <param name="_previousLedgerJournalTrans">
+    ///    The previous <c>LedgerJournalTrans</c> record in the journal.
+    /// </param>
+    /// <param name="_reasonCode">
+    ///    The <c>ReasonCode</c> for the write-off journal.
+    /// </param>
+    /// <param name="_reasonComment">
+    ///    The <c>ReasonComment</c> for the write-off journal.
+    /// </param>
+    /// <returns>
+    ///    The <c>LedgerJournalTrans</c> record that was created.
+    /// </returns>
+    protected LedgerJournalTrans createCustomerAccTypeJournalLine(
+        TmpCustVendTransOpen _localTmpTrans,
+        LedgerJournalEngine _ledgerJournalEngine,
+        LedgerJournalTrans _previousLedgerJournalTrans,
+        ReasonCode _reasonCode,
+        ReasonComment _reasonComment)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+
+        ledgerJournalTrans.data(_previousLedgerJournalTrans);
+
+        // create Customer account type record
+        _ledgerJournalEngine.preCreate(ledgerJournalTrans);
+        ledgerJournalTrans.initValue();
+        _ledgerJournalEngine.initValue(ledgerJournalTrans);
+        ledgerJournalTrans.LineNum = 0;
+
+        ledgerJournalTrans.TransactionType = LedgerTransType::WriteOff;
+        ledgerJournalTrans.TransDate = writeOffDate;
+        ledgerJournalTrans.parmAccount(_localTmpTrans.AccountNum, LedgerJournalACType::Cust);
+        _ledgerJournalEngine.accountModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.CurrencyCode = _localTmpTrans.CurrencyCode;
+        _ledgerJournalEngine.currencyModified(ledgerJournalTrans);
+
+        if (_localTmpTrans.PostingProfile && _localTmpTrans.PostingProfile != ledgerJournalTrans.PostingProfile)
+        {
+            ledgerJournalTrans.PostingProfile = _localTmpTrans.PostingProfile;
+        }
+
+        // post this as a credit so amount should be negative
+        ledgerJournalTrans.amountCur2DebCred(-_localTmpTrans.AmountCur);
+
+        ledgerJournalTrans.DefaultDimension = _localTmpTrans.DefaultDimension;
+
+        this.resetFieldsAndSetOffsetAcc(ledgerJournalTrans, _localTmpTrans, _reasonCode, _reasonComment);
+
+        ledgerJournalTrans.SettleVoucher = this.getSettlementType();
+
+        ledgerJournalTrans.insert();
+        _ledgerJournalEngine.voucherTotals(ledgerJournalTrans, true);
+
+        return ledgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSettlementType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///     Gets the settlement type.
+    /// </summary>
+    /// <returns>
+    ///     The settlement type.
+    /// </returns>
+    public SettlementType getSettlementType()
+    {
+        return SettlementType::SelectedTransact;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerAccTypeJournalLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates the <c>LedgerJournalTrans</c> record of ledger account type for the write-off journal.
+    /// </summary>
+    /// <param name="_localTmpTrans">
+    ///    A <c>TmpCustVendTransOpen</c> record.
+    /// </param>
+    /// <param name="_ledgerJournalEngine">
+    ///    A <c>LedgerJournalEngine_Daily</c> object.
+    /// </param>
+    /// <param name="_previousLedgerJournalTrans">
+    ///    The previous <c>LedgerJournalTrans</c> record in the journal.
+    /// </param>
+    /// <param name="_ledgerDimension">
+    ///    The <c>LedgerDimensionAccount</c> to be assigned to this journal record.
+    /// </param>
+    /// <param name="_ledgerDimension">
+    ///    The <c>AmountCur</c> to be assigned to this journal record.
+    /// </param>
+    /// <param name="_reasonCode">
+    ///    The <c>ReasonCode</c> for the write-off journal.
+    /// </param>
+    /// <param name="_reasonComment">
+    ///    The <c>ReasonComment</c> for the write-off journal.
+    /// </param>
+    /// <returns>
+    ///    The <c>LedgerJournalTrans</c> record that was created.
+    /// </returns>
+    protected LedgerJournalTrans createLedgerAccTypeJournalLine(
+        TmpCustVendTransOpen _localTmpTrans,
+        LedgerJournalEngine _ledgerJournalEngine,
+        LedgerJournalTrans _previousLedgerJournalTrans,
+        LedgerDimensionAccount _ledgerDimension,
+        AmountCur _amount,
+        ReasonCode _reasonCode,
+        ReasonComment _reasonComment)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+
+        ledgerJournalTrans.data(_previousLedgerJournalTrans);
+
+        // create a ledger account type record
+        _ledgerJournalEngine.preCreate(ledgerJournalTrans);
+        ledgerJournalTrans.initValue();
+        _ledgerJournalEngine.initValue(ledgerJournalTrans);
+        ledgerJournalTrans.RecId = 0;
+        ledgerJournalTrans.LineNum = 0;
+
+        ledgerJournalTrans.TransactionType = LedgerTransType::WriteOff;
+        ledgerJournalTrans.TransDate = writeOffDate;
+        ledgerJournalTrans.AccountType = LedgerJournalACType::Ledger;
+
+        // set the ledgerDimension field by merging the default account and the default dimensions
+        ledgerJournalTrans.LedgerDimension = _ledgerDimension;
+        _ledgerJournalEngine.accountModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.DefaultDimension = 0;
+
+        ledgerJournalTrans.CurrencyCode = _localTmpTrans.CurrencyCode;
+        _ledgerJournalEngine.currencyModified(ledgerJournalTrans);
+
+        // Adjust amount by sales tax
+        ledgerJournalTrans.amountCur2DebCred(_amount);
+
+        this.resetFieldsAndSetOffsetAcc(ledgerJournalTrans, _localTmpTrans, _reasonCode, _reasonComment);
+
+        ledgerJournalTrans.insert();
+        _ledgerJournalEngine.voucherTotals(ledgerJournalTrans, true);
+
+        return ledgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTaxJournalLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>LedgerJournalTrans</c> table buffer.
+    /// </summary>
+    /// <param name = "_parameters">
+    /// An <c>CustWriteOffInitTaxJourLinesContractParameters</c> instance with parameters to initialize the <c>LedgerJournalTrans</c> table buffer.
+    /// </param>
+    /// <returns>
+    /// The initialized <c>LedgerJournalTrans</c> table buffer.
+    /// </returns>
+    [Wrappable(true)]
+    protected final LedgerJournalTrans initTaxJournalLine(CustWriteOffInitTaxJourLinesContractParameters _parameters)
+    {
+        LedgerJournalTrans ledgerJournalTrans = _parameters.parmLedgerJournalTrans();
+
+        _parameters.parmLedgerJournalEngine().preCreate(ledgerJournalTrans);
+        ledgerJournalTrans.initValue();
+        _parameters.parmLedgerJournalEngine().initValue(ledgerJournalTrans);
+        ledgerJournalTrans.RecId = 0;
+        ledgerJournalTrans.LineNum = 0;
+
+        ledgerJournalTrans.TransactionType = LedgerTransType::WriteOff;
+        ledgerJournalTrans.TransDate = writeOffDate;
+        ledgerJournalTrans.AccountType = LedgerJournalACType::Ledger;
+
+        ledgerJournalTrans.LedgerDimension = tmpTaxTrans.LedgerDimension;
+        _parameters.parmLedgerJournalEngine().accountModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.DefaultDimension = 0;
+
+        ledgerJournalTrans.CurrencyCode = _parameters.parmLocalTmpTrans().CurrencyCode;
+        _parameters.parmLedgerJournalEngine().currencyModified(ledgerJournalTrans);
+
+        ledgerJournalTrans.amountCur2DebCred(tmpTaxTrans.SourceTaxAmountCur);
+
+        this.resetFieldsAndSetOffsetAcc(ledgerJournalTrans, _parameters.parmLocalTmpTrans(), _parameters.parmReasonCode(), _parameters.parmReasonComment());
+
+        ledgerJournalTrans.TaxCode = tmpTaxTrans.TaxCode;
+        ledgerJournalTrans.calcUserTaxBase();
+
+        return ledgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildTaxJournalLinesQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds a query to fetch <c>TmpTaxWorkTrans</c> records.
+    /// </summary>
+    /// <returns>
+    /// Returns a query to fetch <c>TmpTaxWorkTrans</c> records.
+    /// </returns>
+    [Wrappable(true)]
+    protected final Query buildTaxJournalLinesQuery()
+    {
+        Query query = new Query();
+        QueryBuildDataSource qbds = query.addDataSource(tableNum(TmpTaxWorkTrans));
+        qbds.addGroupByField(fieldNum(TmpTaxWorkTrans, TaxCode));
+        qbds.addGroupByField(fieldNum(TmpTaxWorkTrans, TaxDirection));
+        qbds.addGroupByField(fieldNum(TmpTaxWorkTrans, SourceCurrencyCode));
+        qbds.addGroupByField(fieldNum(TmpTaxWorkTrans, LedgerDimension));
+
+        qbds.fields().clearFieldList();
+        qbds.cursor(tmpTaxTrans);
+
+        qbds.addSelectionField(fieldNum(TmpTaxWorkTrans, SourceTaxAmountCur), SelectionField::Sum);
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTaxJournalLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates the <c>LedgerJournalTrans</c> records with the tax amounts for the write-off journal.
+    /// </summary>
+    /// <param name="_localTmpTrans">
+    ///    A <c>TmpCustVendTransOpen</c> record.
+    /// </param>
+    /// <param name="_ledgerJournalEngine">
+    ///    A <c>LedgerJournalEngine_Daily</c> object.
+    /// </param>
+    /// <param name="_previousLedgerJournalTrans">
+    ///    The previous <c>LedgerJournalTrans</c> record in the journal.
+    /// </param>
+    /// <param name="_reasonCode">
+    ///    The <c>ReasonCode</c> for the write-off journal.
+    /// </param>
+    /// <param name="_reasonComment">
+    ///    The <c>ReasonComment</c> for the write-off journal.
+    /// </param>
+    /// <returns>
+    ///    The last <c>LedgerJournalTrans</c> record that was created.
+    /// </returns>
+    protected LedgerJournalTrans createTaxJournalLines(TmpCustVendTransOpen _localTmpTrans,
+        LedgerJournalEngine _ledgerJournalEngine,
+        LedgerJournalTrans _previousLedgerJournalTrans,
+        ReasonCode _reasonCode,
+        ReasonComment _reasonComment)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+        RecordInsertList recordTaxInsertList = new RecordInsertList(tableNum(LedgerJournalTrans));
+
+        ledgerJournalTrans.data(_previousLedgerJournalTrans);
+
+        CustWriteOffInitTaxJourLinesContractParameters parameters = CustWriteOffInitTaxJourLinesContractParameters::construct();
+
+        parameters.parmLedgerJournalEngine(_ledgerJournalEngine);
+        parameters.parmLedgerJournalTrans(ledgerJournalTrans);
+        parameters.parmLocalTmpTrans(_localTmpTrans);
+        parameters.parmReasonCode(_reasonCode);
+        parameters.parmReasonComment(_reasonComment);
+
+        Query query = this.buildTaxJournalLinesQuery();
+
+        QueryRun queryRun = new QueryRun(query);
+        queryRun.setCursor(tmpTaxTrans);
+
+        //create ledger transaction for the sales tax data
+        //the TmpTaxTrans records were generated via the calcSalesTaxOnOpenTrans invocation within this method
+        while (queryRun.next())
+        {
+            tmpTaxTrans = queryRun.get(tableNum(TmpTaxWorkTrans));
+
+            ledgerJournalTrans = this.initTaxJournalLine(parameters);
+            
+            recordTaxInsertList.add(ledgerJournalTrans);
+            _ledgerJournalEngine.voucherTotals(ledgerJournalTrans, true);
+        }
+
+        if (recordTaxInsertList)
+        {
+            recordTaxInsertList.insertDatabase();
+        }
+
+        return ledgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetFieldsAndSetOffsetAcc</Name>
+				<Source><![CDATA[
+    private void resetFieldsAndSetOffsetAcc(LedgerJournalTrans _ledgerJournalTrans, TmpCustVendTransOpen _localTmpTrans, ReasonCode _reasonCode, ReasonComment _reasonComment)
+    {
+        _ledgerJournalTrans.ReasonRefRecID = ReasonTableRef::createReasonTableRef(_reasonCode, _reasonComment);
+        _ledgerJournalTrans.Txt = this.getTransactionText(_localTmpTrans, _ledgerJournalTrans);
+
+        _ledgerJournalTrans.SkipBlockedForManualEntryCheck = NoYes::Yes;
+
+        //Set the offset account type
+        _ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+        _ledgerJournalTrans.OffsetLedgerDimension = 0;
+        _ledgerJournalTrans.OffsetDefaultDimension = 0;
+
+        //blank out fields like sales tax, etc.
+        _ledgerJournalTrans.TaxGroup = '';
+        _ledgerJournalTrans.TaxItemGroup = '';
+        if (_ledgerJournalTrans.isTaxIntegrationEnabled())
+        {
+            LedgerJournalTransTaxExtension ledgerJournalTransTaxExt = _ledgerJournalTrans.ledgerJournalTransTaxExtension();
+            ledgerJournalTransTaxExt.OverrideSalesTax = NoYes::Yes;
+            _ledgerJournalTrans.packExtensionTable(ledgerJournalTransTaxExt);
+        }
+        _ledgerJournalTrans.PaymMode = '';
+        _ledgerJournalTrans.PaymSpec = '';
+        _ledgerJournalTrans.Prepayment = 0;
+        _ledgerJournalTrans.BankTransType = '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransactionText</Name>
+				<Source><![CDATA[
+    private LedgerJournalTransTxt getTransactionText(TmpCustVendTransOpen _localTmpTrans, LedgerJournalTrans _ledgerJournalTrans)
+    {
+        LedgerJournalTransTxt txt;
+        TransactTxt transactTxt;
+
+        select firstonly Txt from transactTxt
+            where transactTxt.TransactionType == LedgerTransTxt::MCRCustWriteOff
+                && transactTxt.LanguageId == CompanyInfo::find().LanguageId;
+
+        if (transactTxt.Txt != strMin())
+        {
+            TransactionTxt transactionTxt = TransactionTxt::construct();
+            transactionTxt.setFormLetter(_ledgerJournalTrans.JournalNum);
+            transactionTxt.setVoucher(_ledgerJournalTrans.Voucher);
+            txt = transactionTxt.txt(transactTxt.Txt);
+        }
+        else
+        {
+            txt = strFmt("@SYS133612", _localTmpTrans.AccountNum, CustTable::find(_localTmpTrans.AccountNum).name());
+        }
+
+        return txt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addAmountToDimensionMap</Name>
+				<Source><![CDATA[
+    protected void addAmountToDimensionMap(Map _dimensionMap, LedgerDimensionAccount _ledgerDimension, AmountCur _writeOffAmount)
+    {
+        if (_dimensionMap.exists(_ledgerDimension))
+        {
+            _writeOffAmount += _dimensionMap.lookup(_ledgerDimension);
+        }
+
+        _dimensionMap.insert(_ledgerDimension, _writeOffAmount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWriteOffJournalLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the <c>LedgerJournalTrans</c> records for the write-off journal.
+    /// </summary>
+    /// <param name="_localTmpTrans">
+    /// A <c>TmpCustVendTransOpen</c> record.
+    /// </param>
+    /// <param name="_ledgerJournalEngine">
+    /// A <c>LedgerJournalEngine_Daily</c> object.
+    /// </param>
+    /// <param name="_transOpenToSettle">
+    /// A <c>Set</c> object that contains the <c>CustTransOpen</c> table for which to create journal lines.
+    /// </param>
+    /// <param name="_previousLedgerJournalTrans">
+    /// The previous <c>LedgerJournalTrans</c> record in the journal.
+    /// </param>
+    /// <returns>
+    /// The last <c>LedgerJournalTable</c> record that was created.
+    /// </returns>
+    protected LedgerJournalTrans createWriteOffJournalLines(
+        TmpCustVendTransOpen _localTmpTrans,
+        LedgerJournalEngine _ledgerJournalEngine,
+        Set _transOpenToSettle,
+        LedgerJournalTrans _previousLedgerJournalTrans)
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+
+        changecompany(_localTmpTrans.Company)
+        {
+            AmountCur taxAmount = this.calcSalesTaxOnOpenTrans(_transOpenToSettle);
+            Debug::assert(abs(taxAmount) < abs(_localTmpTrans.AmountCur));
+
+            ReasonCode localReasonCode;
+            ReasonComment localReasonComment;
+            [localReasonCode, localReasonComment] = this.findReasonCodeForCompany(_localTmpTrans.Company);
+
+            // Create customer account type record
+            ledgerJournalTrans = this.createCustomerAccTypeJournalLine(_localTmpTrans, _ledgerJournalEngine, _previousLedgerJournalTrans, localReasonCode, localReasonComment);
+
+            // create specTrans records for the transaction to settle
+            this.markTransForSettlement(_transOpenToSettle, ledgerJournalTrans);
+
+            LedgerDimensionDefaultAccount defaultAccount = CustWriteOffFinancialReasonsSetup::findByReasonCode(localReasonCode, _localTmpTrans.Company).WriteOffLedgerDimension;
+
+            AmountCur totalWriteOffAmount = _localTmpTrans.AmountCur - taxAmount;
+
+            // Map ledger dimensions found in transactions to corresponding amounts
+            Map dimensionsToAmounts = this.mapDimensionsToAmounts(_transOpenToSettle, defaultAccount, totalWriteOffAmount);
+
+            // If no ledger dimensions have been applied to lines, gather all amounts into one <c>LedgerJournalTrans</c>
+            if (dimensionsToAmounts.empty())
+            {
+                LedgerDimensionAccount defaultLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(defaultAccount, _localTmpTrans.DefaultDimension);
+
+                ledgerJournalTrans = this.createLedgerAccTypeJournalLine(_localTmpTrans, _ledgerJournalEngine, ledgerJournalTrans, defaultLedgerDimension,
+                                                                         totalWriteOffAmount, localReasonCode, localReasonComment);
+            }
+            else// If ledger dimensions are found, iterate over resulting map and produce one <c>LedgerJournalTrans</c> for each dimension found
+            {
+                MapEnumerator dimensionMapEnumerator = dimensionsToAmounts.getEnumerator();
+
+                while (dimensionMapEnumerator.moveNext())
+                {
+                    if (dimensionMapEnumerator.currentValue() != 0)
+                    {
+                        ledgerJournalTrans = this.createLedgerAccTypeJournalLine(_localTmpTrans, _ledgerJournalEngine, ledgerJournalTrans, dimensionMapEnumerator.currentKey(),
+                                                                         dimensionMapEnumerator.currentValue(), localReasonCode, localReasonComment);
+                    }
+                }
+            }
+
+            //Create Taxlines
+            ledgerJournalTrans = this.createTaxJournalLines(_localTmpTrans, _ledgerJournalEngine, ledgerJournalTrans, localReasonCode, localReasonComment);
+        }
+
+        return ledgerJournalTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mapDimensionsToAmounts</Name>
+				<Source><![CDATA[
+    protected Map mapDimensionsToAmounts(Set _transOpenToSettle, LedgerDimensionDefaultAccount _writeOffLedgerAccount, AmountCur _expectedTotalWriteOffAmount)
+    {
+        // Map for summarizing by Default Dimension
+        Map dimensionAmounts = new Map(Types::Int64, Types::Real);
+        RefRecId custTransOpenRecId;
+        AmountCur actualTotalWriteOffAmount;
+
+        CustTrans custTrans;
+        CustTransOpen custTransOpen;
+
+        SetEnumerator transOpenEnumerator = _transOpenToSettle.getEnumerator();
+
+        while (transOpenEnumerator.moveNext())
+        {
+            custTransOpenRecId = transOpenEnumerator.current();
+
+            if (custTransOpenMap.exists(custTransOpenRecId))
+            {
+                custTransOpen = custTransOpenMap.lookup(custTransOpenRecId);
+            }
+            else
+            {
+                select firstonly custTransOpen
+                    where custTransOpen.RecId == custTransOpenRecId;
+            }
+
+            if (custTransMap.exists(custTransOpenRecId))
+            {
+                custTrans = custTransMap.lookup(custTransOpenRecId);
+            }
+            else
+            {
+                select firstonly custTrans
+                    where custTrans.RecId == custTransOpen.RefRecId;
+            }
+
+            if (custTrans.AccountingEvent)
+            {
+                //Look at the accounting distributions for Source document related documents
+                actualTotalWriteOffAmount += this.getWriteOffAmountsFromAccDistribution(custTrans, custTransOpen, _writeOffLedgerAccount, dimensionAmounts);
+            }
+            else
+            {
+                //Look at the GL Voucher for non-Source document related documents
+                actualTotalWriteOffAmount += this.getWriteOffAmountsFromGeneralJournalAccountEntry(custTrans, custTransOpen, _writeOffLedgerAccount, dimensionAmounts);
+            }
+        }
+
+        if (actualTotalWriteOffAmount != _expectedTotalWriteOffAmount && dimensionAmounts.elements())
+        {
+            //Handle any penny difference created due to scaling of amounts to open amount.
+            MapEnumerator dimensionMapEnumerator = dimensionAmounts.getEnumerator();
+            dimensionMapEnumerator.moveNext();
+            this.addAmountToDimensionMap(dimensionAmounts, dimensionMapEnumerator.currentKey(), (_expectedTotalWriteOffAmount - actualTotalWriteOffAmount));
+        }
+
+        return dimensionAmounts;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>combineTwoLedgerDimensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Combines the <c>MainAccount</c> of a <c>LedgerDimensionDefaultAccount</c> with the dimensions of a <c>LedgerDimensionAccount<c>
+    /// </summary>
+    /// <param name = "_defaultAccount">The default account from which the main account will be pulled</param>
+    /// <param name = "_ledgerDimension">The ledger dimension from which the dimensions will be pulled</param>
+    /// <returns>A <c>LedgerDimensionAccount</c> containing the combination of main account and dimensions</returns>
+    private LedgerDimensionAccount combineTwoLedgerDimensions(LedgerDimensionDefaultAccount _defaultAccount, LedgerDimensionAccount _ledgerDimension)
+    {
+        DimensionDefault defaultDimensions = LedgerDimensionFacade::getDefaultDimensionFromLedgerDimension(_ledgerDimension);
+        return LedgerDimensionFacade::serviceCreateLedgerDimension(_defaultAccount, defaultDimensions);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setOfValuesToQueryRangeValue</Name>
+				<Source><![CDATA[
+    private str setOfValuesToQueryRangeValue(Set _set)
+    {
+        container queryValues;
+        SetEnumerator se = _set.getEnumerator();
+
+        while (se.moveNext())
+        {
+            queryValues += queryValue(se.current());
+        }
+
+        return con2Str(queryValues);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWriteOffAmountsFromGeneralJournalAccountEntry</Name>
+				<Source><![CDATA[
+    private AmountCur getWriteOffAmountsFromGeneralJournalAccountEntry(
+        CustTrans _custTrans,
+        CustTransOpen _custTransOpen,
+        LedgerDimensionDefaultAccount _defaultAccount,
+        Map _dimensionAmounts)
+    {
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntry;
+        AmountCur totalWriteOffAmount;
+
+        boolean isCollectionsWriteOffSeparatedSalesTax = CustParameters::find().CollectionsWriteOffSeparateSalesTax;
+
+        if (FeatureStateProvider::isFeatureEnabled(CustWriteOffSalesInvoiceDefaultFromRevenuePostingTypeFeature::instance())
+            && this.doesPostingTypeSalesRevenueExistForGeneralJournalAccountEntry(_custTrans))
+        {
+            while select TransactionCurrencyAmount, LedgerDimension, PostingType from generalJournalAccountEntry
+                where generalJournalAccountEntry.PostingType == LedgerPostingType::SalesRevenue 
+                    || generalJournalAccountEntry.PostingType == LedgerPostingType::Tax
+                    exists join subledgerVoucherGeneralJournalEntry
+                        where subledgerVoucherGeneralJournalEntry.Voucher == _custTrans.Voucher
+                            && subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == _custTrans.DataAreaId
+                            && subledgerVoucherGeneralJournalEntry.AccountingDate == _custTrans.TransDate
+                            && generalJournalAccountEntry.GeneralJournalEntry == subledgerVoucherGeneralJournalEntry.GeneralJournalEntry
+            {
+                // If separate sales tax is true, skip the tax records
+                if (isCollectionsWriteOffSeparatedSalesTax && generalJournalAccountEntry.PostingType == LedgerPostingType::Tax)
+                {
+                    continue;
+                }
+
+                totalWriteOffAmount += this.getWriteOffAmountFromGeneralJournalAccountEntry(_defaultAccount, _custTrans, _custTransOpen,
+                generalJournalAccountEntry, _dimensionAmounts);
+            }
+
+        }
+        else 
+        {
+            GeneralJournalEntry generalJournalEntry;
+
+            // Select all the associated records in the GL that are not CustBalance.
+            while select TransactionCurrencyAmount, LedgerDimension, PostingType from generalJournalAccountEntry
+                where generalJournalAccountEntry.PostingType != LedgerPostingType::CustBalance
+                    exists join generalJournalEntry
+                        where generalJournalEntry.RecId == generalJournalAccountEntry.GeneralJournalEntry
+                    exists join subledgerVoucherGeneralJournalEntry
+                        where subledgerVoucherGeneralJournalEntry.Voucher == _custTrans.Voucher
+                            && subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == _custTrans.DataAreaId
+                            && subledgerVoucherGeneralJournalEntry.AccountingDate == _custTrans.TransDate
+                            && generalJournalEntry.RecId == subledgerVoucherGeneralJournalEntry.GeneralJournalEntry
+            {
+                // If separate sales tax is true, skip the tax records
+                if (isCollectionsWriteOffSeparatedSalesTax && generalJournalAccountEntry.PostingType == LedgerPostingType::Tax)
+                {
+                    continue;
+                }
+
+                totalWriteOffAmount += this.getWriteOffAmountFromGeneralJournalAccountEntry(_defaultAccount, _custTrans, _custTransOpen,
+                generalJournalAccountEntry, _dimensionAmounts);
+            }
+        }
+
+        return totalWriteOffAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWriteOffAmountFromGeneralJournalAccountEntry</Name>
+				<Source><![CDATA[
+    private AmountCur getWriteOffAmountFromGeneralJournalAccountEntry(
+        LedgerDimensionDefaultAccount _defaultAccount,
+        CustTrans _custTrans,
+        CustTransOpen _custTransOpen,
+        GeneralJournalAccountEntry _generalJournalAccountEntry,
+        Map _dimensionAmounts)
+    {
+        LedgerDimensionAccount ledgerDimension = this.combineTwoLedgerDimensions(_defaultAccount, _generalJournalAccountEntry.LedgerDimension);
+
+        // Is credit in GL, but we want a Debit so we take the negative of the Amount
+        AmountCur currencyOverOriginalAmount =
+                            _custTrans.AmountCur != 0 ? (-_generalJournalAccountEntry.TransactionCurrencyAmount / _custTrans.AmountCur) : 0;
+
+        AmountCur writeOffAmount = CurrencyExchange::round(currencyOverOriginalAmount * _custTransOpen.AmountCur, _custTrans.CurrencyCode);
+
+        this.addAmountToDimensionMap(_dimensionAmounts, ledgerDimension, writeOffAmount);
+
+        return writeOffAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doesPostingTypeSalesRevenueExistForGeneralJournalAccountEntry</Name>
+				<Source><![CDATA[
+    private boolean doesPostingTypeSalesRevenueExistForGeneralJournalAccountEntry(CustTrans _custTrans)
+    {
+        GeneralJournalAccountEntry generalJournalAccountEntry;
+        SubledgerVoucherGeneralJournalEntry subledgerVoucherGeneralJournalEntry;
+
+        select firstonly RecId from generalJournalAccountEntry
+            where generalJournalAccountEntry.PostingType == LedgerPostingType::SalesRevenue
+                exists join subledgerVoucherGeneralJournalEntry
+                    where subledgerVoucherGeneralJournalEntry.Voucher == _custTrans.Voucher
+                        && subledgerVoucherGeneralJournalEntry.VoucherDataAreaId == _custTrans.DataAreaId
+                        && subledgerVoucherGeneralJournalEntry.AccountingDate == _custTrans.TransDate
+                        && generalJournalAccountEntry.GeneralJournalEntry == subledgerVoucherGeneralJournalEntry.GeneralJournalEntry;
+
+        return generalJournalAccountEntry.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWriteOffAmountsFromAccDistribution</Name>
+				<Source><![CDATA[
+    private AmountCur getWriteOffAmountsFromAccDistribution(
+        CustTrans _custTrans,
+        CustTransOpen _custTransOpen,
+        LedgerDimensionDefaultAccount _defaultAccount,
+        Map _dimensionAmounts)
+    {
+        AccountingDistribution accountingDistribution;
+        AmountCur writeOffAmount, totalWriteOffAmount;
+
+        DimensionDefault defaultDimensions;
+        LedgerDimensionAccount ledgerDimension;
+
+        boolean isCollectionsWriteOffSeparatedSalesTax = CustParameters::find().CollectionsWriteOffSeparateSalesTax;
+        boolean isTaxRelated;
+
+        Query query = new Query();
+        QueryBuildDataSource qbds = query.addDataSource(tableNum(AccountingDistribution));
+        qbds.addRange(fieldNum(AccountingDistribution, AccountingEvent)).value(queryValue(_custTrans.AccountingEvent));
+
+        QueryRun qr = new QueryRun(query);
+
+        while (qr.next())
+        {
+            accountingDistribution = qr.get(tableNum(AccountingDistribution));
+
+            isTaxRelated = accountingDistribution.MonetaryAmount == MonetaryAmount::Tax
+                || accountingDistribution.MonetaryAmount == MonetaryAmount::TaxNonRecoverable
+                || accountingDistribution.MonetaryAmount == MonetaryAmount::TaxMeasure
+                || accountingDistribution.MonetaryAmount == MonetaryAmount::TaxMeasureNonRecoverable;
+
+            // If separate sales tax is true, skip the tax records
+            if (isCollectionsWriteOffSeparatedSalesTax && isTaxRelated)
+            {
+                continue;
+            }
+
+            ledgerDimension = this.combineTwoLedgerDimensions(_defaultAccount, accountingDistribution.LedgerDimension);
+
+            AmountCur currencyOverOriginalAmount =
+                            _custTrans.AmountCur != 0 ? (abs(accountingDistribution.TransactionCurrencyAmount) / _custTrans.AmountCur) : 0;
+         
+            currencyOverOriginalAmount = currencyOverOriginalAmount * Sign(_custTrans.AmountCur);
+                    
+            //Round to currency's general rounding rule
+            writeOffAmount = CurrencyExchange::roundWithRuleTypeCurrencyTable(currencyOverOriginalAmount * _custTransOpen.AmountCur,
+                                                                                    Currency::find(accountingDistribution.TransactionCurrency), CurrencyRoundingRuleType::Amount);
+
+            totalWriteOffAmount += writeOffAmount;
+
+            this.addAmountToDimensionMap(_dimensionAmounts, ledgerDimension, writeOffAmount);
+        }
+
+        return totalWriteOffAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns a class that contains the methods that are described by the <c>RunBaseDialogable</c>
+    /// interface.
+    /// </summary>
+    /// <returns>
+    /// A class that contains the methods that are described by the <c>RunBaseDialogable</c> interface.
+    /// </returns>
+    /// <remarks>
+    /// A dialog can be either built by using the <c>Dialog</c> class or by using a class that is created
+    /// in the Application Object Tree (AOT).
+    /// </remarks>
+    public Object dialog()
+    {
+        return Dialog::newFormnameRunbase(formStr(CustWriteOff), this);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findReasonCodeForCompany</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Finds the write-off reason code and reason comment for the given parameters.
+    /// </summary>
+    /// <param name="_companyId">
+    ///    The company for which to find the reason code.
+    /// </param>
+    /// <returns>
+    ///    A container that contains the write-off reason code and write-off reason comment.
+    /// </returns>
+    protected container findReasonCodeForCompany(CompanyId _companyId)
+    {
+        container reasonContainer;
+
+        if (_companyId == defaultCompanyForWriteOffReason)
+        {
+            reasonContainer = [writeOffReasonCodeByUser, writeOffReasonCommentByUser];
+        }
+        else
+        {
+            changecompany(_companyId)
+            {
+                // Check if the reason code selected by the user exists in the current company
+                CustWriteOffFinancialReasonsSetup custWriteOffReason = CustWriteOffFinancialReasonsSetup::findByReasonCode(writeOffReasonCodeByUser, _companyId);
+
+                if (!custWriteOffReason)
+                {
+                    // Use the default write-off reason code from the company
+                    custWriteOffReason = CustWriteOffFinancialReasonsSetup::findDefaultWriteOffReasonByCompany(_companyId);
+                }
+
+                reasonContainer = [custWriteOffReason.Reason, custWriteOffReason.Description];
+            }
+        }
+
+        return reasonContainer;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateSummarizedTmpTaxTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates the <c>TmpTaxWorkTrans</c> table buffer.
+    /// </summary>
+    /// <param name = "_parameters">
+    /// An <c>CustWriteOffGenerateSummaryTmpTaxTransParameters</c> instance with parameters to populate the <c>TmpTaxWorkTrans</c> table buffer.
+    /// </param>
+    /// <returns>
+    /// The Tax Amount to write off.
+    /// </returns>
+    [Wrappable(true)]
+    protected final AmountCur populateSummarizedTmpTaxTrans(CustWriteOffGenerateSummaryTmpTaxTransParameters _parameters)
+    {
+        CustTrans custTrans = _parameters.parmCustTrans();
+        TaxTrans taxTrans = _parameters.parmTaxTrans();
+
+        // all tax trans records have same source currency as the customer transaction
+        Debug::assert(taxTrans.SourceCurrencyCode == custTrans.CurrencyCode);
+
+        tmpTaxTrans.clear();
+        tmpTaxTrans.Voucher = custTrans.Voucher;
+        tmpTaxTrans.TransDate = custTrans.TransDate;
+        tmpTaxTrans.TaxCode = taxTrans.TaxCode;
+        tmpTaxTrans.SourceCurrencyCode = taxTrans.SourceCurrencyCode;
+        tmpTaxTrans.TaxDirection = taxTrans.TaxDirection;
+        tmpTaxTrans.LedgerDimension = _parameters.parmLedgerDimensionAccount();
+
+        AmountCur taxAmountToWriteOff = - _parameters.parmTaxAmount() * _parameters.parmWriteOffPercent();
+        taxAmountToWriteOff = CurrencyExchange::round(taxAmountToWriteOff, custTrans.CurrencyCode);
+        tmpTaxTrans.SourceTaxAmountCur = taxAmountToWriteOff;
+
+        if (_parameters.parmConditionalTaxAllowed())
+        {
+            // check if the tax code has a condition tax code field
+            TaxTable taxTable = TaxTable::find(taxTrans.TaxCode);
+            if (taxTable.PaymentTaxCode != '')
+            {
+                // override the tax code and account number from the tax transaction record with the
+                // condition tax code and account.
+                tmpTaxTrans.TaxCode = taxTable.PaymentTaxCode;
+                
+                LedgerDimensionDefaultAccount defaultAccount = TaxLedgerAccountGroup::accountLedgerDimension(taxTable.PaymentTaxCode, taxTrans.TaxDirection);
+                tmpTaxTrans.LedgerDimension = LedgerDimensionFacade::serviceLedgerDimensionFromLedgerDims(defaultAccount, _parameters.parmLedgerDimensionAccount());
+            }
+        }
+
+        return taxAmountToWriteOff;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateSummarizedTmpTaxTrans</Name>
+				<Source><![CDATA[
+    private AmountCur generateSummarizedTmpTaxTrans(
+        TaxTrans _taxTrans,
+        CustTrans _custTrans,
+        AmountCur _taxAmount,
+        LedgerDimensionAccount _ledgerDimension,
+        Percent _writeOffPercent,
+        boolean _conditionalTaxAllowed)
+    {
+        AmountCur taxAmountToWriteOff;
+
+        if (this.shouldSkipTaxTransOfExchangeRateDiff(_taxTrans))
+        {
+            return taxAmountToWriteOff;
+        }
+
+        CustWriteOffGenerateSummaryTmpTaxTransParameters parameters = CustWriteOffGenerateSummaryTmpTaxTransParameters::construct();
+
+        parameters.parmTaxTrans(_taxTrans);
+        parameters.parmCustTrans(_custTrans);
+        parameters.parmTaxAmount(_taxAmount);
+        parameters.parmLedgerDimensionAccount(LedgerDimensionFacade::serviceCreateLedgerDimension(_ledgerDimension));
+        parameters.parmWriteOffPercent(_writeOffPercent);
+        parameters.parmConditionalTaxAllowed(_conditionalTaxAllowed);
+
+        taxAmountToWriteOff = this.populateSummarizedTmpTaxTrans(parameters);
+
+        tmpTaxTrans.insert();
+
+        return taxAmountToWriteOff;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldSkipTaxTransOfExchangeRateDiff</Name>
+				<Source><![CDATA[
+    private boolean shouldSkipTaxTransOfExchangeRateDiff(TaxTrans _taxTrans)
+    {
+        boolean ret;
+
+        if (TaxSkipTaxSpecificExchangeRateDifferenceTaxTransForWriteOffFlight::instance().isEnabled()
+                && _taxTrans.ExchRateDiffOrigRecId
+                && (_taxTrans.TaxDirection == TaxDirection::OutgoingTax_W
+                    || _taxTrans.TaxDirection == TaxDirection::IncomingTax_W))
+        {
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromCustTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the temporary table with open transaction records from the <c>CustTable</c> form data
+    ///    source.
+    /// </summary>
+    /// <param name="_formDS">
+    ///    The <c>CustTable</c> form data source.
+    /// </param>
+    /// <returns>
+    ///    A list of warning messages.
+    /// </returns>
+    /// <remarks>
+    ///    This method will find all open transaction records for the customer. When the open transaction is
+    ///    not already marked for settlement, it will be inserted into the temporary table.
+    /// </remarks>
+    protected List initFromCustTable(FormDataSource _formDS)
+    {
+        CustTrans custTrans;
+        CustTransOpen custTransOpen;
+        SpecTrans specTrans;
+        boolean skipCustomer;
+        boolean transExistForCust;
+        List custWarningMessages = new List(Types::String);
+
+        // set prefix for any warning messages
+        setPrefix("@SYS134944");
+        setPrefix("@SYS134946");
+
+        for (CustTable custTable = getFirstSelection(_formDS); custTable; custTable = _formDS.getNext())
+        {
+            skipCustomer = false;
+            transExistForCust = false;
+
+            // check if there are credit transaction for the customer, if so display error and
+            // skip this customer.
+            if (CustParameters::find().CollectionsWriteOffSeparateSalesTax
+                    && CustTransOpen::existsCreditTransactionsForCustomer(custTable))
+            {
+                custWarningMessages.addEnd(strFmt("@SYS137411", custTable.AccountNum, custTable.name(), custTable.company()));
+                skipCustomer = true;
+            }
+
+            if (!skipCustomer)
+            {
+                // check if there are transaction marked for the customer, if so display error and
+                // skip this customer.
+                while select crossCompany RecId, AccountNum, AmountCur from custTransOpen
+                    where custTransOpen.AccountNum == custTable.AccountNum
+                       && custTransOpen.DataAreaId == custTable.company()
+                    join Voucher, TransDate from custTrans
+                        where custTrans.RecId == custTransOpen.RefRecId
+                    exists join specTrans
+                        where specTrans.RefCompany == custTransOpen.DataAreaId
+                           && specTrans.RefTableId == custTransOpen.TableId
+                           && specTrans.RefRecId == custTransOpen.RecId
+                {
+                    warning(strFmt("@SYS135079", custTransOpen.AccountNum, custTable.name(), custTable.company(), custTrans.Voucher, custTrans.TransDate, custTransOpen.AmountCur));
+                    skipCustomer = true;
+                }
+            }
+
+            if (!skipCustomer)
+            {
+                // no marked transaction exist for customer, so all the open transaction for the
+                // customer can be added to the temp table
+                while select custTransOpen
+                    where custTransOpen.AccountNum == custTable.AccountNum
+                    join custTrans
+                        where custTrans.RecId == custTransOpen.RefRecId
+                {
+                    this.populateTempTable(custTrans, custTransOpen);
+                    transExistForCust = true;
+                }
+
+                // customer doesn't have any transactions and add warning message
+                if (!transExistForCust)
+                {
+                    custWarningMessages.addEnd(strFmt("@SYS135159", custTable.AccountNum, custTable.name(), custTable.company()));
+                }
+            }
+        }
+        return custWarningMessages;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromCustTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the temporary table with records from the <c>CustTrans</c> form data source.
+    /// </summary>
+    /// <param name="_formDS">
+    ///    A <c>CustTrans</c> form data source.
+    /// </param>
+    /// <returns>
+    ///    true when all transactions can be written off; otherwise, false.
+    /// </returns>
+    /// <remarks>
+    ///    This method will find all the open transaction records for the transaction. When the open
+    ///    transaction is not already marked for settlement it will be inserted into the temporary table.
+    /// </remarks>
+    protected boolean initFromCustTrans(FormDataSource _formDS)
+    {
+        CustTrans custTrans;
+        CustTransOpen custTransOpen;
+        boolean stopProcessing;
+        container companyContext;
+
+        // set prefix for any warning messages
+        setPrefix("@SYS134944");
+        setPrefix("@SYS134946");
+
+        for (CustTrans custTransFromFormDatasource = getFirstSelection(_formDS); custTransFromFormDatasource; custTransFromFormDatasource = _formDS.getNext())
+        {
+            companyContext = [custTransFromFormDatasource.company()];
+
+            // Ensure all fields are selected prior to processing since many of the forms calling
+            // this method set the OnlyFetchActive flag on the datasource. This could result in
+            // incorrect results.
+            select crossCompany:companyContext custTrans
+                where custTrans.RecId == custTransFromFormDatasource.RecId;
+
+            // check if customer transaction is closed
+            if (custTrans.Closed != dateNull())
+            {
+                warning(strFmt("@SYS135079", custTrans.AccountNum, CustTable::findByCompany(custTrans.company(), custTrans.AccountNum).name(), custTrans.company(), custTrans.Voucher, custTrans.TransDate, custTrans.AmountCur));
+                stopProcessing = true;
+            }
+            else
+            {
+                // validate open trans not marked and populate tmp table
+                while select crossCompany:companyContext custTransOpen
+                    where custTransOpen.RefRecId == custTrans.RecId
+                {
+                    if (this.isTransOpenMarked(custTransOpen, custTrans.Voucher, true))
+                    {
+                        // if marked transaction exist stop processing
+                        stopProcessing = true;
+                    }
+                    else
+                    {
+                        this.populateTempTable(custTrans, custTransOpen);
+                    }
+                }
+            }
+        }
+        return stopProcessing;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromCustTransOpen</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Initializes the temporary table with records from the <c>CustTransOpen</c> form data source.
+    /// </summary>
+    /// <param name="_formDS">
+    ///    A <c>CustTransOpen</c> form data source.
+    /// </param>
+    /// <remarks>
+    ///    This method will find all the open transactions from the form data source. When the open
+    ///    transaction is not already marked for settlement it will be inserted into the temporary table.
+    /// </remarks>
+    protected void initFromCustTransOpen(FormDataSource _formDS)
+    {
+        CustTrans custTrans;
+        CustTransOpen custTransOpen;
+        container companyContext;
+
+        // set prefix for any warning messages
+        setPrefix("@SYS134944");
+        setPrefix("@SYS134946");
+
+        for (CustTransOpen custTransOpenFromFormDatasource = getFirstSelection(_formDS); custTransOpenFromFormDatasource; custTransOpenFromFormDatasource = _formDS.getNext())
+        {
+            companyContext = [custTransOpenFromFormDatasource.company()];
+
+            // Ensure all fields are selected prior to processing since many of the forms calling
+            // this method set the OnlyFetchActive flag on the datasource. This could result in
+            // incorrect results.
+            select firstonly crossCompany:companyContext custTransOpen
+                where custTransOpen.RecId == custTransOpenFromFormDatasource.RecId
+                join custTrans
+                    where custTrans.RecId == custTransOpen.RefRecId;
+
+            Debug::assert(custTransOpen.RecId != 0);
+
+            // check if the transaction is marked, will keep processing when marked transaction is found,
+            // just skip the marked transaction
+            if (!this.isTransOpenMarked(custTransOpen, custTrans.Voucher, true))
+            {
+                // transaction not marked, add to temp table
+                this.populateTempTable(custTrans, custTransOpen);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTransOpenMarked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Determines whether the <c>CustTransOpen</c> record is already marked.
+    /// </summary>
+    /// <param name="_custTransOpen">
+    ///    The <c>CustTransOpen</c> record.
+    /// </param>
+    /// <param name="_voucher">
+    ///    The voucher number of the <c>CustTransOpen</c> record.
+    /// </param>
+    /// <param name="_displayWarningMessage">
+    ///    true if the warning message should be displayed when the transaction is already marked; otherwise,
+    ///    false.
+    /// </param>
+    /// <returns>
+    ///    true when the <c>CustTransOpen</c> record is already marked; otherwise, false.
+    /// </returns>
+    protected boolean isTransOpenMarked(CustTransOpen _custTransOpen, Voucher _voucher, boolean _displayWarningMessage)
+    {
+        boolean isTransOpenMarked;
+
+        // check if custTransOpen is already marked
+        if (SpecTrans::existByRef(_custTransOpen.company(), _custTransOpen.TableId, _custTransOpen.RecId))
+        {
+            if (_displayWarningMessage)
+            {
+                warning(strFmt("@SYS135079", _custTransOpen.AccountNum, CustTable::findByCompany(_custTransOpen.company(), _custTransOpen.AccountNum).name(), _custTransOpen.company(), _voucher, _custTransOpen.TransDate, _custTransOpen.AmountCur));
+            }
+            isTransOpenMarked = true;
+        }
+
+        return isTransOpenMarked;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markTransForSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates a <c>SpecTrans</c> record that indicates the <c>CustTransOpen</c> records are marked for
+    ///    settlement.
+    /// </summary>
+    /// <param name="_transOpenToSettle">
+    ///    A <c>Set</c> object that contains the <c>CustTransOpen</c> records to be settled.
+    /// </param>
+    /// <param name="_ledgerJournalTrans">
+    ///    The <c>LedgerJournalTrans</c> record that is used to settle the <c>CustTransOpen</c> records.
+    /// </param>
+    /// <remarks>
+    ///    This will set the <c>UseCashDisc</c> field on the <c>CustTransOpen</c> record to Never, because no
+    ///    cash discounts are taken for write-offs.
+    /// </remarks>
+    protected void markTransForSettlement(Set _transOpenToSettle, LedgerJournalTrans _ledgerJournalTrans)
+    {
+        SpecTransManager specTransManager = SpecTransManager::newFromSpec(_ledgerJournalTrans);
+        RefRecId transOpenRecId;
+        CustTransOpen custTransOpen;
+
+        SetEnumerator enumerator = _transOpenToSettle.getEnumerator();
+
+        ttsbegin;
+
+        while (enumerator.moveNext())
+        {
+            transOpenRecId = enumerator.current();
+
+            // Update the Discount type to never on CustTransOpen
+            custTransOpen = CustTransOpen::find(transOpenRecId, true);
+            Debug::assert(custTransOpen.RecId);
+
+            custTransOpen.UseCashDisc = UseCashDisc::Never;
+            custTransOpen.update();
+
+            specTransManager.insert(custTransOpen.company(), tableNum(CustTransOpen), custTransOpen.RecId, custTransOpen.AmountCur, _ledgerJournalTrans.CurrencyCode);
+
+            this.createInterestWriteOffJournalForInterestTrans(custTransOpen, _ledgerJournalTrans);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustCreateInterestWriteOffJournalForInterestTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether a write off journal must be created when marking a transaction for settlement.
+    /// </summary>
+    /// <param name = "_custTrans">
+    /// The <c>CustTrans</c> record.
+    /// </param>
+    /// <returns>
+    /// true if the transaction is writing off an interest transaction; otherwise false.
+    /// </returns>
+    protected boolean mustCreateInterestWriteOffJournalForInterestTrans(CustTrans _custTrans)
+    {
+        return (_custTrans.TransType == LedgerTransType::Interest);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInterestWriteOffJournalForInterestTrans</Name>
+				<Source><![CDATA[
+    private void createInterestWriteOffJournalForInterestTrans(CustTransOpen _custTransOpen, LedgerJournalTrans _ledgerJournalTrans)
+    {
+        //Insert the records in CustInterestWriteOffUnPostedJournal table if the transaction is writing off an interest transaction.
+        CustTrans custTrans = CustTrans::find(_custTransOpen.RefRecId);
+
+        if (this.mustCreateInterestWriteOffJournalForInterestTrans(custTrans))
+        {
+            CustInterestJour custInterestJour = CustInterestJour::findByVoucher(custTrans.AccountNum, custTrans.Voucher, custTrans.TransDate);
+
+            // Check if table already has entry for the ledger transaction and interest note.
+            if (custInterestJour.RecId && !CustInterestWriteOffUnPostedJournal::exist(_ledgerJournalTrans.RecId, custInterestJour.InterestNote))
+            {
+                CustInterestWriteOffUnPostedJournal custInterestWriteOffUnPostedJournal;
+                custInterestWriteOffUnPostedJournal.LedgerJournalTrans = _ledgerJournalTrans.RecId;
+                custInterestWriteOffUnPostedJournal.InterestNote = custInterestJour.InterestNote;
+                custInterestWriteOffUnPostedJournal.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+        writeOffDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        dataSourceCompany = curExt();
+        custTransMap = new Map(Types::Int64, Types::Record);
+        custTransOpenMap = new Map(Types::Int64, Types::Record);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion,#CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWriteOffReasonCodeByUser</Name>
+				<Source><![CDATA[
+    public ReasonCode parmWriteOffReasonCodeByUser(ReasonCode _writeOffReasonCodeByUser = writeOffReasonCodeByUser)
+    {
+        writeOffReasonCodeByUser = _writeOffReasonCodeByUser;
+        return writeOffReasonCodeByUser;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDefaultCompanyForWriteOffReason</Name>
+				<Source><![CDATA[
+    public CompanyId parmDefaultCompanyForWriteOffReason(CompanyId _defaultCompanyForWriteOffReason = defaultCompanyForWriteOffReason)
+    {
+        defaultCompanyForWriteOffReason = _defaultCompanyForWriteOffReason;
+        return defaultCompanyForWriteOffReason;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWriteOffReasonCommentByUser</Name>
+				<Source><![CDATA[
+    public ReasonComment parmWriteOffReasonCommentByUser(ReasonComment _writeOffReasonCommentByUser = writeOffReasonCommentByUser)
+    {
+        writeOffReasonCommentByUser = _writeOffReasonCommentByUser;
+        return writeOffReasonCommentByUser;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDefaultFinancialReasonCodeSetup</Name>
+				<Source><![CDATA[
+    public CustWriteOffFinancialReasonsSetup parmDefaultFinancialReasonCodeSetup(CustWriteOffFinancialReasonsSetup _defaultFinancialReasonCodeSetup = defaultFinancialReasonCodeSetup)
+    {
+        defaultFinancialReasonCodeSetup = _defaultFinancialReasonCodeSetup;
+        return defaultFinancialReasonCodeSetup;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTmpTrans</Name>
+				<Source><![CDATA[
+    public TmpCustVendTransOpen parmTmpTrans(TmpCustVendTransOpen _tmpTrans = tmpTrans)
+    {
+        tmpTrans = _tmpTrans;
+        return tmpTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWriteOffDate</Name>
+				<Source><![CDATA[
+    public TransDate parmWriteOffDate(TransDate _transDate = writeOffDate)
+    {
+        writeOffDate = _transDate;
+        return writeOffDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateTempTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Creates <c>TmpCustVendTransOpen</c> records.
+    /// </summary>
+    /// <param name="_custTrans">
+    ///    The <c>CustTrans</c> record.
+    /// </param>
+    /// <param name="_custTransOpen">
+    ///    The <c>CustTransOpen</c> record.
+    /// </param>
+    protected void populateTempTable(CustTrans _custTrans, CustTransOpen _custTransOpen)
+    {
+        tmpTrans.clear();
+
+        if (!custTransOpenMap.exists(_custTransOpen.RecId))
+        {
+            //Cache the custTransOpen records to be used for creating distributions
+            custTransOpenMap.insert(_custTransOpen.RecId, _custTransOpen);
+        }
+
+        if (!custTransMap.exists(_custTransOpen.RecId))
+        {
+            //Cache the custTrans records to be used for creating distributions
+            custTransMap.insert(_custTransOpen.RecId, _custTrans);
+        }
+
+        tmpTrans.initFromCustVendTrans(_custTrans);
+        tmpTrans.initFromCustVendTransOpen(_custTransOpen);
+        tmpTrans.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preProcessing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Handles the processing before the write-off form is displayed.
+    /// </summary>
+    /// <param name="_args">
+    ///    The <c>Args</c> object.
+    /// </param>
+    /// <returns>
+    ///    true when the processing is successful and the form can be displayed; otherwise, false.
+    /// </returns>
+    public boolean preProcessing(Args _args)
+    {
+        FormDataSource formDS = FormDataUtil::getFormDataSource(_args.record());
+        Common originator = _args.record();
+        boolean ok;
+        boolean stopProcessing;
+
+        switch (originator.TableId)
+        {
+            case tableNum(CustTrans):
+                stopProcessing = this.initFromCustTrans(formDS);
+                break;
+
+            case tableNum(CustTable):
+                List custWarningMessages = this.initFromCustTable(formDS);
+
+                ListEnumerator custWarningMessagesEnumerator = custWarningMessages.getEnumerator();
+                while (custWarningMessagesEnumerator.moveNext())
+                {
+                    checkFailed(custWarningMessagesEnumerator.current());
+                }
+                break;
+
+            case tableNum(CustTransOpen):
+                this.initFromCustTransOpen(formDS);
+                break;
+
+            default:
+                Debug::assert(false);
+                break;
+        }
+
+        // validation prior to opening form
+        ok = this.preProcessValidation();
+
+        if (!ok || stopProcessing)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>preProcessValidation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Validates that the write-off journal can be created.
+    /// </summary>
+    /// <returns>
+    ///    true when the validation is successful; otherwise, false.
+    /// </returns>
+    protected boolean preProcessValidation()
+    {
+        LedgerDimensionDefaultAccount writeOffLedgerDimension;
+        CustWriteOffJournalName writeOffJournalName;
+        List zeroTransAmtList = new List(Types::Container);
+        boolean ok = true;
+
+        while select AccountNum, Company, CurrencyCode, DefaultDimension, sum(AmountCur)
+                from tmpTrans
+                group by AccountNum, Company, CurrencyCode, DefaultDimension
+        {
+            // error if the transaction amount is zero for the currency code, posting profile and dimension
+            if (tmpTrans.AmountCur == 0)
+            {
+                // Add to the list
+                zeroTransAmtList.addEnd([tmpTrans.Company, tmpTrans.CurrencyCode, tmpTrans.PostingProfile, tmpTrans.DefaultDimension]);
+                ok = false;
+            }
+
+            changecompany(tmpTrans.Company)
+            {
+                custParameters = CustParameters::find();
+
+                writeOffJournalName = custParameters.CollectionsWriteOffLedgerJournalName;
+
+                // validate the journal name
+                if (LedgerJournalName::exist(writeOffJournalName))
+                {
+                    // validate that journal name doesn't have a fixed offset
+                    if (LedgerJournalName::find(writeOffJournalName).FixedOffsetAccount == NoYes::Yes)
+                    {
+                        ok = checkFailed("@SYS134954");
+                    }
+                }
+                else
+                {
+                    ok = checkFailed("@SYS133609");
+                }
+            }
+        }
+
+        // when create seperate sales tax is checked it is an error if any credit transactions exist
+        if (CustParameters::find().CollectionsWriteOffSeparateSalesTax)
+        {
+            tmpTrans.clear();
+
+            select firstonly AmountCur from tmpTrans
+                where tmpTrans.AmountCur < 0;
+
+            if (tmpTrans.AmountCur < 0)
+            {
+                ok = checkFailed("@SYS137410");
+            }
+        }
+
+        if (!zeroTransAmtList.empty())
+        {
+            this.zeroTransWarnings(zeroTransAmtList);
+        }
+
+        // no records in the temp table, stop processing
+        select firstonly RecId from tmpTrans;
+
+        if (tmpTrans.RecId == 0)
+        {
+            ok = false;
+        }
+
+        ok = ok && this.setDefaultCompanyAndReasonSetupForWriteoff();
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDefaultCompanyAndReasonSetupForWriteoff</Name>
+				<Source><![CDATA[
+    protected boolean setDefaultCompanyAndReasonSetupForWriteoff()
+    {
+        boolean continueProcessing = true;
+        CompanyId localDefaultCompanyForWriteOffReason;
+        AccountNum localDefaultAccountNumForWriteOffReason;
+        CustWriteOffFinancialReasonsSetup localDefaultFinancialReasonCodeSetup;
+
+        select firstonly Company, AccountNum from tmpTrans
+            where tmpTrans.Company == dataSourceCompany;
+
+        if (tmpTrans)
+        {
+            //If a transaction exists for the current company, reason code should default for current customer account and company.
+            localDefaultCompanyForWriteOffReason = tmpTrans.Company;
+            localDefaultAccountNumForWriteOffReason = tmpTrans.AccountNum;
+        }
+        else
+        {
+            select firstonly Company, AccountNum from tmpTrans;
+
+            // If we are not processing the transactions from current company
+            // we can default the reason code from any company for which transactions are being processed.
+            localDefaultCompanyForWriteOffReason = tmpTrans.Company;
+            localDefaultAccountNumForWriteOffReason = tmpTrans.AccountNum;
+        }
+
+        localDefaultFinancialReasonCodeSetup = CustWriteOffFinancialReasonsHelper::getWriteOffReasonCodeByAccountCompany(localDefaultAccountNumForWriteOffReason, localDefaultCompanyForWriteOffReason);
+
+        if (!localDefaultFinancialReasonCodeSetup)
+        {
+            continueProcessing = false;
+            SysInfoAction_FormRun infoAction = SysInfoAction_FormRun::newFormName(formStr(CustParameters));
+            warning("@AccountsReceivable:WriteOffReasonsSetupWarning", "", infoAction);
+        }
+        else
+        {
+            this.parmDefaultCompanyForWriteOffReason(localDefaultCompanyForWriteOffReason);
+            this.parmDefaultFinancialReasonCodeSetup(localDefaultFinancialReasonCodeSetup);
+        }
+
+        return continueProcessing;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Contains the code that performs the actual job of the class.
+    /// </summary>
+    public void run()
+    {
+        #OCCRetryCount
+
+        ListEnumerator enumerator = this.createCompanyAccountNumList().getEnumerator();
+
+        while (enumerator.moveNext())
+        {
+            try
+            {
+                // each company/account number will be a create a new journal, and each journal is processed
+                // in a seperate transaction boundary
+
+                ttsbegin;
+                CompanyId companyToProcess;
+                AccountNum accountNumToProcess;
+
+                [companyToProcess, accountNumToProcess] = enumerator.current();
+
+                changecompany(companyToProcess)
+                {
+                    custParameters = CustParameters::find();
+                    this.createWriteOff(companyToProcess, accountNumToProcess);
+                }
+
+                if (appl.ttsLevel())
+                {
+                    ttscommit;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCompanyAccountNumList</Name>
+				<Source><![CDATA[
+    protected List createCompanyAccountNumList()
+    {
+        List companyAccountNumList = new List(Types::Container);
+
+        // Creating this list is needed because a temporary table is being used to get the transactions to process,
+        // and it is not possible to do nested selects on the temporary table.
+        // We first need to group the transactions by company and account number, and then with in this need to process all
+        // the records for the company and account (which is done in the createWriteOff call).
+        while select Company, AccountNum from tmpTrans
+            group by Company, AccountNum
+        {
+            // populate the list
+            companyAccountNumList.addEnd([tmpTrans.Company, tmpTrans.AccountNum]);
+        }
+
+        return companyAccountNumList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container packedClass)
+    {
+        Version version = RunBase::getVersion(packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version,#CurrentList] = packedClass;
+                break;
+
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>zeroTransWarnings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Adds the warning messages that transactions total zero to the infolog.
+    /// </summary>
+    /// <param name="_zeroTransAmtList">
+    ///    A list that contains transactions that total zero.
+    /// </param>
+    protected void zeroTransWarnings(List _zeroTransAmtList)
+    {
+        ListEnumerator enumerator;
+        CompanyId companyId;
+        CurrencyCode currencyCode;
+        PostingProfile postingProfile;
+        DimensionDefault defaultDimension;
+        CustTrans custTrans;
+
+        setPrefix("@SYS134951");
+
+        enumerator = _zeroTransAmtList.getEnumerator();
+        while (enumerator.moveNext())
+        {
+            [companyId, currencyCode, postingProfile, defaultDimension] = enumerator.current();
+
+            while select tmpTrans
+                where tmpTrans.Company == companyId
+                   && tmpTrans.CurrencyCode == currencyCode
+                   && tmpTrans.PostingProfile == postingProfile
+                   && tmpTrans.DefaultDimension == defaultDimension
+            {
+                custTrans = CustTrans::find(tmpTrans.RefRecId);
+
+                checkFailed(strFmt("@SYS135079", tmpTrans.AccountNum, CustTable::findByCompany(tmpTrans.company(), tmpTrans.AccountNum).name(), tmpTrans.company(), custTrans.Voucher, tmpTrans.TransDate, tmpTrans.AmountCur));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///    Constructs an instance of the <c>CustWriteOff</c> class.
+    /// </summary>
+    /// <returns>
+    ///    An instance of the <c>CustWriteOff</c> class.
+    /// </returns>
+    public static CustWriteOff construct()
+    {
+        CustWriteOff custWriteOff = new CustWriteOff();
+
+        return custWriteOff;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        CustWriteOff custWriteOff;
+        var company = curExt();
+        var company1 = CompanyInfo::find();
+        if (!_args || !_args.record())
+        {
+            throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        if (!isConfigurationkeyEnabled(configurationKeyNum(PublicSector)) || !LedgerParameters::find().JournalizingDefinitionEnableValue)
+        {
+            custWriteOff = CustWriteOff::construct();
+        }
+        else
+        {
+            custWriteOff = CustWriteOff_PSN::construct();
+        }
+
+        setPrefix("@AccountsReceivable:WriteOffProcessComplete");
+
+        if (!custWriteOff.preProcessing(_args))
+        {
+            return;
+        }
+
+        if (custWriteOff.prompt())
+        {
+            custWriteOff.runOperation();
+
+            if (_args.caller() && formHasMethod(_args.caller(), identifierStr(setTouched)))
+            {
+                _args.caller().setTouched();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

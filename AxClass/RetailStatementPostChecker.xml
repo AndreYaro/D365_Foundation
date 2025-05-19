@@ -1,0 +1,814 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailStatementPostChecker</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Initialize statement table and validates the statement, cancels the posting if the statement is not correct and stops the batch processing.
+/// </summary>
+class RetailStatementPostChecker extends RunBaseBatch implements BatchRetryable
+{
+    RetailStatementId          statementId;
+    RetailStatementTable       statementTable;
+    RetailStoreTable           storeTable;
+
+    #define.CurrentVersion(1)
+
+    #localmacro.CurrentList
+        statementId
+    #endmacro
+
+    boolean suppressError = false;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>paramSuppressError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parameter indicates whether to show dialog when error occurs
+    /// </summary>
+    /// <param name = "_suppressError">true if the suppress error parameter is set; otherwise, false.</param>
+    /// <returns>The suppressError parameter</returns>
+    public boolean paramSuppressError(boolean _suppressError = suppressError)
+    {
+        suppressError = _suppressError;
+        return suppressError;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkStatement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the statement table and its associated statement lines.
+    /// </summary>
+    /// <returns>
+    /// True if the statement is correct; otherwise false.
+    /// </returns>
+    /// <remarks>
+    /// Cancels the posting and encounters error if the statement is not correct. Calculates the total counted amount and total difference amount.
+    /// </remarks>
+    boolean checkStatement()
+    {
+        RetailStatementLine    statementLine;
+        RetailTransactionTable transactionTable;
+        CustTable           customers;
+        RetailAsyncCustomer asyncCust;
+        RetailAsyncCustomerV2 asyncCustV2;
+        boolean ret = true;
+
+        AmountMST   totalCounted;
+        AmountMST   totalDifference;
+        AmountMST   tmpTotalDifference;
+        int         transCounter;
+
+        // <GEERU>
+        #ISOCountryRegionCodes
+        // </GEERU>
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementPostStepStart(0, 'postCheckStatement');
+
+        // Validate the version
+        RetailEodStatementVersionValidator::validateVersion(statementTable, RetailEodCodeVersion::V1);
+
+        if (!RetailStatementPostChecker::checkGiftCardTaxItemGroupForStatement(statementTable.statementId))
+        {
+            checkFailed(strFmt("@SYS4002411", RetailParameters::find().GiftcardItem));
+
+            RetailTracer::Error('Statement post', 'checkStatement', 'Gift card should not be assigned TaxGroup.');
+
+            return false;
+        }
+
+        if (!RetailStatementPostChecker::CheckDispositionCharge())
+        {
+            checkFailed(strFmt("@Retail:ErrorReturnDispositionCode", RetailParameters::find().ReturnDispositionCodeId));
+
+            RetailTracer::Error('Statement post', 'checkStatement', 'There is a charge associated with return disposition code.');
+
+            return false;
+        }
+
+        if (!storeTable.DefaultCustAccount)
+        {
+            ret = checkFailed("@RET4278");
+
+            RetailTracer::Error('Statement post', 'checkStatement', 'The default customer is missing on store.');
+
+            return false;
+        }
+        else
+        {
+            // Check if there are any unnamed transactions.
+            select firstonly RecId from transactionTable
+                where   transactionTable.store          == statementTable.storeId
+                    &&  transactionTable.StatementId    == statementTable.StatementId
+                    &&  transactionTable.type           == RetailTransactionType::Sales
+                    &&  transactionTable.custAccount    == '';
+
+            // Check if the default customer account is blocked, if there are any unnamed customer transactions.
+            // If not, skip this check.
+            if (transactionTable.RecId && RetailStatementCustUnblocker::isCustomerBlocked(storeTable.DefaultCustAccount))
+            {
+                return checkFailed(strfmt("@Ret_HF_227795:RetailStatementDefaultCustAccountBlockedError", storeTable.StoreNumber, storeTable.DefaultCustAccount));
+            }
+        }
+
+        if (this.isClosingMethodDateTime(statementTable))
+        {
+            date postingDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            TransDate transToDate = statementTable.TransToDate;
+            if (this.isTransactionDateTooOld(postingDate, transToDate))
+            {
+                if (this.isInBatch())
+                {
+                    checkFailed(strFmt("@RET5016", DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), statementTable.transToDate));
+
+                    RetailTracer::Error('Statement post', 'checkStatement', 'Posting & TransToDate are more than 30-days apart.');
+
+                    return false; // Always exit in case of batch processing.
+                }
+                else
+                {
+                    if (!this.paramSuppressError())
+                    {
+                        if (Box::yesNo(strfmt("@RET4143",
+                                      DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), statementTable.TransToDate), DialogButton::No) == DialogButton::No)
+                        {
+                            Box::stop("@RET4144");
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        if (!statementTable.StoreId)
+        {
+            ret = checkFailed("@RET4145");
+
+            RetailTracer::Error('Statement post', 'checkStatement', 'The store number must be specified for statement %1.', statementTable.statementId);
+
+            return ret;
+        }
+        else
+        {
+            if (!RetailStoreTable::exist(statementTable.StoreId))
+            {
+                ret = checkFailed(strfmt(RetailStoreTable::txtNotExist(), statementTable.StoreId));
+                return ret;
+            }
+        }
+
+        /* Check if there are any blocked items and etc. */
+        if (statementTable.numberOfNonExistingItems())
+        {
+            return checkFailed(strfmt("@RET4146", statementTable.numberOfNonExistingItems()));
+        }
+
+        int numberOfBlockedItems = statementTable.numberOfBlockedItems();
+        if (numberOfBlockedItems)
+        {
+            if (this.isInBatch())
+            {
+                checkFailed(strfmt("@RET4147", numberOfBlockedItems));
+
+                RetailTracer::Error('Statement post', 'checkStatement', 'There are blocked products in the statement transaction records.');
+
+                return false; // Always exit in case of batch processing.
+            }
+            else
+            {
+                if (!this.paramSuppressError())
+                {
+                    if (Box::yesNo(strfmt("@RET4147" +' '+
+                             "@RET4148",
+                             numberOfBlockedItems, numberOfBlockedItems), DialogButton::No) == DialogButton::No)
+                    {
+                        Box::stop("@RET4144");
+                        return false;
+                    }
+                }
+                else
+                {
+                    return false;
+                }
+            }
+        }
+
+        int numberOfBlockedCustomers = statementTable.numberOfBlockedCustomers();
+        if (numberOfBlockedCustomers)
+        {
+            if (this.isInBatch())
+            {
+                checkFailed(strfmt("@RET4149", numberOfBlockedCustomers));
+
+                RetailTracer::Error('Statement post', 'checkStatement', 'There are blocked customers in the statement transaction records.');
+
+                return false; // Always exit in case of batch processing.
+            }
+
+            if (!this.paramSuppressError())
+            {
+                if (Box::yesNo(strfmt("@RET4149" +' '+
+                         "@RET4150",
+                         numberOfBlockedCustomers), DialogButton::No) == DialogButton::No)
+                {
+                    Box::stop("@RET4144");
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        int numberOfTransactionsWithValidationError = statementTable.numberOfTransactionsWithValidationError();
+        if (numberOfTransactionsWithValidationError > 0)
+        {
+            // This warning should only be displayed if the execution is not in batch.
+            if (!this.isInBatch() && !this.paramSuppressError())
+            {
+                if (Box::yesNo(strfmt("@Retail:RetailTransactionWithValidationErrorPostStatement", numberOfTransactionsWithValidationError), DialogButton::No) == DialogButton::No)
+                {
+                    Box::stop("@RET4144");
+
+                    return false;
+                }
+            }
+        }
+
+        /* Check if there are any async customer GUIDs in the RetailTransactionTable custAccount. */
+        select count(RecId), maxof(custAccount) from transactionTable
+            exists join asyncCust
+            where transactionTable.StatementId == statementTable.statementId
+                && transactionTable.CustAccountAsync
+                && asyncCust.CustAccountAsync == transactionTable.custAccount;
+
+        transCounter = int642int(transactionTable.RecId);
+        str singleFaultyCustAccountAsyncValue = (transCounter > 0) ? transactionTable.custAccount : '';
+
+        // Check for the async customer records in the RetailAsyncCustomerV2 table.
+        select count(RecId), maxof(custAccount) from transactionTable
+            exists join asyncCustV2
+            where transactionTable.StatementId == statementTable.statementId
+                && transactionTable.CustAccountAsync
+                && asyncCustV2.CustAccountAsync == transactionTable.custAccount;
+
+        transCounter += int642int(transactionTable.RecId);
+        singleFaultyCustAccountAsyncValue = (int642int(transactionTable.RecId) > 0) ? transactionTable.custAccount : singleFaultyCustAccountAsyncValue;
+        if (transCounter)
+        {
+            str localizedErrMessage = strfmt("@Retail_Hotfix_236187:AsyncCustPosting", transCounter, singleFaultyCustAccountAsyncValue);
+
+            if (this.isInBatch())
+            {
+                checkFailed(localizedErrMessage);
+
+                RetailTracer::Error('Statement post', 'checkStatement', strfmt('There are %1 transaction header records with an async customer GUID for customer account, such as %2. User cancelled posting.', transCounter, transactionTable.custAccount));
+
+                return false; // Always exit in case of batch processing.
+            }
+
+            if (!this.paramSuppressError())
+            {
+                Box::stop(strfmt('%1 %2', localizedErrMessage, '@RET4144'));
+                return false;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        if (statementTable.totalDifferenceStore())
+        {
+            select count(RecId) from transactionTable
+                where   transactionTable.store          == statementTable.storeId
+                    &&  transactionTable.StatementId    == statementTable.StatementId
+                    &&  transactionTable.TransCode      == RetailTransactionCode::SalesPaymentDifference;
+
+            transCounter = int642int(transactionTable.RecId);
+            if (transCounter)
+            {
+                if (this.isInBatch())
+                {
+                    checkFailed( strfmt("@RET4151", transCounter, storeTable.MaxTransactionDifferenceAmount));
+
+                    RetailTracer::Error('Statement post', 'checkStatement', 'There are transaction records with a difference between the sales and payment amounts that are greater than the specified amount for the store.');
+
+                    return false; // Always exit in case of batch processing.
+                }
+
+                if (!this.paramSuppressError())
+                {
+                    if (Box::yesNo(strfmt("@RET4151" +' '+
+                                "@RET4152",
+                                transCounter, storeTable.MaxTransactionDifferenceAmount), DialogButton::No) == DialogButton::No)
+                    {
+                        Box::stop("@RET4144");
+                        return false;
+                    }
+                }
+                else
+                {
+                    return false;
+                }
+            }
+        }
+
+        // Calculate difference amount for each batch
+        transCounter = 0;
+        while select sum(SalesPaymentDifference) from transactionTable
+            group by transactionTable.BatchID
+                where   transactionTable.store          == statementTable.storeId
+                    &&  transactionTable.StatementId    == statementTable.StatementId
+                    &&  transactionTable.BatchID        != 0
+        {
+            // Verify if amount difference is greater than the max differnece amount
+            if (abs(transactionTable.SalesPaymentDifference) > storeTable.maxShiftDifferenceAmount)
+            {
+                transCounter++;
+            }
+        }
+
+        if (transCounter > 0)
+        {
+            // If statement posting is being executed in batch mode, log an error and return
+            if (this.isInBatch())
+            {
+                checkFailed( strfmt("@RET4151", transCounter, storeTable.MaxTransactionDifferenceAmount));
+
+                RetailTracer::Error('Statement post', 'checkStatement', 'There are transaction records with a difference between the sales and payment amounts that are greater than the specified amount for the store.');
+
+                return false; // Always exit in case of batch processing.
+            }
+
+            if (!this.paramSuppressError())
+            {
+                if (Box::yesNo(strfmt("@Retail:DifferenceExceedsMaxShiftDifferenceAmount" +' '+
+                                "@RET4152",
+                                transCounter, storeTable.maxShiftDifferenceAmount), DialogButton::No) == DialogButton::No)
+                {
+                    Box::stop("@RET4144");
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        RetailTracer::Info('Posting', 'RetailStatementPostChecker::checkStatement()',
+                           'Displaying field values of statement table. Statement Id = %1, Posting date = %2,  Closing method = %3, Statement method = %4, Number Of NonExisting Items = %5, Number Of blocked Items = %6, Number of blocked customers = %7, Store Id = %8, Statement table RecId = %9',
+                           statementTable.statementId, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), statementTable.closingMethod, statementTable.closingMethod, statementTable.numberOfNonExistingItems(), statementTable.numberOfBlockedItems(), statementTable.numberOfBlockedCustomers(), statementTable.storeId, statementTable.RecId);
+
+        //Check if there are any statement lines.
+        select firstonly statementLine
+            where statementLine.StatementId == statementTable.StatementId;
+        // if statement lines then we check them
+        if (statementLine)
+        {
+            while select StatementId, CountedAmount, DifferenceAmount, Currency, TransAmountStore from statementLine
+                where statementLine.StatementId == statementTable.StatementId
+            {
+                totalCounted += statementLine.CountedAmount;
+                tmpTotalDifference = statementLine.DifferenceAmount;
+                if (statementLine.currency != storeTable.Currency)
+                {
+                    CurrencyExchangeHelper currencyExchHelper = CurrencyExchangeHelper::newExchangeDate(Ledger::primaryLedger(CompanyInfo::findDataArea(curext()).RecId), DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+                    tmpTotalDifference = currencyExchHelper.calculateCurrencyToCurrency(statementLine.currency, storeTable.Currency, statementLine.DifferenceAmount, true);
+                }
+
+                totalDifference += tmpTotalDifference;
+                RetailTracer::Info('Posting', 'RetailStatementPostChecker::checkStatement()',
+                                   'Displaying field values of statement lines. Statement Id = %1, Counted amount = %2,  Transamount to Store = %3, Statement line RecId = %4',
+                                   statementLine.statementId, statementLine.countedAmount, statementLine.transAmountStore, statementLine.RecId);
+            }
+
+            // If there is any difference we check if it with in the limit.
+            if (totalDifference)
+            {
+                if (this.isMaxPostingDifferenceExceeded(totalDifference, storeTable))
+                {
+                    if (!this.isInBatch())
+                    {
+                        if (!this.paramSuppressError())
+                        {
+                            Box::stop(strfmt("@RET4288",
+                                 totalDifference, storeTable.MaximumPostingDifference, storeTable.StoreNumber));
+                        }
+                    }
+                    else
+                    {
+                        checkFailed("@RET4288");
+                    }
+
+                    RetailTracer::Error('Statement post', 'checkStatement', 'The total difference is greater than the maximum posting difference for the store.');
+
+                    return false;
+                }
+                else
+                {
+                    if (this.isInBatch())
+                    {
+                        // Log a warning and continue.
+                        checkFailed(strFmt("@RET5018", totalDifference, storeTable.maximumPostingDifference));
+                    }
+                    else
+                    {
+                        if (!this.paramSuppressError())
+                        {
+                            if (Box::yesNo(strfmt("@RET4154", totalDifference), DialogButton::No) == DialogButton::No)
+                            {
+                                Box::stop("@RET4144");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            select firstonly transactionTable
+                where   transactionTable.store          == statementTable.storeId
+                    &&  transactionTable.StatementId    == statementTable.StatementId;
+
+            if (!transactionTable)
+            {
+                if (! this.isInBatch())
+                {
+                    if (!this.paramSuppressError())
+                    {
+                        Box::stop("@RET4155");
+                    }
+                }
+                else
+                {
+                    checkFailed("@RET4155");
+                }
+
+                RetailTracer::Error('Statement post', 'checkStatement', 'No statement lines were found.');
+
+                return false;
+            }
+        }
+
+        while select statementId, ToAccount, Type, AmountToAccount, CustAccount from transactionTable
+            where   transactionTable.store          == statementTable.storeId
+                &&  transactionTable.statementId    == statementTable.statementId
+                &&  (transactionTable.ToAccount && transactionTable.AmountToAccount && transactionTable.CustAccount
+                    || transactionTable.Type == RetailTransactionType::Payment && transactionTable.CustAccount)
+            notexists join customers
+                index hint AccountIdx
+                where customers.AccountNum == transactionTable.custAccount
+        {
+            error(strfmt("@RET4160", transactionTable.custAccount));
+
+            RetailTracer::Error('Statement post', 'checkStatement', 'Customer %1 does not exist for Statement %2', transactionTable.custAccount, statementTable.statementId);
+
+            ret = false;
+        }
+
+        // The last step in statement calculation is to update CalculatedLines filed.
+        // We verify this filed to ensure statement calculation has finished correctly (no AOS crash, etc).
+        if (!statementTable.CalculatedLines)
+        {
+            error("@Retail:StatementCalcNotComplete");
+
+            RetailTracer::Error('Statement post', 'checkStatement', 'Statement calculating did not finish successfully.');
+
+            ret = false;
+        }
+
+        Microsoft.Dynamics.Retail.Tracing.RetailAXTraceProvider::EventWriteRAXStatementPostStepEnd(0, 'postCheckStatement');
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CheckDispositionCharge</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Return disposition charge is not supported by Retail
+    /// </summary>
+    /// <returns>
+    /// True if disposition code is not associated with charge, otherwise, false.
+    /// </returns>
+    public static boolean CheckDispositionCharge()
+    {
+        boolean             ok = true;
+        RetailParameters retailParameters = RetailParameters::find();
+
+        // Check return disposition code setup in Retail Parameters
+        if (retailParameters.ReturnDispositionCodeId)
+        {
+            ReturnDispositionCode returnDispositionCode = ReturnDispositionCode::find(retailParameters.ReturnDispositionCodeId);
+
+            // Validate return disposition code; return false if it's associated with a charge.
+            if (returnDispositionCode)
+            {
+                MarkupAutoTable markupAutoTable;
+
+                select firstonly markupAutoTable
+                    where markupAutoTable.ModuleType        == MarkupModuleType::Cust &&
+                          markupAutoTable.AccountCode       == TableGroupAll::Table   &&
+                          markupAutoTable.ReturnRelation    == retailParameters.ReturnDispositionCodeId;
+
+                if (markupAutoTable)
+                {
+                    MarkupAutoLine markupAutoLine;
+
+                    select count(RecId) from markupAutoLine
+                        where markupAutoLine.TableRecId     == markupAutoTable.RecId    &&
+                              markupAutoLine.TableTableId   == markupAutoTable.TableId  &&
+                              markupAutoLine.Value;
+
+                    if (markupAutoLine && markupAutoLine.RecId)
+                    {
+                        ok = false;
+                    }
+                }
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkGiftCardTaxItemGroup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the gift card item is taxable
+    /// </summary>
+    /// <returns>
+    /// True if the gift card item is not taxable, otherwise, false.
+    /// </returns>
+    public static boolean checkGiftCardTaxItemGroup()
+    {
+        return RetailStatementPostChecker::checkGiftCardTaxItemGroupForStatement('');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkGiftCardTaxItemGroupForStatement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the gift card item is taxable for a given statement.
+    /// </summary>
+    /// <param name="_statementId"> The statement id.</param>
+    /// <returns>
+    /// True if the gift card item is not taxable, otherwise, false.
+    /// </returns>
+    public static boolean checkGiftCardTaxItemGroupForStatement(RetailStatementId _statementId = '')
+    {
+        boolean             ok = true;
+
+        boolean processGiftCardsAsPrepayments_RU;
+        boolean taxOnGiftCards;
+        ItemId giftcardItemId;
+
+        if (_statementId)
+        {
+            RetailEodStatementConfigurationAccessor statementTableAccessor = RetailEodStatementConfigurationAccessor::constructFromStatementId(_statementId);
+            processGiftCardsAsPrepayments_RU = statementTableAccessor.isProcessGiftCardsAsPrepayments_RU();
+            taxOnGiftCards = statementTableAccessor.isTaxOnGiftCards();
+            giftcardItemId = statementTableAccessor.getGiftCardItem();
+        }
+        else
+        {
+            RetailParameters retailParameters = RetailParameters::find();
+            processGiftCardsAsPrepayments_RU = retailParameters.ProcessGiftCardsAsPrepayments_RU;
+            taxOnGiftCards = retailParameters.TaxOnGiftCards;
+            giftcardItemId = retailParameters.GiftcardItem;
+        }
+
+        // <GEERU>
+        if (processGiftCardsAsPrepayments_RU)
+            return true;
+        // </GEERU>
+
+        if (taxOnGiftCards)
+        {
+            return true;
+        }
+
+        TaxItemGroup giftcardItemTaxGroupId = InventTable::find(giftcardItemId).salesTaxItemGroupId();
+
+        if (giftcardItemTaxGroupId)
+        {
+            TaxOnItem           taxOnItem;
+            while select taxOnItem
+                where taxOnItem.TaxItemGroup == giftcardItemTaxGroupId
+            {
+                if (taxOnItem.showTaxValue())
+                {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        return ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRBO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the <c>RetailStoreTable</c> and <c>RetailStatementTable</c> based on the parm values.
+    /// </summary>
+    void initRBO()
+    {
+        statementTable      = RetailStatementTable::find(statementId);
+        storeTable          = RetailStoreTable::find(statementTable.storeId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmStatementId</Name>
+				<Source><![CDATA[
+    public RetailStatementId parmStatementId(RetailStatementId _statementId = statementId)
+    {
+        statementId = _statementId;
+
+        return statementId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize statement table and validates the statement, encounters error if the statement is not correct and ends the batch processing.
+    /// </summary>
+    /// <remarks>
+    /// Calls method <c>initRBO</c> and <c>checkStatement</c> to validate the statement.
+    /// </remarks>
+    /// <exception cref="Exception::Error">
+    /// If the statement is validated false then the status of batch framework changes to error.
+    /// </exception>
+    void run()
+    {
+        this.initRBO();
+
+        if (!this.checkStatement())
+        {
+            throw error("@RET4144"); // So that the status of batch framework task changes to error.
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Integer version = conpeek(_packedClass, 1);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = _packedClass;
+                break;
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>RetailStatementPostChecker</c>
+    /// class can be run in a new session.
+    /// </summary>
+    /// <returns>false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isMaxPostingDifferenceExceeded</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the total difference exceeds the stores's maximum posting difference.
+    /// </summary>
+    /// <param name="_totalDifference">
+    /// The total difference amount.
+    /// </param>
+    /// <param name="_storeTable">
+    /// The record buffer of <c>RetailStoreTable</c> table.
+    /// </param>
+    /// <returns>
+    /// True if the total difference exceeds the store's maximum posting difference; otherwise, false.
+    /// </returns>
+    protected boolean isMaxPostingDifferenceExceeded(AmountMST _totalDifference, RetailStoreTable _storeTable)
+    {
+        return (abs(_totalDifference) > _storeTable.MaximumPostingDifference);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isClosingMethodDateTime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks the closing method type.
+    /// </summary>
+    /// <param name="_statementTable">
+    /// The record buffer of <c>RetailStatementTable</c> table.
+    /// </param>
+    /// <returns>
+    /// True if the closing method type is DateTime; otherwise, false.
+    /// </returns>
+    protected boolean isClosingMethodDateTime(RetailStatementTable _statementTable)
+    {
+        return (_statementTable.ClosingMethod == RetailClosingMethodType::DateTime);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isTransactionDateTooOld</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Test the the difference between <c>TransToDate</c> field of <c>RetailStatementTable</c> table and system date.
+    /// </summary>
+    /// <param name="_postingDate">
+    /// The date of posting.
+    /// </param>
+    /// <param name="_transToDate">
+    /// The transaction date.
+    /// </param>
+    /// <returns>
+    /// True if the difference in date is greater than 30 days; otherwise, false.
+    /// </returns>
+    protected boolean isTransactionDateTooOld(date _postingDate, TransDate _transToDate)
+    {
+        return (abs(any2int(_postingDate - _transToDate)) > 30);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable() 
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

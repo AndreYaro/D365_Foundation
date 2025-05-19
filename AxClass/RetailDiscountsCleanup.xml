@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>RetailDiscountsCleanup</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.Dynamics.Application.Instrumentation;
+using Microsoft.Dynamics.Commerce.Headquarters.Instrumentation;
+
+/// <summary>
+/// The batch job to clean up expired discounts.
+/// </summary>
+internal class RetailDiscountsCleanup extends RunBaseBatch implements BatchRetryable
+{
+    private static CommerceHQEventSource eventSource = CommerceHQEventSource::Log;
+    private static RetailDiscountDisabledSinceDate noDate = DateTimeUtil::date(DateTimeUtil::minValue());
+    private static ValidToDate neverDate = DateTimeUtil::date(DateTimeUtil::maxValue());
+    private static RetailDiscountDisabledSinceDate todayDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+
+    // The timeout for trying to acquire the lock to run the Delete Expired Discounts Job will be 10 minutes.
+    private static int RetailDiscountsCleanupJobAcquireLockTimeOutMilliseconds = 600000;
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>cleanupExpiredDiscounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Clean up expired discounts.
+    /// </summary>
+    public void cleanupExpiredDiscounts()
+    {
+        int64 totalNumberOfDiscountsDeleted = 0;
+        int64 totalNumberOfDiscountsResetDisabledSince = 0;
+        int64 numberOfDiscountsDeleted = 0;
+        int64 numberOfDiscountsResetDisabledSince = 0;
+
+        using(var totalTelemetry = RetailPricingInstrumentationSegment::construct(classStr(RetailDiscountsCleanup), methodStr(RetailDiscountsCleanup, cleanupExpiredDiscounts)))
+        {
+            CompanyInfo companyInfo;
+            RetailPeriodicDiscount periodicDiscount;
+            while select crosscompany DataArea from companyInfo
+                exists join periodicDiscount
+                    where periodicDiscount.DataAreaId == companyInfo.DataArea
+            {
+                DataAreaId discountDataAreaId = companyInfo.DataArea;
+                numberOfDiscountsDeleted = 0;
+                numberOfDiscountsResetDisabledSince = 0;
+
+                // Log the start of deleting expired discounts for company.
+                using(var subTelemetry = RetailPricingInstrumentationSegment::construct(classStr(RetailDiscountsCleanup), methodStr(RetailDiscountsCleanup, cleanupExpiredDiscounts)))
+                {
+                    changecompany(discountDataAreaId)
+                    {
+                        RetailParameters retailParameters;
+                        select firstonly CleanupExpiredDiscountsRequiredDays from retailParameters
+                            where retailParameters.DataAreaId == discountDataAreaId;
+
+                        int expiredDays = retailParameters.CleanupExpiredDiscountsRequiredDays;
+
+                        if (expiredDays > 0)
+                        {
+                            RetailPeriodicDiscount localPeriodicDiscount;
+
+                            /// Loop through all the discounts (except coupon discounts).
+                            /// 1. If the discount has ValidTo, delete it if (ValidTo + expiredDays < today). Do nothing otherwise.
+                            /// 2. If the discount has no ValidTo, refer to DisabledSince.
+                            ///     2.1 If the discount has DisabledSince, delete it if (DisabledSince + expiredDays < today). Do nothing otherwise.
+                            ///     2.2 If the discount is disabled and has no DisabledSince, set DisabledSince = today.
+                            while select forupdate localPeriodicDiscount
+                                where localPeriodicDiscount.DataAreaId == discountDataAreaId && localPeriodicDiscount.IsDiscountCodeRequired == NoYes::No
+                            {
+                                ttsbegin;
+
+                                if (localPeriodicDiscount.ValidTo < neverDate) // Situation 1
+                                {
+                                    if (DateTimeUtil::date(DateTimeUtil::addDays(localPeriodicDiscount.ValidTo, expiredDays)) < todayDate)
+                                    {
+                                        localPeriodicDiscount.delete();
+                                        numberOfDiscountsDeleted++;
+                                    }
+                                }
+                                else if (localPeriodicDiscount.DisabledSince > noDate) // Situation 2.1
+                                {
+                                    if (DateTimeUtil::date(DateTimeUtil::addDays(localPeriodicDiscount.DisabledSince, expiredDays)) < todayDate)
+                                    {
+                                        localPeriodicDiscount.delete();
+                                        numberOfDiscountsDeleted++;
+                                    }
+                                }
+                                else if (localPeriodicDiscount.Status == RetailDisabledEnabled::Disabled) // Situation 2.2
+                                {
+                                    localPeriodicDiscount.DisabledSince = todayDate;
+                                    numberOfDiscountsResetDisabledSince++;
+                                    localPeriodicDiscount.update();
+                                }
+
+                                ttscommit;
+                            }
+                        }
+
+                        // Log the number of discounts deleted/updated for this company.
+                        subTelemetry.addExtendedData('DataArea', discountDataAreaId);
+                        subTelemetry.addExtendedData('ExpiredDays', int2Str(expiredDays));
+                        subTelemetry.addExtendedData('NumerOfDiscountsDeleted', int642Str(numberOfDiscountsDeleted));
+                        subTelemetry.addExtendedData('NumberOfDiscountsResetDisabledSince', int642Str(numberOfDiscountsResetDisabledSince));
+
+                        totalNumberOfDiscountsDeleted += numberOfDiscountsDeleted;
+                        totalNumberOfDiscountsResetDisabledSince += numberOfDiscountsResetDisabledSince;
+                    }
+                }
+            }
+
+            totalTelemetry.addExtendedData('TotalNumberOfDiscountsDeleted', int642Str(totalNumberOfDiscountsDeleted));
+            totalTelemetry.addExtendedData('TotalNumberOfDiscountsResetDisabledSince', int642Str(totalNumberOfDiscountsResetDisabledSince));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        System.Exception ex;
+
+        using (RetailJobSyncManager jobSyncManager = this.initJobSyncManager())
+        {
+            // We will try to acquire an update lock such that only one Delete Expired Discounts job may execute at a time.
+            // If we are unable to acquire the lock after the set time, the job will throw an exception.
+            jobSyncManager.acquireUpdateLock(RetailDiscountsCleanupJobAcquireLockTimeOutMilliseconds);
+
+            try
+            {
+                this.cleanupExpiredDiscounts();
+            }
+            catch(ex)
+            {
+                var exceptionTelemetry = RetailPricingInstrumentatioBatchFailureSegment::construct(classStr(RetailDiscountsCleanup), methodStr(RetailDiscountsCleanup, cleanupExpiredDiscounts));
+                str exceptionStr = strFmt("%1 Exception details: %2", "@RetailPricing:RetailDiscountsCleanupJobError", RetailDiscountsCleanup::exceptionToString(ex));
+                exceptionTelemetry.addExtendedData('Exception details', exceptionStr);
+                exceptionTelemetry.log();
+                throw error("@RetailPricing:RetailDiscountsCleanupJobError");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static RetailDiscountsCleanup construct()
+    {
+        return new RetailDiscountsCleanup();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        RetailDiscountsCleanup scheduler = new RetailDiscountsCleanup();
+
+        if (scheduler.prompt())
+        {
+            scheduler.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@RetailPricing:DeleteExpiredDiscountsLabel";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method returns a value indicating if the <c>RetailDiscountsCleanup</c> class
+    ///  can be run in a new session.
+    /// </summary>
+    /// <returns>true if the the class <c>RetailDiscountsCleanup</c> can
+    ///  be run in a new session; otherwise, false.</returns>
+    protected boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initJobSyncManager</Name>
+				<Source><![CDATA[
+    private RetailJobSyncManager initJobSyncManager()
+    {
+        str lockName = RetailJobSyncManagerHelper::getRetailDiscountsCleanupJobLockName();
+
+        RetailJobSyncManager jobSyncManager = RetailJobSyncManager::construct(lockName, funcName());
+        jobSyncManager.parmExceptionMessage("@RetailPricing:RetailJobSyncManagerExceptionMessageCleanupExpiredDiscounts");
+
+        return jobSyncManager;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>exceptionToString</Name>
+				<Source><![CDATA[
+    private static str exceptionToString(System.Exception _exception)
+    {
+        if (_exception != null)
+        {
+            str exceptionType = _exception.GetType().FullName;
+            str stackTrace = _exception.StackTrace != null ? _exception.StackTrace.ToString() : strFmt('Exception stack trace was null. Current stack is: %1', System.Environment::StackTrace);
+            str exceptionMessage = _exception.Message != null ? _exception.Message : 'Exception message was null';
+            str exceptionToLog = strFmt("Exception Type: %1 / Exception message: %2 / Exception stacktrace: %3", exceptionType, exceptionMessage, stackTrace);
+
+            return exceptionToLog;
+        }
+        else
+        {
+            return strFmt('%1 was called with a null exception. Printing the current call stack: %2', funcName(),  System.Environment::StackTrace);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustGoBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies whether the job must be run in batch.
+    /// </summary>
+    /// <returns>Always return true.</returns>
+    public boolean mustGoBatch()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

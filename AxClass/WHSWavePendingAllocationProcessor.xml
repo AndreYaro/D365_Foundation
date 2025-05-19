@@ -1,0 +1,612 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>WHSWavePendingAllocationProcessor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// <c>WHSWavePendingAllocationProcessor</c> uses a top picking approach to process wave allocation.
+/// </summary>
+public class WHSWavePendingAllocationProcessor extends RunBaseBatch implements BatchRetryable, SysErrorMessageHelpScopeIBatchProvider
+{
+    WHSWaveId               waveId;
+    WHSWorkCreateId         workCreateId;
+    WHSWorkTransType        workTransType;
+    WHSReleaseToWarehouseId releaseToWarehouseId;
+    boolean                 hasReplenishmentStep;
+    WHSWaveExecutionID      waveExecutionId;
+    WHSWaveStepController   lockedWaveStepController;
+    WHSWorkCreateWave       workCreate;
+    WHSParameters           whsParameters;
+    WHSLoadLineAllocationProcessor     loadLineAllocationProcessor;
+    private WHSWaveMethodStatusHandler waveMethodStatusHandler;
+    private WHSInstrumentationLogger   logger;
+
+    const int64             KeepControllerConnectionAliveTimeoutInMs = 120000; // 2 min * 60 * 1000
+    private const int       ProcessPendingAllocationLineValue = 5;
+    private boolean         shouldEndThread;
+    private boolean         wavePendingAllocationProcessorThreadLimitFlightEnabled = WHSWavePendingAllocationProcessorThreadLimitFlight::instance().isEnabled();
+    private boolean         wavePendingAllocationProcessorUnallocatedRecordsNotProcessedFlightEnabled = WHSWavePendingAllocationProcessorUnallocatedRecordsNotProcessedFlight::instance().isEnabled();
+    private Map             pendingAllocationLineMatchRecId = new Map(Types::Int64, Types::Integer);
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        waveId,
+        workCreateId,
+        workTransType,
+        releaseToWarehouseId,
+        hasReplenishmentStep,
+        waveExecutionId
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>allocatePendingAllocation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process load lines for allocation based on the given criteria.
+    /// </summary>
+    /// <param name="_waveTable">
+    /// The wave table that is currently being processed.
+    /// </param>
+    /// <param name="_pendingAllocation">
+    /// The pending allocation with the criteria used for load line selection.
+    /// </param>
+    /// <returns>
+    /// Number of allocated load lines.
+	/// </returns>
+    /// <remarks>
+    /// The _pendingAllocation records must be selected for update and is modified during this method.
+    /// </remarks>
+    private int allocatePendingAllocation(
+        WHSWaveTable                _waveTable,
+        WHSWavePendingAllocation    _pendingAllocation)
+    {
+        using (var wavePendingAllocationProcessorActivityContext = logger.wavePendingAllocationProcessorActivities().wavePendingAllocationProcessorAllocatePendingAllocation())
+        {
+            int allocatedLines = 0;
+
+            using (var waveLockManager = WHSWaveLockManager::newStandard())
+            {
+                boolean result = waveLockManager.tryLockForItemDemandWaveAllocation(
+                                        _pendingAllocation.ItemId,
+                                        _pendingAllocation.InventDimIdAboveLocation,
+                                        _waveTable.WaveId,
+                                        whsParameters.WaveLockWait);
+
+                if (result)
+                {
+                    this.logStartAllocation(_pendingAllocation);
+
+                    if (loadLineAllocationProcessor == null)
+                    {
+                        loadLineAllocationProcessor = WHSLoadLineAllocationProcessor::newFromPendingAllocationProcessor(this);
+                    
+                        if (WHSParameters::find().WaveProgressLog)
+                        {
+                            RefRecId parentWaveMethodStatusId = WHSWaveMethodStatus::find(_waveTable.WaveId, methodStr(WHSPostEngineBase, allocateWave), 0).RecId;
+                            if (parentWaveMethodStatusId)
+                            {
+                                waveMethodStatusHandler = WHSWaveMethodStatusHandler::newWaveMethodStatusHandler(waveId,
+                                                                                                         this.currentBatch.caption,
+                                                                                                         intMax(),
+                                                                                                         parentWaveMethodStatusId);
+
+                                loadLineAllocationProcessor.parmWaveMethodStatusHandler(waveMethodStatusHandler);
+                                waveMethodStatusHandler.updateWaveStepProgressToStarted();
+                            }
+                        }
+                    }
+
+                    loadLineAllocationProcessor.allocateLoadLinesByAllocationCriteria(_pendingAllocation.ItemId, _pendingAllocation.InventDimIdAboveLocation, _waveTable);
+                    allocatedLines = loadLineAllocationProcessor.allocatedLoadLines();
+
+                    if (wavePendingAllocationProcessorThreadLimitFlightEnabled)
+                    {                                               
+                        if (pendingAllocationLineMatchRecId.exists(_pendingAllocation.RecId))
+                        {
+                            pendingAllocationLineMatchRecId.insert(_pendingAllocation.RecId, pendingAllocationLineMatchRecId.lookup(_pendingAllocation.RecId) + 1);
+                        }
+                        else
+                        {
+                            pendingAllocationLineMatchRecId.insert(_pendingAllocation.RecId, 1);
+                        }
+
+                        if (allocatedLines == 0)
+                        {
+                            logger.wavePendingAllocationProcessorActivities().wavePendingAllocationProcessorNotAllocated(wavePendingAllocationProcessorActivityContext, _pendingAllocation.RecId);
+
+                            if (pendingAllocationLineMatchRecId.lookup(_pendingAllocation.RecId) > ProcessPendingAllocationLineValue)
+                            {
+                                if (wavePendingAllocationProcessorUnallocatedRecordsNotProcessedFlightEnabled)
+                                {
+                                    shouldEndThread = true;
+                                }
+                                else
+                                {
+                                    _pendingAllocation.Processed = NoYes::Yes;
+                                    _pendingAllocation.update();
+                                }
+
+                                this.logNotAllocated(_pendingAllocation, pendingAllocationLineMatchRecId.lookup(_pendingAllocation.RecId));
+                            }
+                        }
+                        else
+                        {                            
+                            _pendingAllocation.Processed = NoYes::Yes;
+                            _pendingAllocation.update();
+
+                            pendingAllocationLineMatchRecId.remove(_pendingAllocation.RecId);
+                        }
+                    }
+                    else
+                    {
+                        _pendingAllocation.Processed = NoYes::Yes;
+                        _pendingAllocation.update();
+                    }         
+
+                    this.logEndAllocation(_pendingAllocation);
+
+                    // Release the lock
+                    waveLockManager.releaseForItemDemandWaveAllocation(_pendingAllocation.ItemId, _pendingAllocation.InventDimIdAboveLocation);
+                }
+                else
+                {
+                    throw error(strFmt("@WAX:WaveAllocationLockFailureError", _pendingAllocation.ItemId, _pendingAllocation.InventDimIdAboveLocation, InventDim::find(_pendingAllocation.InventDimIdAboveLocation).preFix(), whsParameters.WaveLockWait));
+                }
+            }
+
+            return allocatedLines;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allowSaveLast</Name>
+				<Source><![CDATA[
+    public boolean allowSaveLast()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWaveErrorIndicator</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a <c>WHSWaveErroredIndicator</c> for the currently running wave to signal the error for parallel running tasks of this wave.
+    /// </summary>
+    private void createWaveErrorIndicator()
+    {
+        WHSWaveErroredIndicator::createRecordIfUnique(waveId, waveExecutionId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteControlRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes the locked control record
+    /// </summary>
+    /// <remarks>
+    /// The control record should already be selected with a pessimistic lock.
+    /// This method should be called withing transaction scope of the select for this record.
+    /// </remarks>
+    private void deleteControlRecord()
+    {
+        if (lockedWaveStepController.RecId)
+        {
+            lockedWaveStepController.delete();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPostMethodName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the name of the post method that is being mimicked by <c>WHSWavePendingAllocationProcessor</c>.
+    /// </summary>
+    /// <returns>
+    /// The the name of the post method being mimicked
+    /// </returns>
+    private WHSPostMethodName getPostMethodName()
+    {
+        return methodStr(WHSPostEngineBase, allocateWave);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasWaveErrored</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks to see if the wave has errored in a parallel task.
+    /// </summary>
+    /// <returns>
+    /// true if an error has occured; otherwise. false.
+    /// </returns>
+    private boolean hasWaveErrored()
+    {
+        return WHSWaveErroredIndicator::exists(waveId, waveExecutionId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logEndAllocation</Name>
+				<Source><![CDATA[
+    private void logEndAllocation(WHSWavePendingAllocation _pendingAllocation)
+    {
+        if (whsParameters.CreatePendingAllocationLog)
+        {
+            WHSWaveAllocationProcessingLog::createLog(_pendingAllocation,
+                                                    this.parmCurrentBatch().RecId,
+                                                    strFmt("@WAX:WaveAllocationFinishedLogMessage", _pendingAllocation.ItemId, _pendingAllocation.InventDimIdAboveLocation));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logNotAllocated</Name>
+				<Source><![CDATA[
+    private void logNotAllocated(WHSWavePendingAllocation _pendingAllocation, int _matchCount)
+    {
+        if (whsParameters.CreatePendingAllocationLog)
+        {
+            WHSWaveAllocationProcessingLog::createLog(_pendingAllocation,
+                                                    this.parmCurrentBatch().RecId,
+                                                    strFmt("@WAX:WaveNotAllocatedLogMessage", _pendingAllocation.ItemId, _pendingAllocation.InventDimIdAboveLocation, _matchCount));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logStartAllocation</Name>
+				<Source><![CDATA[
+    private void logStartAllocation(WHSWavePendingAllocation _pendingAllocation)
+    {
+        if (whsParameters.CreatePendingAllocationLog)
+        {
+            WHSWaveAllocationProcessingLog::createLog(_pendingAllocation,
+                                                    this.parmCurrentBatch().RecId,
+                                                    strFmt("@WAX:WaveAllocationStartedLogMessage", _pendingAllocation.ItemId, _pendingAllocation.InventDimIdAboveLocation));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+        super();
+
+        whsParameters = WHSParameters::find();
+
+        logger = WHSInstrumentationLogger::instance(classStr(WHSWavePendingAllocationProcessor));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmHasReplenishmentStep</Name>
+				<Source><![CDATA[
+    public boolean parmHasReplenishmentStep(boolean _hasReplenishmentStep = hasReplenishmentStep)
+    {
+        hasReplenishmentStep = _hasReplenishmentStep;
+
+        return hasReplenishmentStep;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmReleaseToWarehouseId</Name>
+				<Source><![CDATA[
+    public WHSReleaseToWarehouseId parmReleaseToWarehouseId(WHSReleaseToWarehouseId _releaseToWarehouseId = releaseToWarehouseId)
+    {
+        releaseToWarehouseId = _releaseToWarehouseId;
+
+        return releaseToWarehouseId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWaveExecutionId</Name>
+				<Source><![CDATA[
+    public WHSWaveExecutionID parmWaveExecutionId(WHSWaveExecutionID _waveExecutionId = waveExecutionId)
+    {
+        waveExecutionId = _waveExecutionId;
+
+        return waveExecutionId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWaveId</Name>
+				<Source><![CDATA[
+    public WHSWaveId parmWaveId(WHSWaveId _waveId = waveId)
+    {
+        waveId = _waveId;
+
+        return waveId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWorkCreateId</Name>
+				<Source><![CDATA[
+    public WHSWorkCreateId parmWorkCreateId(WHSWorkCreateId _workCreateId = workCreateId)
+    {
+        workCreateId = _workCreateId;
+
+        return workCreateId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmWorkTransType</Name>
+				<Source><![CDATA[
+    public WHSWorkTransType parmWorkTransType(WHSWorkTransType _workTransType = workTransType)
+    {
+        workTransType = _workTransType;
+
+        return workTransType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process pending allocation records for the currently running wave.
+    /// </summary>
+    public void run()
+    {
+        using (SysErrorMessageHelpScope scope = SysErrorMessageHelpScope::newErrorContextBatchServer(this))
+        {
+            UserConnection controllerConn;
+            WHSInstrumentationWaveProcessingPerformanceTask perfTask;
+
+            try
+            {
+                var waveTable = WHSWaveTable::find(waveId);
+                perfTask = WHSInstrumentationWaveProcessingPerformanceTask::newAllocationProcessor(waveTable, waveExecutionId, funcName());
+
+                // A user connection is used for the control record so that we can reduce the transaction scope for the actual processing of pending allocations
+                controllerConn = new UserConnection();
+                controllerConn.ttsbegin();
+
+                // Insert control record
+                lockedWaveStepController = WHSWaveStepController::createAndLockControlRecord(waveId, waveExecutionId, this.getPostMethodName(), waveTable.InventLocationId, controllerConn);
+
+                // Attempt to cleanup waves that have errored and not cleaned themselves up.
+                WHSWaveProcessingDataCleanup::identifyAndCleanupErroredWavesForWarehouse(waveTable.inventLocationid, waveTable.waveId, waveExecutionId);
+
+                WHSWavePendingAllocation pendingAllocation;
+                pendingAllocation.readPast(true);
+
+                int allocatedLoadLines = 0;
+                int executedAllocations = 0;
+
+                do
+                {
+                    // If the wave has errored in a parallel process then we need to end this thread
+                    if (this.hasWaveErrored()
+                        || shouldEndThread)
+                    {
+                        break;
+                    }
+
+                    ttsBegin;
+                    select pessimisticLock firstOnly pendingAllocation
+                        where pendingAllocation.WaveId      == waveId
+                        &&    pendingAllocation.Processed   == NoYes::No;
+
+                    if (pendingAllocation.RecId != 0)
+                    {
+                        allocatedLoadLines += this.allocatePendingAllocation(waveTable, pendingAllocation);
+                        ++executedAllocations;
+
+                        // Update perf task details so that they are logged even if exception is thrown
+                        perfTask.setAllocatedLoadLines(allocatedLoadLines)
+                            .setExecutedAllocations(executedAllocations);
+                    }
+                    ttsCommit;
+
+                            
+                }
+                while (pendingAllocation.RecId != 0);
+
+                if (waveMethodStatusHandler)
+                {
+                    waveMethodStatusHandler.setTotalSteps(allocatedLoadLines);
+                    waveMethodStatusHandler.updateWaveStepProgressToCompleted();
+                }
+
+                // Delete the control record which indicates we have safely ended this cycle of allocation
+                this.deleteControlRecord();
+
+                controllerConn.ttscommit();
+            }
+            catch
+            {
+                controllerConn.ttsabort();
+                // Create a wave error indicator to signal that other allocation tasks should stop and let the post allocation task call into wave cleanup.
+                this.createWaveErrorIndicator();
+                throw error(strFmt("@WAX:WaveAllocationError", waveId));
+            }
+            finally
+            {
+                controllerConn.finalize();
+   
+                if (perfTask != null)
+                {
+                    perfTask.endTask();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Version version = RunBase::getVersion(_packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = _packedClass;
+                break;
+
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static WHSWavePendingAllocationProcessor construct()
+    {
+        WHSWavePendingAllocationProcessor wavePendingAllocationProcessor = new WHSWavePendingAllocationProcessor();
+
+        return wavePendingAllocationProcessor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@WAX:WaveAllocationClassDescription";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>newFromPostEngine</Name>
+				<Source><![CDATA[
+    public static WHSWavePendingAllocationProcessor newFromPostEngine(WHSPostEngine _postEngine)
+    {
+        WHSWavePendingAllocationProcessor wavePendingAllocationProcessor = WHSWavePendingAllocationProcessor::construct();
+        wavePendingAllocationProcessor.parmWaveId(_postEngine.parmWaveTable().WaveId);
+        wavePendingAllocationProcessor.parmWorkTransType(WHSWaveTable::getWorkTransType(_postEngine.parmWaveTable().WaveId));
+        wavePendingAllocationProcessor.parmReleaseToWarehouseId(_postEngine.parmReleaseToWarehouseId());
+        wavePendingAllocationProcessor.parmHasReplenishmentStep(_postEngine.parmWaveTable().waveTemplate().hasReplenishmentStep());
+        wavePendingAllocationProcessor.parmWaveExecutionId(_postEngine.parmWaveExecutionId());
+
+        return wavePendingAllocationProcessor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Specifies if the batch task is retryable for transient exceptions or not.
+    /// </summary>
+    /// <returns>
+    /// If true is returned, the batch task is retryable, otherwise it is not.
+    /// </returns>
+    [Hookable(false)]
+    final public boolean isRetryable()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>batchInfo</Name>
+				<Source><![CDATA[
+    public BatchInfo batchInfo()
+    {
+        BatchInfo ret = super();
+
+        ret.parmRetryable(false);
+        ret.parmRetriesOnFailure(0);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>errorMessageHelpScopeFormName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the form name used for the error context using a <c>SysErrorMessageHelpScope</c> class.
+    /// </summary>
+    /// <returns>The form name used for the error context.</returns>
+    [Hookable(false)]
+    public FormName errorMessageHelpScopeFormName()
+    {
+        return strFmt('%1_%2', formStr(Dialog), classStr(WhsWaveExecute));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>errorMessageHelpScopeActionName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the action name used for the error context using a <c>SysErrorMessageHelpScope</c> class.
+    /// </summary>
+    /// <returns>The action name used for the error context.</returns>
+    [Hookable(false)]
+    public str errorMessageHelpScopeActionName()
+    {
+        return menuItemActionStr(WHSWaveExecute);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
